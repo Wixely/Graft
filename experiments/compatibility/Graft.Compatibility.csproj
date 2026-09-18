@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <InterceptorsNamespaces>$(InterceptorsNamespaces);Dapper.AOT</InterceptorsNamespaces>
+    <EmitCompilerGeneratedFiles>true</EmitCompilerGeneratedFiles>
+    <PublishAot Condition="'$(NativeProbe)' == 'true'">true</PublishAot>
+    <PublishIISAssets>false</PublishIISAssets>
+    <DebugType Condition="'$(Configuration)' == 'Release'">none</DebugType>
+    <DefaultItemExcludes>$(DefaultItemExcludes);artifacts/**</DefaultItemExcludes>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <RuntimeFrameworkVersion Condition="'$(SelfContained)' == 'true'">10.0.12</RuntimeFrameworkVersion>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(StaticProbe)' == 'true'">
+    <PublishAot>true</PublishAot>
+    <StaticExecutable>true</StaticExecutable>
+    <StaticOpenSslLinking>true</StaticOpenSslLinking>
+    <StaticICULinking>true</StaticICULinking>
+    <EmbedIcuDataPath>/usr/share/icu/74.2/icudt74l.dat</EmbedIcuDataPath>
+    <IlcGenerateStackTraceData>false</IlcGenerateStackTraceData>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(StaticProbe)' == 'true'">
+    <DirectPInvoke Include="e_sqlite3" />
+    <NativeLibrary Include="/usr/lib/libsqlite3.a" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Dapper" Version="2.1.79" />
+    <PackageReference Include="Dapper.AOT" Version="1.1.0" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
+  </ItemGroup>
+</Project>

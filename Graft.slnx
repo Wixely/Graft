@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/experiments/" />
+  <Folder Name="/experiments/compatibility/">
+    <Project Path="experiments/compatibility/Graft.Compatibility.csproj" />
+  </Folder>
+</Solution>
