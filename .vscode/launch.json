@@ -57,6 +57,19 @@
       "console": "integratedTerminal"
     },
     {
+      "name": "Debug operator TLS lifecycle",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build MVP-08 packaging acceptance",
+      "program": "${workspaceFolder}/tests/Graft.Packaging.Acceptance/bin/Debug/net10.0/Graft.Packaging.Acceptance.dll",
+      "args": [
+        "tls",
+        "${workspaceFolder}/src/Graft.Server/bin/Debug/net10.0/Graft.Server.dll"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
       "name": "Debug UI and authentication probe",
       "type": "coreclr",
       "request": "launch",

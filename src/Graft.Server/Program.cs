@@ -15,7 +15,7 @@ using Microsoft.AspNetCore.Hosting.Server.Features;
 
 if (!Arguments.TryParse(args, out Arguments? parsedSettings))
 {
-    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>].");
+    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>].");
     return 2;
 }
 Arguments settings = parsedSettings!;
@@ -30,17 +30,7 @@ LoginThrottle loginThrottle = new();
 string? serverOrigin = null;
 const string SessionCookie = "__Host-graft-session";
 
-using RSA rsa = RSA.Create(2048);
-CertificateRequest certificateRequest = new("CN=localhost", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
-SubjectAlternativeNameBuilder names = new();
-names.AddIpAddress(IPAddress.Loopback);
-names.AddDnsName("localhost");
-certificateRequest.CertificateExtensions.Add(names.Build());
-using X509Certificate2 generated = certificateRequest.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddHours(2));
-using X509Certificate2? imported = OperatingSystem.IsWindows()
-    ? X509CertificateLoader.LoadPkcs12(generated.Export(X509ContentType.Pkcs12), null, X509KeyStorageFlags.DefaultKeySet)
-    : null;
-X509Certificate2 certificate = imported ?? generated;
+using X509Certificate2 certificate = LoadCertificate(settings);
 
 WebApplicationBuilder builder = WebApplication.CreateSlimBuilder(new WebApplicationOptions { Args = [] });
 builder.Host.UseWindowsService(options => options.ServiceName = "Graft");
@@ -584,6 +574,63 @@ static string Origin(HttpContext context) => context.Request.Scheme + "://" + co
 static string ProjectWebUrl(HttpContext context, ProjectDetails project) =>
     Origin(context) + "/" + Uri.EscapeDataString(project.Project.Namespace) + "/" + Uri.EscapeDataString(project.Project.Slug);
 
+static X509Certificate2 LoadCertificate(Arguments settings)
+{
+    X509Certificate2 certificate;
+    if (settings.Certificate is not null)
+    {
+        string? password = settings.CertificatePasswordFile is null ? null : ReadPassword(settings.CertificatePasswordFile);
+        certificate = X509CertificateLoader.LoadPkcs12FromFile(settings.Certificate, password,
+            OperatingSystem.IsWindows() ? X509KeyStorageFlags.DefaultKeySet : X509KeyStorageFlags.EphemeralKeySet);
+    }
+    else
+    {
+        using RSA rsa = RSA.Create(2048);
+        CertificateRequest request = new("CN=localhost", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        SubjectAlternativeNameBuilder names = new();
+        names.AddIpAddress(IPAddress.Loopback);
+        names.AddIpAddress(IPAddress.IPv6Loopback);
+        names.AddDnsName("localhost");
+        request.CertificateExtensions.Add(names.Build());
+        X509Certificate2 generated = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddHours(2));
+        if (!OperatingSystem.IsWindows()) return generated;
+        using (generated)
+            certificate = X509CertificateLoader.LoadPkcs12(generated.Export(X509ContentType.Pkcs12), null,
+                X509KeyStorageFlags.DefaultKeySet);
+    }
+
+    DateTimeOffset now = DateTimeOffset.UtcNow;
+    if (!certificate.HasPrivateKey || now < certificate.NotBefore.ToUniversalTime() || now >= certificate.NotAfter.ToUniversalTime())
+    {
+        certificate.Dispose();
+        throw new InvalidOperationException("The TLS certificate must have a private key and be currently valid.");
+    }
+    X509EnhancedKeyUsageExtension[] usages = certificate.Extensions.OfType<X509EnhancedKeyUsageExtension>().ToArray();
+    if (usages.Length > 0 && !usages.SelectMany(item => item.EnhancedKeyUsages.Cast<Oid>())
+        .Any(oid => oid.Value == "1.3.6.1.5.5.7.3.1"))
+    {
+        certificate.Dispose();
+        throw new InvalidOperationException("The TLS certificate enhanced key usage does not permit server authentication.");
+    }
+    if (settings.Origin is not null && !certificate.MatchesHostname(new Uri(settings.Origin).Host,
+        allowWildcards: true, allowCommonName: false))
+    {
+        certificate.Dispose();
+        throw new InvalidOperationException("The TLS certificate subject alternative name does not match the configured origin.");
+    }
+    return certificate;
+}
+
+static string ReadPassword(string path)
+{
+    string password = File.ReadAllText(path, new UTF8Encoding(false, true));
+    if (password.EndsWith("\r\n", StringComparison.Ordinal)) password = password[..^2];
+    else if (password.EndsWith('\n')) password = password[..^1];
+    if (password.Contains('\r') || password.Contains('\n') || password.Contains('\0'))
+        throw new InvalidDataException("The certificate password file must contain one UTF-8 line.");
+    return password;
+}
+
 sealed record AuthorizedRepository(
     ProjectInfo Project,
     AuthenticatedIdentity Identity,
@@ -614,22 +661,29 @@ sealed class LoginThrottle
     }
 }
 
-sealed record Arguments(string Database, string Repositories, IPAddress ListenAddress, int ListenPort, string? Origin)
+sealed record Arguments(string Database, string Repositories, IPAddress ListenAddress, int ListenPort, string? Origin,
+    string? Certificate, string? CertificatePasswordFile)
 {
     public static bool TryParse(string[] values, out Arguments? result)
     {
         result = null;
-        if (values.Length is < 4 or > 8 || values.Length % 2 != 0) return false;
+        if (values.Length is < 4 or > 12 || values.Length % 2 != 0) return false;
         string? database = null;
         string? repositories = null;
         string? listen = null;
         string? origin = null;
+        string? certificate = null;
+        string? certificatePasswordFile = null;
+        HashSet<string> seen = new(StringComparer.Ordinal);
         for (int index = 0; index < values.Length; index += 2)
         {
+            if (!seen.Add(values[index])) return false;
             if (values[index] == "--database") database = values[index + 1];
             else if (values[index] == "--repositories") repositories = values[index + 1];
             else if (values[index] == "--listen") listen = values[index + 1];
             else if (values[index] == "--origin") origin = values[index + 1];
+            else if (values[index] == "--certificate") certificate = values[index + 1];
+            else if (values[index] == "--certificate-password-file") certificatePasswordFile = values[index + 1];
             else return false;
         }
         if (string.IsNullOrWhiteSpace(database) || string.IsNullOrWhiteSpace(repositories)) return false;
@@ -649,8 +703,15 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             !string.IsNullOrEmpty(originUri.UserInfo) || !string.IsNullOrEmpty(originUri.Query) ||
             !string.IsNullOrEmpty(originUri.Fragment)))
             return false;
+        if (certificatePasswordFile is not null && certificate is null) return false;
+        if (!IPAddress.IsLoopback(address) && certificate is null) return false;
+        if (!IPAddress.IsLoopback(address) && origin is null) return false;
+        if (certificate is not null && (string.IsNullOrWhiteSpace(certificate) || !File.Exists(certificate))) return false;
+        if (certificatePasswordFile is not null && (string.IsNullOrWhiteSpace(certificatePasswordFile) ||
+            !File.Exists(certificatePasswordFile))) return false;
         result = new(Path.GetFullPath(database), Path.GetFullPath(repositories), address, port,
-            origin is null ? null : origin.TrimEnd('/'));
+            origin is null ? null : origin.TrimEnd('/'), certificate is null ? null : Path.GetFullPath(certificate),
+            certificatePasswordFile is null ? null : Path.GetFullPath(certificatePasswordFile));
         return true;
     }
 }

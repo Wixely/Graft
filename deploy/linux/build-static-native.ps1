@@ -1,11 +1,15 @@
 param(
     [Parameter(Mandatory = $true)][string]$Distribution,
-    [string]$BuildRoot = ('/root/graft-product-build-' + [Guid]::NewGuid().ToString('N'))
+    [string]$BuildRoot = ('/root/graft-product-build-' + [Guid]::NewGuid().ToString('N')),
+    [string]$OutputName = 'static-linux-x64-release'
 )
 
 $ErrorActionPreference = 'Stop'
 if ($BuildRoot -notmatch '^/root/graft-product-build-[a-zA-Z0-9-]+$') {
     throw 'Use a dedicated /root/graft-product-build-* directory.'
+}
+if ($OutputName -notmatch '^static-linux-x64-[a-zA-Z0-9-]+$') {
+    throw 'Use a simple static-linux-x64-* output name.'
 }
 
 function Invoke-Linux {
@@ -76,7 +80,7 @@ try {
             throw ('Output still requires a dynamic loader or shared library: ' + $binary)
         }
     }
-    $destination = $source + '/artifacts/mvp08/static-linux-x64-release'
+    $destination = $source + '/artifacts/mvp08/' + $OutputName
     & wsl.exe -d $Distribution -u root --exec test -e $destination
     if ($LASTEXITCODE -eq 0) { throw 'Release destination already exists; existing files were preserved.' }
     Invoke-Linux -Command @('mkdir', '-p', ($destination + '/server'), ($destination + '/admin'))

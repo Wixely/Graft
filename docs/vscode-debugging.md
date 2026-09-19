@@ -14,6 +14,7 @@ Set server breakpoints in `experiments/ui-server`. The browser client is publish
 | Debug MVP-06 repository UI and API | Runs the real Git client, GitLab-style API and browser-session/repository checks against a disposable HTTPS server, SQLite database and durable object/ref directory. |
 | Debug MVP-07 import and recovery | Runs synthetic bundle inventory, repeatable Git HTTPS import, quiescence, backup/tamper/restore and rollback checks through the admin CLI. |
 | Debug MVP-08 interactive packaging checks | Starts the Debug server through the packaging harness and measures startup, working set and loopback health latency against provisional gates. |
+| Debug operator TLS lifecycle | Generates disposable PKCS#12/password files, pins the certificate, tests restart and replacement, and verifies non-loopback refusal without a certificate. |
 | Debug UI and authentication probe | Interactive UI with server C# breakpoints and browser opening. |
 | Debug compatibility probe | Runs the six compatibility checks and exits. |
 | Debug storage migration probe | Runs the disposable DnaX/SQLite migration checks and exits. |
