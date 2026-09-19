@@ -12,15 +12,15 @@ The import evidence is deliberately repository-only. A C# bundle parser inventor
 
 Backups use a consistent SQLite backup plus the complete repository tree. Every file and directory is inventoried; files are hashed. Links/reparse points, undeclared paths, tampering, live-server backup and existing restore targets are rejected. Restore verifies before publishing fresh targets and removes a database published before a later failure. The rollback rehearsal uses a synthetic incompatible schema change and a second fresh restore. Online backup, cross-process clusters and power-loss atomicity across separate database/repository paths remain outside the evidence.
 
-The main release gates are the durable DnaX package source, a real CA/DNS/client-trust environment and integrated static-musl execution on the required Linux 3.10.108 host. Windows Service, local operator-managed certificate loading, restart/replacement, systemd and container secret plumbing pass. Exact GitLab fixtures and interactive production-browser execution also remain open.
+The main release gates are the durable DnaX package source, a real CA/DNS/client-trust environment and integrated static-musl execution on the required Linux 3.10.108 host. The user deferred the legacy-host run for now. Windows Service, local operator-managed certificate loading, restart/replacement, systemd and container secret plumbing pass. A GitLab 18.0.0 source-backed project-creation fixture now passes; live reference-instance, pinned-client and interactive production-browser execution remain open.
 
-Private project creation now passes through both the Blazor session API and the bounded GitLab-style REST route. The write route requires `api`, creates an empty durable repository through pending/ready publication, and rejects duplicates, invalid paths, unsupported visibility, and unsupported fields. The combined Windows JIT and NativeAOT harness now passes 76 assertions; see [project creation evidence](validation/2026-09-19-project-creation.md).
+Private project creation now passes through both the Blazor session API and the bounded GitLab-style REST route. The write route requires `api`, creates an empty durable repository through pending/ready publication, and rejects duplicates, invalid paths, unsupported visibility, and unsupported fields. A pinned GitLab 18.0.0 source fixture added path-only creation and raises the combined Windows JIT and NativeAOT harness to 87 assertions; see [source-fixture evidence](validation/2026-09-19-gitlab-18-source-fixture.md).
 
 No remote is configured. Do not deploy, publish, import production data, expose a network listener or select repository visibility without explicit authorization.
 
 ## Next work
 
-Transfer the integrated static-musl server/admin pair to the Linux 3.10.108 host and repeat TLS, interactive, Git and operations acceptance. Validate the intended CA-issued certificate, DNS and client trust chain before non-loopback deployment.
+Keep the recorded static-musl server/admin pair available for the deferred Linux 3.10.108 run. For GitLab compatibility, the next evidence step is an authorized GitLab 18.0 reference instance plus a pinned `glab` executable; neither is installed or configured by this repository. Validate the intended CA-issued certificate, DNS and client trust chain before non-loopback deployment.
 
 Continue to use the ignored reproducible DnaX feed until the user or DnaX maintainer selects an approved durable package source. Do not substitute a server-side Git executable or native Git library.
 
@@ -30,7 +30,7 @@ Continue to use the ignored reproducible DnaX feed until the user or DnaX mainta
 | --- | --- | --- |
 | Deployment TLS trust | Operator + implementation agent | Intended CA certificate, DNS/SAN, client trust and renewal rehearsal |
 | Required legacy host | Implementation agent + user | Integrated static-musl artifact inspected and run on Linux 3.10.108 with sanitized evidence |
-| GitLab fixture | Implementation agent | Version-matched fixtures and pinned `glab` workflow replace rolling-document inference |
+| GitLab live/client fixture | Implementation agent | Run a GitLab 18.0 reference instance and pinned `glab`; compare full wire responses with the existing source-backed fixture |
 | DnaX distribution | User/DnaX maintainer | Clean checkout restores without a sibling source tree or locally prepared feed |
 
-Recommended next action: Owner: User + implementation agent — run required-host acceptance. Remaining work: deployment CA/DNS trust, DnaX distribution, exact GitLab fixtures, interactive browser execution and the Linux 3.10.108 MVP-08 gate.
+Recommended next action: Owner: User — provide or authorize an isolated GitLab 18.0 reference and pinned `glab` client for live comparison. Owner: Implementation agent — run the source-backed cases against both services and record wire deviations. Remaining work: deployment CA/DNS trust, DnaX distribution, live GitLab/client comparison, interactive browser execution and the deferred Linux 3.10.108 MVP-08 gate.

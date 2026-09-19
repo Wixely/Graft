@@ -1,12 +1,12 @@
 # GitLab conformance plan
 
-Recorded: 2026-09-18. Updated: 2026-09-19. Status: bounded MVP-06 REST and browser subsets implemented; exact upstream fixture pending. Owner: Implementation agent. Review: 2026-09-25 and before each selected upstream API-version change.
+Recorded: 2026-09-18. Updated: 2026-09-19. Status: bounded REST and browser subsets implemented; GitLab 18.0.0 source fixture passes for project creation, while reference-instance and existing-client runs remain pending. Owner: Implementation agent. Review: 2026-09-25 and before each selected upstream API-version change.
 
 Confirmed goal: GitLab APIs/URL conventions and GitLab-style apps, with most GitLab functionality. Exact GitLab versions/editions and clients remain TBD. Reference for research: [official REST documentation](https://docs.gitlab.com/api/rest/). Recheck official documentation before implementing a versioned contract.
 
 | Surface | Evidence to record | Current status |
 | --- | --- | --- |
-| REST | Method/path, request/response/error shape, auth, scopes, pagination, encoding, status codes, redirects | Bounded read subset passes the C# harness; exact upstream comparison pending |
+| REST | Method/path, request/response/error shape, auth, scopes, pagination, encoding, status codes, redirects | Bounded read/write subset passes the C# harness; GL-004 has a version-matched source fixture, while live upstream comparison remains pending |
 | GraphQL | Supported schema/queries/mutations, pagination and authorization | Not implemented |
 | Browser/raw/archive URLs | Namespace nesting, refs, filenames, downloads, canonical redirects | Personal namespace project/deep-link route implemented; raw/archive and nesting pending |
 | Git HTTPS/SSH and LFS | Clone/fetch/push, auth and ref permissions, large-object integrity | Bounded Git HTTPS subset passes; SSH and LFS pending |
@@ -23,18 +23,18 @@ The current workflow covers authenticated user/project discovery, read-only repo
 
 MVP-06 update: [repository UI and API evidence](validation/2026-09-19-mvp06-repository-api-ui.md) demonstrates product namespace routing, HTTPS/token authentication, durable storage and the selected REST reads. This is implementation evidence against rolling official documentation, not a version-matched GitLab compatibility result.
 
-Provisional version candidate: **GitLab CE 18.0.0, REST v4**. This is an agent-proposed reproducible contract fixture, not a user-selected version, a recommendation to deploy an old GitLab release, or a verified comparison environment. Official rolling documentation was consulted on 2026-09-18; it is not proof of 18.0.0 behavior. Before marking any row passing, obtain version-matched source/fixtures or captures from an authorized isolated reference, hash the fixtures and record deviations. No reference GitLab instance was installed or accessed during preparation.
+Provisional version candidate: **GitLab CE 18.0.0, REST v4**. This remains an agent-proposed baseline rather than a user-selected deployment version. The GL-004 fixture now pins the official unified repository tag `v18.0.0-ee`, commit `504fd9e5236e13d674e051c6b8a1e9892b371c58`, and hashes the tagged documentation, endpoint source, request specs, authentication and scope documentation. See [source-fixture evidence](validation/2026-09-19-gitlab-18-source-fixture.md). No reference GitLab instance was installed or accessed.
 
 Client candidates: installed **Git 2.53.0.windows.2** for actual transport interoperability; **glab** `api user`, `api projects` and `api projects/<id>` for REST discovery, with an exact release version to be pinned before acceptance. A C# HttpClient harness verifies wire/error behavior independently but does not substitute for an existing-client test. GitlabMCPSharp remains a later client candidate. No broad glab support is implied.
 
-The read rows marked **implemented** were tested on 2026-09-19 by the 64-assertion MVP-06 harness under Windows JIT and NativeAOT. GL-004 was added later and the combined workflow passes 76 assertions in both modes. Their reference is current official documentation, so GitLab CE 18.0 response equivalence remains unverified. Git transport uses protocol v0/SHA-1. A future report must add exact upstream/client/build IDs and fixture hashes.
+The read rows marked **implemented** were tested on 2026-09-19 by the 64-assertion MVP-06 harness under Windows JIT and NativeAOT. The combined workflow now passes 87 assertions in both modes. GL-004 is driven by the pinned 18.0.0 source fixture; the other rows still reference rolling official documentation. Git transport uses protocol v0/SHA-1. A future live report must add an exact reference-instance build and pinned client result.
 
 | Fixture ID | Surface / request | Required assertions | Official reference |
 | --- | --- | --- | --- |
 | GL-001 | `GET /api/v4/user` | **Implemented:** current identity, missing token and revoked token; `PRIVATE-TOKEN` and Bearer; API scope required | [Users](https://docs.gitlab.com/api/users/) |
 | GL-002 | `GET /api/v4/projects` | **Implemented subset:** visible private projects, selected fields, offset pagination headers; unsupported query parameters rejected | [Projects](https://docs.gitlab.com/api/projects/) |
 | GL-003 | `GET /api/v4/projects/:id` | **Implemented subset:** numeric and percent-encoded personal namespace/project lookup; inaccessible projects concealed; selected fields | [Projects](https://docs.gitlab.com/api/projects/) |
-| GL-004 | `POST /api/v4/projects` | **Implemented JSON subset:** authenticated user's personal namespace, required name, optional/generated path, description and private visibility; `api` scope, `201` response, duplicate/path errors and explicit rejection of unsupported fields or visibility. Form payloads, namespaces, initialization options and other GitLab attributes pending | [Projects](https://docs.gitlab.com/api/projects/) |
+| GL-004 | `POST /api/v4/projects` | **Implemented, GitLab 18.0 source-fixture subset:** authenticated user's personal namespace; name-only, path-only or explicit name/path; generated path, description and private visibility; `api` scope, `201` response, duplicate/path errors and explicit rejection of unsupported fields. Public/internal visibility, form payloads, namespaces, initialization options and other attributes remain explicit deviations | [Tagged Projects source](https://gitlab.com/gitlab-org/gitlab/-/blob/v18.0.0-ee/doc/api/projects.md) |
 | GL-005 | Token transport | **Implemented subset:** `PRIVATE-TOKEN` and Bearer; scopes intersect live membership; query-string token unsupported | [Authentication](https://docs.gitlab.com/api/rest/authentication/) |
 | GL-006 | `GET /api/v4/projects/:id/repository/branches` | **Implemented subset:** branch list, default branch and commit details; protection/merge fields are fixed MVP values | [Branches](https://docs.gitlab.com/api/branches/) |
 | GL-007 | `GET /api/v4/projects/:id/repository/commits` | **Implemented subset:** selected ref, newest-first traversal and offset pagination; filter options pending | [Commits](https://docs.gitlab.com/api/commits/) |
@@ -47,4 +47,4 @@ The read rows marked **implemented** were tested on 2026-09-19 by the 64-asserti
 
 Git HTTPS token authentication needs its own GitLab-version fixture; API header acceptance does not prove Git credential compatibility. REST unknown routes must return an explicit API error, never the Blazor HTML fallback. Treat unsupported query fields deliberately: document version-matched ignore/reject behavior instead of silently claiming full endpoint support.
 
-Deferred surfaces remain not implemented: GraphQL, write-side project/repository REST APIs, raw/archive routes, SSH/LFS, OAuth, CI/runner protocol, webhooks, nested groups and complete browser URL conventions. Repository-only import via an ordinary push preserves Git content; it is not a GitLab data migration.
+Deferred surfaces remain not implemented: GraphQL, additional write-side project/repository REST APIs, raw/archive routes, SSH/LFS, OAuth, CI/runner protocol, webhooks, nested groups and complete browser URL conventions. Repository-only import via an ordinary push preserves Git content; it is not a GitLab data migration.

@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Json;
+using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -370,6 +371,8 @@ async Task CheckApi(string address, string apiToken, string readApiToken, string
         new { name = "Imported", path = "imported", visibility = "private", import_url = "https://example.invalid/repository.git" }))
         Check(property.StatusCode == System.Net.HttpStatusCode.BadRequest, "unsupported project property rejected");
 
+    await CheckGitLab180Fixture(address, apiToken, readApiToken);
+
     string projectApi = "/api/v4/projects/" + projectId + "/repository";
     using (HttpResponseMessage branches = await ApiGet(address, projectApi + "/branches", apiToken))
     {
@@ -430,6 +433,51 @@ async Task<HttpResponseMessage> ApiPost(string address, string path, string? tok
     HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false };
     HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
     HttpRequestMessage request = new(HttpMethod.Post, path) { Content = JsonContent.Create(body) };
+    if (token is not null) request.Headers.Add("PRIVATE-TOKEN", token);
+    HttpResponseMessage response = await client.SendAsync(request);
+    request.Dispose();
+    client.Dispose();
+    handler.Dispose();
+    return response;
+}
+
+async Task CheckGitLab180Fixture(string address, string apiToken, string readApiToken)
+{
+    string resource = Assembly.GetExecutingAssembly().GetManifestResourceNames()
+        .Single(name => name.EndsWith("gitlab-ce-18.0.0-rest-v4.json", StringComparison.Ordinal));
+    using Stream stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(resource)!;
+    using JsonDocument fixture = await JsonDocument.ParseAsync(stream);
+    JsonElement root = fixture.RootElement;
+    Check(root.GetProperty("commit").GetString() == "504fd9e5236e13d674e051c6b8a1e9892b371c58" &&
+        root.GetProperty("sources").GetArrayLength() == 5, "GitLab 18.0 fixture provenance");
+
+    foreach (JsonElement item in root.GetProperty("creation_cases").EnumerateArray())
+    {
+        string id = item.GetProperty("id").GetString()!;
+        string? token = item.GetProperty("token").GetString() switch
+        {
+            "api" => apiToken,
+            "read_api" => readApiToken,
+            "none" => null,
+            _ => throw new InvalidDataException("Unknown fixture token for " + id)
+        };
+        using HttpResponseMessage response = await ApiPostJson(address, "/api/v4/projects", token,
+            item.GetProperty("body").GetRawText());
+        int expected = item.GetProperty("graft_status").GetInt32();
+        Check((int)response.StatusCode == expected, "GitLab 18.0 fixture " + id + " status");
+        if (expected != 201) continue;
+        using JsonDocument result = JsonDocument.Parse(await response.Content.ReadAsStreamAsync());
+        Check(result.RootElement.GetProperty("name").GetString() == item.GetProperty("expected_name").GetString() &&
+            result.RootElement.GetProperty("path").GetString() == item.GetProperty("expected_path").GetString(),
+            "GitLab 18.0 fixture " + id + " response");
+    }
+}
+
+async Task<HttpResponseMessage> ApiPostJson(string address, string path, string? token, string body)
+{
+    HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false };
+    HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
+    HttpRequestMessage request = new(HttpMethod.Post, path) { Content = new StringContent(body, Encoding.UTF8, "application/json") };
     if (token is not null) request.Headers.Add("PRIVATE-TOKEN", token);
     HttpResponseMessage response = await client.SendAsync(request);
     request.Dispose();

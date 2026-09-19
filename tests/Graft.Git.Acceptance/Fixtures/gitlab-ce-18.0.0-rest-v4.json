@@ -1,0 +1,91 @@
+{
+  "baseline": "GitLab CE 18.0.0 REST v4",
+  "tag": "v18.0.0-ee",
+  "commit": "504fd9e5236e13d674e051c6b8a1e9892b371c58",
+  "sources": [
+    {
+      "path": "doc/api/projects.md",
+      "sha256": "9082a894d23db8a5ca278fb3f566dbb393700b81c2c16623a45c387624deac56"
+    },
+    {
+      "path": "lib/api/projects.rb",
+      "sha256": "7ccd191eb31fcebf42170685e6276ec02b8e3bf369bc850ed64db0fbfd7c3ef8"
+    },
+    {
+      "path": "spec/requests/api/projects_spec.rb",
+      "sha256": "2d2b8f31db6204b68c0b1cb6b57711a94978bc245cd18e62242fb3202d984a09"
+    },
+    {
+      "path": "doc/api/rest/authentication.md",
+      "sha256": "2d5bf76b251662200cb92353ea312fe16698ba0e21cdc61c234fc756e3516bcd"
+    },
+    {
+      "path": "doc/user/profile/personal_access_tokens.md",
+      "sha256": "51748982d7770865b793659cd123ba45760a7005132418d4f8b68c42d6c37fe0"
+    }
+  ],
+  "creation_cases": [
+    {
+      "id": "name-only",
+      "token": "api",
+      "body": { "name": "Fixture Name Only" },
+      "upstream_status": 201,
+      "graft_status": 201,
+      "expected_name": "Fixture Name Only",
+      "expected_path": "fixture-name-only",
+      "classification": "supported"
+    },
+    {
+      "id": "path-only",
+      "token": "api",
+      "body": { "path": "fixture_path_only" },
+      "upstream_status": 201,
+      "graft_status": 201,
+      "expected_name": "fixture_path_only",
+      "expected_path": "fixture_path_only",
+      "classification": "supported"
+    },
+    {
+      "id": "name-and-path",
+      "token": "api",
+      "body": { "name": "Fixture Custom Name", "path": "fixture-custom-path", "visibility": "private" },
+      "upstream_status": 201,
+      "graft_status": 201,
+      "expected_name": "Fixture Custom Name",
+      "expected_path": "fixture-custom-path",
+      "classification": "supported"
+    },
+    {
+      "id": "missing-name-and-path",
+      "token": "api",
+      "body": {},
+      "upstream_status": 400,
+      "graft_status": 400,
+      "classification": "supported"
+    },
+    {
+      "id": "missing-token",
+      "token": "none",
+      "body": { "name": "Fixture Missing Token" },
+      "upstream_status": 401,
+      "graft_status": 401,
+      "classification": "supported"
+    },
+    {
+      "id": "read-api-write",
+      "token": "read_api",
+      "body": { "name": "Fixture Read Scope" },
+      "upstream_status": 403,
+      "graft_status": 403,
+      "classification": "supported"
+    },
+    {
+      "id": "public-visibility",
+      "token": "api",
+      "body": { "name": "Fixture Public", "visibility": "public" },
+      "upstream_status": 201,
+      "graft_status": 400,
+      "classification": "intentional-private-only-deviation"
+    }
+  ]
+}
