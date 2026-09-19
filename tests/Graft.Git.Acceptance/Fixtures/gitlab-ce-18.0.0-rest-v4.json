@@ -85,6 +85,8 @@
       "body": { "name": "Fixture Public", "visibility": "public" },
       "upstream_status": 201,
       "graft_status": 400,
+      "expected_name": "Fixture Public",
+      "expected_path": "fixture-public",
       "classification": "intentional-private-only-deviation"
     }
   ]
