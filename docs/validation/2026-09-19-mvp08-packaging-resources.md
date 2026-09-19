@@ -6,14 +6,14 @@ Date: 2026-09-19. Status: conditional PASS. Owner: Implementation agent. Review 
 
 Graft now has Windows interactive and Windows Service hosting integration, Linux interactive and systemd integration, an optional non-root container definition, and an integrated static-musl build for both the server and administration tool. The same server artifact continues to pass the 64 MVP-06 Git/API assertions and 36 MVP-07 import/recovery assertions on Windows NativeAOT and local Linux static-musl NativeAOT.
 
-The slice remains conditional because this non-elevated Windows session could not register a temporary service and the new integrated static-musl artifacts have not run on the mandatory Linux 3.10.108 host. Operator certificate loading now has [separate local evidence](2026-09-19-operator-tls.md); a real CA/DNS trust environment remains external acceptance. These are explicit release gates rather than inferred passes.
+The slice remains conditional because the new integrated static-musl artifacts have not run on the mandatory Linux 3.10.108 host. An elevated Windows run subsequently passed the complete temporary-service lifecycle. Operator certificate loading has [separate local evidence](2026-09-19-operator-tls.md); a real CA/DNS trust environment remains external acceptance. These are explicit release gates rather than inferred passes.
 
 ## Exercised matrix
 
 | Mode | Environment and artifact | Result |
 | --- | --- | --- |
 | Windows interactive | Windows x64 NativeAOT, .NET SDK 10.0.300 | PASS: 206 packaging/resource assertions; 64 Git/API; 36 operations |
-| Windows Service | NativeAOT host compiled with Windows service lifetime | BLOCKED: live SCM test requires administrator privileges unavailable in this session |
+| Windows Service | Windows x64 NativeAOT, elevated disposable SCM registration | PASS: 5 assertions covering create, certificate-backed readiness, running state, stop and maintenance-lock release |
 | Linux interactive | Ubuntu 24.04.4 WSL kernel, static-musl NativeAOT server/admin | PASS: 206 packaging/resource assertions; 64 Git/API; 36 operations |
 | Linux systemd | Ubuntu 24.04.4 WSL, self-contained CoreCLR server, systemd `Type=notify` | PASS: 6 assertions covering install, readiness, notify state, stop and maintenance-lock release |
 | Rootless container | Podman on Ubuntu 24.04.4 WSL, Ubuntu .NET 10 runtime-deps image | PASS: 7 assertions covering build, non-root execution, read-only root, volume, health and restart |
@@ -43,6 +43,6 @@ The Windows publication directory includes native symbol files for local diagnos
 - Loopback development still uses a generated certificate. Service/container definitions use operator certificate files; real CA/DNS trust requires deployment-environment acceptance.
 - The systemd and container runs used a modern local Linux environment. They do not establish Linux 3.10 service-manager, container or general distribution support.
 - The container is an optional CoreCLR deployment and does not replace the mandatory static-musl direct-host path.
-- Service stop released the maintenance lease under systemd. The equivalent SCM check remains pending with the elevated lifecycle run.
+- Service stop released the maintenance lease under both systemd and the Windows Service Control Manager.
 
-Recommended next action: Owner: User + implementation agent — run the Windows Service harness from an elevated disposable Windows environment, then transfer the recorded static-musl server/admin pair to the required Linux 3.10.108 host and repeat the TLS, interactive, Git and operations acceptance commands. Owner: Operator — supply the intended CA/DNS trust environment for deployment acceptance.
+Recommended next action: Owner: User + implementation agent — transfer the recorded static-musl server/admin pair to the required Linux 3.10.108 host and repeat the TLS, interactive, Git and operations acceptance commands. Owner: Operator — supply the intended CA/DNS trust environment for deployment acceptance.

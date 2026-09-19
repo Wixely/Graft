@@ -75,6 +75,8 @@ Run the Windows Service mode only from an elevated disposable session; it create
 dotnet run --project tests\Graft.Packaging.Acceptance\Graft.Packaging.Acceptance.csproj -c Release -- windows-service artifacts\mvp08\server-win-x64\Graft.Server.exe
 ```
 
+The elevated Windows NativeAOT run passed all five lifecycle assertions on 2026-09-19, including certificate-backed readiness, clean stop and maintenance-lock release.
+
 Build the integrated static Linux server and admin tool with the existing isolated WSL toolchain:
 
 ```powershell

@@ -10,6 +10,7 @@ The C# acceptance harness generated a synthetic self-signed server certificate, 
 | --- | --- |
 | Windows managed server | PASS, 6 TLS lifecycle/validation assertions |
 | Windows x64 NativeAOT server | PASS, 6 TLS lifecycle/validation assertions; 64 Git/API and 36 operations regressions |
+| Windows Service | PASS, 5 elevated SCM lifecycle assertions with disposable operator certificate files |
 | Linux x64 self-contained CoreCLR | PASS, 6 TLS lifecycle/validation assertions |
 | Linux static-musl NativeAOT | PASS, 6 TLS lifecycle/validation assertions; 64 Git/API and 36 operations regressions |
 | systemd `Type=notify` | PASS, 6 lifecycle assertions using operator certificate files |
@@ -17,4 +18,4 @@ The C# acceptance harness generated a synthetic self-signed server certificate, 
 
 The test certificate was deliberately private and untrusted; clients pinned its exact fingerprint. This proves certificate selection, private-key loading, restart behavior, renewal replacement and deployment secret plumbing. It does not prove a public/private CA chain, DNS, revocation, automated issuance or a real client trust store. Those belong to the operator environment and must be verified before exposing a listener.
 
-Recommended next action: Owner: User + implementation agent — execute the elevated Windows Service acceptance with disposable certificate files and run the final static-musl artifacts on Linux 3.10.108. Owner: Operator — provide the intended CA-issued certificate/DNS/trust environment for deployment acceptance.
+Recommended next action: Owner: User + implementation agent — run the final static-musl artifacts on Linux 3.10.108. Owner: Operator — provide the intended CA-issued certificate/DNS/trust environment for deployment acceptance.

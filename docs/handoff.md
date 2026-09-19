@@ -12,13 +12,13 @@ The import evidence is deliberately repository-only. A C# bundle parser inventor
 
 Backups use a consistent SQLite backup plus the complete repository tree. Every file and directory is inventoried; files are hashed. Links/reparse points, undeclared paths, tampering, live-server backup and existing restore targets are rejected. Restore verifies before publishing fresh targets and removes a database published before a later failure. The rollback rehearsal uses a synthetic incompatible schema change and a second fresh restore. Online backup, cross-process clusters and power-loss atomicity across separate database/repository paths remain outside the evidence.
 
-The main release gates are the durable DnaX package source, a real CA/DNS/client-trust environment, an elevated Windows Service acceptance run and integrated static-musl execution on the required Linux 3.10.108 host. Local operator-managed certificate loading, restart/replacement, systemd and container secret plumbing pass. Exact GitLab fixtures and interactive production-browser execution also remain open.
+The main release gates are the durable DnaX package source, a real CA/DNS/client-trust environment and integrated static-musl execution on the required Linux 3.10.108 host. Windows Service, local operator-managed certificate loading, restart/replacement, systemd and container secret plumbing pass. Exact GitLab fixtures and interactive production-browser execution also remain open.
 
 No remote is configured. Do not deploy, publish, import production data, expose a network listener or select repository visibility without explicit authorization.
 
 ## Next work
 
-Run `tests/Graft.Packaging.Acceptance` in an elevated disposable Windows environment to verify Service Control Manager start, certificate loading, readiness, stop and lease release. Then transfer the integrated static-musl server/admin pair to the Linux 3.10.108 host and repeat TLS, interactive, Git and operations acceptance. Validate the intended CA-issued certificate, DNS and client trust chain before non-loopback deployment.
+Transfer the integrated static-musl server/admin pair to the Linux 3.10.108 host and repeat TLS, interactive, Git and operations acceptance. Validate the intended CA-issued certificate, DNS and client trust chain before non-loopback deployment.
 
 Continue to use the ignored reproducible DnaX feed until the user or DnaX maintainer selects an approved durable package source. Do not substitute a server-side Git executable or native Git library.
 
@@ -26,10 +26,9 @@ Continue to use the ignored reproducible DnaX feed until the user or DnaX mainta
 
 | Work | Owner | Acceptance |
 | --- | --- | --- |
-| Windows Service acceptance | Implementation agent + user | Elevated SCM start, ready, stop and maintenance-lock release |
 | Deployment TLS trust | Operator + implementation agent | Intended CA certificate, DNS/SAN, client trust and renewal rehearsal |
 | Required legacy host | Implementation agent + user | Integrated static-musl artifact inspected and run on Linux 3.10.108 with sanitized evidence |
 | GitLab fixture | Implementation agent | Version-matched fixtures and pinned `glab` workflow replace rolling-document inference |
 | DnaX distribution | User/DnaX maintainer | Clean checkout restores without a sibling source tree or locally prepared feed |
 
-Recommended next action: Owner: User + implementation agent — run elevated Windows Service and required-host acceptance. Remaining work: deployment CA/DNS trust, DnaX distribution, exact GitLab fixtures, interactive browser execution and the two environment-dependent MVP-08 gates.
+Recommended next action: Owner: User + implementation agent — run required-host acceptance. Remaining work: deployment CA/DNS trust, DnaX distribution, exact GitLab fixtures, interactive browser execution and the Linux 3.10.108 MVP-08 gate.
