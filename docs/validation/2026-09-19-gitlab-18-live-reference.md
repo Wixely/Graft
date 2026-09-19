@@ -47,6 +47,6 @@ The full solution passed with zero warnings and errors using `dotnet build Graft
 
 ## Boundary and next action
 
-This proves the selected creation fixture against GitLab CE 18.0.0 and proves the pinned CLI against that reference server. It does not yet run `glab` against Graft or extend compatibility beyond the recorded endpoints and workflows. The Linux 3.10.108 product-artifact run remains deferred at the user's request.
+This proves the selected creation fixture against GitLab CE 18.0.0 and proves the pinned CLI against that reference server. The same CLI workflow now also passes [against Graft](2026-09-19-glab-graft.md). Compatibility beyond the recorded endpoints and workflows remains open. The Linux 3.10.108 product-artifact run remains deferred at the user's request.
 
-Recommended next action: run the same pinned `glab` workflows against a disposable Graft instance and turn any client-visible mismatch into a versioned acceptance case. Owner: next implementation agent.
+Recommended next action: run the implemented Blazor project creation and repository-browsing workflow in an interactive browser. Owner: implementation agent.

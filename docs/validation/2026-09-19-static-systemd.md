@@ -29,4 +29,4 @@ No managed build, trimming, or AOT warning was emitted. The static runtime build
 
 ## Boundary
 
-This result validates static NativeAOT service notification and the then-current product workflow on the available WSL system. A [GitLab 18.0 source-backed fixture](2026-09-19-gitlab-18-source-fixture.md) was added later and now passes a [live reference instance](2026-09-19-gitlab-18-live-reference.md); pinned-client execution against Graft remains open. Linux 3.10.108 execution is deferred, while a real deployment CA/DNS trust chain, the durable DnaX package source, and interactive browser execution remain open.
+This result validates static NativeAOT service notification and the then-current product workflow on the available WSL system. A [GitLab 18.0 source-backed fixture](2026-09-19-gitlab-18-source-fixture.md) was added later and now passes a [live reference instance](2026-09-19-gitlab-18-live-reference.md); pinned `glab` API workflows also pass [against Graft](2026-09-19-glab-graft.md). Linux 3.10.108 execution is deferred, while a real deployment CA/DNS trust chain, the durable DnaX package source, and interactive browser execution remain open.

@@ -13,7 +13,7 @@ Confirmed goal: GitLab APIs/URL conventions and GitLab-style apps, with most Git
 | OAuth/tokens/webhooks | Token lifecycle/scopes, application flows, payloads, auth and delivery/retry behavior | Not implemented |
 | CI configuration | Includes/templates, stages/jobs, expressions, variables, artifacts, caches, environments | Not implemented |
 | Runner protocol | Enrollment/polling/jobs/logs/artifacts/cancellation separately from CupriNet transport | Not implemented |
-| CLI/SDK/MCP clients | Host configurable, pinned client version, concrete end-to-end workflows | Candidates: glab, GitLab SDKs, GitlabMCPSharp; none tested against Graft |
+| CLI/SDK/MCP clients | Host configurable, pinned client version, concrete end-to-end workflows | `glab` 1.58.0 API auth/user/list/create/read passes against Graft; GitLab SDKs and GitlabMCPSharp remain candidates |
 
 Each future matrix row should record upstream version, requirement source, fixture, implementation status, last tested date, build identifier, expected result and known deviation. A path match without behavior/auth fidelity is not compatibility. Distinguish imported CI files from executable pipeline compatibility.
 
@@ -25,9 +25,9 @@ MVP-06 update: [repository UI and API evidence](validation/2026-09-19-mvp06-repo
 
 Provisional version candidate: **GitLab CE 18.0.0, REST v4**. This remains an agent-proposed baseline rather than a user-selected deployment version. The GL-004 fixture pins the official unified repository tag `v18.0.0-ee`, commit `504fd9e5236e13d674e051c6b8a1e9892b371c58`, and hashes the tagged documentation, endpoint source, request specs, authentication and scope documentation. See [source-fixture evidence](validation/2026-09-19-gitlab-18-source-fixture.md). All seven creation cases later passed a disposable [GitLab CE 18.0.0 reference](validation/2026-09-19-gitlab-18-live-reference.md), and pinned `glab` 1.58.0 workflows passed against that reference.
 
-Client candidates: installed **Git 2.53.0.windows.2** for actual transport interoperability; **glab** `api user`, `api projects` and `api projects/<id>` for REST discovery, with an exact release version to be pinned before acceptance. A C# HttpClient harness verifies wire/error behavior independently but does not substitute for an existing-client test. GitlabMCPSharp remains a later client candidate. No broad glab support is implied.
+Client evidence: installed **Git 2.53.0.windows.2** provides actual transport interoperability. Pinned **glab 1.58.0** passes `auth login` plus `api user`, project list, project create and project read against both the GitLab reference and Graft; see [pinned-client evidence](validation/2026-09-19-glab-graft.md). A C# HttpClient harness verifies additional wire/error behavior independently. GitlabMCPSharp remains a later client candidate. No broad glab support is implied.
 
-The read rows marked **implemented** were tested on 2026-09-19 by the 64-assertion MVP-06 harness under Windows JIT and NativeAOT. The combined workflow now passes 87 assertions in both modes. GL-004 is driven by the pinned 18.0.0 source fixture; the other rows still reference rolling official documentation. Git transport uses protocol v0/SHA-1. A future live report must add an exact reference-instance build and pinned client result.
+The read rows marked **implemented** were tested on 2026-09-19 by the 64-assertion MVP-06 harness under Windows JIT and NativeAOT. The combined workflow now passes 87 assertions in both modes. GL-004 is driven by the pinned 18.0.0 source fixture; the other rows still reference rolling official documentation. Git transport uses protocol v0/SHA-1. The live GitLab CE 18.0.0 and pinned `glab` 1.58.0 reports establish the exact bounded reference/client result described above.
 
 | Fixture ID | Surface / request | Required assertions | Official reference |
 | --- | --- | --- | --- |
