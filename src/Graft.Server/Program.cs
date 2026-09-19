@@ -123,6 +123,39 @@ app.MapPost("/api/logout", async context =>
     context.Response.StatusCode = StatusCodes.Status204NoContent;
 });
 
+app.MapPost("/api/password", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    PasswordChangeRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.PasswordChangeRequest, context.RequestAborted);
+    if (request?.CurrentPassword is not { Length: >= 16 and <= 256 } || request.NewPassword is not { Length: >= 16 and <= 256 })
+    { await ApiError(context, 400, "password"); return; }
+    try
+    {
+        await store.ChangePasswordAsync(browser.Value.Identity, request.CurrentPassword, request.NewPassword, context.RequestAborted);
+        context.Response.Cookies.Delete(SessionCookie, SessionCookieOptions(null));
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (ArgumentException) { await ApiError(context, 400, "password"); }
+    catch (InvalidOperationException error) { await ApiError(context, 400, error.Message); }
+});
+
+app.MapGet("/api/users", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!browser.Value.Identity.IsAdministrator) { await ApiError(context, 403, "administrator"); return; }
+    if (!await OnlyQuery(context)) return;
+    IReadOnlyList<UserAccount> users = await store.ListUsersAsync(browser.Value.Identity, context.RequestAborted);
+    UserAccountResponse[] response = users.Select(user =>
+        new UserAccountResponse(user.Id, user.Username, user.IsAdministrator, user.Disabled)).ToArray();
+    await context.Response.WriteAsJsonAsync(response, ApiJson.Default.UserAccountResponseArray, null, context.RequestAborted);
+});
+
 app.MapPost("/api/users", async context =>
 {
     if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
@@ -139,11 +172,49 @@ app.MapPost("/api/users", async context =>
     {
         UserAccount user = await store.CreateUserAsync(browser.Value.Identity, request.Username, request.Password, context.RequestAborted);
         context.Response.StatusCode = StatusCodes.Status201Created;
-        await context.Response.WriteAsJsonAsync(new UserAccountResponse(user.Id, user.Username, user.IsAdministrator),
+        await context.Response.WriteAsJsonAsync(new UserAccountResponse(user.Id, user.Username, user.IsAdministrator, user.Disabled),
             ApiJson.Default.UserAccountResponse, null, context.RequestAborted);
     }
     catch (ArgumentException) { await ApiError(context, 400, "username"); }
     catch (UserConflictException) { await ApiError(context, 400, "username has already been taken"); }
+});
+
+app.MapPost("/api/users/{userId:long}/reset-password", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!browser.Value.Identity.IsAdministrator) { await ApiError(context, 403, "administrator"); return; }
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    PasswordResetRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.PasswordResetRequest, context.RequestAborted);
+    if (request?.NewPassword is not { Length: >= 16 and <= 256 }) { await ApiError(context, 400, "password"); return; }
+    long userId = Convert.ToInt64(context.Request.RouteValues["userId"], System.Globalization.CultureInfo.InvariantCulture);
+    try
+    {
+        await store.ResetPasswordAsync(browser.Value.Identity, userId, request.NewPassword, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (ArgumentException) { await ApiError(context, 400, "password"); }
+    catch (InvalidOperationException error) { await ApiError(context, 400, error.Message); }
+});
+
+app.MapPost("/api/users/{userId:long}/disable", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!browser.Value.Identity.IsAdministrator) { await ApiError(context, 403, "administrator"); return; }
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    long userId = Convert.ToInt64(context.Request.RouteValues["userId"], System.Globalization.CultureInfo.InvariantCulture);
+    try
+    {
+        await store.DisableUserAsync(browser.Value.Identity, userId, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (InvalidOperationException error) { await ApiError(context, 400, error.Message); }
 });
 
 app.MapGet("/api/tokens", async context =>

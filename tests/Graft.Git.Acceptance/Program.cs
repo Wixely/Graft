@@ -627,25 +627,25 @@ async Task CheckBrowser(string address, string username, string password, long p
 
 async Task CheckUserAdministration(string address, string adminPassword, string createdPassword)
 {
-    CookieContainer cookies = new();
-    using HttpClientHandler handler = new()
+    CookieContainer adminCookies = new();
+    using HttpClientHandler adminHandler = new()
     {
-        CookieContainer = cookies,
+        CookieContainer = adminCookies,
         ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
         UseProxy = false
     };
-    using HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
+    using HttpClient adminClient = new(adminHandler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
     using HttpRequestMessage login = new(HttpMethod.Post, "/api/login")
     {
         Content = JsonContent.Create(new { username = "admin", password = adminPassword })
     };
     login.Headers.Add("Origin", address);
-    using (HttpResponseMessage response = await client.SendAsync(login)) Check(response.IsSuccessStatusCode, "administrator browser login");
-    string csrf;
-    using (HttpResponseMessage session = await client.GetAsync("/api/session"))
+    using (HttpResponseMessage response = await adminClient.SendAsync(login)) Check(response.IsSuccessStatusCode, "administrator browser login");
+    string adminCsrf;
+    using (HttpResponseMessage session = await adminClient.GetAsync("/api/session"))
     {
         using JsonDocument json = JsonDocument.Parse(await session.Content.ReadAsStreamAsync());
-        csrf = json.RootElement.GetProperty("csrf").GetString()!;
+        adminCsrf = json.RootElement.GetProperty("csrf").GetString()!;
         Check(json.RootElement.GetProperty("is_administrator").GetBoolean(), "browser session exposes administrator status");
     }
     using (HttpRequestMessage create = new(HttpMethod.Post, "/api/users")
@@ -654,8 +654,8 @@ async Task CheckUserAdministration(string address, string adminPassword, string 
     })
     {
         create.Headers.Add("Origin", address);
-        create.Headers.Add("X-Graft-CSRF", csrf);
-        using HttpResponseMessage response = await client.SendAsync(create);
+        create.Headers.Add("X-Graft-CSRF", adminCsrf);
+        using HttpResponseMessage response = await adminClient.SendAsync(create);
         Check(response.StatusCode == System.Net.HttpStatusCode.Created, "administrator creates user in browser API");
     }
     using (HttpRequestMessage duplicate = new(HttpMethod.Post, "/api/users")
@@ -664,16 +664,152 @@ async Task CheckUserAdministration(string address, string adminPassword, string 
     })
     {
         duplicate.Headers.Add("Origin", address);
-        duplicate.Headers.Add("X-Graft-CSRF", csrf);
-        using HttpResponseMessage response = await client.SendAsync(duplicate);
+        duplicate.Headers.Add("X-Graft-CSRF", adminCsrf);
+        using HttpResponseMessage response = await adminClient.SendAsync(duplicate);
         Check(response.StatusCode == System.Net.HttpStatusCode.BadRequest, "browser user creation rejects duplicate username");
     }
-    using HttpRequestMessage createdLogin = new(HttpMethod.Post, "/api/login")
+
+    long userId;
+    long adminId;
+    using (HttpResponseMessage response = await adminClient.GetAsync("/api/users"))
     {
-        Content = JsonContent.Create(new { username = "webuser", password = createdPassword })
+        using JsonDocument json = JsonDocument.Parse(await response.Content.ReadAsStreamAsync());
+        JsonElement user = json.RootElement.EnumerateArray().Single(item => item.GetProperty("username").GetString() == "webuser");
+        JsonElement administrator = json.RootElement.EnumerateArray().Single(item => item.GetProperty("username").GetString() == "admin");
+        userId = user.GetProperty("id").GetInt64();
+        adminId = administrator.GetProperty("id").GetInt64();
+        Check(response.IsSuccessStatusCode && !user.GetProperty("disabled").GetBoolean(), "administrator lists active users");
+    }
+    using (HttpRequestMessage selfReset = new(HttpMethod.Post, $"/api/users/{adminId}/reset-password")
+    {
+        Content = JsonContent.Create(new { new_password = Password() })
+    })
+    {
+        selfReset.Headers.Add("Origin", address);
+        selfReset.Headers.Add("X-Graft-CSRF", adminCsrf);
+        using HttpResponseMessage response = await adminClient.SendAsync(selfReset);
+        Check(response.StatusCode == HttpStatusCode.BadRequest, "administrator cannot reset own password without current password");
+    }
+
+    CookieContainer userCookies = new();
+    using HttpClientHandler userHandler = new()
+    {
+        CookieContainer = userCookies,
+        ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
+        UseProxy = false
     };
-    createdLogin.Headers.Add("Origin", address);
-    using (HttpResponseMessage response = await client.SendAsync(createdLogin)) Check(response.IsSuccessStatusCode, "browser-created user can log in");
+    using HttpClient userClient = new(userHandler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
+
+    async Task<HttpResponseMessage> LoginUser(string password)
+    {
+        HttpRequestMessage request = new(HttpMethod.Post, "/api/login")
+        {
+            Content = JsonContent.Create(new { username = "webuser", password })
+        };
+        request.Headers.Add("Origin", address);
+        HttpResponseMessage response = await userClient.SendAsync(request);
+        request.Dispose();
+        return response;
+    }
+
+    async Task<string> UserCsrf()
+    {
+        using HttpResponseMessage response = await userClient.GetAsync("/api/session");
+        using JsonDocument json = JsonDocument.Parse(await response.Content.ReadAsStreamAsync());
+        return json.RootElement.GetProperty("csrf").GetString()!;
+    }
+
+    async Task<string> CreateUserToken(string csrf, string name)
+    {
+        using HttpRequestMessage request = new(HttpMethod.Post, "/api/tokens")
+        {
+            Content = JsonContent.Create(new { name, scopes = new[] { "read_api" }, expires_in_days = 30 })
+        };
+        request.Headers.Add("Origin", address);
+        request.Headers.Add("X-Graft-CSRF", csrf);
+        using HttpResponseMessage response = await userClient.SendAsync(request);
+        using JsonDocument json = JsonDocument.Parse(await response.Content.ReadAsStreamAsync());
+        return json.RootElement.GetProperty("secret").GetString()!;
+    }
+
+    using (HttpResponseMessage response = await LoginUser(createdPassword)) Check(response.IsSuccessStatusCode, "browser-created user can log in");
+    using (HttpResponseMessage response = await userClient.GetAsync("/api/users"))
+        Check(response.StatusCode == HttpStatusCode.Forbidden, "ordinary user cannot list users");
+    string userCsrf = await UserCsrf();
+    string resetRevokedToken = await CreateUserToken(userCsrf, "before-reset");
+    string resetPassword = Password();
+    using (HttpRequestMessage reset = new(HttpMethod.Post, $"/api/users/{userId}/reset-password")
+    {
+        Content = JsonContent.Create(new { new_password = resetPassword })
+    })
+    {
+        reset.Headers.Add("Origin", address);
+        reset.Headers.Add("X-Graft-CSRF", adminCsrf);
+        using HttpResponseMessage response = await adminClient.SendAsync(reset);
+        Check(response.StatusCode == HttpStatusCode.NoContent, "administrator resets another user's password");
+    }
+    using (HttpResponseMessage response = await userClient.GetAsync("/api/projects"))
+        Check(response.StatusCode == HttpStatusCode.Unauthorized, "password reset revokes browser sessions");
+    using (HttpResponseMessage response = await ApiGet(address, "/api/v4/user", resetRevokedToken))
+        Check(response.StatusCode == HttpStatusCode.Unauthorized, "password reset revokes personal tokens");
+    using (HttpResponseMessage response = await LoginUser(createdPassword))
+        Check(response.StatusCode == HttpStatusCode.Unauthorized, "old password rejected after reset");
+    using (HttpResponseMessage response = await LoginUser(resetPassword)) Check(response.IsSuccessStatusCode, "reset password authenticates");
+
+    userCsrf = await UserCsrf();
+    using (HttpRequestMessage wrongCurrent = new(HttpMethod.Post, "/api/password")
+    {
+        Content = JsonContent.Create(new { current_password = Password(), new_password = Password() })
+    })
+    {
+        wrongCurrent.Headers.Add("Origin", address);
+        wrongCurrent.Headers.Add("X-Graft-CSRF", userCsrf);
+        using HttpResponseMessage response = await userClient.SendAsync(wrongCurrent);
+        Check(response.StatusCode == HttpStatusCode.BadRequest, "password change rejects wrong current password");
+    }
+    using (HttpResponseMessage response = await userClient.GetAsync("/api/projects"))
+        Check(response.IsSuccessStatusCode, "rejected password change preserves session");
+    string changeRevokedToken = await CreateUserToken(userCsrf, "before-change");
+    string changedPassword = Password();
+    using (HttpRequestMessage change = new(HttpMethod.Post, "/api/password")
+    {
+        Content = JsonContent.Create(new { current_password = resetPassword, new_password = changedPassword })
+    })
+    {
+        change.Headers.Add("Origin", address);
+        change.Headers.Add("X-Graft-CSRF", userCsrf);
+        using HttpResponseMessage response = await userClient.SendAsync(change);
+        Check(response.StatusCode == HttpStatusCode.NoContent, "user changes password with current password");
+    }
+    using (HttpResponseMessage response = await userClient.GetAsync("/api/projects"))
+        Check(response.StatusCode == HttpStatusCode.Unauthorized, "password change revokes browser sessions");
+    using (HttpResponseMessage response = await ApiGet(address, "/api/v4/user", changeRevokedToken))
+        Check(response.StatusCode == HttpStatusCode.Unauthorized, "password change revokes personal tokens");
+    using (HttpResponseMessage response = await LoginUser(resetPassword))
+        Check(response.StatusCode == HttpStatusCode.Unauthorized, "previous password rejected after change");
+    using (HttpResponseMessage response = await LoginUser(changedPassword)) Check(response.IsSuccessStatusCode, "changed password authenticates");
+
+    userCsrf = await UserCsrf();
+    string disableRevokedToken = await CreateUserToken(userCsrf, "before-disable");
+    using (HttpRequestMessage disable = new(HttpMethod.Post, $"/api/users/{userId}/disable"))
+    {
+        disable.Headers.Add("Origin", address);
+        disable.Headers.Add("X-Graft-CSRF", adminCsrf);
+        using HttpResponseMessage response = await adminClient.SendAsync(disable);
+        Check(response.StatusCode == HttpStatusCode.NoContent, "administrator disables another user");
+    }
+    using (HttpResponseMessage response = await userClient.GetAsync("/api/projects"))
+        Check(response.StatusCode == HttpStatusCode.Unauthorized, "disable revokes browser sessions");
+    using (HttpResponseMessage response = await ApiGet(address, "/api/v4/user", disableRevokedToken))
+        Check(response.StatusCode == HttpStatusCode.Unauthorized, "disable revokes personal tokens");
+    using (HttpResponseMessage response = await LoginUser(changedPassword))
+        Check(response.StatusCode == HttpStatusCode.Unauthorized, "disabled user cannot log in");
+    using (HttpResponseMessage response = await adminClient.GetAsync("/api/users"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await response.Content.ReadAsStreamAsync());
+        JsonElement user = json.RootElement.EnumerateArray().Single(item => item.GetProperty("id").GetInt64() == userId);
+        Check(response.IsSuccessStatusCode && user.GetProperty("disabled").GetBoolean(), "administrator list exposes disabled state");
+    }
 }
 
 async Task CheckPersonalAccessTokens(string address, string username, string password, long projectId)

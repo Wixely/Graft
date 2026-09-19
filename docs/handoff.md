@@ -1,6 +1,6 @@
 # Next-agent handoff
 
-Updated: 2026-09-19. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
+Updated: 2026-09-20. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
 
 ## Current state
 
@@ -10,7 +10,7 @@ MVP-01 through MVP-07 pass within their recorded scopes. [MVP-08 packaging and r
 
 `Graft.Admin bootstrap` creates the first administrator from a protected password file while holding both maintenance leases. The 41-assertion operations workflow proves live-server exclusion, login, administrator status, hashed-at-rest storage and one-use refusal with both managed and Windows NativeAOT administration binaries.
 
-The authenticated product exposes administrator-only ordinary-user creation, project-owner membership management and user-managed personal access tokens. A user chooses explicit scopes and a 1–365 day lifetime, sees the random secret once, lists active token metadata and revokes only their own tokens. The current Git/API/browser harness passes 107 assertions under the runtime and Windows NativeAOT server; it proves a browser-created token authenticates real Git HTTPS and fails immediately after revocation. Rendered MCPHub Chromium also passes token creation and revocation.
+The authenticated product exposes administrator-only ordinary-user creation and account management, project-owner membership management, and user-managed personal access tokens. Users can change their password with the current password; administrators can list, reset, and disable other accounts. Every successful change, reset, or disable revokes all affected sessions and tokens. The current Git/API/browser harness passes 127 assertions under the runtime and Windows NativeAOT server. Rendered MCPHub Chromium also passes token and account credential workflows. See [account credential evidence](validation/2026-09-20-account-credentials.md).
 
 The import evidence is deliberately repository-only. A C# bundle parser inventories branches/tags and emits eight explicit excluded metadata categories. Git 2.53.0.windows.2 imports the repository through the supported HTTPS route; repeating the import preserves the same refs and object IDs and leaves the source unchanged. This is not a GitLab API/export metadata importer.
 
@@ -24,7 +24,7 @@ No remote is configured. Do not deploy, publish, import production data, expose 
 
 ## Next work
 
-Keep the recorded static-musl server/admin pair available for the deferred Linux 3.10.108 run. Add authenticated password change and administrator password-reset/user-disable workflows so temporary credentials have an operational lifecycle. Validate the intended CA-issued certificate, DNS, client trust and renewal path before non-loopback deployment.
+Keep the recorded static-musl server/admin pair available for the deferred Linux 3.10.108 run. Add an administrator re-enable workflow that requires a fresh password while keeping older sessions and tokens revoked. Validate the intended CA-issued certificate, DNS, client trust and renewal path before non-loopback deployment.
 
 Continue to use the ignored reproducible DnaX feed until the user or DnaX maintainer selects an approved durable package source. Do not substitute a server-side Git executable or native Git library.
 
@@ -32,9 +32,9 @@ Continue to use the ignored reproducible DnaX feed until the user or DnaX mainta
 
 | Work | Owner | Acceptance |
 | --- | --- | --- |
-| Account credential lifecycle | Implementation agent | User changes a temporary password; administrator resets or disables an account; active sessions and tokens follow the documented revocation policy |
+| Account re-enable | Implementation agent | Administrator re-enables a disabled account with a fresh password; older sessions and tokens remain revoked |
 | Deployment TLS trust | Operator + implementation agent | Intended CA certificate, DNS/SAN, client trust and renewal rehearsal |
 | Required legacy host | Implementation agent + user | Integrated static-musl artifact inspected and run on Linux 3.10.108 with sanitized evidence |
 | DnaX distribution | User/DnaX maintainer | Clean checkout restores without a sibling source tree or locally prepared feed |
 
-Recommended next action: Owner: Implementation agent — add password change and administrator reset/disable workflows. Remaining release gates: deployment CA/DNS trust, DnaX distribution and the deferred Linux 3.10.108 MVP-08 run.
+Recommended next action: Owner: Implementation agent — add administrator account re-enable with a required fresh password and retained audit history. Remaining release gates: deployment CA/DNS trust, DnaX distribution and the deferred Linux 3.10.108 MVP-08 run.
