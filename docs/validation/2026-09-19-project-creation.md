@@ -32,4 +32,4 @@ The checks cover authentication and write scope, the `201` project shape, an emp
 
 ## Remaining boundary
 
-Interactive execution of the Blazor form in a rendered browser remains unverified because the installed browser-control skill's required in-app runtime was unavailable in that session. HTTPS-level browser API and embedded asset checks still pass. Exact GitLab 18 fixtures and pinned `glab` 1.58.0 API workflows now pass; deployment CA/DNS trust, the durable DnaX feed, interactive browser execution and integrated execution on Linux 3.10.108 remain open.
+The form and repository browser now pass [rendered Chromium validation](2026-09-19-browser-ui.md). That run exposed and fixed a project-path pattern that Chromium rejected under its Unicode `v` regular-expression rules. Exact GitLab 18 fixtures and pinned `glab` 1.58.0 API workflows also pass. Deployment CA/DNS trust, the durable DnaX feed and integrated execution on Linux 3.10.108 remain open.

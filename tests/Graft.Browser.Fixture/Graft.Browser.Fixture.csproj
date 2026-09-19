@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/Graft.Core/Graft.Core.csproj" />
+    <ProjectReference Include="../../src/Graft.Git/Graft.Git.csproj" />
+    <ProjectReference Include="../../src/Graft.Storage/Graft.Storage.csproj" />
+    <ProjectReference Include="../../src/Graft.Server/Graft.Server.csproj" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+</Project>
