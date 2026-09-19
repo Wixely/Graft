@@ -119,6 +119,70 @@ public sealed class GraftStore : IAsyncDisposable
         return new(id, username, false, false);
     }
 
+    public async Task<IReadOnlyList<UserAccount>> ListUsersAsync(
+        AuthenticatedIdentity actor,
+        CancellationToken cancellationToken = default)
+    {
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        AuthenticatedIdentity liveActor = await RequireLiveIdentityAsync(db, null, actor, cancellationToken);
+        if (!liveActor.IsAdministrator) throw new UnauthorizedAccessException("Administrator access is required.");
+        IEnumerable<IdentityRow> rows = await db.QueryAsync<IdentityRow>("""
+            SELECT Id, Username, IsAdministrator, Disabled
+            FROM Users
+            ORDER BY NormalizedUsername;
+            """);
+        return rows.Select(row => new UserAccount(row.Id, row.Username, row.IsAdministrator != 0, row.Disabled != 0)).ToArray();
+    }
+
+    public async Task ChangePasswordAsync(
+        AuthenticatedIdentity actor,
+        string currentPassword,
+        string newPassword,
+        CancellationToken cancellationToken = default)
+    {
+        PasswordHash.ValidatePassword(newPassword);
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
+        UserCredentialRow? user = await db.QuerySingleOrDefaultAsync<UserCredentialRow>("""
+            SELECT Id, Username, PasswordHash, IsAdministrator, Disabled
+            FROM Users WHERE Id = @Id;
+            """, new IdParameters(actor.UserId), transaction);
+        if (user is null || user.Disabled != 0) throw new UnauthorizedAccessException("Identity is unavailable.");
+        if (!PasswordHash.Verify(currentPassword, user.PasswordHash))
+            throw new InvalidOperationException("Current password was not accepted.");
+        if (PasswordHash.Verify(newPassword, user.PasswordHash))
+            throw new InvalidOperationException("New password must differ from the current password.");
+
+        string passwordHash = PasswordHash.Create(newPassword);
+        string now = Now();
+        await db.ExecuteAsync("UPDATE Users SET PasswordHash = @PasswordHash WHERE Id = @Id;",
+            new PasswordUpdateParameters(actor.UserId, passwordHash), transaction);
+        await RevokeUserCredentialsAsync(db, transaction, actor.UserId, now);
+        await AuditAsync(db, transaction, actor.UserId, "change-password", "user", actor.UserId.ToString(CultureInfo.InvariantCulture), "Password changed and credentials revoked.", now);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
+    public async Task ResetPasswordAsync(
+        AuthenticatedIdentity actor,
+        long userId,
+        string newPassword,
+        CancellationToken cancellationToken = default)
+    {
+        if (actor.UserId == userId) throw new InvalidOperationException("Administrators must change their own password using the current password.");
+        string passwordHash = PasswordHash.Create(newPassword);
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
+        AuthenticatedIdentity liveActor = await RequireLiveIdentityAsync(db, transaction, actor, cancellationToken);
+        if (!liveActor.IsAdministrator) throw new UnauthorizedAccessException("Administrator access is required.");
+        string now = Now();
+        int changed = await db.ExecuteAsync("UPDATE Users SET PasswordHash = @PasswordHash WHERE Id = @Id AND Disabled = 0;",
+            new PasswordUpdateParameters(userId, passwordHash), transaction);
+        if (changed != 1) throw new InvalidOperationException("User is unavailable or disabled.");
+        await RevokeUserCredentialsAsync(db, transaction, userId, now);
+        await AuditAsync(db, transaction, actor.UserId, "reset-password", "user", userId.ToString(CultureInfo.InvariantCulture), "Password reset and credentials revoked.", now);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
     public async Task<SessionGrant?> LoginAsync(
         string username,
         string password,
@@ -507,10 +571,7 @@ public sealed class GraftStore : IAsyncDisposable
         string now = Now();
         int changed = await db.ExecuteAsync("UPDATE Users SET Disabled = 1 WHERE Id = @Id AND Disabled = 0;", new IdParameters(userId), transaction);
         if (changed != 1) throw new InvalidOperationException("User is unavailable or already disabled.");
-        await db.ExecuteAsync("UPDATE BrowserSessions SET RevokedAtUtc = @RevokedAtUtc WHERE UserId = @UserId AND RevokedAtUtc IS NULL;",
-            new RevokeUserParameters(userId, now), transaction);
-        await db.ExecuteAsync("UPDATE AccessTokens SET RevokedAtUtc = @RevokedAtUtc WHERE UserId = @UserId AND RevokedAtUtc IS NULL;",
-            new RevokeUserParameters(userId, now), transaction);
+        await RevokeUserCredentialsAsync(db, transaction, userId, now);
         await AuditAsync(db, transaction, actor.UserId, "disable-user", "user", userId.ToString(CultureInfo.InvariantCulture), "User disabled and credentials revoked.", now);
         await transaction.CommitAsync(cancellationToken);
     }
@@ -603,6 +664,18 @@ public sealed class GraftStore : IAsyncDisposable
             INSERT INTO AuditEvents (ActorUserId, Action, TargetType, TargetId, Detail, CreatedAtUtc)
             VALUES (@ActorUserId, @Action, @TargetType, @TargetId, @Detail, @CreatedAtUtc);
             """, new AuditParameters(actorUserId, action, targetType, targetId, detail, createdAtUtc), transaction);
+    }
+
+    private static async Task RevokeUserCredentialsAsync(
+        SqliteConnection db,
+        SqliteTransaction transaction,
+        long userId,
+        string revokedAtUtc)
+    {
+        await db.ExecuteAsync("UPDATE BrowserSessions SET RevokedAtUtc = @RevokedAtUtc WHERE UserId = @UserId AND RevokedAtUtc IS NULL;",
+            new RevokeUserParameters(userId, revokedAtUtc), transaction);
+        await db.ExecuteAsync("UPDATE AccessTokens SET RevokedAtUtc = @RevokedAtUtc WHERE UserId = @UserId AND RevokedAtUtc IS NULL;",
+            new RevokeUserParameters(userId, revokedAtUtc), transaction);
     }
 
     private async Task<SqliteConnection> OpenConnectionAsync(CancellationToken cancellationToken)
@@ -701,6 +774,7 @@ internal sealed record RevokeByIdParameters(long Id, string RevokedAtUtc);
 internal sealed record RevokeOwnTokenParameters(long Id, long UserId, string RevokedAtUtc);
 internal sealed record ActiveTokensParameters(long UserId, string NowUtc);
 internal sealed record RevokeUserParameters(long UserId, string RevokedAtUtc);
+internal sealed record PasswordUpdateParameters(long Id, string PasswordHash);
 internal sealed record CreateProjectParameters(long OwnerUserId, string Slug, string NormalizedSlug, string Name, string Description, string StorageId, string CreatedAtUtc);
 internal sealed record MembershipParameters(long ProjectId, long UserId, int Role, long GrantedByUserId, string CreatedAtUtc);
 internal sealed record ProjectUserParameters(long ProjectId, long UserId);
