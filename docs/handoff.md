@@ -1,8 +1,16 @@
 # Next-agent handoff
 
-Updated: 2026-09-18. Review: at the start/end of the next work session. Owner: Next agent; product choices belong to the user.
+Updated: 2026-09-19. Review: at the start/end of the next work session. Owner: Next agent; product choices belong to the user.
 
 ## Current state
+
+Latest MVP-03 update: [DnaX migration feasibility](validation/2026-09-19-storage-migrations.md) passes all six scenarios in Windows JIT, Windows NativeAOT and local static-musl NativeAOT; every application Dapper call has a generated interceptor. Adoption is held because the exact tagged DnaX packages are absent from NuGet.org/GitHub release assets and the new binary has not run on the required host. The next material decision is an approved durable package source; after clean-restore verification, implementation proceeds to MVP-04.
+
+MVP-02 [Blazor UI/auth feasibility](validation/2026-09-18-ui-nativeaot.md) passes on Windows: an isolated NativeAOT executable embeds the published client and serves HTTPS; browser login/refresh/logout and 50 HTTP assertions plus direct session checks pass. No browser-native workload was installed. Sessions and data remain synthetic/in-memory.
+
+Latest update: user authorized the recommended MVP-01 work. The [managed C# Git feasibility experiment](validation/2026-09-18-managed-git.md) passes 42 direct checks and Git push/clone/fetch/branch/tag/fsck workflows on Windows in JIT and NativeAOT. No server Git subprocess or native Git library is used. It is loopback HTTP with bounded in-memory storage, not durable or authenticated hosting. Next: MVP-02; all required-host and product acceptance work remains.
+
+Update from the MVP preparation request on 2026-09-18: [MVP scope and work packages](mvp-plan.md), [proposed ADR 0004](decisions/0004-csharp-mvp-proposal.md), expanded [conformance matrix](compatibility.md) and [inspection/build evidence](validation/2026-09-18-mvp-preparation.md) are ready for review. The Windows probe build and all six checks passed. Fully C# is now explicit user direction; strict managed Git is the working interpretation. Material architecture choices remain proposed, and no app implementation was started.
 
 The user asked for a local repository with enough context for another agent to begin work. This repository contains the agreed direction, historical decisions, a runnable compatibility probe and a tested native executable path. Graft itself is not implemented. There are no remote credentials, configured remotes, hosted environments or production data here.
 
@@ -10,7 +18,7 @@ The key discovery is complete: a statically linked musl NativeAOT probe runs dir
 
 ## GRAFT-001 — define the first application slice
 
-Status: Ready. Owner: Next agent. Due: next work session. Work locally; use synthetic data.
+Status: Reviewable proposal prepared; feasibility and architecture acceptance remain. Owner: Implementation agent. Review: 2026-09-25 or next work session. Work locally; use synthetic data. The original checklist below is retained as the preparation scope; unverified items are now explicit gates in the MVP plan.
 
 1. Read the start-here documents and inspect `git status`. Build and run the existing probe using the runbook to establish that the new checkout is healthy.
 2. Inspect .NET 10's actual NativeAOT/UI constraints and propose how a browser UI will coexist with the demonstrated standalone server. Evaluate the inherited Blazor default explicitly. A separate browser client served as static files is a candidate, not a selected architecture. Do not silently adopt a non-Blazor framework or Node pipeline.
@@ -37,4 +45,4 @@ No full implementation, migration or deployment is claimed by completing reposit
 
 Implementation decisions and work progress now belong here. The sibling PLAN checkout retains reusable preferences, original discovery history and private infrastructure knowledge. The original sibling `Graft.Compatibility` folder remains intact; its maintained probe source was copied into this repository. Use this repository for future probe edits, and clearly distinguish new artifacts from the already-accepted archive.
 
-Recommended next action: Next agent begins GRAFT-001. No user action is required to repeat the unchanged compatibility test.
+Recommended next action: User/DnaX maintainer selects and authorizes a durable package distribution route for the tested tag. Implementation agent then proves a clean restore and begins MVP-04. Remaining work: DnaX distribution/required-host acceptance and MVP-04 through MVP-08, including integrated auth/storage; no user action is required to repeat the unchanged compatibility test.

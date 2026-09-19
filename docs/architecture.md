@@ -2,6 +2,10 @@
 
 Status: proposals/open questions, except where tied to a confirmed decision. Recorded: 2026-09-18. Owner: Next agent. Review: GRAFT-001.
 
+The current concrete recommendation is [ADR 0004](decisions/0004-csharp-mvp-proposal.md): a NativeAOT API/static-file host, standalone Blazor WebAssembly client, DnaX trial and managed C# Git feasibility gate. See [the MVP plan](mvp-plan.md) for scope and [research/build evidence](validation/2026-09-18-mvp-preparation.md) for what is verified. This is a proposal, including an explicit review of the inherited Blazor-host deployment rule; no full-stack compatibility is claimed.
+
+MVP-02 [demonstrates the browser/API boundary on Windows](validation/2026-09-18-ui-nativeaot.md): standalone Blazor client assets embedded in a NativeAOT executable, with opaque revocable sessions, HTTPS and source-generated JSON. MVP-03 [demonstrates DnaX migrations with Dapper.AOT](validation/2026-09-19-storage-migrations.md) in Windows and local static-musl NativeAOT. DnaX package distribution and required-host execution remain gates before product adoption.
+
 ## Starting constraints
 
 Use C#/.NET 10 and Dapper.AOT. Preserve the demonstrated static-musl NativeAOT path for the required Linux x64 host. The tested probe statically links native libraries: “managed solution” does not mean SQLite/TLS/libc disappear. Track those dependencies and their security-update/rebuild path.
@@ -21,7 +25,7 @@ Use C#/.NET 10 and Dapper.AOT. Preserve the demonstrated static-musl NativeAOT p
 | --- | --- |
 | Browser UI and NativeAOT | Check current .NET 10 support. Blazor default remains relevant; server-side rendering/hosting must not be assumed compatible because minimal HTTP endpoints passed. Compare options and document tradeoffs. |
 | Static native libraries | Keep full globalization; audit OpenSSL providers, certificate trust, DNS and library updates. The probe's embedded ICU fix is essential. |
-| Database manifests | Evaluate DnaX's generator/migration dependencies and provider adapters with AOT before selecting them. Application owns ordered migrations and restore policy. |
+| Database manifests | DnaX 10.0.0-alpha.7 passed the migration/AOT experiment. Adoption waits for a reproducible approved package feed and target-host execution. The application owns ordered migrations, preservation fixtures and restore policy. |
 | Git backend | Compare correctness, licenses, footprint, old-kernel compatibility and standalone packaging; external Git is not yet authorized as a product dependency. |
 | HTTP/API serialization | Confirm source-generated serializers and endpoint patterns work in a published binary. Do not disable warnings globally. |
 | Authentication and permissions | Map GitLab token/membership semantics into a simple explainable model without broadening access. Avoid separate inconsistent auth implementations. |

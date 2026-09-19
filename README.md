@@ -2,7 +2,7 @@
 
 Graft is a planned locally hosted GitLab alternative in C#/.NET 10. It targets GitLab APIs, URL conventions, applications and CI/CD, with simpler operations, permissions and runners, low resource use, and GitLab data import.
 
-Status as of **2026-09-18**: local repository and engineering handoff; a standalone compatibility experiment is implemented and verified. There is no Graft server, UI, Git hosting implementation or production database yet. Remote hosting, visibility and project license are undecided. No remote is configured.
+Status as of **2026-09-19**: [fully C# MVP proposal prepared](docs/mvp-plan.md); compatibility, [managed Git](docs/validation/2026-09-18-managed-git.md), [Blazor UI/auth](docs/validation/2026-09-18-ui-nativeaot.md) and [DnaX storage migration](docs/validation/2026-09-19-storage-migrations.md) experiments are verified within their recorded scopes. The storage experiment passes JIT, Windows NativeAOT and local static-musl NativeAOT, but DnaX adoption is held until its packages have a reproducible approved source. There is no integrated production forge or durable Git hosting yet. Remote hosting, visibility and project license are undecided. No remote is configured.
 
 ## Start here
 
@@ -36,8 +36,13 @@ Linux static NativeAOT requires the separate toolchain/runbook; a Windows build 
 | --- | --- |
 | `docs/` | Requirements, decisions, architecture questions, work queue and evidence |
 | `experiments/compatibility/` | Probe source, pinned NuGet dependencies and build scripts |
+| `experiments/managed-git/` | Bounded C# smart HTTP/pack experiment; [runbook](experiments/managed-git/README.md) |
+| `experiments/managed-git-client/` | C# acceptance harness using installed Git as an independent test client |
+| `experiments/storage/` | DnaX/SQLite migration and Dapper.AOT probe; [runbook](experiments/storage/README.md) |
+| `experiments/ui-server/` | NativeAOT API, embedded Blazor delivery and session probe; [runbook](experiments/ui-server/README.md) |
+| `experiments/ui-client/`, `ui-contracts/`, `ui-checks/` | Standalone C#/Razor client, JSON contracts, HTTP and browser checks |
 | `artifacts/reference/` | Ignored local copy of the accepted archive and checksum; not committed |
 
 The original discovery notes remain in the sibling [PLAN idea](../PLAN/inbox/local-git-forge.md). This repository is now the canonical implementation/handoff context. Private infrastructure details stay in PLAN; project docs use a neutral target-host description.
 
-Recommended next action — Owner: Next agent: complete task **GRAFT-001** in [the handoff](docs/handoff.md), resolving the NativeAOT/UI boundary and defining the first GitLab-compatible application slice. Do not re-run the unchanged NAS probe merely to rediscover the recorded result.
+Recommended next action - Owner: User/DnaX maintainer: make the tested DnaX packages available from an approved durable feed. Owner: Implementation agent: verify a clean restore, then begin **MVP-04**, accounts/projects/membership. Review [the MVP plan](docs/mvp-plan.md) and [MVP-03 evidence](docs/validation/2026-09-19-storage-migrations.md). Do not re-run the unchanged NAS probe merely to rediscover the recorded result.
