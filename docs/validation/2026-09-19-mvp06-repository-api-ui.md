@@ -25,7 +25,7 @@ This result establishes the implementation boundary recorded below. It does not 
 
 The selected response shapes and authentication behavior were derived from the current official GitLab Users, Projects, Branches, Commits, Repositories and Repository Files documentation reviewed on 2026-09-19. The C# harness covers GL-001, GL-002, GL-003 and GL-005 and the repository read rows GL-006 through GL-009 in [the conformance plan](../compatibility.md).
 
-Covered checks include missing/revoked token failures, private-project filtering, pagination headers, numeric and percent-encoded project IDs, branch and commit identity, exact pushed HEAD, hostile HTML preserved as data, binary round trip, traversal rejection and explicit unknown-API errors. `glab` is not installed, so no external GitLab REST client was exercised.
+Covered checks include missing/revoked token failures, private-project filtering, pagination headers, numeric and percent-encoded project IDs, branch and commit identity, exact pushed HEAD, hostile HTML preserved as data, binary round trip, traversal rejection and explicit unknown-API errors. No external GitLab REST client was exercised in this original run; pinned `glab` 1.58.0 was [validated later](2026-09-19-glab-graft.md).
 
 The provisional GitLab CE 18.0 baseline still lacks version-matched fixtures. Current rolling documentation can differ from that release. Known MVP deviations include fixed branch protection/merge fields, limited commit/tree query options, personal namespaces only, and `last_commit_id` equal to the selected commit rather than a computed path-specific last-change commit.
 

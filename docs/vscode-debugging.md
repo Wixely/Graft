@@ -27,6 +27,8 @@ Set server breakpoints in `experiments/ui-server`. The browser client is publish
 
 Each launch builds its required projects in Debug mode. **Ctrl+Shift+B** still builds the complete solution. The UI acceptance task builds the host and checks sequentially. Avoid concurrent UI builds or debug launches in this checkout because they share generated client assets.
 
+The **run pinned glab acceptance in WSL** task prompts for an existing WSL distribution and runs the version-pinned client workflow. The official image must already be present; use the documented PowerShell runner with `-PullImage` only after approving that pull. A Windows `coreclr` launch is not provided for this harness because its behavior depends on the Linux host network namespace and rootless Podman. Debug it from a VS Code WSL window when step debugging is needed.
+
 Acceptance harnesses start child server processes. Their launch options debug the harness; server breakpoints require attaching to the child process, which may exit quickly. For ordinary server debugging, select the interactive server launch instead.
 
 These `coreclr` options debug managed DLLs, not published NativeAOT executables. NativeAOT acceptance remains a separate runbook step. Automatic browser opening follows the [official C# debugger configuration](https://code.visualstudio.com/docs/csharp/debugger-settings), using the host's `READY` output in the Debug Console.

@@ -32,4 +32,4 @@ The checks cover authentication and write scope, the `201` project shape, an emp
 
 ## Remaining boundary
 
-Interactive execution of the Blazor form in a rendered browser remains unverified because the installed browser-control skill's required in-app runtime was unavailable in this session. HTTPS-level browser API and embedded asset checks still pass. Exact GitLab version fixtures, a pinned `glab` run, deployment CA/DNS trust, the durable DnaX feed, and integrated execution on Linux 3.10.108 remain open.
+Interactive execution of the Blazor form in a rendered browser remains unverified because the installed browser-control skill's required in-app runtime was unavailable in that session. HTTPS-level browser API and embedded asset checks still pass. Exact GitLab 18 fixtures and pinned `glab` 1.58.0 API workflows now pass; deployment CA/DNS trust, the durable DnaX feed, interactive browser execution and integrated execution on Linux 3.10.108 remain open.

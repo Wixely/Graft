@@ -57,6 +57,14 @@ dotnet tests\Graft.GitLab.Reference\bin\Release\net10.0\Graft.GitLab.Reference.d
 
 The recorded live run used the official GitLab CE 18.0.0 and `glab` 1.58.0 container images in a loopback-only rootless Podman network. See [the live-reference evidence](validation/2026-09-19-gitlab-18-live-reference.md) for exact digests, results, isolation, and remaining scope.
 
+Run the same pinned `glab` API workflow against disposable Graft with an existing WSL distribution and rootless Podman. The image must already be present unless its official pull is explicitly requested with `-PullImage`:
+
+```powershell
+.\tests\Graft.Glab.Acceptance\run.ps1 -Distribution <existing-wsl-distribution>
+```
+
+The C# harness generates a private fixture CA and validates TLS normally, mounts its synthetic token read-only, verifies the created project after shutdown, and deletes all temporary state. See [pinned-client evidence](validation/2026-09-19-glab-graft.md).
+
 MVP-07 adds the NativeAOT-compatible administration tool and a separate import/recovery acceptance executable. It needs both the server and admin tool paths:
 
 ```powershell
