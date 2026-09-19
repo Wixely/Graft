@@ -11,7 +11,7 @@ Set server breakpoints in `experiments/ui-server`. The browser client is publish
 | Launch option | Behavior |
 | --- | --- |
 | Debug MVP-04 accounts and permissions | Runs the disposable SQLite acceptance flow for accounts, projects, sessions, tokens, roles and revocation. |
-| Debug MVP-05 durable authenticated Git | Runs the real Git client against a disposable HTTPS server, SQLite database and durable object/ref directory. |
+| Debug MVP-06 repository UI and API | Runs the real Git client, GitLab-style API and browser-session/repository checks against a disposable HTTPS server, SQLite database and durable object/ref directory. |
 | Debug UI and authentication probe | Interactive UI with server C# breakpoints and browser opening. |
 | Debug compatibility probe | Runs the six compatibility checks and exits. |
 | Debug storage migration probe | Runs the disposable DnaX/SQLite migration checks and exits. |

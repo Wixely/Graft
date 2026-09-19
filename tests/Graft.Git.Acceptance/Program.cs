@@ -1,7 +1,10 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Net;
+using System.Net.Http.Json;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using Graft.Core;
 using Graft.Git;
 using Graft.Storage;
@@ -32,7 +35,9 @@ try
     string bobPassword = Password();
     string carolPassword = Password();
     TokenGrant aliceToken;
+    TokenGrant aliceApiToken;
     TokenGrant bobToken;
+    TokenGrant bobApiToken;
     ProjectInfo project;
     UserAccount bob;
     AuthenticatedIdentity aliceIdentity;
@@ -62,7 +67,9 @@ try
             });
         await fixture.SetMembershipAsync(aliceIdentity, project.Id, bob.Id, ProjectRole.Developer);
         aliceToken = await fixture.CreateTokenAsync(aliceIdentity, "clone-token", TokenScope.ReadRepository, DateTimeOffset.UtcNow.AddHours(1));
+        aliceApiToken = await fixture.CreateTokenAsync(aliceIdentity, "api-token", TokenScope.ReadApi | TokenScope.ReadRepository, DateTimeOffset.UtcNow.AddHours(1));
         bobToken = await fixture.CreateTokenAsync(bobIdentity, "push-token", TokenScope.WriteRepository, DateTimeOffset.UtcNow.AddHours(1));
+        bobApiToken = await fixture.CreateTokenAsync(bobIdentity, "member-api-token", TokenScope.ReadApi | TokenScope.WriteRepository, DateTimeOffset.UtcNow.AddHours(1));
         await fixture.CreateProjectWithRepositoryAsync(carolIdentity, "private", "Carol private repository",
             (created, cancellationToken) =>
             {
@@ -83,6 +90,8 @@ try
     Directory.CreateDirectory(source);
     await Git(source, ["init", "--initial-branch=main"]);
     File.WriteAllText(Path.Combine(source, "readme.txt"), "durable synthetic repository\n");
+    File.WriteAllText(Path.Combine(source, "hostile.html"), "<script>throw new Error('must remain text')</script>\n");
+    File.WriteAllBytes(Path.Combine(source, "binary.dat"), [0, 1, 2, 0, 255]);
     await Git(source, ["add", "."]);
     await Git(source, ["commit", "-m", "Initial durable commit"]);
     await Git(source, ["remote", "add", "origin", bobUrl]);
@@ -99,6 +108,9 @@ try
     Check((await Git(clone, ["rev-parse", "refs/remotes/origin/main"])).Trim() == firstHead, "restart preserves refs and objects");
     await Git(clone, ["fsck", "--full", "--strict"]);
     Check(true, "restart clone passes fsck");
+
+    await CheckApi(address, aliceApiToken.Secret, aliceToken.Secret, bobApiToken.Secret, project.Id, firstHead);
+    await CheckBrowser(address, "alice", alicePassword, project.Id);
 
     File.AppendAllText(Path.Combine(source, "readme.txt"), "second revision\n");
     await Git(source, ["add", "."]);
@@ -134,8 +146,11 @@ try
     await using (GraftStore revoke = await GraftStore.OpenAsync(databasePath))
     {
         await revoke.RevokeTokenAsync(aliceIdentity, aliceToken.Id);
+        await revoke.RevokeTokenAsync(aliceIdentity, aliceApiToken.Id);
     }
     await GitFails(clone, ["fetch", "origin"], "revoked token blocks fetch");
+    using (HttpResponseMessage revokedApi = await ApiGet(address, "/api/v4/user", aliceApiToken.Secret))
+        Check(revokedApi.StatusCode == System.Net.HttpStatusCode.Unauthorized, "revoked token blocks API");
     string crossProjectUrl = AuthenticatedUrl(address, "bob", bobToken.Secret, "carol/private.git");
     await GitFails(root, ["ls-remote", crossProjectUrl], "cross-project path does not disclose repository");
 
@@ -281,6 +296,166 @@ async Task<(int ExitCode, string Output)> RunGit(string directory, string[] argu
     {
         if (!process.HasExited) { process.Kill(entireProcessTree: true); await process.WaitForExitAsync(); }
     }
+}
+
+async Task CheckApi(string address, string apiToken, string repositoryOnlyToken, string memberApiToken, long projectId, string expectedHead)
+{
+    using (HttpResponseMessage missing = await ApiGet(address, "/api/v4/user", null))
+        Check(missing.StatusCode == System.Net.HttpStatusCode.Unauthorized, "API requires token");
+    using (HttpResponseMessage insufficient = await ApiGet(address, "/api/v4/user", repositoryOnlyToken))
+        Check(insufficient.StatusCode == System.Net.HttpStatusCode.Forbidden, "repository-only token cannot read user API");
+
+    using (HttpResponseMessage user = await ApiGet(address, "/api/v4/user", apiToken))
+    {
+        Check(user.IsSuccessStatusCode, "current-user API succeeds");
+        using JsonDocument json = JsonDocument.Parse(await user.Content.ReadAsStreamAsync());
+        Check(json.RootElement.GetProperty("username").GetString() == "alice", "current-user identity");
+    }
+
+    using (HttpResponseMessage projects = await ApiGet(address, "/api/v4/projects?per_page=1&page=1", apiToken))
+    {
+        Check(projects.IsSuccessStatusCode && projects.Headers.GetValues("X-Total").Single() == "1", "visible-project pagination");
+        using JsonDocument json = JsonDocument.Parse(await projects.Content.ReadAsStreamAsync());
+        Check(json.RootElement.GetArrayLength() == 1 && json.RootElement[0].GetProperty("id").GetInt64() == projectId,
+            "project list excludes inaccessible project");
+    }
+
+    using (HttpResponseMessage numeric = await ApiGet(address, "/api/v4/projects/" + projectId, apiToken))
+        Check(numeric.IsSuccessStatusCode, "numeric project lookup");
+    using (HttpResponseMessage encoded = await ApiGet(address, "/api/v4/projects/" + Uri.EscapeDataString("alice/durable"), apiToken))
+    {
+        Check(encoded.IsSuccessStatusCode, "encoded project lookup");
+        using JsonDocument json = JsonDocument.Parse(await encoded.Content.ReadAsStreamAsync());
+        Check(json.RootElement.GetProperty("path_with_namespace").GetString() == "alice/durable", "encoded project response");
+    }
+    using (HttpResponseMessage member = await ApiGet(address, "/api/v4/projects/" + projectId, memberApiToken))
+        Check(member.IsSuccessStatusCode, "member project lookup");
+
+    string projectApi = "/api/v4/projects/" + projectId + "/repository";
+    using (HttpResponseMessage branches = await ApiGet(address, projectApi + "/branches", apiToken))
+    {
+        Check(branches.IsSuccessStatusCode, "branches API");
+        using JsonDocument json = JsonDocument.Parse(await branches.Content.ReadAsStreamAsync());
+        Check(json.RootElement[0].GetProperty("name").GetString() == "main" &&
+            json.RootElement[0].GetProperty("commit").GetProperty("id").GetString() == expectedHead, "branch head matches Git");
+    }
+    using (HttpResponseMessage commits = await ApiGet(address, projectApi + "/commits?ref_name=main", apiToken))
+    {
+        Check(commits.IsSuccessStatusCode, "commits API");
+        using JsonDocument json = JsonDocument.Parse(await commits.Content.ReadAsStreamAsync());
+        Check(json.RootElement[0].GetProperty("id").GetString() == expectedHead, "commit history matches Git");
+    }
+    using (HttpResponseMessage tree = await ApiGet(address, projectApi + "/tree?ref=main", apiToken))
+    {
+        Check(tree.IsSuccessStatusCode, "tree API");
+        using JsonDocument json = JsonDocument.Parse(await tree.Content.ReadAsStreamAsync());
+        Check(json.RootElement.EnumerateArray().Any(entry => entry.GetProperty("name").GetString() == "hostile.html"), "tree lists hostile filename");
+    }
+    using (HttpResponseMessage hostile = await ApiGet(address, projectApi + "/files/hostile.html?ref=main", apiToken))
+    {
+        Check(hostile.IsSuccessStatusCode && hostile.Content.Headers.ContentType?.MediaType == "application/json", "hostile file is JSON data");
+        using JsonDocument json = JsonDocument.Parse(await hostile.Content.ReadAsStreamAsync());
+        string content = Encoding.UTF8.GetString(Convert.FromBase64String(json.RootElement.GetProperty("content").GetString()!));
+        Check(content.StartsWith("<script>", StringComparison.Ordinal), "hostile HTML returned encoded, unchanged");
+    }
+    using (HttpResponseMessage binary = await ApiGet(address, projectApi + "/files/binary.dat?ref=main", apiToken))
+    {
+        using JsonDocument json = JsonDocument.Parse(await binary.Content.ReadAsStreamAsync());
+        Check(binary.IsSuccessStatusCode && Convert.FromBase64String(json.RootElement.GetProperty("content").GetString()!).SequenceEqual(new byte[] { 0, 1, 2, 0, 255 }),
+            "binary file round trip");
+    }
+    using (HttpResponseMessage traversal = await ApiGet(address, projectApi + "/files/..?ref=main", apiToken))
+        Check(traversal.StatusCode is System.Net.HttpStatusCode.BadRequest or System.Net.HttpStatusCode.NotFound, "file traversal rejected");
+    using (HttpResponseMessage unsupported = await ApiGet(address, "/api/v4/not-supported", apiToken))
+    {
+        Check(unsupported.StatusCode == System.Net.HttpStatusCode.NotFound && unsupported.Content.Headers.ContentType?.MediaType == "application/json",
+            "unknown API route returns JSON 404");
+    }
+}
+
+async Task<HttpResponseMessage> ApiGet(string address, string path, string? token)
+{
+    HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false };
+    HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
+    HttpRequestMessage request = new(HttpMethod.Get, path);
+    if (token is not null) request.Headers.Add("PRIVATE-TOKEN", token);
+    HttpResponseMessage response = await client.SendAsync(request);
+    request.Dispose();
+    client.Dispose();
+    handler.Dispose();
+    return response;
+}
+
+async Task CheckBrowser(string address, string username, string password, long projectId)
+{
+    CookieContainer cookies = new();
+    using HttpClientHandler handler = new()
+    {
+        CookieContainer = cookies,
+        ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
+        UseProxy = false
+    };
+    using HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
+    using (HttpResponseMessage shell = await client.GetAsync("/"))
+    {
+        string html = await shell.Content.ReadAsStringAsync();
+        Check(shell.IsSuccessStatusCode && shell.Content.Headers.ContentType?.MediaType == "text/html" &&
+            html.Contains("blazor.webassembly.js", StringComparison.Ordinal), "embedded Blazor shell");
+        Check(shell.Headers.Contains("Content-Security-Policy"), "browser security policy");
+    }
+    using (HttpRequestMessage assetRequest = new(HttpMethod.Get, "/app.css"))
+    {
+        assetRequest.Headers.AcceptEncoding.ParseAdd("br");
+        using HttpResponseMessage asset = await client.SendAsync(assetRequest);
+        Check(asset.IsSuccessStatusCode && asset.Content.Headers.ContentEncoding.Contains("br") && asset.Headers.ETag is not null,
+            "compressed embedded asset with cache validator");
+    }
+    using (HttpResponseMessage deep = await client.GetAsync("/alice/durable"))
+        Check(deep.IsSuccessStatusCode && deep.Content.Headers.ContentType?.MediaType == "text/html", "browser deep link shell");
+    using (HttpResponseMessage anonymous = await client.GetAsync("/api/session"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await anonymous.Content.ReadAsStreamAsync());
+        Check(anonymous.IsSuccessStatusCode && !json.RootElement.GetProperty("authenticated").GetBoolean(), "browser starts anonymous");
+    }
+    using HttpRequestMessage login = new(HttpMethod.Post, "/api/login");
+    login.Headers.Add("Origin", address);
+    login.Content = JsonContent.Create(new { username, password });
+    using (HttpResponseMessage response = await client.SendAsync(login))
+        Check(response.IsSuccessStatusCode, "browser login");
+
+    string csrf;
+    using (HttpResponseMessage session = await client.GetAsync("/api/session"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await session.Content.ReadAsStreamAsync());
+        csrf = json.RootElement.GetProperty("csrf").GetString()!;
+        Check(json.RootElement.GetProperty("authenticated").GetBoolean() && csrf.Length == 64, "browser session and CSRF");
+    }
+    using (HttpResponseMessage projects = await client.GetAsync("/api/projects"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await projects.Content.ReadAsStreamAsync());
+        Check(projects.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 1 &&
+            json.RootElement[0].GetProperty("id").GetInt64() == projectId, "browser project visibility");
+    }
+    using (HttpResponseMessage repository = await client.GetAsync($"/api/browser/projects/{projectId}?ref=main&file=hostile.html"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await repository.Content.ReadAsStreamAsync());
+        Check(repository.IsSuccessStatusCode && json.RootElement.GetProperty("branches")[0].GetProperty("name").GetString() == "main",
+            "browser repository branches");
+        string content = Encoding.UTF8.GetString(Convert.FromBase64String(json.RootElement.GetProperty("file").GetProperty("content").GetString()!));
+        Check(content.StartsWith("<script>", StringComparison.Ordinal), "browser file content stays encoded in JSON");
+    }
+    using HttpRequestMessage rejectedLogout = new(HttpMethod.Post, "/api/logout");
+    rejectedLogout.Headers.Add("Origin", address);
+    rejectedLogout.Headers.Add("X-Graft-CSRF", new string('0', 64));
+    using (HttpResponseMessage rejected = await client.SendAsync(rejectedLogout))
+        Check(rejected.StatusCode == System.Net.HttpStatusCode.Forbidden, "browser logout rejects wrong CSRF");
+    using HttpRequestMessage logout = new(HttpMethod.Post, "/api/logout");
+    logout.Headers.Add("Origin", address);
+    logout.Headers.Add("X-Graft-CSRF", csrf);
+    using (HttpResponseMessage response = await client.SendAsync(logout))
+        Check(response.StatusCode == System.Net.HttpStatusCode.NoContent, "browser logout");
+    using (HttpResponseMessage replay = await client.GetAsync("/api/projects"))
+        Check(replay.StatusCode == System.Net.HttpStatusCode.Unauthorized, "logged-out browser session rejected");
 }
 
 void TestInterruptedCommitsLeaveRefsUnchanged(Repository current, string repositoryPath)

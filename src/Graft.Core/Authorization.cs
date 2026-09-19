@@ -94,8 +94,10 @@ public static class ProjectAuthorization
 
     private static bool ScopeAllows(TokenScope scopes, ProjectAction action) => action switch
     {
-        ProjectAction.ReadRest or ProjectAction.BrowseRepository =>
+        ProjectAction.ReadRest =>
             scopes.HasFlag(TokenScope.Api) || scopes.HasFlag(TokenScope.ReadApi),
+        ProjectAction.BrowseRepository =>
+            scopes.HasFlag(TokenScope.Api) || scopes.HasFlag(TokenScope.ReadApi) || scopes.HasFlag(TokenScope.ReadRepository),
         ProjectAction.FetchRepository =>
             scopes.HasFlag(TokenScope.Api) || scopes.HasFlag(TokenScope.ReadRepository) || scopes.HasFlag(TokenScope.WriteRepository),
         ProjectAction.PushRepository =>
@@ -109,5 +111,7 @@ public static class ProjectAuthorization
 
 public sealed record UserAccount(long Id, string Username, bool IsAdministrator, bool Disabled);
 public sealed record ProjectInfo(long Id, long OwnerUserId, string Namespace, string Slug, string Name, string StorageId);
+public sealed record ProjectDetails(ProjectInfo Project, string Description, DateTimeOffset CreatedAtUtc);
+public sealed record ProjectPage(IReadOnlyList<ProjectDetails> Projects, long Total);
 public sealed record SessionGrant(string Secret, DateTimeOffset ExpiresAtUtc);
 public sealed record TokenGrant(long Id, string Secret, TokenScope Scopes, DateTimeOffset ExpiresAtUtc);

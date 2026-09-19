@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk.Web">
+<Project Sdk="Microsoft.NET.Sdk.Web" TreatAsLocalProperty="_AllowedClientPublishDir">
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
@@ -9,10 +9,26 @@
     <RuntimeFrameworkVersion Condition="'$(SelfContained)' == 'true'">10.0.12</RuntimeFrameworkVersion>
     <RestorePackagesWithLockFile Condition="'$(RuntimeIdentifier)' == ''">true</RestorePackagesWithLockFile>
     <NuGetLockFilePath Condition="'$(RuntimeIdentifier)' != ''">$(BaseIntermediateOutputPath)packages.$(RuntimeIdentifier).lock.json</NuGetLockFilePath>
+    <ClientPublishDir>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)/../../artifacts/client/'))</ClientPublishDir>
   </PropertyGroup>
   <ItemGroup>
+    <ProjectReference Include="../Graft.Contracts/Graft.Contracts.csproj" />
     <ProjectReference Include="../Graft.Core/Graft.Core.csproj" />
     <ProjectReference Include="../Graft.Git/Graft.Git.csproj" />
     <ProjectReference Include="../Graft.Storage/Graft.Storage.csproj" />
   </ItemGroup>
+  <Target Name="PublishGraftClient" BeforeTargets="PrepareForBuild" Condition="'$(DesignTimeBuild)' != 'true'">
+    <PropertyGroup><_AllowedClientPublishDir>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)/../../artifacts/client/'))</_AllowedClientPublishDir></PropertyGroup>
+    <Error Condition="'$(ClientPublishDir)' != '$(_AllowedClientPublishDir)'" Text="Client asset cleanup is restricted to this repository's artifacts/client directory." />
+    <RemoveDir Directories="$(ClientPublishDir)" />
+    <MSBuild Projects="../Graft.Client/Graft.Client.csproj" Targets="Restore;Publish" BuildInParallel="false"
+      RemoveProperties="RuntimeIdentifier;SelfContained;PublishAot;PublishTrimmed;OutputPath;TargetFramework;NoBuild;NoRestore;CurrentSolutionConfigurationContents;BuildingSolutionFile"
+      Properties="Configuration=Release;PublishDir=$(ClientPublishDir);BuildProjectReferences=true" />
+    <ItemGroup>
+      <_ClientAsset Include="$(ClientPublishDir)wwwroot/**/*" Exclude="$(ClientPublishDir)wwwroot/**/*.pdb;$(ClientPublishDir)wwwroot/**/*.map" />
+      <EmbeddedResource Include="@(_ClientAsset)">
+        <LogicalName>web/%(_ClientAsset.RecursiveDir)%(_ClientAsset.Filename)%(_ClientAsset.Extension)</LogicalName>
+      </EmbeddedResource>
+    </ItemGroup>
+  </Target>
 </Project>

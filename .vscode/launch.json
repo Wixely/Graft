@@ -19,10 +19,10 @@
       "console": "integratedTerminal"
     },
     {
-      "name": "Debug MVP-05 durable authenticated Git",
+      "name": "Debug MVP-06 repository UI and API",
       "type": "coreclr",
       "request": "launch",
-      "preLaunchTask": "build MVP-05 Git acceptance",
+      "preLaunchTask": "build MVP-06 repository acceptance",
       "program": "${workspaceFolder}/tests/Graft.Git.Acceptance/bin/Debug/net10.0/Graft.Git.Acceptance.dll",
       "args": [
         "${workspaceFolder}/src/Graft.Server/bin/Debug/net10.0/Graft.Server.dll"

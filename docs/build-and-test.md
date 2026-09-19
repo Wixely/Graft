@@ -35,16 +35,16 @@ dotnet publish tests\Graft.Acceptance\Graft.Acceptance.csproj -c Release -r win-
 
 The package-preparation script verifies the exact public source tag and commit before packing. This local process does not replace the durable-feed release gate. See [MVP-04 evidence](validation/2026-09-19-mvp04-accounts-permissions.md).
 
-MVP-05 runs an ordinary Git client against the integrated HTTPS server and a disposable database/repository root. Git must be on `PATH`; the harness isolates Git configuration and disables certificate verification only for its ephemeral loopback certificate.
+MVP-06 extends the ordinary Git client workflow with GitLab-style REST reads, browser-session APIs, embedded Blazor assets and repository browsing against the same disposable database/repository root. Git must be on `PATH`; the harness isolates Git configuration and disables certificate verification only for its ephemeral loopback certificate.
 
 ```powershell
 dotnet build tests\Graft.Git.Acceptance\Graft.Git.Acceptance.csproj -c Debug
 dotnet tests\Graft.Git.Acceptance\bin\Debug\net10.0\Graft.Git.Acceptance.dll src\Graft.Server\bin\Debug\net10.0\Graft.Server.dll
-dotnet publish src\Graft.Server\Graft.Server.csproj -c Release -r win-x64 --self-contained true -p:GraftServerAot=true -o artifacts\mvp05\win-x64
-dotnet tests\Graft.Git.Acceptance\bin\Debug\net10.0\Graft.Git.Acceptance.dll artifacts\mvp05\win-x64\Graft.Server.exe
+dotnet publish src\Graft.Server\Graft.Server.csproj -c Release -r win-x64 --self-contained true -p:GraftServerAot=true -o artifacts\mvp06\win-x64
+dotnet tests\Graft.Git.Acceptance\bin\Debug\net10.0\Graft.Git.Acceptance.dll artifacts\mvp06\win-x64\Graft.Server.exe
 ```
 
-See [MVP-05 evidence](validation/2026-09-19-mvp05-durable-git.md) for covered behavior and remaining operational gates.
+See [MVP-06 evidence](validation/2026-09-19-mvp06-repository-api-ui.md) for covered behavior, exact compatibility boundaries and remaining operational gates. The published server embeds a trimmed Blazor WebAssembly client; WebAssembly AOT is not enabled and the optional `wasm-tools` workload is not required for this slice.
 
 `experiments/compatibility/Graft.Compatibility.csproj` has separate `NativeProbe` and `StaticProbe` switches. Plain `NativeProbe` enables AOT only; **StaticProbe** also sets static-musl executable linking, OpenSSL, ICU plus embedded data, and direct SQLite imports. Use `linux-musl-x64`, not the earlier CoreCLR `linux-x64` path, for the accepted standalone technique.
 

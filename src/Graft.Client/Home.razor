@@ -1,0 +1,88 @@
+@page "/"
+@page "/projects"
+@inject HttpClient Http
+
+<PageTitle>Graft · Projects</PageTitle>
+<p class="eyebrow">YOUR PROJECTS</p>
+<h1>Code, kept close.</h1>
+@if (Loading) { <p role="status">Loading…</p> }
+else if (Session?.Authenticated == true)
+{
+    <section>
+        <div class="section-heading"><div><h2>Private projects</h2><p>Signed in as <strong>@Session.Username</strong></p></div>
+            <button class="secondary" @onclick="Logout" disabled="@Busy">Sign out</button></div>
+        @if (Projects.Length == 0) { <p>No accessible projects.</p> }
+        @foreach (ProjectResponse project in Projects)
+        {
+            <a class="project" href="/@project.PathWithNamespace"><span class="project-icon" aria-hidden="true">G</span>
+                <span><strong>@project.NameWithNamespace</strong><small>@project.Description</small></span><span class="private">Private</span></a>
+        }
+    </section>
+}
+else
+{
+    <section class="sign-in">
+        <h2>Sign in</h2><p>Use your local Graft account.</p>
+        <form @onsubmit="Login" @onsubmit:preventDefault>
+            <label for="username">Username</label><input id="username" autocomplete="username" @bind="Username" required maxlength="39" />
+            <label for="password">Password</label><input id="password" type="password" autocomplete="current-password" @bind="Password" required minlength="16" maxlength="256" />
+            <button type="submit" disabled="@Busy">@(Busy ? "Signing in…" : "Sign in")</button>
+        </form>
+    </section>
+}
+@if (Message.Length > 0) { <p role="status" class="message">@Message</p> }
+
+@code {
+    private SessionResponse? Session;
+    private ProjectResponse[] Projects = [];
+    private string Username = "";
+    private string Password = "";
+    private string Message = "";
+    private bool Loading = true;
+    private bool Busy;
+
+    protected override async Task OnInitializedAsync()
+    {
+        try { await Refresh(); }
+        catch (HttpRequestException) { Message = "Graft could not be reached."; }
+        finally { Loading = false; }
+    }
+
+    private async Task Refresh()
+    {
+        Session = await Http.GetFromJsonAsync("api/session", ApiJson.Default.SessionResponse);
+        Projects = Session?.Authenticated == true
+            ? await Http.GetFromJsonAsync("api/projects", ApiJson.Default.ProjectResponseArray) ?? [] : [];
+    }
+
+    private async Task Login()
+    {
+        if (Busy) return;
+        Busy = true; Message = "";
+        try
+        {
+            using HttpResponseMessage response = await Http.PostAsJsonAsync("api/login", new LoginRequest(Username, Password), ApiJson.Default.LoginRequest);
+            Password = "";
+            if (response.IsSuccessStatusCode) { await Refresh(); Message = "Signed in."; }
+            else Message = response.StatusCode == HttpStatusCode.Unauthorized ? "Username or password was not accepted." : "Sign-in failed.";
+        }
+        catch (HttpRequestException) { Password = ""; Message = "Graft could not be reached."; }
+        finally { Busy = false; }
+    }
+
+    private async Task Logout()
+    {
+        if (Busy || Session is null) return;
+        Busy = true;
+        try
+        {
+            using HttpRequestMessage request = new(HttpMethod.Post, "api/logout");
+            request.Headers.Add("X-Graft-CSRF", Session.Csrf);
+            using HttpResponseMessage response = await Http.SendAsync(request);
+            response.EnsureSuccessStatusCode();
+            await Refresh(); Message = "Signed out.";
+        }
+        catch (HttpRequestException) { Message = "Sign-out could not be confirmed."; }
+        finally { Busy = false; }
+    }
+}

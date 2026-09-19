@@ -71,6 +71,9 @@
           "SQLitePCLRaw.core": "2.1.12"
         }
       },
+      "graft.contracts": {
+        "type": "Project"
+      },
       "graft.core": {
         "type": "Project"
       },

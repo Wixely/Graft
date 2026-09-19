@@ -1,0 +1,87 @@
+@page "/{Namespace}/{Slug}"
+@inject HttpClient Http
+
+<PageTitle>Graft · @Slug</PageTitle>
+@if (Loading) { <p role="status">Loading repository…</p> }
+else if (Page is null) { <h1>Repository unavailable</h1><p>@Message</p> }
+else
+{
+    <p class="eyebrow">@Page.Project.Namespace.Name / PRIVATE</p>
+    <h1>@Page.Project.Name</h1><p class="intro">@Page.Project.Description</p>
+    <div class="repository-grid">
+        <section><h2>Files</h2>
+            @if (Path.Length > 0) { <button class="link-button" @onclick="Up">← @Path</button> }
+            @foreach (TreeEntryResponse entry in Page.Tree)
+            {
+                <button class="tree-entry" @onclick="() => Open(entry)"><span>@(entry.Type == "tree" ? "▣" : "□")</span><strong>@entry.Name</strong><small>@entry.Mode</small></button>
+            }
+        </section>
+        <aside><section><h2>Branches</h2>@foreach (BranchResponse branch in Page.Branches) { <p><strong>@branch.Name</strong><br /><small>@branch.Commit.ShortId</small></p> }</section></aside>
+    </div>
+    @if (Page.File is not null)
+    {
+        <section class="file"><h2>@Page.File.FilePath</h2>
+            @if (FileText is null) { <p>Binary file · @Page.File.Size bytes</p> }
+            else { <pre>@FileText</pre> }
+        </section>
+    }
+    <section><h2>Recent commits</h2>@foreach (CommitResponse commit in Page.Commits)
+        { <article class="commit"><code>@commit.ShortId</code><span><strong>@commit.Title</strong><small>@commit.AuthorName · @commit.AuthoredDate.ToString("u")</small></span></article> }</section>
+}
+
+@code {
+    [Parameter] public string Namespace { get; set; } = "";
+    [Parameter] public string Slug { get; set; } = "";
+    private RepositoryPageResponse? Page;
+    private string Path = "";
+    private string FilePath = "";
+    private string? FileText;
+    private string Message = "";
+    private bool Loading = true;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        try
+        {
+            SessionResponse? session = await Http.GetFromJsonAsync("api/session", ApiJson.Default.SessionResponse);
+            if (session?.Authenticated != true) { Message = "Sign in from the projects page."; return; }
+            ProjectResponse[] projects = await Http.GetFromJsonAsync("api/projects", ApiJson.Default.ProjectResponseArray) ?? [];
+            ProjectResponse? project = projects.SingleOrDefault(item => item.PathWithNamespace == Namespace + "/" + Slug);
+            if (project is null) { Message = "You do not have access to this project."; return; }
+            await Load(project.Id);
+        }
+        catch (HttpRequestException) { Message = "Repository data could not be loaded."; }
+        finally { Loading = false; }
+    }
+
+    private async Task Load(long id)
+    {
+        string query = $"api/browser/projects/{id}?ref=main&path={Uri.EscapeDataString(Path)}" +
+            (FilePath.Length == 0 ? "" : "&file=" + Uri.EscapeDataString(FilePath));
+        Page = await Http.GetFromJsonAsync(query, ApiJson.Default.RepositoryPageResponse);
+        FileText = Page?.File is null ? null : DecodeText(Page.File.Content);
+    }
+
+    private async Task Open(TreeEntryResponse entry)
+    {
+        if (entry.Type == "tree") { Path = entry.Path; FilePath = ""; }
+        else { FilePath = entry.Path; }
+        if (Page is not null) await Load(Page.Project.Id);
+    }
+
+    private async Task Up()
+    {
+        int separator = Path.LastIndexOf('/');
+        Path = separator < 0 ? "" : Path[..separator];
+        FilePath = "";
+        if (Page is not null) await Load(Page.Project.Id);
+    }
+
+    private static string? DecodeText(string content)
+    {
+        byte[] bytes = Convert.FromBase64String(content);
+        if (bytes.Contains((byte)0)) return null;
+        try { return new UTF8Encoding(false, true).GetString(bytes); }
+        catch (DecoderFallbackException) { return null; }
+    }
+}
