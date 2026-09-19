@@ -4,6 +4,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <DebugType Condition="'$(Configuration)' == 'Release'">none</DebugType>
     <PublishAot Condition="'$(GraftServerAot)' == 'true'">true</PublishAot>
     <PublishIISAssets>false</PublishIISAssets>
     <RuntimeFrameworkVersion Condition="'$(SelfContained)' == 'true'">10.0.12</RuntimeFrameworkVersion>
@@ -11,18 +12,33 @@
     <NuGetLockFilePath Condition="'$(RuntimeIdentifier)' != ''">$(BaseIntermediateOutputPath)packages.$(RuntimeIdentifier).lock.json</NuGetLockFilePath>
     <ClientPublishDir>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)/../../artifacts/client/'))</ClientPublishDir>
   </PropertyGroup>
+  <PropertyGroup Condition="'$(GraftServerStatic)' == 'true'">
+    <PublishAot>true</PublishAot>
+    <StaticExecutable>true</StaticExecutable>
+    <StaticOpenSslLinking>true</StaticOpenSslLinking>
+    <StaticICULinking>true</StaticICULinking>
+    <EmbedIcuDataPath>/usr/share/icu/74.2/icudt74l.dat</EmbedIcuDataPath>
+    <IlcGenerateStackTraceData>false</IlcGenerateStackTraceData>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(GraftServerStatic)' == 'true'">
+    <DirectPInvoke Include="e_sqlite3" />
+    <NativeLibrary Include="/usr/lib/libsqlite3.a" />
+  </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../Graft.Contracts/Graft.Contracts.csproj" />
     <ProjectReference Include="../Graft.Core/Graft.Core.csproj" />
     <ProjectReference Include="../Graft.Git/Graft.Git.csproj" />
     <ProjectReference Include="../Graft.Operations/Graft.Operations.csproj" />
     <ProjectReference Include="../Graft.Storage/Graft.Storage.csproj" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Systemd" Version="10.0.12" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.12" />
   </ItemGroup>
   <Target Name="PublishGraftClient" BeforeTargets="PrepareForBuild" Condition="'$(DesignTimeBuild)' != 'true'">
     <PropertyGroup><_AllowedClientPublishDir>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)/../../artifacts/client/'))</_AllowedClientPublishDir></PropertyGroup>
     <Error Condition="'$(ClientPublishDir)' != '$(_AllowedClientPublishDir)'" Text="Client asset cleanup is restricted to this repository's artifacts/client directory." />
-    <RemoveDir Directories="$(ClientPublishDir)" />
+    <RemoveDir Directories="$(ClientPublishDir)" Condition="'$(GraftSkipClientPublish)' != 'true'" />
     <MSBuild Projects="../Graft.Client/Graft.Client.csproj" Targets="Restore;Publish" BuildInParallel="false"
+      Condition="'$(GraftSkipClientPublish)' != 'true'"
       RemoveProperties="RuntimeIdentifier;SelfContained;PublishAot;PublishTrimmed;OutputPath;TargetFramework;NoBuild;NoRestore;CurrentSolutionConfigurationContents;BuildingSolutionFile"
       Properties="Configuration=Release;PublishDir=$(ClientPublishDir);BuildProjectReferences=true" />
     <ItemGroup>

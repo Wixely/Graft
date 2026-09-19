@@ -66,6 +66,21 @@
       "problemMatcher": "$msCompile"
     },
     {
+      "label": "build MVP-08 packaging acceptance",
+      "type": "process",
+      "command": "dotnet",
+      "args": [
+        "build",
+        "tests/Graft.Packaging.Acceptance/Graft.Packaging.Acceptance.csproj",
+        "-c",
+        "Debug"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": "$msCompile"
+    },
+    {
       "label": "build Graft admin",
       "type": "process",
       "command": "dotnet",

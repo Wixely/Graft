@@ -1,0 +1,29 @@
+[Unit]
+Description=Graft private Git forge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=@USER@
+Group=@GROUP@
+ExecStart=@EXECUTABLE@ --database @DATABASE@ --repositories @REPOSITORIES@ --listen https://127.0.0.1:7443 --origin https://127.0.0.1:7443
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=@DATA_DIRECTORY@
+WorkingDirectory=@INSTALL_DIRECTORY@
+
+[Install]
+WantedBy=multi-user.target

@@ -15,7 +15,7 @@ using Microsoft.AspNetCore.Hosting.Server.Features;
 
 if (!Arguments.TryParse(args, out Arguments? parsedSettings))
 {
-    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory>. The current host binds loopback HTTPS only.");
+    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>].");
     return 2;
 }
 Arguments settings = parsedSettings!;
@@ -43,11 +43,13 @@ using X509Certificate2? imported = OperatingSystem.IsWindows()
 X509Certificate2 certificate = imported ?? generated;
 
 WebApplicationBuilder builder = WebApplication.CreateSlimBuilder(new WebApplicationOptions { Args = [] });
+builder.Host.UseWindowsService(options => options.ServiceName = "Graft");
+builder.Host.UseSystemd();
 builder.Logging.ClearProviders();
 builder.Services.ConfigureHttpJsonOptions(options => options.SerializerOptions.TypeInfoResolverChain.Insert(0, ApiJson.Default));
 builder.WebHost.ConfigureKestrel(options =>
 {
-    options.Listen(IPAddress.Loopback, 0, listen => listen.UseHttps(certificate));
+    options.Listen(settings.ListenAddress, settings.ListenPort, listen => listen.UseHttps(certificate));
     options.Limits.MaxRequestBodySize = Limits.RequestBytes;
     options.Limits.MaxConcurrentConnections = 16;
     options.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(5);
@@ -92,6 +94,13 @@ app.MapGet("/api/session", async context =>
         ? new(false, null, "")
         : new(true, browser.Value.Identity.Username, Csrf(browser.Value.Secret));
     await context.Response.WriteAsJsonAsync(response, ApiJson.Default.SessionResponse, null, context.RequestAborted);
+});
+
+app.MapGet("/healthz", async context =>
+{
+    if (!await OnlyQuery(context)) return;
+    context.Response.ContentType = "text/plain; charset=utf-8";
+    await context.Response.WriteAsync("healthy", context.RequestAborted);
 });
 
 app.MapPost("/api/login", async context =>
@@ -354,7 +363,7 @@ app.MapFallback("/{**path}", context => assets.Serve(context));
 
 await app.StartAsync();
 string address = app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.Single();
-serverOrigin = address;
+serverOrigin = settings.Origin ?? address;
 Console.WriteLine("MODE: " + (RuntimeFeature.IsDynamicCodeSupported ? "JIT" : "NativeAOT"));
 Console.WriteLine($"ASSETS: {assets.Count}; bytes={assets.Bytes}");
 Console.WriteLine("READY: " + address);
@@ -605,22 +614,43 @@ sealed class LoginThrottle
     }
 }
 
-sealed record Arguments(string Database, string Repositories)
+sealed record Arguments(string Database, string Repositories, IPAddress ListenAddress, int ListenPort, string? Origin)
 {
     public static bool TryParse(string[] values, out Arguments? result)
     {
         result = null;
-        if (values.Length != 4) return false;
+        if (values.Length is < 4 or > 8 || values.Length % 2 != 0) return false;
         string? database = null;
         string? repositories = null;
+        string? listen = null;
+        string? origin = null;
         for (int index = 0; index < values.Length; index += 2)
         {
             if (values[index] == "--database") database = values[index + 1];
             else if (values[index] == "--repositories") repositories = values[index + 1];
+            else if (values[index] == "--listen") listen = values[index + 1];
+            else if (values[index] == "--origin") origin = values[index + 1];
             else return false;
         }
         if (string.IsNullOrWhiteSpace(database) || string.IsNullOrWhiteSpace(repositories)) return false;
-        result = new(Path.GetFullPath(database), Path.GetFullPath(repositories));
+        IPAddress address = IPAddress.Loopback;
+        int port = 0;
+        if (listen is not null)
+        {
+            if (!Uri.TryCreate(listen, UriKind.Absolute, out Uri? uri) || uri.Scheme != Uri.UriSchemeHttps ||
+                uri.AbsolutePath != "/" || !string.IsNullOrEmpty(uri.Query) || !string.IsNullOrEmpty(uri.Fragment) ||
+                !IPAddress.TryParse(uri.Host, out IPAddress? parsedAddress) || uri.Port is < 1 or > 65535)
+                return false;
+            address = parsedAddress;
+            port = uri.Port;
+        }
+        if (origin is not null && (!Uri.TryCreate(origin, UriKind.Absolute, out Uri? originUri) ||
+            originUri.Scheme != Uri.UriSchemeHttps || originUri.AbsolutePath != "/" ||
+            !string.IsNullOrEmpty(originUri.UserInfo) || !string.IsNullOrEmpty(originUri.Query) ||
+            !string.IsNullOrEmpty(originUri.Fragment)))
+            return false;
+        result = new(Path.GetFullPath(database), Path.GetFullPath(repositories), address, port,
+            origin is null ? null : origin.TrimEnd('/'));
         return true;
     }
 }

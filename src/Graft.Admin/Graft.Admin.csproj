@@ -5,10 +5,23 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <DebugType Condition="'$(Configuration)' == 'Release'">none</DebugType>
     <PublishAot Condition="'$(GraftAdminAot)' == 'true'">true</PublishAot>
     <RestorePackagesWithLockFile Condition="'$(RuntimeIdentifier)' == ''">true</RestorePackagesWithLockFile>
     <NuGetLockFilePath Condition="'$(RuntimeIdentifier)' != ''">$(BaseIntermediateOutputPath)packages.$(RuntimeIdentifier).lock.json</NuGetLockFilePath>
   </PropertyGroup>
+  <PropertyGroup Condition="'$(GraftAdminStatic)' == 'true'">
+    <PublishAot>true</PublishAot>
+    <StaticExecutable>true</StaticExecutable>
+    <StaticOpenSslLinking>true</StaticOpenSslLinking>
+    <StaticICULinking>true</StaticICULinking>
+    <EmbedIcuDataPath>/usr/share/icu/74.2/icudt74l.dat</EmbedIcuDataPath>
+    <IlcGenerateStackTraceData>false</IlcGenerateStackTraceData>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(GraftAdminStatic)' == 'true'">
+    <DirectPInvoke Include="e_sqlite3" />
+    <NativeLibrary Include="/usr/lib/libsqlite3.a" />
+  </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../Graft.Operations/Graft.Operations.csproj" />
   </ItemGroup>

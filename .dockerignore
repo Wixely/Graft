@@ -1,0 +1,8 @@
+.git
+**/bin
+**/obj
+artifacts/*
+!artifacts/mvp08
+artifacts/mvp08/*
+!artifacts/mvp08/server-linux-x64
+!artifacts/mvp08/server-linux-x64/**

@@ -44,6 +44,19 @@
       "console": "integratedTerminal"
     },
     {
+      "name": "Debug MVP-08 interactive packaging checks",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build MVP-08 packaging acceptance",
+      "program": "${workspaceFolder}/tests/Graft.Packaging.Acceptance/bin/Debug/net10.0/Graft.Packaging.Acceptance.dll",
+      "args": [
+        "interactive",
+        "${workspaceFolder}/src/Graft.Server/bin/Debug/net10.0/Graft.Server.dll"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
       "name": "Debug UI and authentication probe",
       "type": "coreclr",
       "request": "launch",

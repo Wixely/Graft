@@ -19,7 +19,7 @@ Checkout setup validation on 2026-09-18: solution build passed with zero warning
 
 For MVP-02, the [UI/auth runbook](../experiments/ui-server/README.md) covers automatic client publication/embedding, HTTP acceptance, C# browser scripts, debugging and Windows NativeAOT. The solution build includes this experiment and may restore pinned Blazor NuGet assets; it does not install a browser-native workload. [Recorded UI/auth acceptance](validation/2026-09-18-ui-nativeaot.md) is Windows-only.
 
-The separate [managed Git runbook](../experiments/managed-git/README.md) covers MVP-01's C# self-checks, real Git client harness, VS Code configurations and Windows NativeAOT publish. Its [acceptance evidence](validation/2026-09-18-managed-git.md) does not extend the old-host result. The static Linux instructions below still apply to the original compatibility probe only.
+The separate [managed Git runbook](../experiments/managed-git/README.md) covers MVP-01's C# self-checks, real Git client harness, VS Code configurations and Windows NativeAOT publish. Its [acceptance evidence](validation/2026-09-18-managed-git.md) does not extend the old-host result. The original compatibility-probe instructions below remain the accepted legacy-host baseline; the MVP-08 product build is a new artifact with its own pending host gate.
 
 The [storage migration runbook](../experiments/storage/README.md) covers MVP-03's JIT, Windows NativeAOT and static-musl commands. [Recorded storage evidence](validation/2026-09-19-storage-migrations.md) includes migration failure/recovery behavior and Dapper interception. Its static binary has not run on the required host, and clean external restore is blocked until the tagged DnaX packages have an approved durable source.
 
@@ -59,6 +59,28 @@ dotnet tests\Graft.Operations.Acceptance\bin\Release\net10.0\Graft.Operations.Ac
 ```
 
 See [the operations runbook](operations.md) for backup, verification, fresh-target restore and repository-only import inventory commands. [MVP-07 evidence](validation/2026-09-19-mvp07-import-recovery.md) records the tested boundary.
+
+MVP-08 adds service lifetimes, deployment definitions, a static-musl product build and resource/lifecycle acceptance. The ordinary Windows NativeAOT baseline is:
+
+```powershell
+dotnet publish src\Graft.Server\Graft.Server.csproj -c Release -r win-x64 --self-contained true -p:PublishAot=true -o artifacts\mvp08\server-win-x64
+dotnet publish src\Graft.Admin\Graft.Admin.csproj -c Release -r win-x64 --self-contained true -p:PublishAot=true -o artifacts\mvp08\admin-win-x64
+dotnet run --project tests\Graft.Packaging.Acceptance\Graft.Packaging.Acceptance.csproj -c Release -- interactive artifacts\mvp08\server-win-x64\Graft.Server.exe
+```
+
+Run the Windows Service mode only from an elevated disposable session; it creates and removes a randomly named service and copies the publication beneath ProgramData:
+
+```powershell
+dotnet run --project tests\Graft.Packaging.Acceptance\Graft.Packaging.Acceptance.csproj -c Release -- windows-service artifacts\mvp08\server-win-x64\Graft.Server.exe
+```
+
+Build the integrated static Linux server and admin tool with the existing isolated WSL toolchain:
+
+```powershell
+.\deploy\linux\build-static-native.ps1 -Distribution <existing-wsl-distribution>
+```
+
+The systemd acceptance requires root in a systemd Linux environment. The container acceptance requires rootless Podman and the self-contained `linux-x64` publication expected by the Containerfile. `.dockerignore` and `.containerignore` restrict the build context to source/deployment files and that publication. Both tests clean their temporary service/container state. See [the deployment runbook](deployment.md) and [MVP-08 evidence](validation/2026-09-19-mvp08-packaging-resources.md) for commands, results and boundaries.
 
 `experiments/compatibility/Graft.Compatibility.csproj` has separate `NativeProbe` and `StaticProbe` switches. Plain `NativeProbe` enables AOT only; **StaticProbe** also sets static-musl executable linking, OpenSSL, ICU plus embedded data, and direct SQLite imports. Use `linux-musl-x64`, not the earlier CoreCLR `linux-x64` path, for the accepted standalone technique.
 
