@@ -275,6 +275,58 @@ public sealed class GraftStore : IAsyncDisposable
         return row is null ? null : new(row.Id, row.OwnerUserId, row.Namespace, row.Slug, row.Name, row.StorageId);
     }
 
+    public async Task<ProjectDetails?> GetReadyProjectAsync(long projectId, CancellationToken cancellationToken = default)
+    {
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        ProjectDetailsRow? row = await db.QuerySingleOrDefaultAsync<ProjectDetailsRow>("""
+            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.Description, p.StorageId, p.CreatedAtUtc
+            FROM Projects p
+            JOIN Users u ON u.Id = p.OwnerUserId
+            WHERE p.Id = @Id AND p.State = 'ready';
+            """, new IdParameters(projectId));
+        return row is null ? null : ToDetails(row);
+    }
+
+    public async Task<ProjectDetails?> FindReadyProjectDetailsAsync(
+        string projectNamespace,
+        string slug,
+        CancellationToken cancellationToken = default)
+    {
+        ProjectInfo? project = await FindReadyProjectAsync(projectNamespace, slug, cancellationToken);
+        return project is null ? null : await GetReadyProjectAsync(project.Id, cancellationToken);
+    }
+
+    public async Task<ProjectPage> ListAccessibleProjectsAsync(
+        AuthenticatedIdentity identity,
+        int skip,
+        int take,
+        CancellationToken cancellationToken = default)
+    {
+        if (skip < 0 || take is < 1 or > 100) throw new ArgumentOutOfRangeException(nameof(take));
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        AuthenticatedIdentity live = await RequireLiveIdentityAsync(db, null, identity, cancellationToken);
+        ProjectListParameters parameters = new(live.UserId, live.IsAdministrator ? 1 : 0, take, skip);
+        IEnumerable<ProjectDetailsRow> rows = await db.QueryAsync<ProjectDetailsRow>("""
+            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.Description, p.StorageId, p.CreatedAtUtc
+            FROM Projects p
+            JOIN Users u ON u.Id = p.OwnerUserId
+            WHERE p.State = 'ready' AND (
+                @IsAdministrator = 1 OR p.OwnerUserId = @UserId OR
+                EXISTS (SELECT 1 FROM ProjectMemberships m WHERE m.ProjectId = p.Id AND m.UserId = @UserId)
+            )
+            ORDER BY p.Id
+            LIMIT @Take OFFSET @Skip;
+            """, parameters);
+        long total = await db.QuerySingleAsync<long>("""
+            SELECT COUNT(*) FROM Projects p
+            WHERE p.State = 'ready' AND (
+                @IsAdministrator = 1 OR p.OwnerUserId = @UserId OR
+                EXISTS (SELECT 1 FROM ProjectMemberships m WHERE m.ProjectId = p.Id AND m.UserId = @UserId)
+            );
+            """, parameters);
+        return new(rows.Select(ToDetails).ToArray(), total);
+    }
+
     private async Task<ProjectInfo> CreateProjectCoreAsync(
         AuthenticatedIdentity actor,
         string slug,
@@ -449,7 +501,7 @@ public sealed class GraftStore : IAsyncDisposable
 
     private static async Task<AuthenticatedIdentity> RequireLiveIdentityAsync(
         SqliteConnection db,
-        SqliteTransaction transaction,
+        SqliteTransaction? transaction,
         AuthenticatedIdentity identity,
         CancellationToken cancellationToken) =>
         await FindLiveIdentityAsync(db, transaction, identity, cancellationToken)
@@ -495,6 +547,11 @@ public sealed class GraftStore : IAsyncDisposable
     private static string Digest(string secret) => Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(secret)));
     private static string Now() => DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture);
 
+    private static ProjectDetails ToDetails(ProjectDetailsRow row) => new(
+        new(row.Id, row.OwnerUserId, row.Namespace, row.Slug, row.Name, row.StorageId),
+        row.Description,
+        DateTimeOffset.Parse(row.CreatedAtUtc, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind));
+
     public async ValueTask DisposeAsync()
     {
         await services.DisposeAsync();
@@ -524,7 +581,7 @@ internal sealed class TokenIdentityRow : IdentityRow { public long Scopes { get;
 internal sealed class TokenOwnerRow { public long UserId { get; set; } }
 internal sealed class ProjectOwnerRow { public long OwnerUserId { get; set; } }
 internal sealed class ProjectAccessRow { public long OwnerUserId { get; set; } public long? Role { get; set; } }
-internal sealed class ProjectPathRow
+internal class ProjectPathRow
 {
     public long Id { get; set; }
     public long OwnerUserId { get; set; }
@@ -532,6 +589,11 @@ internal sealed class ProjectPathRow
     public string Slug { get; set; } = "";
     public string Name { get; set; } = "";
     public string StorageId { get; set; } = "";
+}
+internal sealed class ProjectDetailsRow : ProjectPathRow
+{
+    public string Description { get; set; } = "";
+    public string CreatedAtUtc { get; set; } = "";
 }
 
 internal sealed record CreateUserParameters(string Username, string NormalizedUsername, string PasswordHash, string CreatedAtUtc);
@@ -548,5 +610,6 @@ internal sealed record MembershipParameters(long ProjectId, long UserId, int Rol
 internal sealed record ProjectUserParameters(long ProjectId, long UserId);
 internal sealed record PermissionQueryParameters(long ProjectId, long UserId);
 internal sealed record ProjectPathParameters(string NormalizedNamespace, string NormalizedSlug);
+internal sealed record ProjectListParameters(long UserId, int IsAdministrator, int Take, int Skip);
 internal sealed record RawValueParameters(string Value);
 internal sealed record AuditParameters(long? ActorUserId, string Action, string TargetType, string? TargetId, string Detail, string CreatedAtUtc);

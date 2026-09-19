@@ -36,7 +36,7 @@
       "problemMatcher": "$msCompile"
     },
     {
-      "label": "build MVP-05 Git acceptance",
+      "label": "build MVP-06 repository acceptance",
       "type": "process",
       "command": "dotnet",
       "args": [
