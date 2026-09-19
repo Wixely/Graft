@@ -2,7 +2,7 @@
 
 Graft is a planned locally hosted GitLab alternative in C#/.NET 10. It targets GitLab APIs, URL conventions, applications and CI/CD, with simpler operations, permissions and runners, low resource use, and GitLab data import.
 
-Status as of **2026-09-19**: [fully C# MVP proposal prepared](docs/mvp-plan.md); compatibility, [managed Git](docs/validation/2026-09-18-managed-git.md), [Blazor UI/auth](docs/validation/2026-09-18-ui-nativeaot.md) and [DnaX storage migration](docs/validation/2026-09-19-storage-migrations.md) experiments are verified within their recorded scopes. The storage experiment passes JIT, Windows NativeAOT and local static-musl NativeAOT, but DnaX adoption is held until its packages have a reproducible approved source. There is no integrated production forge or durable Git hosting yet. Remote hosting, visibility and project license are undecided. No remote is configured.
+Status as of **2026-09-19**: the [MVP-04 account/project/permission core](docs/validation/2026-09-19-mvp04-accounts-permissions.md) passes 66 checks under Windows JIT and NativeAOT. Compatibility, [managed Git](docs/validation/2026-09-18-managed-git.md), [Blazor UI/auth](docs/validation/2026-09-18-ui-nativeaot.md) and [DnaX storage migration](docs/validation/2026-09-19-storage-migrations.md) experiments remain verified within their recorded scopes. DnaX package distribution and required-host execution remain gates. There is no production HTTP surface or durable Git hosting yet. Remote hosting, visibility and project license are undecided. No remote is configured.
 
 ## Start here
 
@@ -35,6 +35,8 @@ Linux static NativeAOT requires the separate toolchain/runbook; a Windows build 
 | Path | Purpose |
 | --- | --- |
 | `docs/` | Requirements, decisions, architecture questions, work queue and evidence |
+| `src/Graft.Core/`, `src/Graft.Storage/` | MVP authorization policy and DnaX/SQLite persistence |
+| `tests/Graft.Acceptance/` | Disposable MVP-04 persistence and authorization acceptance executable |
 | `experiments/compatibility/` | Probe source, pinned NuGet dependencies and build scripts |
 | `experiments/managed-git/` | Bounded C# smart HTTP/pack experiment; [runbook](experiments/managed-git/README.md) |
 | `experiments/managed-git-client/` | C# acceptance harness using installed Git as an independent test client |
@@ -45,4 +47,4 @@ Linux static NativeAOT requires the separate toolchain/runbook; a Windows build 
 
 The original discovery notes remain in the sibling [PLAN idea](../PLAN/inbox/local-git-forge.md). This repository is now the canonical implementation/handoff context. Private infrastructure details stay in PLAN; project docs use a neutral target-host description.
 
-Recommended next action - Owner: User/DnaX maintainer: make the tested DnaX packages available from an approved durable feed. Owner: Implementation agent: verify a clean restore, then begin **MVP-04**, accounts/projects/membership. Review [the MVP plan](docs/mvp-plan.md) and [MVP-03 evidence](docs/validation/2026-09-19-storage-migrations.md). Do not re-run the unchanged NAS probe merely to rediscover the recorded result.
+Recommended next action - Owner: Implementation agent: begin **MVP-05**, connecting durable managed Git storage and real transport authorization to the MVP-04 core. Owner: User/DnaX maintainer: make the tested DnaX packages available from an approved durable feed. Review [the MVP plan](docs/mvp-plan.md) and [MVP-04 evidence](docs/validation/2026-09-19-mvp04-accounts-permissions.md). Do not re-run the unchanged NAS probe merely to rediscover the recorded result.
