@@ -234,7 +234,54 @@ public sealed class GraftStore : IAsyncDisposable
         string slug,
         string name,
         string description = "",
+        CancellationToken cancellationToken = default) =>
+        await CreateProjectCoreAsync(actor, slug, name, description, null, cancellationToken);
+
+    public async Task<ProjectInfo> CreateProjectWithRepositoryAsync(
+        AuthenticatedIdentity actor,
+        string slug,
+        string name,
+        Func<ProjectInfo, CancellationToken, Task> initializeRepository,
+        string description = "",
         CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(initializeRepository);
+        return await CreateProjectCoreAsync(actor, slug, name, description, initializeRepository, cancellationToken);
+    }
+
+    public async Task<ProjectInfo?> FindReadyProjectAsync(
+        string projectNamespace,
+        string slug,
+        CancellationToken cancellationToken = default)
+    {
+        string normalizedNamespace;
+        string normalizedSlug;
+        try
+        {
+            normalizedNamespace = NormalizeName(projectNamespace, nameof(projectNamespace));
+            normalizedSlug = NormalizeName(slug, nameof(slug));
+        }
+        catch (ArgumentException) { return null; }
+
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        ProjectPathRow? row = await db.QuerySingleOrDefaultAsync<ProjectPathRow>("""
+            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.StorageId
+            FROM Projects p
+            JOIN Users u ON u.Id = p.OwnerUserId
+            WHERE u.NormalizedUsername = @NormalizedNamespace
+              AND p.NormalizedSlug = @NormalizedSlug
+              AND p.State = 'ready';
+            """, new ProjectPathParameters(normalizedNamespace, normalizedSlug));
+        return row is null ? null : new(row.Id, row.OwnerUserId, row.Namespace, row.Slug, row.Name, row.StorageId);
+    }
+
+    private async Task<ProjectInfo> CreateProjectCoreAsync(
+        AuthenticatedIdentity actor,
+        string slug,
+        string name,
+        string description,
+        Func<ProjectInfo, CancellationToken, Task>? initializeRepository,
+        CancellationToken cancellationToken)
     {
         string normalizedSlug = NormalizeName(slug, nameof(slug));
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
@@ -247,12 +294,23 @@ public sealed class GraftStore : IAsyncDisposable
         string now = Now();
         long id = await db.QuerySingleAsync<long>("""
             INSERT INTO Projects (OwnerUserId, Slug, NormalizedSlug, Name, Description, StorageId, State, CreatedAtUtc)
-            VALUES (@OwnerUserId, @Slug, @NormalizedSlug, @Name, @Description, @StorageId, 'ready', @CreatedAtUtc)
+            VALUES (@OwnerUserId, @Slug, @NormalizedSlug, @Name, @Description, @StorageId, 'pending', @CreatedAtUtc)
             RETURNING Id;
             """, new CreateProjectParameters(liveActor.UserId, slug, normalizedSlug, name, description, storageId, now), transaction);
-        await AuditAsync(db, transaction, actor.UserId, "create-project", "project", id.ToString(CultureInfo.InvariantCulture), "Private project created.", now);
+        await AuditAsync(db, transaction, actor.UserId, "begin-create-project", "project", id.ToString(CultureInfo.InvariantCulture), "Private project metadata created in pending state.", now);
         await transaction.CommitAsync(cancellationToken);
-        return new(id, liveActor.UserId, liveActor.Username, slug, name, storageId);
+
+        ProjectInfo project = new(id, liveActor.UserId, liveActor.Username, slug, name, storageId);
+        if (initializeRepository is not null) await initializeRepository(project, cancellationToken);
+
+        await using SqliteConnection readyDb = await OpenConnectionAsync(cancellationToken);
+        await using SqliteTransaction readyTransaction = readyDb.BeginTransaction(deferred: false);
+        int changed = await readyDb.ExecuteAsync("UPDATE Projects SET State = 'ready' WHERE Id = @Id AND State = 'pending';",
+            new IdParameters(id), readyTransaction);
+        if (changed != 1) throw new InvalidOperationException("Pending project could not be made ready.");
+        await AuditAsync(readyDb, readyTransaction, actor.UserId, "create-project", "project", id.ToString(CultureInfo.InvariantCulture), "Private project and repository are ready.", Now());
+        await readyTransaction.CommitAsync(cancellationToken);
+        return project;
     }
 
     public async Task SetMembershipAsync(
@@ -466,6 +524,15 @@ internal sealed class TokenIdentityRow : IdentityRow { public long Scopes { get;
 internal sealed class TokenOwnerRow { public long UserId { get; set; } }
 internal sealed class ProjectOwnerRow { public long OwnerUserId { get; set; } }
 internal sealed class ProjectAccessRow { public long OwnerUserId { get; set; } public long? Role { get; set; } }
+internal sealed class ProjectPathRow
+{
+    public long Id { get; set; }
+    public long OwnerUserId { get; set; }
+    public string Namespace { get; set; } = "";
+    public string Slug { get; set; } = "";
+    public string Name { get; set; } = "";
+    public string StorageId { get; set; } = "";
+}
 
 internal sealed record CreateUserParameters(string Username, string NormalizedUsername, string PasswordHash, string CreatedAtUtc);
 internal sealed record NormalizedNameParameters(string NormalizedUsername);
@@ -480,5 +547,6 @@ internal sealed record CreateProjectParameters(long OwnerUserId, string Slug, st
 internal sealed record MembershipParameters(long ProjectId, long UserId, int Role, long GrantedByUserId, string CreatedAtUtc);
 internal sealed record ProjectUserParameters(long ProjectId, long UserId);
 internal sealed record PermissionQueryParameters(long ProjectId, long UserId);
+internal sealed record ProjectPathParameters(string NormalizedNamespace, string NormalizedSlug);
 internal sealed record RawValueParameters(string Value);
 internal sealed record AuditParameters(long? ActorUserId, string Action, string TargetType, string? TargetId, string Detail, string CreatedAtUtc);

@@ -1,7 +1,7 @@
 using System.Globalization;
 using System.Text;
 
-namespace Graft.ManagedGit;
+namespace Graft.Git;
 
 public sealed class GitInputException(string message) : Exception(message);
 

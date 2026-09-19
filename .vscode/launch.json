@@ -19,6 +19,18 @@
       "console": "integratedTerminal"
     },
     {
+      "name": "Debug MVP-05 durable authenticated Git",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build MVP-05 Git acceptance",
+      "program": "${workspaceFolder}/tests/Graft.Git.Acceptance/bin/Debug/net10.0/Graft.Git.Acceptance.dll",
+      "args": [
+        "${workspaceFolder}/src/Graft.Server/bin/Debug/net10.0/Graft.Server.dll"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
       "name": "Debug UI and authentication probe",
       "type": "coreclr",
       "request": "launch",

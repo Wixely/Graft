@@ -5,5 +5,7 @@
     <Nullable>enable</Nullable>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <IsAotCompatible>true</IsAotCompatible>
+    <RestorePackagesWithLockFile Condition="'$(RuntimeIdentifier)' == ''">true</RestorePackagesWithLockFile>
+    <NuGetLockFilePath Condition="'$(RuntimeIdentifier)' != ''">$(BaseIntermediateOutputPath)packages.$(RuntimeIdentifier).lock.json</NuGetLockFilePath>
   </PropertyGroup>
 </Project>

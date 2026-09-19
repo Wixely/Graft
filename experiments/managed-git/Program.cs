@@ -1,6 +1,6 @@
 using System.Net;
 using System.Runtime.CompilerServices;
-using Graft.ManagedGit;
+using Graft.Git;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 
