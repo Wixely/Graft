@@ -51,6 +51,45 @@
       "problemMatcher": "$msCompile"
     },
     {
+      "label": "build MVP-07 operations acceptance",
+      "type": "process",
+      "command": "dotnet",
+      "args": [
+        "build",
+        "tests/Graft.Operations.Acceptance/Graft.Operations.Acceptance.csproj",
+        "-c",
+        "Debug"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "build Graft admin",
+      "type": "process",
+      "command": "dotnet",
+      "args": [
+        "build",
+        "src/Graft.Admin/Graft.Admin.csproj",
+        "-c",
+        "Debug"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "build MVP-07 acceptance and tools",
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "build MVP-07 operations acceptance",
+        "build Graft admin"
+      ],
+      "problemMatcher": []
+    },
+    {
       "label": "build compatibility probe",
       "type": "process",
       "command": "dotnet",
