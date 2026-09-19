@@ -3,4 +3,17 @@
   <Folder Name="/experiments/compatibility/">
     <Project Path="experiments/compatibility/Graft.Compatibility.csproj" />
   </Folder>
+  <Folder Name="/experiments/managed-git/">
+    <Project Path="experiments/managed-git/Graft.ManagedGit.csproj" />
+  </Folder>
+  <Folder Name="/experiments/managed-git-client/">
+    <Project Path="experiments/managed-git-client/Graft.ManagedGit.Client.csproj" />
+  </Folder>
+  <Folder Name="/experiments/storage/">
+    <Project Path="experiments/storage/Graft.StorageProbe.csproj" />
+  </Folder>
+  <Folder Name="/experiments/ui/">
+    <Project Path="experiments/ui-server/Graft.Ui.Server.csproj" />
+    <Project Path="experiments/ui-checks/Graft.Ui.Checks.csproj" />
+  </Folder>
 </Solution>
