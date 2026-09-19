@@ -14,4 +14,7 @@
     <ProjectReference Include="../../src/Graft.Storage/Graft.Storage.csproj" />
     <ProjectReference Include="../../src/Graft.Server/Graft.Server.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Fixtures/*.json" />
+  </ItemGroup>
 </Project>

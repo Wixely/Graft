@@ -17,7 +17,7 @@ The server creates metadata in the existing pending state, initializes an empty 
 - The REST route requires a live token with `api`; `read_api`, repository-only, missing, and revoked credentials cannot create a project.
 - Browser creation requires the live secure session, exact origin, and session-derived CSRF value.
 
-This is a deliberately narrow JSON subset of the current official GitLab Projects API and token-scope documentation reviewed on 2026-09-19. It is not a version-matched GitLab CE 18.0 fixture. GitLab also accepts broader fields and request forms that Graft does not yet support.
+This began as a deliberately narrow JSON subset of the current official GitLab Projects API and token-scope documentation reviewed on 2026-09-19. A later [GitLab 18.0 source-backed fixture](2026-09-19-gitlab-18-source-fixture.md) pinned the upstream sources, added path-only creation and raised the current workflow to 87 assertions. GitLab still accepts broader fields and request forms that Graft does not support.
 
 ## Verification
 

@@ -29,4 +29,4 @@ No managed build, trimming, or AOT warning was emitted. The static runtime build
 
 ## Boundary
 
-This result validates static NativeAOT service notification and the current product workflow on the available WSL system. Linux 3.10.108 execution, a real deployment CA/DNS trust chain, exact GitLab fixtures, the durable DnaX package source, and interactive browser execution remain open.
+This result validates static NativeAOT service notification and the then-current product workflow on the available WSL system. A [GitLab 18.0 source-backed fixture](2026-09-19-gitlab-18-source-fixture.md) was added later; live reference/client comparison remains open. Linux 3.10.108 execution is deferred, while a real deployment CA/DNS trust chain, the durable DnaX package source, and interactive browser execution remain open.

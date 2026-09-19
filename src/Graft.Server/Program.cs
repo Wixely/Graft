@@ -485,13 +485,16 @@ async Task<ProjectCreateRequest?> ReadProjectCreateRequest(HttpContext context)
 async Task CreateProject(HttpContext context, AuthenticatedIdentity identity, ProjectCreateRequest request)
 {
     string name = request.Name?.Trim() ?? "";
+    string requestedPath = request.Path?.Trim() ?? "";
     string description = request.Description ?? "";
     string visibility = request.Visibility ?? "private";
-    if (name.Length is < 1 or > 200) { await ApiError(context, 400, "name must be 1-200 characters"); return; }
+    if (name.Length == 0 && requestedPath.Length == 0) { await ApiError(context, 400, "name or path is required"); return; }
+    if (name.Length == 0) name = requestedPath;
+    if (name.Length > 200) { await ApiError(context, 400, "name must be at most 200 characters"); return; }
     if (description.Length > 2_000) { await ApiError(context, 400, "description must be at most 2000 characters"); return; }
     if (!string.Equals(visibility, "private", StringComparison.Ordinal))
     { await ApiError(context, 400, "visibility must be private"); return; }
-    string path = request.Path is null ? ProjectPathFromName(name) : request.Path.Trim();
+    string path = requestedPath.Length == 0 ? ProjectPathFromName(name) : requestedPath;
     if (!ValidProjectPath(path))
     {
         await ApiError(context, 400, "path must be 2-39 ASCII letters or numbers separated by single dots, underscores or hyphens");

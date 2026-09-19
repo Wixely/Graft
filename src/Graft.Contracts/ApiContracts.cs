@@ -82,7 +82,7 @@ public sealed record FileResponse(
 public sealed record ErrorResponse(string Message);
 public sealed record SessionResponse(bool Authenticated, string? Username, string Csrf);
 public sealed record LoginRequest(string Username, string Password);
-public sealed record ProjectCreateRequest(string Name, string? Path, string? Description, string? Visibility);
+public sealed record ProjectCreateRequest(string? Name, string? Path, string? Description, string? Visibility);
 public sealed record RepositoryPageResponse(
     ProjectResponse Project,
     IReadOnlyList<BranchResponse> Branches,
