@@ -344,11 +344,19 @@ public sealed class GraftStore : IAsyncDisposable
         AuthenticatedIdentity liveActor = await RequireLiveIdentityAsync(db, transaction, actor, cancellationToken);
         string storageId = Guid.NewGuid().ToString("N");
         string now = Now();
-        long id = await db.QuerySingleAsync<long>("""
-            INSERT INTO Projects (OwnerUserId, Slug, NormalizedSlug, Name, Description, StorageId, State, CreatedAtUtc)
-            VALUES (@OwnerUserId, @Slug, @NormalizedSlug, @Name, @Description, @StorageId, 'pending', @CreatedAtUtc)
-            RETURNING Id;
-            """, new CreateProjectParameters(liveActor.UserId, slug, normalizedSlug, name, description, storageId, now), transaction);
+        long id;
+        try
+        {
+            id = await db.QuerySingleAsync<long>("""
+                INSERT INTO Projects (OwnerUserId, Slug, NormalizedSlug, Name, Description, StorageId, State, CreatedAtUtc)
+                VALUES (@OwnerUserId, @Slug, @NormalizedSlug, @Name, @Description, @StorageId, 'pending', @CreatedAtUtc)
+                RETURNING Id;
+                """, new CreateProjectParameters(liveActor.UserId, slug, normalizedSlug, name, description, storageId, now), transaction);
+        }
+        catch (SqliteException error) when (error.SqliteErrorCode == 19)
+        {
+            throw new ProjectConflictException("A project with this path already exists in the namespace.", error);
+        }
         await AuditAsync(db, transaction, actor.UserId, "begin-create-project", "project", id.ToString(CultureInfo.InvariantCulture), "Private project metadata created in pending state.", now);
         await transaction.CommitAsync(cancellationToken);
 
@@ -559,6 +567,8 @@ public sealed class GraftStore : IAsyncDisposable
     }
 
 }
+
+public sealed class ProjectConflictException(string message, Exception innerException) : Exception(message, innerException);
 
 internal sealed class UserCredentialRow
 {

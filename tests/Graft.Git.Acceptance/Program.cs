@@ -36,6 +36,7 @@ try
     string carolPassword = Password();
     TokenGrant aliceToken;
     TokenGrant aliceApiToken;
+    TokenGrant aliceReadApiToken;
     TokenGrant bobToken;
     TokenGrant bobApiToken;
     ProjectInfo project;
@@ -67,7 +68,8 @@ try
             });
         await fixture.SetMembershipAsync(aliceIdentity, project.Id, bob.Id, ProjectRole.Developer);
         aliceToken = await fixture.CreateTokenAsync(aliceIdentity, "clone-token", TokenScope.ReadRepository, DateTimeOffset.UtcNow.AddHours(1));
-        aliceApiToken = await fixture.CreateTokenAsync(aliceIdentity, "api-token", TokenScope.ReadApi | TokenScope.ReadRepository, DateTimeOffset.UtcNow.AddHours(1));
+        aliceApiToken = await fixture.CreateTokenAsync(aliceIdentity, "api-token", TokenScope.Api | TokenScope.ReadRepository, DateTimeOffset.UtcNow.AddHours(1));
+        aliceReadApiToken = await fixture.CreateTokenAsync(aliceIdentity, "read-api-token", TokenScope.ReadApi, DateTimeOffset.UtcNow.AddHours(1));
         bobToken = await fixture.CreateTokenAsync(bobIdentity, "push-token", TokenScope.WriteRepository, DateTimeOffset.UtcNow.AddHours(1));
         bobApiToken = await fixture.CreateTokenAsync(bobIdentity, "member-api-token", TokenScope.ReadApi | TokenScope.WriteRepository, DateTimeOffset.UtcNow.AddHours(1));
         await fixture.CreateProjectWithRepositoryAsync(carolIdentity, "private", "Carol private repository",
@@ -109,7 +111,7 @@ try
     await Git(clone, ["fsck", "--full", "--strict"]);
     Check(true, "restart clone passes fsck");
 
-    await CheckApi(address, aliceApiToken.Secret, aliceToken.Secret, bobApiToken.Secret, project.Id, firstHead);
+    await CheckApi(address, aliceApiToken.Secret, aliceReadApiToken.Secret, aliceToken.Secret, bobApiToken.Secret, project.Id, firstHead);
     await CheckBrowser(address, "alice", alicePassword, project.Id);
 
     File.AppendAllText(Path.Combine(source, "readme.txt"), "second revision\n");
@@ -298,7 +300,7 @@ async Task<(int ExitCode, string Output)> RunGit(string directory, string[] argu
     }
 }
 
-async Task CheckApi(string address, string apiToken, string repositoryOnlyToken, string memberApiToken, long projectId, string expectedHead)
+async Task CheckApi(string address, string apiToken, string readApiToken, string repositoryOnlyToken, string memberApiToken, long projectId, string expectedHead)
 {
     using (HttpResponseMessage missing = await ApiGet(address, "/api/v4/user", null))
         Check(missing.StatusCode == System.Net.HttpStatusCode.Unauthorized, "API requires token");
@@ -330,6 +332,43 @@ async Task CheckApi(string address, string apiToken, string repositoryOnlyToken,
     }
     using (HttpResponseMessage member = await ApiGet(address, "/api/v4/projects/" + projectId, memberApiToken))
         Check(member.IsSuccessStatusCode, "member project lookup");
+
+    using (HttpResponseMessage missingCreate = await ApiPost(address, "/api/v4/projects", null,
+        new { name = "Missing token", path = "missing-token", visibility = "private" }))
+        Check(missingCreate.StatusCode == System.Net.HttpStatusCode.Unauthorized, "project creation requires token");
+    using (HttpResponseMessage readOnlyCreate = await ApiPost(address, "/api/v4/projects", readApiToken,
+        new { name = "Read only", path = "read-only", visibility = "private" }))
+        Check(readOnlyCreate.StatusCode == System.Net.HttpStatusCode.Forbidden, "read_api token cannot create project");
+    using (HttpResponseMessage created = await ApiPost(address, "/api/v4/projects", apiToken,
+        new { name = "API Created", path = "api-created", description = "Created through REST", visibility = "private" }))
+    {
+        Check(created.StatusCode == System.Net.HttpStatusCode.Created, "API creates private project");
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStreamAsync());
+        Check(json.RootElement.GetProperty("path_with_namespace").GetString() == "alice/api-created" &&
+            json.RootElement.GetProperty("default_branch").ValueKind == JsonValueKind.Null, "created project response and empty repository");
+    }
+    using (HttpResponseMessage derived = await ApiPost(address, "/api/v4/projects", apiToken,
+        new { name = "Derived Path", visibility = "private" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await derived.Content.ReadAsStreamAsync());
+        Check(derived.StatusCode == System.Net.HttpStatusCode.Created &&
+            json.RootElement.GetProperty("path").GetString() == "derived-path", "project path derives from name");
+    }
+    using (HttpResponseMessage duplicate = await ApiPost(address, "/api/v4/projects", apiToken,
+        new { name = "Duplicate", path = "api-created", visibility = "private" }))
+        Check(duplicate.StatusCode == System.Net.HttpStatusCode.BadRequest, "duplicate project path rejected");
+    using (HttpResponseMessage invalid = await ApiPost(address, "/api/v4/projects", apiToken,
+        new { name = "Invalid", path = "../invalid", visibility = "private" }))
+        Check(invalid.StatusCode == System.Net.HttpStatusCode.BadRequest, "invalid project path rejected");
+    using (HttpResponseMessage special = await ApiPost(address, "/api/v4/projects", apiToken,
+        new { name = "Consecutive", path = "invalid--path", visibility = "private" }))
+        Check(special.StatusCode == System.Net.HttpStatusCode.BadRequest, "consecutive path punctuation rejected");
+    using (HttpResponseMessage visibility = await ApiPost(address, "/api/v4/projects", apiToken,
+        new { name = "Public", path = "public-project", visibility = "public" }))
+        Check(visibility.StatusCode == System.Net.HttpStatusCode.BadRequest, "unsupported visibility rejected");
+    using (HttpResponseMessage property = await ApiPost(address, "/api/v4/projects", apiToken,
+        new { name = "Imported", path = "imported", visibility = "private", import_url = "https://example.invalid/repository.git" }))
+        Check(property.StatusCode == System.Net.HttpStatusCode.BadRequest, "unsupported project property rejected");
 
     string projectApi = "/api/v4/projects/" + projectId + "/repository";
     using (HttpResponseMessage branches = await ApiGet(address, projectApi + "/branches", apiToken))
@@ -386,6 +425,19 @@ async Task<HttpResponseMessage> ApiGet(string address, string path, string? toke
     return response;
 }
 
+async Task<HttpResponseMessage> ApiPost(string address, string path, string? token, object body)
+{
+    HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false };
+    HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
+    HttpRequestMessage request = new(HttpMethod.Post, path) { Content = JsonContent.Create(body) };
+    if (token is not null) request.Headers.Add("PRIVATE-TOKEN", token);
+    HttpResponseMessage response = await client.SendAsync(request);
+    request.Dispose();
+    client.Dispose();
+    handler.Dispose();
+    return response;
+}
+
 async Task CheckBrowser(string address, string username, string password, long projectId)
 {
     CookieContainer cookies = new();
@@ -433,8 +485,28 @@ async Task CheckBrowser(string address, string username, string password, long p
     using (HttpResponseMessage projects = await client.GetAsync("/api/projects"))
     {
         using JsonDocument json = JsonDocument.Parse(await projects.Content.ReadAsStreamAsync());
-        Check(projects.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 1 &&
-            json.RootElement[0].GetProperty("id").GetInt64() == projectId, "browser project visibility");
+        Check(projects.IsSuccessStatusCode && json.RootElement.EnumerateArray().Any(item =>
+            item.GetProperty("id").GetInt64() == projectId), "browser project visibility");
+    }
+    using HttpRequestMessage rejectedCreate = new(HttpMethod.Post, "/api/projects")
+    {
+        Content = JsonContent.Create(new { name = "Rejected browser", path = "rejected-browser", visibility = "private" })
+    };
+    rejectedCreate.Headers.Add("Origin", address);
+    rejectedCreate.Headers.Add("X-Graft-CSRF", new string('0', 64));
+    using (HttpResponseMessage rejected = await client.SendAsync(rejectedCreate))
+        Check(rejected.StatusCode == System.Net.HttpStatusCode.Forbidden, "browser project creation rejects wrong CSRF");
+    using HttpRequestMessage create = new(HttpMethod.Post, "/api/projects")
+    {
+        Content = JsonContent.Create(new { name = "Browser Created", description = "Created in browser", visibility = "private" })
+    };
+    create.Headers.Add("Origin", address);
+    create.Headers.Add("X-Graft-CSRF", csrf);
+    using (HttpResponseMessage created = await client.SendAsync(create))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStreamAsync());
+        Check(created.StatusCode == System.Net.HttpStatusCode.Created &&
+            json.RootElement.GetProperty("path_with_namespace").GetString() == "alice/browser-created", "browser creates private project");
     }
     using (HttpResponseMessage repository = await client.GetAsync($"/api/browser/projects/{projectId}?ref=main&file=hostile.html"))
     {
