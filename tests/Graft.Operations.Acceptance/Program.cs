@@ -32,6 +32,30 @@ ConcurrentQueue<string> serverLines = new();
 
 try
 {
+    string bootstrapDatabase = Path.Combine(root, "bootstrap", "graft.db");
+    string bootstrapRepositories = Path.Combine(root, "bootstrap", "repositories");
+    string bootstrapPassword = Password();
+    string bootstrapPasswordFile = Path.Combine(root, "bootstrap.password");
+    File.WriteAllText(bootstrapPasswordFile, bootstrapPassword + Environment.NewLine, new UTF8Encoding(false));
+    _ = await StartServer(bootstrapDatabase, bootstrapRepositories);
+    await Throws<InvalidOperationException>(() => Admin(["bootstrap", "--database", bootstrapDatabase,
+        "--repositories", bootstrapRepositories, "--username", "operator", "--password-file", bootstrapPasswordFile]),
+        "running server blocks CLI bootstrap");
+    await StopServer();
+    await Admin(["bootstrap", "--database", bootstrapDatabase, "--repositories", bootstrapRepositories,
+        "--username", "operator", "--password-file", bootstrapPasswordFile]);
+    await using (GraftStore bootstrapped = await GraftStore.OpenAsync(bootstrapDatabase))
+    {
+        SessionGrant? session = await bootstrapped.LoginAsync("operator", bootstrapPassword);
+        AuthenticatedIdentity identity = Required(session is null ? null : await bootstrapped.ResolveSessionAsync(session.Secret),
+            "CLI bootstrap administrator login");
+        Check(identity.IsAdministrator, "CLI bootstrap grants administrator role");
+        Check(!await bootstrapped.ContainsStoredSecretAsync(bootstrapPassword), "CLI bootstrap hashes password at rest");
+    }
+    await Throws<InvalidOperationException>(() => Admin(["bootstrap", "--database", bootstrapDatabase,
+        "--repositories", bootstrapRepositories, "--username", "second", "--password-file", bootstrapPasswordFile]),
+        "CLI bootstrap is one-use");
+
     string adminPassword = Password();
     string alicePassword = Password();
     TokenGrant importToken;

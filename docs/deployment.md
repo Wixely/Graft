@@ -12,6 +12,14 @@ Without `--listen`, interactive mode chooses a random loopback port. A configure
 
 The certificate must contain a currently valid private key. If it has an enhanced-key-usage extension, that extension must allow TLS server authentication. Its subject alternative name must match the `--origin` hostname; common-name fallback is deliberately disabled. Store the password in a separate UTF-8 file containing one line. A final CRLF or LF is removed. Do not place the password in arguments, environment variables, repository files or service definitions. Restrict both files to the service identity, with the PKCS#12 file treated as a private key.
 
+Before starting a fresh deployment, use the matching `Graft.Admin` publication to create the first administrator while the server is stopped:
+
+```text
+Graft.Admin bootstrap --database <path> --repositories <directory> --username <name> --password-file <protected UTF-8 path>
+```
+
+Bootstrap is one-use and holds the same maintenance locks as backup and restore. Remove the password file after verifying sign-in. See [operator operations](operations.md) for the Windows development form and security boundary.
+
 ## Windows
 
 Publish a self-contained NativeAOT server, then run it interactively:

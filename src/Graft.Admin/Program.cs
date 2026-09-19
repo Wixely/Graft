@@ -1,5 +1,8 @@
+using System.Text;
 using System.Text.Json;
+using Graft.Core;
 using Graft.Operations;
+using Graft.Storage;
 
 if (args.Length == 0)
 {
@@ -12,6 +15,18 @@ try
     Dictionary<string, string> options = Parse(args[1..]);
     switch (args[0])
     {
+        case "bootstrap":
+        {
+            RequireOnly(options, "database", "repositories", "username", "password-file");
+            string database = Required(options, "database");
+            string repositories = Required(options, "repositories");
+            string password = ReadPassword(Required(options, "password-file"));
+            using MaintenanceLease lease = MaintenanceLease.Acquire(database, repositories);
+            await using GraftStore store = await GraftStore.OpenAsync(database);
+            UserAccount administrator = await store.BootstrapAdministratorAsync(Required(options, "username"), password);
+            Console.WriteLine($"BOOTSTRAP: PASS; username={administrator.Username}");
+            break;
+        }
         case "backup":
         {
             RequireOnly(options, "database", "repositories", "output");
@@ -84,8 +99,23 @@ static void RequireOnly(Dictionary<string, string> options, params string[] name
         throw new ArgumentException("Missing or unsupported option.");
 }
 
+static string ReadPassword(string path)
+{
+    string fullPath = Path.GetFullPath(path);
+    FileInfo file = new(fullPath);
+    if (!file.Exists || file.Length is < 16 or > 1_024)
+        throw new ArgumentException("Password file must contain between 16 and 1024 UTF-8 bytes.");
+    string password = new UTF8Encoding(false, true).GetString(File.ReadAllBytes(fullPath));
+    if (password.EndsWith("\r\n", StringComparison.Ordinal)) password = password[..^2];
+    else if (password.EndsWith('\n')) password = password[..^1];
+    if (password.Contains('\r') || password.Contains('\n'))
+        throw new ArgumentException("Password file must contain one line.");
+    return password;
+}
+
 static void Usage() => Console.Error.WriteLine(
-    "Usage: Graft.Admin backup --database <path> --repositories <path> --output <directory>\n" +
+    "Usage: Graft.Admin bootstrap --database <path> --repositories <path> --username <name> --password-file <UTF-8 path>\n" +
+    "       Graft.Admin backup --database <path> --repositories <path> --output <directory>\n" +
     "       Graft.Admin verify --input <backup-directory>\n" +
     "       Graft.Admin restore --input <backup-directory> --database <path> --repositories <path>\n" +
     "       Graft.Admin inspect-bundle --input <bundle> --output <report.json>");

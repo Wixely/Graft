@@ -24,5 +24,6 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../Graft.Operations/Graft.Operations.csproj" />
+    <ProjectReference Include="../Graft.Storage/Graft.Storage.csproj" />
   </ItemGroup>
 </Project>

@@ -89,6 +89,8 @@ dotnet tests\Graft.Operations.Acceptance\bin\Release\net10.0\Graft.Operations.Ac
 
 See [the operations runbook](operations.md) for backup, verification, fresh-target restore and repository-only import inventory commands. [MVP-07 evidence](validation/2026-09-19-mvp07-import-recovery.md) records the tested boundary.
 
+The administration tool also provides the one-use offline administrator bootstrap. Its current 41-assertion operations workflow verifies live-server exclusion, successful login, administrator status, hashed-at-rest storage and reuse refusal under both managed and `win-x64` NativeAOT administration binaries. See [bootstrap evidence](validation/2026-09-19-operator-bootstrap.md).
+
 MVP-08 adds service lifetimes, deployment definitions, a static-musl product build and resource/lifecycle acceptance. The ordinary Windows NativeAOT baseline is:
 
 ```powershell
