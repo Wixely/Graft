@@ -1,14 +1,114 @@
 {
   "version": "0.2.0",
+  "inputs": [
+    {
+      "id": "graftFixturePassword",
+      "type": "promptString",
+      "description": "Temporary UI probe password (16-256 characters; username fixture)",
+      "password": true
+    }
+  ],
   "configurations": [
+    {
+      "name": "Debug UI and authentication probe",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build UI probe",
+      "program": "${workspaceFolder}/experiments/ui-server/bin/Debug/net10.0/Graft.Ui.Server.dll",
+      "args": [
+        "--fixture"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "internalConsole",
+      "env": {
+        "GRAFT_UI_PROBE_PASSWORD": "${input:graftFixturePassword}"
+      },
+      "serverReadyAction": {
+        "action": "openExternally",
+        "pattern": "READY:\\s+(https://127\\.0\\.0\\.1:[0-9]+)",
+        "uriFormat": "%s/projects"
+      }
+    },
     {
       "name": "Debug compatibility probe",
       "type": "coreclr",
       "request": "launch",
-      "preLaunchTask": "build",
+      "preLaunchTask": "build compatibility probe",
       "program": "${workspaceFolder}/experiments/compatibility/bin/Debug/net10.0/Graft.Compatibility.dll",
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal"
+    },
+    {
+      "name": "Debug storage migration probe",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build storage migration probe",
+      "program": "${workspaceFolder}/experiments/storage/bin/Debug/net10.0/Graft.StorageProbe.dll",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Debug managed Git probe (loopback, disposable)",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build managed Git probe",
+      "program": "${workspaceFolder}/experiments/managed-git/bin/Debug/net10.0/Graft.ManagedGit.dll",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Debug managed Git acceptance client",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build managed Git acceptance client",
+      "program": "${workspaceFolder}/experiments/managed-git-client/bin/Debug/net10.0/Graft.ManagedGit.Client.dll",
+      "args": [
+        "${workspaceFolder}/experiments/managed-git/bin/Debug/net10.0/Graft.ManagedGit.dll"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Debug UI HTTP acceptance checks",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build UI acceptance checks",
+      "program": "${workspaceFolder}/experiments/ui-checks/bin/Debug/net10.0/Graft.Ui.Checks.dll",
+      "args": [
+        "${workspaceFolder}/experiments/ui-server/bin/Debug/net10.0/Graft.Ui.Server.dll"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Debug managed Git self-checks",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build managed Git probe",
+      "program": "${workspaceFolder}/experiments/managed-git/bin/Debug/net10.0/Graft.ManagedGit.dll",
+      "args": [
+        "--self-test"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Debug UI session self-checks",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build UI probe",
+      "program": "${workspaceFolder}/experiments/ui-server/bin/Debug/net10.0/Graft.Ui.Server.dll",
+      "args": [
+        "--self-test"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Attach to .NET process",
+      "type": "coreclr",
+      "request": "attach",
+      "processId": "${command:pickProcess}"
     }
   ]
 }
