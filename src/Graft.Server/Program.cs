@@ -146,6 +146,57 @@ app.MapPost("/api/users", async context =>
     catch (UserConflictException) { await ApiError(context, 400, "username has already been taken"); }
 });
 
+app.MapGet("/api/tokens", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!await OnlyQuery(context)) return;
+    IReadOnlyList<PersonalAccessToken> tokens = await store.ListActiveTokensAsync(browser.Value.Identity, context.RequestAborted);
+    TokenResponse[] response = tokens.Select(token => new TokenResponse(
+        token.Id, token.Name, TokenScopeNames(token.Scopes), token.ExpiresAtUtc, token.CreatedAtUtc)).ToArray();
+    await context.Response.WriteAsJsonAsync(response, ApiJson.Default.TokenResponseArray, null, context.RequestAborted);
+});
+
+app.MapPost("/api/tokens", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    TokenCreateRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.TokenCreateRequest, context.RequestAborted);
+    if (request?.Name is not { Length: >= 1 and <= 100 } || request.ExpiresInDays is < 1 or > 365 ||
+        !TryTokenScopes(request.Scopes, out TokenScope scopes))
+    { await ApiError(context, 400, "token"); return; }
+    try
+    {
+        TokenGrant token = await store.CreateTokenAsync(browser.Value.Identity, request.Name.Trim(), scopes,
+            DateTimeOffset.UtcNow.AddDays(request.ExpiresInDays), context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status201Created;
+        await context.Response.WriteAsJsonAsync(new TokenCreatedResponse(
+            token.Id, request.Name.Trim(), token.Secret, TokenScopeNames(token.Scopes), token.ExpiresAtUtc),
+            ApiJson.Default.TokenCreatedResponse, null, context.RequestAborted);
+    }
+    catch (ArgumentException) { await ApiError(context, 400, "token"); }
+});
+
+app.MapDelete("/api/tokens/{tokenId:long}", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    long tokenId = Convert.ToInt64(context.Request.RouteValues["tokenId"], System.Globalization.CultureInfo.InvariantCulture);
+    try
+    {
+        await store.RevokeOwnTokenAsync(browser.Value.Identity, tokenId, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "token"); }
+});
+
 app.MapGet("/api/projects", async context =>
 {
     (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
@@ -631,6 +682,36 @@ static bool ValidProjectPath(string path)
 
 static bool AsciiLetterOrNumber(char character) =>
     character is >= 'A' and <= 'Z' or >= 'a' and <= 'z' or >= '0' and <= '9';
+
+static bool TryTokenScopes(string[]? values, out TokenScope scopes)
+{
+    scopes = TokenScope.None;
+    if (values is null || values.Length is < 1 or > 4) return false;
+    foreach (string value in values)
+    {
+        TokenScope parsed = value switch
+        {
+            "read_api" => TokenScope.ReadApi,
+            "api" => TokenScope.Api,
+            "read_repository" => TokenScope.ReadRepository,
+            "write_repository" => TokenScope.WriteRepository,
+            _ => TokenScope.None
+        };
+        if (parsed == TokenScope.None || scopes.HasFlag(parsed)) return false;
+        scopes |= parsed;
+    }
+    return true;
+}
+
+static string[] TokenScopeNames(TokenScope scopes)
+{
+    List<string> names = [];
+    if (scopes.HasFlag(TokenScope.ReadApi)) names.Add("read_api");
+    if (scopes.HasFlag(TokenScope.Api)) names.Add("api");
+    if (scopes.HasFlag(TokenScope.ReadRepository)) names.Add("read_repository");
+    if (scopes.HasFlag(TokenScope.WriteRepository)) names.Add("write_repository");
+    return names.ToArray();
+}
 
 async Task<ApiProject?> AuthorizeApiProject(HttpContext context, ProjectAction action)
 {

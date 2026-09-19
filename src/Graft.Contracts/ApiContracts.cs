@@ -84,6 +84,9 @@ public sealed record SessionResponse(bool Authenticated, string? Username, bool 
 public sealed record LoginRequest(string Username, string Password);
 public sealed record UserCreateRequest(string Username, string Password);
 public sealed record UserAccountResponse(long Id, string Username, bool IsAdministrator);
+public sealed record TokenCreateRequest(string Name, string[] Scopes, int ExpiresInDays);
+public sealed record TokenCreatedResponse(long Id, string Name, string Secret, string[] Scopes, DateTimeOffset ExpiresAtUtc);
+public sealed record TokenResponse(long Id, string Name, string[] Scopes, DateTimeOffset ExpiresAtUtc, DateTimeOffset CreatedAtUtc);
 public sealed record ProjectCreateRequest(string? Name, string? Path, string? Description, string? Visibility);
 public sealed record MembershipSetRequest(string Username, string Role);
 public sealed record ProjectMemberResponse(long UserId, string Username, string Role);
@@ -108,6 +111,9 @@ public sealed record RepositoryPageResponse(
 [JsonSerializable(typeof(LoginRequest))]
 [JsonSerializable(typeof(UserCreateRequest))]
 [JsonSerializable(typeof(UserAccountResponse))]
+[JsonSerializable(typeof(TokenCreateRequest))]
+[JsonSerializable(typeof(TokenCreatedResponse))]
+[JsonSerializable(typeof(TokenResponse[]))]
 [JsonSerializable(typeof(ProjectCreateRequest))]
 [JsonSerializable(typeof(MembershipSetRequest))]
 [JsonSerializable(typeof(ProjectMemberResponse[]))]
