@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Net;
+using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
@@ -378,6 +379,12 @@ app.MapFallback("/{**path}", context => assets.Serve(context));
 await app.StartAsync();
 string address = app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.Single();
 serverOrigin = settings.Origin ?? address;
+NotifySystemd("READY=1\nSTATUS=Graft is ready");
+app.Lifetime.ApplicationStopping.Register(() =>
+{
+    try { NotifySystemd("STOPPING=1\nSTATUS=Graft is stopping"); }
+    catch (SocketException) { }
+});
 Console.WriteLine("MODE: " + (RuntimeFeature.IsDynamicCodeSupported ? "JIT" : "NativeAOT"));
 Console.WriteLine($"ASSETS: {assets.Count}; bytes={assets.Bytes}");
 Console.WriteLine("READY: " + address);
@@ -686,6 +693,17 @@ static async Task ApiError(HttpContext context, int status, string message)
 }
 
 static string Origin(HttpContext context) => context.Request.Scheme + "://" + context.Request.Host.Value;
+
+static void NotifySystemd(string message)
+{
+    if (!OperatingSystem.IsLinux()) return;
+    string? path = Environment.GetEnvironmentVariable("NOTIFY_SOCKET");
+    if (string.IsNullOrEmpty(path)) return;
+    if (path[0] == '@') path = "\0" + path[1..];
+    using Socket socket = new(AddressFamily.Unix, SocketType.Dgram, ProtocolType.Unspecified);
+    socket.SendTo(Encoding.UTF8.GetBytes(message), new UnixDomainSocketEndPoint(path));
+}
+
 static string ProjectWebUrl(HttpContext context, ProjectDetails project) =>
     Origin(context) + "/" + Uri.EscapeDataString(project.Project.Namespace) + "/" + Uri.EscapeDataString(project.Project.Slug);
 
