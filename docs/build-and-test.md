@@ -46,6 +46,16 @@ dotnet tests\Graft.Git.Acceptance\bin\Debug\net10.0\Graft.Git.Acceptance.dll art
 
 See [MVP-06 evidence](validation/2026-09-19-mvp06-repository-api-ui.md) for covered behavior, exact compatibility boundaries and remaining operational gates. The published server embeds a trimmed Blazor WebAssembly client; WebAssembly AOT is not enabled and the optional `wasm-tools` workload is not required for this slice.
 
+For rendered UI work, start the disposable production fixture with a temporary password. It creates a `fixture` administrator, seeds `fixture/seeded` with text, hostile HTML and binary files, prints the random loopback URL, and removes all state on Enter:
+
+```powershell
+dotnet build tests\Graft.Browser.Fixture\Graft.Browser.Fixture.csproj -c Debug
+$env:GRAFT_BROWSER_FIXTURE_PASSWORD = '<temporary-16-to-256-character-password>'
+dotnet tests\Graft.Browser.Fixture\bin\Debug\net10.0\Graft.Browser.Fixture.dll src\Graft.Server\bin\Debug\net10.0\Graft.Server.dll
+```
+
+The **Debug production browser fixture** VS Code option supplies the password through a masked prompt and opens `/projects`. The generated loopback certificate is untrusted; use only a temporary browser exception or test-instance trust and remove it after the run. See [rendered-browser evidence](validation/2026-09-19-browser-ui.md).
+
 The GitLab 18 reference harness executes the same checked-in project-creation fixture against an approved, disposable GitLab instance. Supply synthetic token files for an administrator `api` token and a `read_api` token; the harness reads but never prints their values:
 
 ```powershell

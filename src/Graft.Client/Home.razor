@@ -14,7 +14,7 @@ else if (Session?.Authenticated == true)
         <form class="create-project" @onsubmit="CreateProject" @onsubmit:preventDefault>
             <h3>Create a private project</h3>
             <label for="project-name">Name</label><input id="project-name" @bind="ProjectName" required maxlength="200" />
-            <label for="project-path">Path (optional)</label><input id="project-path" @bind="ProjectPath" maxlength="39" pattern="[A-Za-z0-9][A-Za-z0-9._-]+" />
+            <label for="project-path">Path (optional)</label><input id="project-path" @bind="ProjectPath" minlength="2" maxlength="39" pattern="[A-Za-z0-9](?:[A-Za-z0-9]|[._\-][A-Za-z0-9])+" />
             <label for="project-description">Description</label><input id="project-description" @bind="ProjectDescription" maxlength="2000" />
             <button type="submit" disabled="@Busy">@(Busy ? "Creatingâ€¦" : "Create project")</button>
         </form>

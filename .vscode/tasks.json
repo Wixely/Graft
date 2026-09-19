@@ -28,6 +28,21 @@
       }
     },
     {
+      "label": "build browser fixture",
+      "type": "process",
+      "command": "dotnet",
+      "args": [
+        "build",
+        "tests/Graft.Browser.Fixture/Graft.Browser.Fixture.csproj",
+        "-c",
+        "Debug"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": "$msCompile"
+    },
+    {
       "label": "build MVP-04 acceptance",
       "type": "process",
       "command": "dotnet",

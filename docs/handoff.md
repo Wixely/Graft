@@ -12,7 +12,7 @@ The import evidence is deliberately repository-only. A C# bundle parser inventor
 
 Backups use a consistent SQLite backup plus the complete repository tree. Every file and directory is inventoried; files are hashed. Links/reparse points, undeclared paths, tampering, live-server backup and existing restore targets are rejected. Restore verifies before publishing fresh targets and removes a database published before a later failure. The rollback rehearsal uses a synthetic incompatible schema change and a second fresh restore. Online backup, cross-process clusters and power-loss atomicity across separate database/repository paths remain outside the evidence.
 
-The main release gates are the durable DnaX package source, a real CA/DNS/client-trust environment and integrated static-musl execution on the required Linux 3.10.108 host. The user deferred the legacy-host run for now. Windows Service, local operator-managed certificate loading, restart/replacement, systemd and container secret plumbing pass. A GitLab 18.0.0 source-backed project-creation fixture now passes against both Graft and a live GitLab CE 18.0.0 reference. Pinned `glab` 1.58.0 API workflows pass against both services; interactive production-browser execution remains open.
+The main release gates are the durable DnaX package source, a real CA/DNS/client-trust environment and integrated static-musl execution on the required Linux 3.10.108 host. The user deferred the legacy-host run for now. Windows Service, local operator-managed certificate loading, restart/replacement, systemd and container secret plumbing pass. A GitLab 18.0.0 source-backed project-creation fixture now passes against both Graft and a live GitLab CE 18.0.0 reference. Pinned `glab` 1.58.0 API workflows pass against both services. The production Blazor workflow now passes [rendered Chromium validation](validation/2026-09-19-browser-ui.md); that run found and fixed an invalid project-path HTML pattern.
 
 Private project creation now passes through both the Blazor session API and the bounded GitLab-style REST route. The write route requires `api`, creates an empty durable repository through pending/ready publication, and rejects duplicates, invalid paths, unsupported visibility, and unsupported fields. A pinned GitLab 18.0.0 source fixture added path-only creation and raises the combined Windows JIT and NativeAOT harness to 87 assertions; see [source-fixture evidence](validation/2026-09-19-gitlab-18-source-fixture.md) and [live-reference evidence](validation/2026-09-19-gitlab-18-live-reference.md).
 
@@ -20,7 +20,7 @@ No remote is configured. Do not deploy, publish, import production data, expose 
 
 ## Next work
 
-Keep the recorded static-musl server/admin pair available for the deferred Linux 3.10.108 run. The next locally actionable evidence step is the implemented Blazor project-creation and repository-browsing workflow in an interactive browser, including rendered behavior and accessibility checks. Validate the intended CA-issued certificate, DNS and client trust chain before non-loopback deployment.
+Keep the recorded static-musl server/admin pair available for the deferred Linux 3.10.108 run. Validate the intended CA-issued certificate, DNS, client trust and renewal path before non-loopback deployment. The browser fixture and VS Code launch option are available for future UI regression work.
 
 Continue to use the ignored reproducible DnaX feed until the user or DnaX maintainer selects an approved durable package source. Do not substitute a server-side Git executable or native Git library.
 
@@ -30,7 +30,6 @@ Continue to use the ignored reproducible DnaX feed until the user or DnaX mainta
 | --- | --- | --- |
 | Deployment TLS trust | Operator + implementation agent | Intended CA certificate, DNS/SAN, client trust and renewal rehearsal |
 | Required legacy host | Implementation agent + user | Integrated static-musl artifact inspected and run on Linux 3.10.108 with sanitized evidence |
-| Interactive browser | Implementation agent | Create and browse a project in the rendered Blazor UI; record keyboard, focus, error and hostile-content behavior |
 | DnaX distribution | User/DnaX maintainer | Clean checkout restores without a sibling source tree or locally prepared feed |
 
-Recommended next action: Owner: Implementation agent — run the implemented Blazor workflow in an interactive browser and record rendered/accessibility results. Remaining work: deployment CA/DNS trust, DnaX distribution, interactive browser execution and the deferred Linux 3.10.108 MVP-08 gate.
+Recommended next action: Owner: Operator + implementation agent — validate the intended deployment certificate, DNS/SAN, client trust and renewal procedure. Remaining work: deployment CA/DNS trust, DnaX distribution and the deferred Linux 3.10.108 MVP-08 gate.

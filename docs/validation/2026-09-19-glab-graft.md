@@ -46,4 +46,4 @@ dotnet publish tests\Graft.Glab.Acceptance\Graft.Glab.Acceptance.csproj -c Relea
 
 This establishes existing-client compatibility only for `glab api` authentication and the user/list/create/read REST workflow. It does not claim general `glab` command compatibility, GraphQL, issues, merge requests, pipelines, releases, repository management commands, or Git transport through `glab`. Git transport has separate real-Git acceptance evidence.
 
-Recommended next action: run the implemented Blazor project creation and repository-browsing workflow in an interactive browser and record rendered behavior and accessibility results. Owner: implementation agent. The Linux 3.10.108 product-artifact run remains deferred at the user's request.
+The subsequent [rendered-browser run](2026-09-19-browser-ui.md) closes the interactive Blazor evidence item. Recommended next action: Owner: Operator + implementation agent — validate the intended CA-issued certificate, DNS name, client trust and renewal path. The Linux 3.10.108 product-artifact run remains deferred at the user's request.

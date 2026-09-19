@@ -49,4 +49,4 @@ The full solution passed with zero warnings and errors using `dotnet build Graft
 
 This proves the selected creation fixture against GitLab CE 18.0.0 and proves the pinned CLI against that reference server. The same CLI workflow now also passes [against Graft](2026-09-19-glab-graft.md). Compatibility beyond the recorded endpoints and workflows remains open. The Linux 3.10.108 product-artifact run remains deferred at the user's request.
 
-Recommended next action: run the implemented Blazor project creation and repository-browsing workflow in an interactive browser. Owner: implementation agent.
+The later [rendered Chromium run](2026-09-19-browser-ui.md) closes the interactive Blazor evidence item. Recommended next action: Owner: Operator + implementation agent — validate the intended deployment certificate, DNS/SAN, client trust and renewal procedure.

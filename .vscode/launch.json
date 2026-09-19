@@ -10,6 +10,26 @@
   ],
   "configurations": [
     {
+      "name": "Debug production browser fixture",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build browser fixture",
+      "program": "${workspaceFolder}/tests/Graft.Browser.Fixture/bin/Debug/net10.0/Graft.Browser.Fixture.dll",
+      "args": [
+        "${workspaceFolder}/src/Graft.Server/bin/Debug/net10.0/Graft.Server.dll"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "internalConsole",
+      "env": {
+        "GRAFT_BROWSER_FIXTURE_PASSWORD": "${input:graftFixturePassword}"
+      },
+      "serverReadyAction": {
+        "action": "openExternally",
+        "pattern": "READY:\\s+(https://127\\.0\\.0\\.1:[0-9]+/projects)",
+        "uriFormat": "%s"
+      }
+    },
+    {
       "name": "Debug MVP-04 accounts and permissions",
       "type": "coreclr",
       "request": "launch",

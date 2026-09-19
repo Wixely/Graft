@@ -33,7 +33,7 @@ The provisional GitLab CE 18.0 baseline still lacks version-matched fixtures. Cu
 
 The harness verifies the embedded index and security headers, project deep-link shell, anonymous and authenticated sessions, private project listing, combined repository snapshot, encoded hostile file content, rejected CSRF and session revocation. These are HTTPS-level checks against the published client assets and browser-facing API.
 
-The WebAssembly client publishes as trimmed IL. `RunAOTCompilation` and `WasmBuildNative` are disabled, so the optional `wasm-tools` workload is not required. Interactive WebAssembly execution in a rendered browser remains unverified for this production slice.
+The WebAssembly client publishes as trimmed IL. `RunAOTCompilation` and `WasmBuildNative` are disabled, so the optional `wasm-tools` workload is not required. The later [rendered Chromium run](2026-09-19-browser-ui.md) validates the production client workflow and records its boundary.
 
 ## Commands
 
