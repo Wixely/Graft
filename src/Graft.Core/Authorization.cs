@@ -116,3 +116,4 @@ public sealed record ProjectDetails(ProjectInfo Project, string Description, Dat
 public sealed record ProjectPage(IReadOnlyList<ProjectDetails> Projects, long Total);
 public sealed record SessionGrant(string Secret, DateTimeOffset ExpiresAtUtc);
 public sealed record TokenGrant(long Id, string Secret, TokenScope Scopes, DateTimeOffset ExpiresAtUtc);
+public sealed record PersonalAccessToken(long Id, string Name, TokenScope Scopes, DateTimeOffset ExpiresAtUtc, DateTimeOffset CreatedAtUtc);

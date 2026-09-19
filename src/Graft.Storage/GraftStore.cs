@@ -218,6 +218,41 @@ public sealed class GraftStore : IAsyncDisposable
             : new(row.Id, row.Username, row.IsAdministrator != 0, IdentityKind.PersonalAccessToken, (TokenScope)row.Scopes);
     }
 
+    public async Task<IReadOnlyList<PersonalAccessToken>> ListActiveTokensAsync(
+        AuthenticatedIdentity actor,
+        CancellationToken cancellationToken = default)
+    {
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        AuthenticatedIdentity liveActor = await RequireLiveIdentityAsync(db, null, actor, cancellationToken);
+        IEnumerable<TokenRow> rows = await db.QueryAsync<TokenRow>("""
+            SELECT Id, Name, Scopes, ExpiresAtUtc, CreatedAtUtc
+            FROM AccessTokens
+            WHERE UserId = @UserId AND RevokedAtUtc IS NULL AND ExpiresAtUtc > @NowUtc
+            ORDER BY Id DESC;
+            """, new ActiveTokensParameters(liveActor.UserId, Now()));
+        return rows.Select(row => new PersonalAccessToken(row.Id, row.Name, (TokenScope)row.Scopes,
+            DateTimeOffset.Parse(row.ExpiresAtUtc, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+            DateTimeOffset.Parse(row.CreatedAtUtc, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind))).ToArray();
+    }
+
+    public async Task RevokeOwnTokenAsync(
+        AuthenticatedIdentity actor,
+        long tokenId,
+        CancellationToken cancellationToken = default)
+    {
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
+        AuthenticatedIdentity liveActor = await RequireLiveIdentityAsync(db, transaction, actor, cancellationToken);
+        string now = Now();
+        int changed = await db.ExecuteAsync("""
+            UPDATE AccessTokens SET RevokedAtUtc = @RevokedAtUtc
+            WHERE Id = @Id AND UserId = @UserId AND RevokedAtUtc IS NULL;
+            """, new RevokeOwnTokenParameters(tokenId, liveActor.UserId, now), transaction);
+        if (changed != 1) throw new UnauthorizedAccessException("Token unavailable.");
+        await AuditAsync(db, transaction, actor.UserId, "revoke-token", "token", tokenId.ToString(CultureInfo.InvariantCulture), "Personal token revoked.", now);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
     public async Task RevokeTokenAsync(
         AuthenticatedIdentity actor,
         long tokenId,
@@ -629,6 +664,14 @@ internal class IdentityRow
 
 internal sealed class TokenIdentityRow : IdentityRow { public long Scopes { get; set; } }
 internal sealed class TokenOwnerRow { public long UserId { get; set; } }
+internal sealed class TokenRow
+{
+    public long Id { get; set; }
+    public string Name { get; set; } = "";
+    public long Scopes { get; set; }
+    public string ExpiresAtUtc { get; set; } = "";
+    public string CreatedAtUtc { get; set; } = "";
+}
 internal sealed class ProjectOwnerRow { public long OwnerUserId { get; set; } }
 internal sealed class ProjectAccessRow { public long OwnerUserId { get; set; } public long? Role { get; set; } }
 internal sealed class ProjectMemberRow { public long UserId { get; set; } public string Username { get; set; } = ""; public long Role { get; set; } }
@@ -655,6 +698,8 @@ internal sealed record RevokeSecretParameters(string SecretDigest, string Revoke
 internal sealed record TokenParameters(long UserId, string Name, string SecretDigest, int Scopes, string ExpiresAtUtc, string CreatedAtUtc);
 internal sealed record IdParameters(long Id);
 internal sealed record RevokeByIdParameters(long Id, string RevokedAtUtc);
+internal sealed record RevokeOwnTokenParameters(long Id, long UserId, string RevokedAtUtc);
+internal sealed record ActiveTokensParameters(long UserId, string NowUtc);
 internal sealed record RevokeUserParameters(long UserId, string RevokedAtUtc);
 internal sealed record CreateProjectParameters(long OwnerUserId, string Slug, string NormalizedSlug, string Name, string Description, string StorageId, string CreatedAtUtc);
 internal sealed record MembershipParameters(long ProjectId, long UserId, int Role, long GrantedByUserId, string CreatedAtUtc);

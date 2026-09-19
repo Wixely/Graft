@@ -114,6 +114,7 @@ try
 
     await CheckApi(address, aliceApiToken.Secret, aliceReadApiToken.Secret, aliceToken.Secret, bobApiToken.Secret, project.Id, firstHead);
     await CheckBrowser(address, "alice", alicePassword, project.Id);
+    await CheckPersonalAccessTokens(address, "alice", alicePassword, project.Id);
     await CheckUserAdministration(address, adminPassword, Password());
 
     File.AppendAllText(Path.Combine(source, "readme.txt"), "second revision\n");
@@ -673,6 +674,95 @@ async Task CheckUserAdministration(string address, string adminPassword, string 
     };
     createdLogin.Headers.Add("Origin", address);
     using (HttpResponseMessage response = await client.SendAsync(createdLogin)) Check(response.IsSuccessStatusCode, "browser-created user can log in");
+}
+
+async Task CheckPersonalAccessTokens(string address, string username, string password, long projectId)
+{
+    CookieContainer cookies = new();
+    using HttpClientHandler handler = new()
+    {
+        CookieContainer = cookies,
+        ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
+        UseProxy = false
+    };
+    using HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
+    using HttpRequestMessage login = new(HttpMethod.Post, "/api/login")
+    {
+        Content = JsonContent.Create(new { username, password })
+    };
+    login.Headers.Add("Origin", address);
+    using (HttpResponseMessage response = await client.SendAsync(login)) Check(response.IsSuccessStatusCode, "token workflow browser login");
+
+    string csrf;
+    using (HttpResponseMessage session = await client.GetAsync("/api/session"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await session.Content.ReadAsStreamAsync());
+        csrf = json.RootElement.GetProperty("csrf").GetString()!;
+        Check(csrf.Length == 64, "token workflow CSRF");
+    }
+    using (HttpRequestMessage invalid = new(HttpMethod.Post, "/api/tokens")
+    {
+        Content = JsonContent.Create(new { name = "invalid", scopes = Array.Empty<string>(), expires_in_days = 30 })
+    })
+    {
+        invalid.Headers.Add("Origin", address);
+        invalid.Headers.Add("X-Graft-CSRF", csrf);
+        using HttpResponseMessage response = await client.SendAsync(invalid);
+        Check(response.StatusCode == HttpStatusCode.BadRequest, "personal token requires a scope");
+    }
+
+    long tokenId;
+    string tokenSecret;
+    using (HttpRequestMessage create = new(HttpMethod.Post, "/api/tokens")
+    {
+        Content = JsonContent.Create(new { name = "browser-git", scopes = new[] { "read_repository" }, expires_in_days = 30 })
+    })
+    {
+        create.Headers.Add("Origin", address);
+        create.Headers.Add("X-Graft-CSRF", csrf);
+        using HttpResponseMessage response = await client.SendAsync(create);
+        using JsonDocument json = JsonDocument.Parse(await response.Content.ReadAsStreamAsync());
+        tokenId = json.RootElement.GetProperty("id").GetInt64();
+        tokenSecret = json.RootElement.GetProperty("secret").GetString()!;
+        DateTimeOffset expiry = json.RootElement.GetProperty("expires_at_utc").GetDateTimeOffset();
+        Check(response.StatusCode == HttpStatusCode.Created && tokenSecret.StartsWith("graft_pat_", StringComparison.Ordinal) &&
+            json.RootElement.GetProperty("scopes")[0].GetString() == "read_repository" &&
+            expiry > DateTimeOffset.UtcNow.AddDays(29) && expiry <= DateTimeOffset.UtcNow.AddDays(31),
+            "browser creates scoped expiring personal token");
+    }
+    using (HttpResponseMessage response = await client.GetAsync("/api/tokens"))
+    {
+        string content = await response.Content.ReadAsStringAsync();
+        using JsonDocument json = JsonDocument.Parse(content);
+        JsonElement listed = json.RootElement.EnumerateArray().Single(item => item.GetProperty("id").GetInt64() == tokenId);
+        Check(response.IsSuccessStatusCode && listed.GetProperty("name").GetString() == "browser-git" &&
+            !content.Contains(tokenSecret, StringComparison.Ordinal), "token list omits one-time secret");
+    }
+
+    string gitUrl = AuthenticatedUrl(address, username, tokenSecret, $"alice/durable.git");
+    await Git(root, ["ls-remote", gitUrl]);
+    Check(true, "browser-created personal token authenticates Git HTTPS");
+    using (HttpRequestMessage wrongCsrf = new(HttpMethod.Delete, $"/api/tokens/{tokenId}"))
+    {
+        wrongCsrf.Headers.Add("Origin", address);
+        wrongCsrf.Headers.Add("X-Graft-CSRF", new string('0', 64));
+        using HttpResponseMessage response = await client.SendAsync(wrongCsrf);
+        Check(response.StatusCode == HttpStatusCode.Forbidden, "personal token revocation rejects wrong CSRF");
+    }
+    using (HttpRequestMessage revoke = new(HttpMethod.Delete, $"/api/tokens/{tokenId}"))
+    {
+        revoke.Headers.Add("Origin", address);
+        revoke.Headers.Add("X-Graft-CSRF", csrf);
+        using HttpResponseMessage response = await client.SendAsync(revoke);
+        Check(response.StatusCode == HttpStatusCode.NoContent, "browser revokes personal token");
+    }
+    using (HttpResponseMessage response = await client.GetAsync("/api/tokens"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await response.Content.ReadAsStreamAsync());
+        Check(response.IsSuccessStatusCode && !json.RootElement.EnumerateArray().Any(item => item.GetProperty("id").GetInt64() == tokenId),
+            "revoked personal token leaves active list");
+    }
+    await GitFails(root, ["ls-remote", gitUrl], "revoked browser-created token blocks Git HTTPS");
 }
 
 void TestInterruptedCommitsLeaveRefsUnchanged(Repository current, string repositoryPath)
