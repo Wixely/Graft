@@ -46,6 +46,20 @@ dotnet tests\Graft.Git.Acceptance\bin\Debug\net10.0\Graft.Git.Acceptance.dll art
 
 See [MVP-06 evidence](validation/2026-09-19-mvp06-repository-api-ui.md) for covered behavior, exact compatibility boundaries and remaining operational gates. The published server embeds a trimmed Blazor WebAssembly client; WebAssembly AOT is not enabled and the optional `wasm-tools` workload is not required for this slice.
 
+MVP-07 adds the NativeAOT-compatible administration tool and a separate import/recovery acceptance executable. It needs both the server and admin tool paths:
+
+```powershell
+dotnet build tests\Graft.Operations.Acceptance\Graft.Operations.Acceptance.csproj -c Debug
+dotnet build src\Graft.Admin\Graft.Admin.csproj -c Debug
+dotnet tests\Graft.Operations.Acceptance\bin\Debug\net10.0\Graft.Operations.Acceptance.dll src\Graft.Server\bin\Debug\net10.0\Graft.Server.dll src\Graft.Admin\bin\Debug\net10.0\Graft.Admin.dll
+
+dotnet publish src\Graft.Server\Graft.Server.csproj -c Release -r win-x64 --self-contained true -p:GraftServerAot=true -o artifacts\mvp07\server-win-x64
+dotnet publish src\Graft.Admin\Graft.Admin.csproj -c Release -r win-x64 --self-contained true -p:GraftAdminAot=true -o artifacts\mvp07\admin-win-x64
+dotnet tests\Graft.Operations.Acceptance\bin\Release\net10.0\Graft.Operations.Acceptance.dll artifacts\mvp07\server-win-x64\Graft.Server.exe artifacts\mvp07\admin-win-x64\Graft.Admin.exe
+```
+
+See [the operations runbook](operations.md) for backup, verification, fresh-target restore and repository-only import inventory commands. [MVP-07 evidence](validation/2026-09-19-mvp07-import-recovery.md) records the tested boundary.
+
 `experiments/compatibility/Graft.Compatibility.csproj` has separate `NativeProbe` and `StaticProbe` switches. Plain `NativeProbe` enables AOT only; **StaticProbe** also sets static-musl executable linking, OpenSSL, ICU plus embedded data, and direct SQLite imports. Use `linux-musl-x64`, not the earlier CoreCLR `linux-x64` path, for the accepted standalone technique.
 
 The original Linux build used an isolated Alpine 3.21 root filesystem inside existing WSL, SDK 10.0.401, Clang 19, static native libraries and the command:

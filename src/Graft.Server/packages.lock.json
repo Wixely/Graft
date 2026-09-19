@@ -80,6 +80,13 @@
       "graft.git": {
         "type": "Project"
       },
+      "graft.operations": {
+        "type": "Project",
+        "dependencies": {
+          "Graft.Git": "[1.0.0, )",
+          "Microsoft.Data.Sqlite": "[10.0.12, )"
+        }
+      },
       "graft.storage": {
         "type": "Project",
         "dependencies": {

@@ -2,7 +2,7 @@
 
 Graft is a planned locally hosted GitLab alternative in C#/.NET 10. It targets GitLab APIs, URL conventions, applications and CI/CD, with simpler operations, permissions and runners, low resource use, and GitLab data import.
 
-Status as of **2026-09-19**: the [MVP-06 repository UI and API slice](docs/validation/2026-09-19-mvp06-repository-api-ui.md) passes 64 integrated assertions under Windows JIT and NativeAOT. It adds private project discovery, branches, commit history, safe text/binary file reads, browser sessions and a bounded GitLab REST v4 subset while retaining the MVP-05 real Git and durability checks. DnaX distribution, production TLS/operations, a version-matched GitLab fixture, interactive browser execution and required-host execution remain gates. Remote hosting, visibility and project license are undecided. No remote is configured.
+Status as of **2026-09-19**: the [MVP-07 import and recovery slice](docs/validation/2026-09-19-mvp07-import-recovery.md) passes 36 operational assertions under Windows JIT and NativeAOT while retaining all 64 MVP-06 assertions. It adds repository-only import inventory/loss reporting, repeatable Git HTTPS import, enforced quiescence, hashed SQLite/repository backups, tamper detection, fresh-target restore and rollback rehearsal. DnaX distribution, production TLS/service packaging, a version-matched GitLab fixture, interactive browser execution, integrated static-musl publication and required-host execution remain gates. Remote hosting, visibility and project license are undecided. No remote is configured.
 
 ## Start here
 
@@ -38,8 +38,10 @@ Linux static NativeAOT requires the separate toolchain/runbook; a Windows build 
 | `src/Graft.Core/`, `src/Graft.Storage/` | MVP authorization policy and DnaX/SQLite persistence |
 | `src/Graft.Git/`, `src/Graft.Server/` | Managed Git engine, repository read model, durable storage and authenticated HTTPS/API host |
 | `src/Graft.Client/`, `src/Graft.Contracts/` | Blazor WebAssembly repository browser and source-generated wire contracts |
+| `src/Graft.Operations/`, `src/Graft.Admin/` | Quiescence lease, backup/restore, import inventory and NativeAOT administration CLI |
 | `tests/Graft.Acceptance/` | Disposable MVP-04 persistence and authorization acceptance executable |
 | `tests/Graft.Git.Acceptance/` | Integrated MVP-06 real Git, repository API, browser-session, restart and revocation acceptance executable |
+| `tests/Graft.Operations.Acceptance/` | MVP-07 synthetic import, backup, tamper, restore and rollback acceptance executable |
 | `experiments/compatibility/` | Probe source, pinned NuGet dependencies and build scripts |
 | `experiments/managed-git/` | Bounded C# smart HTTP/pack experiment; [runbook](experiments/managed-git/README.md) |
 | `experiments/managed-git-client/` | C# acceptance harness using installed Git as an independent test client |
@@ -50,4 +52,4 @@ Linux static NativeAOT requires the separate toolchain/runbook; a Windows build 
 
 The original discovery notes remain in the sibling [PLAN idea](../PLAN/inbox/local-git-forge.md). This repository is now the canonical implementation/handoff context. Private infrastructure details stay in PLAN; project docs use a neutral target-host description.
 
-Recommended next action - Owner: Implementation agent: begin **MVP-07** with a synthetic repository import rehearsal, inventory and loss report while retaining the MVP-06 acceptance suite. Owner: User/DnaX maintainer: make the tested DnaX packages available from an approved durable feed. Review [the MVP plan](docs/mvp-plan.md) and [MVP-06 evidence](docs/validation/2026-09-19-mvp06-repository-api-ui.md).
+Recommended next action - Owner: Implementation agent: begin **MVP-08** packaging and resource validation, starting with interactive and Windows Service lifecycle support plus a measured idle/load baseline. Owner: User/DnaX maintainer: make the tested DnaX packages available from an approved durable feed. Review [the operations runbook](docs/operations.md), [MVP plan](docs/mvp-plan.md) and [MVP-07 evidence](docs/validation/2026-09-19-mvp07-import-recovery.md).

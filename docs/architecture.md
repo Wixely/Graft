@@ -6,6 +6,8 @@ The current concrete recommendation is [ADR 0004](decisions/0004-csharp-mvp-prop
 
 MVP-02 [demonstrates the browser/API boundary on Windows](validation/2026-09-18-ui-nativeaot.md): standalone Blazor client assets embedded in a NativeAOT executable, with opaque revocable sessions, HTTPS and source-generated JSON. MVP-03 [demonstrates DnaX migrations with Dapper.AOT](validation/2026-09-19-storage-migrations.md) in Windows and local static-musl NativeAOT. DnaX package distribution and required-host execution remain gates before product adoption.
 
+MVP-07 adds an offline operations boundary: the server holds exclusive database and repository maintenance leases for its lifetime; the NativeAOT `Graft.Admin` tool must acquire both before backup or restore. Backups contain a SQLite snapshot plus the repository tree and a SHA-256 manifest. Restore verifies before publishing into fresh targets and removes a partially published database on failure. This is a single-process quiesced design; online backup and clustered writers remain outside the demonstrated boundary.
+
 ## Starting constraints
 
 Use C#/.NET 10 and Dapper.AOT. Preserve the demonstrated static-musl NativeAOT path for the required Linux x64 host. The tested probe statically links native libraries: “managed solution” does not mean SQLite/TLS/libc disappear. Track those dependencies and their security-update/rebuild path.

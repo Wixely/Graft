@@ -7,6 +7,7 @@ using System.Text;
 using Graft.Contracts;
 using Graft.Core;
 using Graft.Git;
+using Graft.Operations;
 using Graft.Server;
 using Graft.Storage;
 using Microsoft.AspNetCore.Hosting.Server;
@@ -14,12 +15,13 @@ using Microsoft.AspNetCore.Hosting.Server.Features;
 
 if (!Arguments.TryParse(args, out Arguments? parsedSettings))
 {
-    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory>. The MVP-05 host binds loopback HTTPS only.");
+    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory>. The current host binds loopback HTTPS only.");
     return 2;
 }
 Arguments settings = parsedSettings!;
 
 Directory.CreateDirectory(settings.Repositories);
+using MaintenanceLease maintenanceLease = MaintenanceLease.Acquire(settings.Database, settings.Repositories);
 await using GraftStore store = await GraftStore.OpenAsync(settings.Database);
 WebAssets assets = new();
 ConcurrentDictionary<string, Lazy<RepositoryEndpoint>> repositories = new(StringComparer.Ordinal);
