@@ -21,6 +21,21 @@
       }
     },
     {
+      "label": "build MVP-04 acceptance",
+      "type": "process",
+      "command": "dotnet",
+      "args": [
+        "build",
+        "tests/Graft.Acceptance/Graft.Acceptance.csproj",
+        "-c",
+        "Debug"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": "$msCompile"
+    },
+    {
       "label": "build compatibility probe",
       "type": "process",
       "command": "dotnet",

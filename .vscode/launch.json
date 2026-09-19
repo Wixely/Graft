@@ -10,6 +10,15 @@
   ],
   "configurations": [
     {
+      "name": "Debug MVP-04 accounts and permissions",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build MVP-04 acceptance",
+      "program": "${workspaceFolder}/tests/Graft.Acceptance/bin/Debug/net10.0/Graft.Acceptance.dll",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
       "name": "Debug UI and authentication probe",
       "type": "coreclr",
       "request": "launch",

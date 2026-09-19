@@ -1,4 +1,11 @@
 <Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Graft.Core/Graft.Core.csproj" />
+    <Project Path="src/Graft.Storage/Graft.Storage.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Graft.Acceptance/Graft.Acceptance.csproj" />
+  </Folder>
   <Folder Name="/experiments/" />
   <Folder Name="/experiments/compatibility/">
     <Project Path="experiments/compatibility/Graft.Compatibility.csproj" />

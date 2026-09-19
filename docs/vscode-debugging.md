@@ -10,6 +10,7 @@ Set server breakpoints in `experiments/ui-server`. The browser client is publish
 
 | Launch option | Behavior |
 | --- | --- |
+| Debug MVP-04 accounts and permissions | Runs the disposable SQLite acceptance flow for accounts, projects, sessions, tokens, roles and revocation. |
 | Debug UI and authentication probe | Interactive UI with server C# breakpoints and browser opening. |
 | Debug compatibility probe | Runs the six compatibility checks and exits. |
 | Debug storage migration probe | Runs the disposable DnaX/SQLite migration checks and exits. |
