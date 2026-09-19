@@ -27,7 +27,7 @@ Provisional version candidate: **GitLab CE 18.0.0, REST v4**. This remains an ag
 
 Client evidence: installed **Git 2.53.0.windows.2** provides actual transport interoperability. Pinned **glab 1.58.0** passes `auth login` plus `api user`, project list, project create and project read against both the GitLab reference and Graft; see [pinned-client evidence](validation/2026-09-19-glab-graft.md). A C# HttpClient harness verifies additional wire/error behavior independently. GitlabMCPSharp remains a later client candidate. No broad glab support is implied.
 
-The read rows marked **implemented** were tested on 2026-09-19 by the 64-assertion MVP-06 harness under Windows JIT and NativeAOT. The combined workflow now passes 87 assertions in both modes. GL-004 is driven by the pinned 18.0.0 source fixture; the other rows still reference rolling official documentation. Git transport uses protocol v0/SHA-1. The live GitLab CE 18.0.0 and pinned `glab` 1.58.0 reports establish the exact bounded reference/client result described above.
+The read rows marked **implemented** were first tested by the 64-assertion MVP-06 harness. The GitLab 18.0 project-creation fixture raised that workflow to 87 assertions, and the later user/membership slice raises the current Windows JIT and NativeAOT workflow to 97. GL-004 is driven by the pinned 18.0.0 source fixture; the other rows still reference rolling official documentation. Git transport uses protocol v0/SHA-1. The live GitLab CE 18.0.0 and pinned `glab` 1.58.0 reports establish the exact bounded reference/client result described above.
 
 | Fixture ID | Surface / request | Required assertions | Official reference |
 | --- | --- | --- | --- |
@@ -43,7 +43,7 @@ The read rows marked **implemented** were tested on 2026-09-19 by the 64-asserti
 | GIT-001 | `GET /:namespace/:project.git/info/refs?service=git-upload-pack` and `git-receive-pack` | **Implemented bounded subset:** auth before disclosure, correct service responses, refs and empty repository | [Git HTTP](https://git-scm.com/docs/http-protocol) |
 | GIT-002 | `POST /:namespace/:project.git/git-upload-pack` | **Implemented bounded subset:** clone/fetch through Git 2.53.0.windows.2, exact content and inaccessible rejection | [Git HTTP](https://git-scm.com/docs/http-protocol) |
 | GIT-003 | `POST /:namespace/:project.git/git-receive-pack` | **Implemented bounded subset:** initial/incremental push, branches/tags, token auth, stale ref and interrupted publication checks | [Git HTTP](https://git-scm.com/docs/http-protocol), [pack format](https://git-scm.com/docs/pack-format) |
-| WEB-001 | `/:namespace/:project` | **Implemented subset:** authenticated project creation/discovery, deep-link shell, tree/history/file API, CSRF login/logout; interactive WASM execution pending | Graft MVP UX acceptance; no complete GitLab browser URL parity claimed |
+| WEB-001 | `/:namespace/:project` | **Implemented subset:** authenticated project and user creation, membership management, deep-link shell, tree/history/file API, CSRF login/logout; rendered Chromium workflow passes | Graft MVP UX acceptance; no complete GitLab browser URL parity claimed |
 
 Git HTTPS token authentication needs its own GitLab-version fixture; API header acceptance does not prove Git credential compatibility. REST unknown routes must return an explicit API error, never the Blazor HTML fallback. Treat unsupported query fields deliberately: document version-matched ignore/reject behavior instead of silently claiming full endpoint support.
 

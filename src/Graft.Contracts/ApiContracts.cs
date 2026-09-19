@@ -80,11 +80,16 @@ public sealed record FileResponse(
     [property: JsonPropertyName("execute_filemode")] bool ExecuteFilemode);
 
 public sealed record ErrorResponse(string Message);
-public sealed record SessionResponse(bool Authenticated, string? Username, string Csrf);
+public sealed record SessionResponse(bool Authenticated, string? Username, bool IsAdministrator, string Csrf);
 public sealed record LoginRequest(string Username, string Password);
+public sealed record UserCreateRequest(string Username, string Password);
+public sealed record UserAccountResponse(long Id, string Username, bool IsAdministrator);
 public sealed record ProjectCreateRequest(string? Name, string? Path, string? Description, string? Visibility);
+public sealed record MembershipSetRequest(string Username, string Role);
+public sealed record ProjectMemberResponse(long UserId, string Username, string Role);
 public sealed record RepositoryPageResponse(
     ProjectResponse Project,
+    bool CanManage,
     IReadOnlyList<BranchResponse> Branches,
     IReadOnlyList<CommitResponse> Commits,
     IReadOnlyList<TreeEntryResponse> Tree,
@@ -101,6 +106,10 @@ public sealed record RepositoryPageResponse(
 [JsonSerializable(typeof(ErrorResponse))]
 [JsonSerializable(typeof(SessionResponse))]
 [JsonSerializable(typeof(LoginRequest))]
+[JsonSerializable(typeof(UserCreateRequest))]
+[JsonSerializable(typeof(UserAccountResponse))]
 [JsonSerializable(typeof(ProjectCreateRequest))]
+[JsonSerializable(typeof(MembershipSetRequest))]
+[JsonSerializable(typeof(ProjectMemberResponse[]))]
 [JsonSerializable(typeof(RepositoryPageResponse))]
 public partial class ApiJson : JsonSerializerContext;

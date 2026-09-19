@@ -101,11 +101,19 @@ public sealed class GraftStore : IAsyncDisposable
         if (!liveActor.IsAdministrator) throw new UnauthorizedAccessException("Administrator access is required.");
 
         string now = Now();
-        long id = await db.QuerySingleAsync<long>("""
-            INSERT INTO Users (Username, NormalizedUsername, PasswordHash, IsAdministrator, Disabled, CreatedAtUtc)
-            VALUES (@Username, @NormalizedUsername, @PasswordHash, 0, 0, @CreatedAtUtc)
-            RETURNING Id;
-            """, new CreateUserParameters(username, normalized, passwordHash, now), transaction);
+        long id;
+        try
+        {
+            id = await db.QuerySingleAsync<long>("""
+                INSERT INTO Users (Username, NormalizedUsername, PasswordHash, IsAdministrator, Disabled, CreatedAtUtc)
+                VALUES (@Username, @NormalizedUsername, @PasswordHash, 0, 0, @CreatedAtUtc)
+                RETURNING Id;
+                """, new CreateUserParameters(username, normalized, passwordHash, now), transaction);
+        }
+        catch (SqliteException error) when (error.SqliteErrorCode == 19)
+        {
+            throw new UserConflictException("A user with this username already exists.", error);
+        }
         await AuditAsync(db, transaction, actor.UserId, "create-user", "user", id.ToString(CultureInfo.InvariantCulture), "Ordinary user created.", now);
         await transaction.CommitAsync(cancellationToken);
         return new(id, username, false, false);
@@ -403,6 +411,37 @@ public sealed class GraftStore : IAsyncDisposable
         await transaction.CommitAsync(cancellationToken);
     }
 
+    public async Task<UserAccount?> FindActiveUserAsync(
+        string username,
+        CancellationToken cancellationToken = default)
+    {
+        string normalized = NormalizeName(username, nameof(username));
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        IdentityRow? row = await db.QuerySingleOrDefaultAsync<IdentityRow>("""
+            SELECT Id, Username, IsAdministrator, Disabled
+            FROM Users WHERE NormalizedUsername = @NormalizedUsername AND Disabled = 0;
+            """, new NormalizedNameParameters(normalized));
+        return row is null ? null : new(row.Id, row.Username, row.IsAdministrator != 0, false);
+    }
+
+    public async Task<IReadOnlyList<ProjectMember>> ListProjectMembersAsync(
+        AuthenticatedIdentity actor,
+        long projectId,
+        CancellationToken cancellationToken = default)
+    {
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        PermissionDecision permission = await DecideAsync(db, null, actor, projectId, ProjectAction.ManageProject, cancellationToken);
+        if (!permission.Allowed) throw new UnauthorizedAccessException(permission.Explanation);
+        IEnumerable<ProjectMemberRow> rows = await db.QueryAsync<ProjectMemberRow>("""
+            SELECT u.Id AS UserId, u.Username, m.Role
+            FROM ProjectMemberships m
+            JOIN Users u ON u.Id = m.UserId
+            WHERE m.ProjectId = @Id AND u.Disabled = 0
+            ORDER BY u.NormalizedUsername;
+            """, new IdParameters(projectId));
+        return rows.Select(row => new ProjectMember(row.UserId, row.Username, (ProjectRole)row.Role)).ToArray();
+    }
+
     public async Task RevokeMembershipAsync(
         AuthenticatedIdentity actor,
         long projectId,
@@ -569,6 +608,7 @@ public sealed class GraftStore : IAsyncDisposable
 }
 
 public sealed class ProjectConflictException(string message, Exception innerException) : Exception(message, innerException);
+public sealed class UserConflictException(string message, Exception innerException) : Exception(message, innerException);
 
 internal sealed class UserCredentialRow
 {
@@ -591,6 +631,7 @@ internal sealed class TokenIdentityRow : IdentityRow { public long Scopes { get;
 internal sealed class TokenOwnerRow { public long UserId { get; set; } }
 internal sealed class ProjectOwnerRow { public long OwnerUserId { get; set; } }
 internal sealed class ProjectAccessRow { public long OwnerUserId { get; set; } public long? Role { get; set; } }
+internal sealed class ProjectMemberRow { public long UserId { get; set; } public string Username { get; set; } = ""; public long Role { get; set; } }
 internal class ProjectPathRow
 {
     public long Id { get; set; }

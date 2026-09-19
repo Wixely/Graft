@@ -16,8 +16,17 @@ else if (Session?.Authenticated == true)
             <label for="project-name">Name</label><input id="project-name" @bind="ProjectName" required maxlength="200" />
             <label for="project-path">Path (optional)</label><input id="project-path" @bind="ProjectPath" minlength="2" maxlength="39" pattern="[A-Za-z0-9](?:[A-Za-z0-9]|[._\-][A-Za-z0-9])+" />
             <label for="project-description">Description</label><input id="project-description" @bind="ProjectDescription" maxlength="2000" />
-            <button type="submit" disabled="@Busy">@(Busy ? "Creatingâ€¦" : "Create project")</button>
+            <button type="submit" disabled="@Busy">@(Busy ? "Creating…" : "Create project")</button>
         </form>
+        @if (Session.IsAdministrator)
+        {
+            <form class="create-project" @onsubmit="CreateUser" @onsubmit:preventDefault>
+                <h3>Create a user</h3>
+                <label for="new-username">Username</label><input id="new-username" @bind="NewUsername" required minlength="2" maxlength="39" pattern="[A-Za-z0-9][A-Za-z0-9._\-]*" autocomplete="off" />
+                <label for="new-password">Temporary password</label><input id="new-password" type="password" @bind="NewPassword" required minlength="16" maxlength="256" autocomplete="new-password" />
+                <button type="submit" disabled="@Busy">@(Busy ? "Creating…" : "Create user")</button>
+            </form>
+        }
         @if (Projects.Length == 0) { <p>No accessible projects.</p> }
         @foreach (ProjectResponse project in Projects)
         {
@@ -47,6 +56,8 @@ else
     private string ProjectName = "";
     private string ProjectPath = "";
     private string ProjectDescription = "";
+    private string NewUsername = "";
+    private string NewPassword = "";
     private string Message = "";
     private bool Loading = true;
     private bool Busy;
@@ -120,6 +131,28 @@ else
             }
         }
         catch (HttpRequestException) { Message = "Project creation could not be confirmed."; }
+        finally { Busy = false; }
+    }
+
+    private async Task CreateUser()
+    {
+        if (Busy || Session is null) return;
+        Busy = true; Message = "";
+        try
+        {
+            using HttpRequestMessage request = new(HttpMethod.Post, "api/users");
+            request.Headers.Add("X-Graft-CSRF", Session.Csrf);
+            request.Content = JsonContent.Create(new UserCreateRequest(NewUsername, NewPassword), ApiJson.Default.UserCreateRequest);
+            using HttpResponseMessage response = await Http.SendAsync(request);
+            NewPassword = "";
+            if (response.IsSuccessStatusCode) { NewUsername = ""; Message = "User created."; }
+            else
+            {
+                ErrorResponse? error = await response.Content.ReadFromJsonAsync(ApiJson.Default.ErrorResponse);
+                Message = error?.Message ?? "User creation failed.";
+            }
+        }
+        catch (HttpRequestException) { NewPassword = ""; Message = "User creation could not be confirmed."; }
         finally { Busy = false; }
     }
 }
