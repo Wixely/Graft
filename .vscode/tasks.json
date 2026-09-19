@@ -5,9 +5,119 @@
       "label": "build",
       "type": "process",
       "command": "dotnet",
-      "args": ["build", "Graft.slnx"],
+      "args": [
+        "build",
+        "Graft.slnx",
+        "-c",
+        "Debug"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
       "problemMatcher": "$msCompile",
-      "group": { "kind": "build", "isDefault": true }
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    },
+    {
+      "label": "build compatibility probe",
+      "type": "process",
+      "command": "dotnet",
+      "args": [
+        "build",
+        "experiments/compatibility/Graft.Compatibility.csproj",
+        "-c",
+        "Debug"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "build storage migration probe",
+      "type": "process",
+      "command": "dotnet",
+      "args": [
+        "build",
+        "experiments/storage/Graft.StorageProbe.csproj",
+        "-c",
+        "Debug"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "build managed Git probe",
+      "type": "process",
+      "command": "dotnet",
+      "args": [
+        "build",
+        "experiments/managed-git/Graft.ManagedGit.csproj",
+        "-c",
+        "Debug"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "build managed Git acceptance client",
+      "type": "process",
+      "command": "dotnet",
+      "args": [
+        "build",
+        "experiments/managed-git-client/Graft.ManagedGit.Client.csproj",
+        "-c",
+        "Debug"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "build UI probe",
+      "type": "process",
+      "command": "dotnet",
+      "args": [
+        "build",
+        "experiments/ui-server/Graft.Ui.Server.csproj",
+        "-c",
+        "Debug"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "build UI checks client",
+      "type": "process",
+      "command": "dotnet",
+      "args": [
+        "build",
+        "experiments/ui-checks/Graft.Ui.Checks.csproj",
+        "-c",
+        "Debug"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "build UI acceptance checks",
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "build UI probe",
+        "build UI checks client"
+      ],
+      "problemMatcher": []
     }
   ]
 }
