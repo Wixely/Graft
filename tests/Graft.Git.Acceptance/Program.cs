@@ -736,6 +736,16 @@ async Task CheckUserAdministration(string address, string adminPassword, string 
     using (HttpResponseMessage response = await userClient.GetAsync("/api/users"))
         Check(response.StatusCode == HttpStatusCode.Forbidden, "ordinary user cannot list users");
     string userCsrf = await UserCsrf();
+    using (HttpRequestMessage forbiddenEnable = new(HttpMethod.Post, $"/api/users/{userId}/enable")
+    {
+        Content = JsonContent.Create(new { new_password = Password() })
+    })
+    {
+        forbiddenEnable.Headers.Add("Origin", address);
+        forbiddenEnable.Headers.Add("X-Graft-CSRF", userCsrf);
+        using HttpResponseMessage response = await userClient.SendAsync(forbiddenEnable);
+        Check(response.StatusCode == HttpStatusCode.Forbidden, "ordinary user cannot enable accounts");
+    }
     string resetRevokedToken = await CreateUserToken(userCsrf, "before-reset");
     string resetPassword = Password();
     using (HttpRequestMessage reset = new(HttpMethod.Post, $"/api/users/{userId}/reset-password")
@@ -809,6 +819,49 @@ async Task CheckUserAdministration(string address, string adminPassword, string 
         using JsonDocument json = JsonDocument.Parse(await response.Content.ReadAsStreamAsync());
         JsonElement user = json.RootElement.EnumerateArray().Single(item => item.GetProperty("id").GetInt64() == userId);
         Check(response.IsSuccessStatusCode && user.GetProperty("disabled").GetBoolean(), "administrator list exposes disabled state");
+    }
+
+    string enabledPassword = Password();
+    using (HttpRequestMessage wrongCsrf = new(HttpMethod.Post, $"/api/users/{userId}/enable")
+    {
+        Content = JsonContent.Create(new { new_password = enabledPassword })
+    })
+    {
+        wrongCsrf.Headers.Add("Origin", address);
+        wrongCsrf.Headers.Add("X-Graft-CSRF", new string('0', 64));
+        using HttpResponseMessage response = await adminClient.SendAsync(wrongCsrf);
+        Check(response.StatusCode == HttpStatusCode.Forbidden, "account enable rejects wrong CSRF");
+    }
+    using (HttpRequestMessage enable = new(HttpMethod.Post, $"/api/users/{userId}/enable")
+    {
+        Content = JsonContent.Create(new { new_password = enabledPassword })
+    })
+    {
+        enable.Headers.Add("Origin", address);
+        enable.Headers.Add("X-Graft-CSRF", adminCsrf);
+        using HttpResponseMessage response = await adminClient.SendAsync(enable);
+        Check(response.StatusCode == HttpStatusCode.NoContent, "administrator enables account with fresh password");
+    }
+    using (HttpResponseMessage response = await LoginUser(changedPassword))
+        Check(response.StatusCode == HttpStatusCode.Unauthorized, "pre-disable password stays invalid after enable");
+    using (HttpResponseMessage response = await ApiGet(address, "/api/v4/user", disableRevokedToken))
+        Check(response.StatusCode == HttpStatusCode.Unauthorized, "enable does not restore revoked tokens");
+    using (HttpResponseMessage response = await LoginUser(enabledPassword)) Check(response.IsSuccessStatusCode, "fresh enable password authenticates");
+    using (HttpResponseMessage response = await adminClient.GetAsync("/api/users"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await response.Content.ReadAsStreamAsync());
+        JsonElement user = json.RootElement.EnumerateArray().Single(item => item.GetProperty("id").GetInt64() == userId);
+        Check(response.IsSuccessStatusCode && !user.GetProperty("disabled").GetBoolean(), "administrator list exposes re-enabled state");
+    }
+    using (HttpRequestMessage duplicateEnable = new(HttpMethod.Post, $"/api/users/{userId}/enable")
+    {
+        Content = JsonContent.Create(new { new_password = Password() })
+    })
+    {
+        duplicateEnable.Headers.Add("Origin", address);
+        duplicateEnable.Headers.Add("X-Graft-CSRF", adminCsrf);
+        using HttpResponseMessage response = await adminClient.SendAsync(duplicateEnable);
+        Check(response.StatusCode == HttpStatusCode.BadRequest, "active account cannot be enabled again");
     }
 }
 

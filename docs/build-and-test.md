@@ -46,7 +46,7 @@ dotnet tests\Graft.Git.Acceptance\bin\Debug\net10.0\Graft.Git.Acceptance.dll art
 
 See [MVP-06 evidence](validation/2026-09-19-mvp06-repository-api-ui.md) for covered behavior, exact compatibility boundaries and remaining operational gates. The published server embeds a trimmed Blazor WebAssembly client; WebAssembly AOT is not enabled and the optional `wasm-tools` workload is not required for this slice.
 
-The current extension adds administrator user creation and account lifecycle, owner-managed project roles, and user-managed personal access tokens while retaining this harness. It passes 127 assertions against both managed and Windows NativeAOT servers; see [user/membership evidence](validation/2026-09-19-user-membership.md), [token evidence](validation/2026-09-19-personal-access-tokens.md), and [account credential evidence](validation/2026-09-20-account-credentials.md).
+The current extension adds administrator user creation and account lifecycle, owner-managed project roles, and user-managed personal access tokens while retaining this harness. It passes 135 assertions against both managed and Windows NativeAOT servers; see [user/membership evidence](validation/2026-09-19-user-membership.md), [token evidence](validation/2026-09-19-personal-access-tokens.md), and [account credential evidence](validation/2026-09-20-account-credentials.md).
 
 For rendered UI work, start the disposable production fixture with a temporary password. It creates a `fixture` administrator, seeds `fixture/seeded` with text, hostile HTML and binary files, prints the random loopback URL, and removes all state on Enter:
 
