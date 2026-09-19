@@ -66,6 +66,7 @@ MVP-08 adds service lifetimes, deployment definitions, a static-musl product bui
 dotnet publish src\Graft.Server\Graft.Server.csproj -c Release -r win-x64 --self-contained true -p:PublishAot=true -o artifacts\mvp08\server-win-x64
 dotnet publish src\Graft.Admin\Graft.Admin.csproj -c Release -r win-x64 --self-contained true -p:PublishAot=true -o artifacts\mvp08\admin-win-x64
 dotnet run --project tests\Graft.Packaging.Acceptance\Graft.Packaging.Acceptance.csproj -c Release -- interactive artifacts\mvp08\server-win-x64\Graft.Server.exe
+dotnet run --project tests\Graft.Packaging.Acceptance\Graft.Packaging.Acceptance.csproj -c Release -- tls artifacts\mvp08\server-win-x64\Graft.Server.exe
 ```
 
 Run the Windows Service mode only from an elevated disposable session; it creates and removes a randomly named service and copies the publication beneath ProgramData:
@@ -80,7 +81,7 @@ Build the integrated static Linux server and admin tool with the existing isolat
 .\deploy\linux\build-static-native.ps1 -Distribution <existing-wsl-distribution>
 ```
 
-The systemd acceptance requires root in a systemd Linux environment. The container acceptance requires rootless Podman and the self-contained `linux-x64` publication expected by the Containerfile. `.dockerignore` and `.containerignore` restrict the build context to source/deployment files and that publication. Both tests clean their temporary service/container state. See [the deployment runbook](deployment.md) and [MVP-08 evidence](validation/2026-09-19-mvp08-packaging-resources.md) for commands, results and boundaries.
+The systemd acceptance requires root in a systemd Linux environment. The container acceptance requires rootless Podman and the self-contained `linux-x64` publication expected by the Containerfile. `.dockerignore` and `.containerignore` restrict the build context to source/deployment files and that publication. Both tests generate disposable certificate/password files and clean their temporary service/container state. See [the deployment runbook](deployment.md), [MVP-08 evidence](validation/2026-09-19-mvp08-packaging-resources.md) and [TLS evidence](validation/2026-09-19-operator-tls.md) for commands, results and boundaries.
 
 `experiments/compatibility/Graft.Compatibility.csproj` has separate `NativeProbe` and `StaticProbe` switches. Plain `NativeProbe` enables AOT only; **StaticProbe** also sets static-musl executable linking, OpenSSL, ICU plus embedded data, and direct SQLite imports. Use `linux-musl-x64`, not the earlier CoreCLR `linux-x64` path, for the accepted standalone technique.
 

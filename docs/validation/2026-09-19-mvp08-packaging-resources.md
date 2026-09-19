@@ -6,7 +6,7 @@ Date: 2026-09-19. Status: conditional PASS. Owner: Implementation agent. Review 
 
 Graft now has Windows interactive and Windows Service hosting integration, Linux interactive and systemd integration, an optional non-root container definition, and an integrated static-musl build for both the server and administration tool. The same server artifact continues to pass the 64 MVP-06 Git/API assertions and 36 MVP-07 import/recovery assertions on Windows NativeAOT and local Linux static-musl NativeAOT.
 
-The slice remains conditional because this non-elevated Windows session could not register a temporary service and the new integrated static-musl artifacts have not run on the mandatory Linux 3.10.108 host. Production TLS is also unresolved. These are explicit release gates rather than inferred passes.
+The slice remains conditional because this non-elevated Windows session could not register a temporary service and the new integrated static-musl artifacts have not run on the mandatory Linux 3.10.108 host. Operator certificate loading now has [separate local evidence](2026-09-19-operator-tls.md); a real CA/DNS trust environment remains external acceptance. These are explicit release gates rather than inferred passes.
 
 ## Exercised matrix
 
@@ -40,9 +40,9 @@ The Windows publication directory includes native symbol files for local diagnos
 ## Boundaries and next acceptance
 
 - The health route proves process readiness only; it does not inspect database/repository health.
-- The generated certificate changes on restart and is not trusted. Stable certificate loading and renewal are required before remote use.
+- Loopback development still uses a generated certificate. Service/container definitions use operator certificate files; real CA/DNS trust requires deployment-environment acceptance.
 - The systemd and container runs used a modern local Linux environment. They do not establish Linux 3.10 service-manager, container or general distribution support.
 - The container is an optional CoreCLR deployment and does not replace the mandatory static-musl direct-host path.
 - Service stop released the maintenance lease under systemd. The equivalent SCM check remains pending with the elevated lifecycle run.
 
-Recommended next action: Owner: User + implementation agent — run the Windows Service harness from an elevated disposable Windows environment, then transfer the recorded static-musl server/admin pair to the required Linux 3.10.108 host and repeat the interactive, Git and operations acceptance commands. Owner: Implementation agent — add operator-managed certificate loading before any non-loopback deployment.
+Recommended next action: Owner: User + implementation agent — run the Windows Service harness from an elevated disposable Windows environment, then transfer the recorded static-musl server/admin pair to the required Linux 3.10.108 host and repeat the TLS, interactive, Git and operations acceptance commands. Owner: Operator — supply the intended CA/DNS trust environment for deployment acceptance.

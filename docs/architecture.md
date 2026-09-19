@@ -10,6 +10,8 @@ MVP-07 adds an offline operations boundary: the server holds exclusive database 
 
 MVP-08 keeps one host implementation across console, Windows Service and systemd lifetimes. Explicit HTTPS listener/origin arguments make service and container bindings deterministic. `/healthz` reports process readiness. Linux systemd uses `Type=notify`; the optional container runs the self-contained CoreCLR publication as a non-root user with a read-only root filesystem. The legacy-host path is a separate static-musl NativeAOT server/admin pair. Local lifecycle and static functional tests pass, while elevated Windows Service and Linux 3.10.108 execution remain acceptance gates.
 
+TLS configuration uses an operator PKCS#12 file and a separate password file. The password is not accepted on the command line. Non-loopback binding requires the operator certificate, and startup validates the private key, validity interval, server-authentication EKU when present, and subject alternative name against the public origin. Certificates load at startup, so renewal uses a coordinated file replacement and service restart. systemd paths, container secrets and the static-musl import pass locally; CA/DNS trust remains an environment acceptance concern.
+
 ## Starting constraints
 
 Use C#/.NET 10 and Dapper.AOT. Preserve the demonstrated static-musl NativeAOT path for the required Linux x64 host. The tested probe statically links native libraries: “managed solution” does not mean SQLite/TLS/libc disappear. Track those dependencies and their security-update/rebuild path.
