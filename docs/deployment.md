@@ -48,7 +48,7 @@ systemctl show graft --property=ActiveState --property=SubState --property=Type
 curl --insecure https://127.0.0.1:7443/healthz
 ```
 
-The unit uses `Type=notify`, restarts on failure, restricts filesystem writes to the data directory and applies basic service hardening. Stop the unit before maintenance operations.
+The unit uses `Type=notify`, restarts on failure, restricts filesystem writes to the data directory and applies basic service hardening. The static NativeAOT server's managed notification path passes the full temporary-unit lifecycle recorded in [static systemd evidence](validation/2026-09-19-static-systemd.md). Stop the unit before maintenance operations.
 
 ## Optional container
 

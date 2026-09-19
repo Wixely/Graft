@@ -6,7 +6,7 @@ Date: 2026-09-19. Status: conditional PASS. Owner: Implementation agent. Review 
 
 Graft now has Windows interactive and Windows Service hosting integration, Linux interactive and systemd integration, an optional non-root container definition, and an integrated static-musl build for both the server and administration tool. The same server artifact continues to pass the 64 MVP-06 Git/API assertions and 36 MVP-07 import/recovery assertions on Windows NativeAOT and local Linux static-musl NativeAOT.
 
-The slice remains conditional because the new integrated static-musl artifacts have not run on the mandatory Linux 3.10.108 host. An elevated Windows run subsequently passed the complete temporary-service lifecycle. Operator certificate loading has [separate local evidence](2026-09-19-operator-tls.md); a real CA/DNS trust environment remains external acceptance. These are explicit release gates rather than inferred passes.
+The slice remains conditional because the new integrated static-musl artifacts have not run on the mandatory Linux 3.10.108 host. An elevated Windows run subsequently passed the complete temporary-service lifecycle. A later WSL rerun also passed systemd using the static NativeAOT server after adding an explicit managed notification path; see [static systemd evidence](2026-09-19-static-systemd.md). Operator certificate loading has [separate local evidence](2026-09-19-operator-tls.md); a real CA/DNS trust environment remains external acceptance. These are explicit release gates rather than inferred passes.
 
 ## Exercised matrix
 
@@ -16,6 +16,7 @@ The slice remains conditional because the new integrated static-musl artifacts h
 | Windows Service | Windows x64 NativeAOT, elevated disposable SCM registration | PASS: 5 assertions covering create, certificate-backed readiness, running state, stop and maintenance-lock release |
 | Linux interactive | Ubuntu 24.04.4 WSL kernel, static-musl NativeAOT server/admin | PASS: 206 packaging/resource assertions; 64 Git/API; 36 operations |
 | Linux systemd | Ubuntu 24.04.4 WSL, self-contained CoreCLR server, systemd `Type=notify` | PASS: 6 assertions covering install, readiness, notify state, stop and maintenance-lock release |
+| Linux static systemd follow-up | Ubuntu 24.04.4 WSL kernel 6.18.33.2, static-musl NativeAOT server | PASS: 6 assertions covering install, explicit managed readiness notification, running state, stop and maintenance-lock release |
 | Rootless container | Podman on Ubuntu 24.04.4 WSL, Ubuntu .NET 10 runtime-deps image | PASS: 7 assertions covering build, non-root execution, read-only root, volume, health and restart |
 | Required legacy host | Linux 3.10.108 x86_64 | PENDING: integrated artifact execution requires user-coordinated access |
 
