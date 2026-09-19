@@ -5,6 +5,7 @@ Recorded: 2026-09-18. Source: explicit requests and corrections during Graft dis
 ## Confirmed
 
 - **Graft** is a locally hosted GitLab alternative written in managed C#/.NET 10.
+- On 2026-09-18 MVP preparation was requested, entirely in C#. The [MVP plan](mvp-plan.md) uses C# application logic and proposes managed C# Git; the precise native dependency boundary remains an explicit open interpretation.
 - Target GitLab-style applications, API operations and URL conventions. Include most GitLab functionality. GitHub compatibility is not required; all initial references to GitHub were corrected.
 - Support importing GitLab data.
 - Reduce memory use and latency. Performance improvements must be measured; no numeric budget is chosen yet.

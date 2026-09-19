@@ -11,11 +11,17 @@ dotnet build Graft.slnx
 dotnet run --project experiments/compatibility/Graft.Compatibility.csproj --no-build
 ```
 
-VS Code: **Debug compatibility probe** builds the solution then launches the Debug DLL. Running it on Windows validates only this developer baseline. `dotnet test` is not an application conformance suite here; the probe executable is the current functional oracle.
+VS Code: **Debug compatibility probe** builds its project then launches the Debug DLL. See [VS Code debugging](vscode-debugging.md) for the UI, Git, self-check and attach options. Running it on Windows validates only this developer baseline. `dotnet test` is not an application conformance suite here; the probe executable is the current functional oracle.
 
 Checkout setup validation on 2026-09-18: solution build passed with zero warnings/errors; all six probe checks passed on Windows x64 with the installed .NET 10.0.8 runtime. The first Windows run exposed Schannel's inability to use the generated ephemeral RSA key. The maintained source now imports that test certificate with default key storage on Windows only and disposes it after the test; no certificate/trust store is installed. Linux retains the original key path. Exception reporting now includes inner exception type/HResult without paths. The accepted Linux archive was not rebuilt or altered by these developer-baseline fixes.
 
 ## Static Linux NativeAOT
+
+For MVP-02, the [UI/auth runbook](../experiments/ui-server/README.md) covers automatic client publication/embedding, HTTP acceptance, C# browser scripts, debugging and Windows NativeAOT. The solution build includes this experiment and may restore pinned Blazor NuGet assets; it does not install a browser-native workload. [Recorded UI/auth acceptance](validation/2026-09-18-ui-nativeaot.md) is Windows-only.
+
+The separate [managed Git runbook](../experiments/managed-git/README.md) covers MVP-01's C# self-checks, real Git client harness, VS Code configurations and Windows NativeAOT publish. Its [acceptance evidence](validation/2026-09-18-managed-git.md) does not extend the old-host result. The static Linux instructions below still apply to the original compatibility probe only.
+
+The [storage migration runbook](../experiments/storage/README.md) covers MVP-03's JIT, Windows NativeAOT and static-musl commands. [Recorded storage evidence](validation/2026-09-19-storage-migrations.md) includes migration failure/recovery behavior and Dapper interception. Its static binary has not run on the required host, and clean restore is blocked until the tagged DnaX packages have an approved durable source.
 
 `experiments/compatibility/Graft.Compatibility.csproj` has separate `NativeProbe` and `StaticProbe` switches. Plain `NativeProbe` enables AOT only; **StaticProbe** also sets static-musl executable linking, OpenSSL, ICU plus embedded data, and direct SQLite imports. Use `linux-musl-x64`, not the earlier CoreCLR `linux-x64` path, for the accepted standalone technique.
 
