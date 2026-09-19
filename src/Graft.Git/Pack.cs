@@ -4,7 +4,7 @@ using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
 
-namespace Graft.ManagedGit;
+namespace Graft.Git;
 
 public sealed record GitObject(int Type, byte[] Data)
 {

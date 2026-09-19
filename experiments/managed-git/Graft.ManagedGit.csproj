@@ -11,5 +11,6 @@
   </PropertyGroup>
   <ItemGroup>
     <Content Update="NuGet.config" CopyToPublishDirectory="Never" />
+    <ProjectReference Include="../../src/Graft.Git/Graft.Git.csproj" />
   </ItemGroup>
 </Project>

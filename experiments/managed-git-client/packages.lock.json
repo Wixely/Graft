@@ -2,8 +2,14 @@
   "version": 1,
   "dependencies": {
     "net10.0": {
-      "graft.managedgit": {
+      "graft.git": {
         "type": "Project"
+      },
+      "graft.managedgit": {
+        "type": "Project",
+        "dependencies": {
+          "Graft.Git": "[1.0.0, )"
+        }
       }
     }
   }

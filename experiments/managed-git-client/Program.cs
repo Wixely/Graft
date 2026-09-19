@@ -2,7 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
 using System.Text;
-using Graft.ManagedGit;
+using Graft.Git;
 
 if (args.Length != 1 || !File.Exists(args[0]))
 {

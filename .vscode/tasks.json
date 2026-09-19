@@ -36,6 +36,21 @@
       "problemMatcher": "$msCompile"
     },
     {
+      "label": "build MVP-05 Git acceptance",
+      "type": "process",
+      "command": "dotnet",
+      "args": [
+        "build",
+        "tests/Graft.Git.Acceptance/Graft.Git.Acceptance.csproj",
+        "-c",
+        "Debug"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": "$msCompile"
+    },
+    {
       "label": "build compatibility probe",
       "type": "process",
       "command": "dotnet",

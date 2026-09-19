@@ -1,15 +1,47 @@
 using System.Text;
 
-namespace Graft.ManagedGit;
+namespace Graft.Git;
 
-// One synthetic repository, in memory, accessed under the host's single-operation gate.
-// This deliberately provides no persistence, authentication, checkout, hooks or subprocesses.
+public sealed record RepositoryState(
+    Dictionary<string, GitObject> Objects,
+    Dictionary<string, string> Refs);
+
+public interface IRepositoryPersistence
+{
+    RepositoryState Load();
+    void Commit(
+        IReadOnlyDictionary<string, GitObject> objects,
+        IReadOnlyDictionary<string, string> refs,
+        CancellationToken cancellationToken);
+}
+
+// Access must be serialized by the host. A persistence implementation commits validated
+// objects and refs before the new dictionaries become visible to readers.
 public sealed class Repository
 {
+    private readonly IRepositoryPersistence? persistence;
     public Dictionary<string, GitObject> Objects { get; private set; } = new(StringComparer.Ordinal);
     public Dictionary<string, string> Refs { get; private set; } = new(StringComparer.Ordinal);
     public int OffsetDeltas { get; private set; }
     public int ReferenceDeltas { get; private set; }
+
+    public Repository(IRepositoryPersistence? persistence = null)
+    {
+        this.persistence = persistence;
+        if (persistence is null) return;
+        RepositoryState state = persistence.Load();
+        Limits.Require(state.Objects.Count <= Limits.ObjectCount, "repository-object-count");
+        Limits.Require(state.Objects.Values.Sum(value => (long)value.Data.Length) <= Limits.ExpandedBytes, "repository-budget");
+        Limits.Require(state.Refs.Count <= Limits.RefCount, "ref-count");
+        foreach ((string name, string id) in state.Refs)
+        {
+            Limits.Require(Limits.IsRef(name) && Limits.IsId(id), "stored-ref");
+            Limits.Require(state.Objects.ContainsKey(id), "stored-ref-object");
+        }
+        Graph.Walk(state.Objects, state.Refs.Values, CancellationToken.None);
+        Objects = state.Objects;
+        Refs = state.Refs;
+    }
 
     public byte[] Advertise(string service)
     {
@@ -84,6 +116,7 @@ public sealed class Repository
         foreach (var name in stagedRefs.Keys)
             Limits.Require(!stagedRefs.Keys.Any(other => other.StartsWith(name + "/", StringComparison.Ordinal)), "ref-prefix-conflict");
         cancellationToken.ThrowIfCancellationRequested();
+        persistence?.Commit(stagedObjects, stagedRefs, cancellationToken);
         Objects = stagedObjects;
         Refs = stagedRefs;
         OffsetDeltas += pack.OffsetDeltas;

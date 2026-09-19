@@ -1,6 +1,6 @@
 # Managed Git feasibility probe
 
-MVP-01 only: a disposable, bounded, single-repository smart HTTP server in C#/.NET 10. All Git parsing, object hashing, delta application, refs and protocol behavior are implemented here. No Git executable, libgit2 or other Git library is used by the server. The separate client harness invokes installed Git as an independent oracle.
+MVP-01 only: a disposable, bounded, single-repository smart HTTP server in C#/.NET 10. The reusable Git parsing, object hashing, delta application, refs and protocol engine now lives in `src/Graft.Git`; this experiment remains its in-memory regression host. No Git executable, libgit2 or other Git library is used by the server. The separate client harness invokes installed Git as an independent oracle.
 
 The server binds only IPv4 loopback on an OS-selected port, prints `READY: http://127.0.0.1:<port>` and serves `/fixture.git`. It accepts no configuration arguments other than `--self-test`. Storage is in memory and lost at exit. It has no authentication, TLS, durable refs, hooks, checkout, UI or database. Use synthetic data only. Do not expose this experiment as a forge.
 
