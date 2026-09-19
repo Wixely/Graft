@@ -46,6 +46,17 @@ dotnet tests\Graft.Git.Acceptance\bin\Debug\net10.0\Graft.Git.Acceptance.dll art
 
 See [MVP-06 evidence](validation/2026-09-19-mvp06-repository-api-ui.md) for covered behavior, exact compatibility boundaries and remaining operational gates. The published server embeds a trimmed Blazor WebAssembly client; WebAssembly AOT is not enabled and the optional `wasm-tools` workload is not required for this slice.
 
+The GitLab 18 reference harness executes the same checked-in project-creation fixture against an approved, disposable GitLab instance. Supply synthetic token files for an administrator `api` token and a `read_api` token; the harness reads but never prints their values:
+
+```powershell
+dotnet build tests\Graft.GitLab.Reference\Graft.GitLab.Reference.csproj -c Release
+dotnet tests\Graft.GitLab.Reference\bin\Release\net10.0\Graft.GitLab.Reference.dll `
+  <GitLab-base-URL> <api-token-file> <read-api-token-file> `
+  tests\Graft.Git.Acceptance\Fixtures\gitlab-ce-18.0.0-rest-v4.json
+```
+
+The recorded live run used the official GitLab CE 18.0.0 and `glab` 1.58.0 container images in a loopback-only rootless Podman network. See [the live-reference evidence](validation/2026-09-19-gitlab-18-live-reference.md) for exact digests, results, isolation, and remaining scope.
+
 MVP-07 adds the NativeAOT-compatible administration tool and a separate import/recovery acceptance executable. It needs both the server and admin tool paths:
 
 ```powershell

@@ -43,4 +43,4 @@ dotnet tests/Graft.Git.Acceptance/bin/Release/net10.0/Graft.Git.Acceptance.dll a
 
 ## Boundary
 
-This is version-matched source and request-spec evidence. No GitLab 18.0 reference instance or pinned `glab` executable was run, so full wire-response equivalence and existing-client compatibility remain open. The user deferred the Linux 3.10.108 run for now.
+This source-backed fixture is now also verified against a disposable GitLab CE 18.0.0 instance and a pinned `glab` 1.58.0 client. See [the live-reference evidence](2026-09-19-gitlab-18-live-reference.md). Compatibility beyond the recorded endpoints and workflows remains open. The user deferred the Linux 3.10.108 run for now.
