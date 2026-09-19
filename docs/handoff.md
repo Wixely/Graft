@@ -14,6 +14,8 @@ Backups use a consistent SQLite backup plus the complete repository tree. Every 
 
 The main release gates are the durable DnaX package source, a real CA/DNS/client-trust environment and integrated static-musl execution on the required Linux 3.10.108 host. Windows Service, local operator-managed certificate loading, restart/replacement, systemd and container secret plumbing pass. Exact GitLab fixtures and interactive production-browser execution also remain open.
 
+Private project creation now passes through both the Blazor session API and the bounded GitLab-style REST route. The write route requires `api`, creates an empty durable repository through pending/ready publication, and rejects duplicates, invalid paths, unsupported visibility, and unsupported fields. The combined Windows JIT and NativeAOT harness now passes 76 assertions; see [project creation evidence](validation/2026-09-19-project-creation.md).
+
 No remote is configured. Do not deploy, publish, import production data, expose a network listener or select repository visibility without explicit authorization.
 
 ## Next work

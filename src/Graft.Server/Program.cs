@@ -4,6 +4,7 @@ using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using System.Text.Json;
 using Graft.Contracts;
 using Graft.Core;
 using Graft.Git;
@@ -132,6 +133,18 @@ app.MapGet("/api/projects", async context =>
     await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.ProjectResponseArray, null, context.RequestAborted);
 });
 
+app.MapPost("/api/projects", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    ProjectCreateRequest? request = await ReadProjectCreateRequest(context);
+    if (request is null) return;
+    await CreateProject(context, browser.Value.Identity, request);
+});
+
 app.MapGet("/api/browser/projects/{projectId:long}", async context =>
 {
     (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
@@ -192,6 +205,17 @@ app.MapGet("/api/v4/projects", async context =>
         response.Add(await ProjectResponseFor(context, project));
     SetPagination(context, page, perPage, projects.Total);
     await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.ProjectResponseArray, null, context.RequestAborted);
+});
+
+app.MapPost("/api/v4/projects", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: false);
+    if (identity is null) return;
+    if (!identity.TokenScopes.HasFlag(TokenScope.Api))
+    { await ApiError(context, 403, "403 Forbidden: insufficient_scope"); return; }
+    ProjectCreateRequest? request = await ReadProjectCreateRequest(context);
+    if (request is null) return;
+    await CreateProject(context, identity, request);
 });
 
 app.MapGet("/api/v4/projects/{projectId}/repository/branches", async context =>
@@ -425,6 +449,97 @@ async Task<AuthenticatedIdentity?> AuthenticateApi(HttpContext context, bool req
     }
     return identity;
 }
+
+async Task<ProjectCreateRequest?> ReadProjectCreateRequest(HttpContext context)
+{
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return null; }
+    try
+    {
+        using JsonDocument document = await JsonDocument.ParseAsync(context.Request.Body, cancellationToken: context.RequestAborted);
+        if (document.RootElement.ValueKind != JsonValueKind.Object)
+        { await ApiError(context, 400, "project must be a JSON object"); return null; }
+        string[] allowed = ["name", "path", "description", "visibility"];
+        string? unsupported = document.RootElement.EnumerateObject()
+            .Select(property => property.Name)
+            .FirstOrDefault(name => !allowed.Contains(name, StringComparer.Ordinal));
+        if (unsupported is not null)
+        { await ApiError(context, 400, "unsupported project property: " + unsupported); return null; }
+        ProjectCreateRequest? request = document.RootElement.Deserialize(ApiJson.Default.ProjectCreateRequest);
+        if (request is null) { await ApiError(context, 400, "project is required"); return null; }
+        return request;
+    }
+    catch (JsonException)
+    {
+        await ApiError(context, 400, "invalid JSON");
+        return null;
+    }
+}
+
+async Task CreateProject(HttpContext context, AuthenticatedIdentity identity, ProjectCreateRequest request)
+{
+    string name = request.Name?.Trim() ?? "";
+    string description = request.Description ?? "";
+    string visibility = request.Visibility ?? "private";
+    if (name.Length is < 1 or > 200) { await ApiError(context, 400, "name must be 1-200 characters"); return; }
+    if (description.Length > 2_000) { await ApiError(context, 400, "description must be at most 2000 characters"); return; }
+    if (!string.Equals(visibility, "private", StringComparison.Ordinal))
+    { await ApiError(context, 400, "visibility must be private"); return; }
+    string path = request.Path is null ? ProjectPathFromName(name) : request.Path.Trim();
+    if (!ValidProjectPath(path))
+    {
+        await ApiError(context, 400, "path must be 2-39 ASCII letters or numbers separated by single dots, underscores or hyphens");
+        return;
+    }
+    try
+    {
+        ProjectInfo project = await store.CreateProjectWithRepositoryAsync(identity, path, name,
+            (created, cancellationToken) =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                _ = EndpointFor(created);
+                return Task.CompletedTask;
+            }, description, context.RequestAborted);
+        ProjectDetails details = (await store.GetReadyProjectAsync(project.Id, context.RequestAborted))!;
+        context.Response.StatusCode = StatusCodes.Status201Created;
+        await context.Response.WriteAsJsonAsync(await ProjectResponseFor(context, details), ApiJson.Default.ProjectResponse, null, context.RequestAborted);
+    }
+    catch (ProjectConflictException)
+    {
+        await ApiError(context, 400, "path has already been taken");
+    }
+}
+
+static string ProjectPathFromName(string name)
+{
+    StringBuilder path = new(name.Length);
+    bool separator = false;
+    foreach (char character in name)
+    {
+        if (character is >= 'A' and <= 'Z') { path.Append((char)(character + ('a' - 'A'))); separator = false; }
+        else if (character is >= 'a' and <= 'z' or >= '0' and <= '9' or '_' or '-' or '.')
+        { path.Append(character); separator = false; }
+        else if (char.IsWhiteSpace(character) && path.Length > 0 && !separator)
+        { path.Append('-'); separator = true; }
+        else return "";
+    }
+    return path.ToString().TrimEnd('-');
+}
+
+static bool ValidProjectPath(string path)
+{
+    if (path.Length is < 2 or > 39 || !AsciiLetterOrNumber(path[0]) || !AsciiLetterOrNumber(path[^1])) return false;
+    bool previousSpecial = false;
+    foreach (char character in path)
+    {
+        if (AsciiLetterOrNumber(character)) { previousSpecial = false; continue; }
+        if (character is not ('_' or '-' or '.') || previousSpecial) return false;
+        previousSpecial = true;
+    }
+    return true;
+}
+
+static bool AsciiLetterOrNumber(char character) =>
+    character is >= 'A' and <= 'Z' or >= 'a' and <= 'z' or >= '0' and <= '9';
 
 async Task<ApiProject?> AuthorizeApiProject(HttpContext context, ProjectAction action)
 {

@@ -11,6 +11,13 @@ else if (Session?.Authenticated == true)
     <section>
         <div class="section-heading"><div><h2>Private projects</h2><p>Signed in as <strong>@Session.Username</strong></p></div>
             <button class="secondary" @onclick="Logout" disabled="@Busy">Sign out</button></div>
+        <form class="create-project" @onsubmit="CreateProject" @onsubmit:preventDefault>
+            <h3>Create a private project</h3>
+            <label for="project-name">Name</label><input id="project-name" @bind="ProjectName" required maxlength="200" />
+            <label for="project-path">Path (optional)</label><input id="project-path" @bind="ProjectPath" maxlength="39" pattern="[A-Za-z0-9][A-Za-z0-9._-]+" />
+            <label for="project-description">Description</label><input id="project-description" @bind="ProjectDescription" maxlength="2000" />
+            <button type="submit" disabled="@Busy">@(Busy ? "Creatingâ€¦" : "Create project")</button>
+        </form>
         @if (Projects.Length == 0) { <p>No accessible projects.</p> }
         @foreach (ProjectResponse project in Projects)
         {
@@ -37,6 +44,9 @@ else
     private ProjectResponse[] Projects = [];
     private string Username = "";
     private string Password = "";
+    private string ProjectName = "";
+    private string ProjectPath = "";
+    private string ProjectDescription = "";
     private string Message = "";
     private bool Loading = true;
     private bool Busy;
@@ -83,6 +93,33 @@ else
             await Refresh(); Message = "Signed out.";
         }
         catch (HttpRequestException) { Message = "Sign-out could not be confirmed."; }
+        finally { Busy = false; }
+    }
+
+    private async Task CreateProject()
+    {
+        if (Busy || Session is null) return;
+        Busy = true; Message = "";
+        try
+        {
+            using HttpRequestMessage request = new(HttpMethod.Post, "api/projects");
+            request.Headers.Add("X-Graft-CSRF", Session.Csrf);
+            string? path = string.IsNullOrWhiteSpace(ProjectPath) ? null : ProjectPath;
+            request.Content = JsonContent.Create(new ProjectCreateRequest(ProjectName, path, ProjectDescription, "private"),
+                ApiJson.Default.ProjectCreateRequest);
+            using HttpResponseMessage response = await Http.SendAsync(request);
+            if (response.IsSuccessStatusCode)
+            {
+                ProjectName = ""; ProjectPath = ""; ProjectDescription = "";
+                await Refresh(); Message = "Project created.";
+            }
+            else
+            {
+                ErrorResponse? error = await response.Content.ReadFromJsonAsync(ApiJson.Default.ErrorResponse);
+                Message = error?.Message ?? "Project creation failed.";
+            }
+        }
+        catch (HttpRequestException) { Message = "Project creation could not be confirmed."; }
         finally { Busy = false; }
     }
 }
