@@ -1,0 +1,16 @@
+services:
+  graft:
+    build:
+      context: ../..
+      dockerfile: deploy/container/Containerfile
+    ports:
+      - "127.0.0.1:8443:8443"
+    volumes:
+      - graft-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    restart: unless-stopped
+
+volumes:
+  graft-data:

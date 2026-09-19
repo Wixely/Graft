@@ -13,6 +13,7 @@
     <Project Path="tests/Graft.Acceptance/Graft.Acceptance.csproj" />
     <Project Path="tests/Graft.Git.Acceptance/Graft.Git.Acceptance.csproj" />
     <Project Path="tests/Graft.Operations.Acceptance/Graft.Operations.Acceptance.csproj" />
+    <Project Path="tests/Graft.Packaging.Acceptance/Graft.Packaging.Acceptance.csproj" />
   </Folder>
   <Folder Name="/experiments/" />
   <Folder Name="/experiments/compatibility/">

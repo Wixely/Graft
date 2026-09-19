@@ -1,0 +1,10 @@
+FROM mcr.microsoft.com/dotnet/runtime-deps:10.0-noble-chiseled-extra
+
+WORKDIR /app
+COPY --chown=1654:1654 --chmod=0755 artifacts/mvp08/server-linux-x64/ /app/
+COPY --chown=1654:1654 deploy/container/data/ /data/
+
+USER 1654:1654
+EXPOSE 8443
+VOLUME ["/data"]
+ENTRYPOINT ["/app/Graft.Server", "--database", "/data/graft.db", "--repositories", "/data/repositories", "--listen", "https://0.0.0.0:8443", "--origin", "https://localhost:8443"]

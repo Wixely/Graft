@@ -2,7 +2,7 @@
 
 Graft is a planned locally hosted GitLab alternative in C#/.NET 10. It targets GitLab APIs, URL conventions, applications and CI/CD, with simpler operations, permissions and runners, low resource use, and GitLab data import.
 
-Status as of **2026-09-19**: the [MVP-07 import and recovery slice](docs/validation/2026-09-19-mvp07-import-recovery.md) passes 36 operational assertions under Windows JIT and NativeAOT while retaining all 64 MVP-06 assertions. It adds repository-only import inventory/loss reporting, repeatable Git HTTPS import, enforced quiescence, hashed SQLite/repository backups, tamper detection, fresh-target restore and rollback rehearsal. DnaX distribution, production TLS/service packaging, a version-matched GitLab fixture, interactive browser execution, integrated static-musl publication and required-host execution remain gates. Remote hosting, visibility and project license are undecided. No remote is configured.
+Status as of **2026-09-19**: [MVP-08 packaging and resource validation](docs/validation/2026-09-19-mvp08-packaging-resources.md) conditionally passes. Windows NativeAOT interactive, Linux static-musl interactive, systemd and rootless Podman paths are implemented and measured; the Linux static binaries retain all 64 MVP-06 and 36 MVP-07 assertions. Live Windows Service acceptance is blocked by this session's lack of elevation, and the integrated static binaries still require execution on the mandatory Linux 3.10.108 host. DnaX distribution, production TLS, a version-matched GitLab fixture and interactive browser execution remain gates. Remote hosting, visibility and project license are undecided. No remote is configured.
 
 ## Start here
 
@@ -39,9 +39,11 @@ Linux static NativeAOT requires the separate toolchain/runbook; a Windows build 
 | `src/Graft.Git/`, `src/Graft.Server/` | Managed Git engine, repository read model, durable storage and authenticated HTTPS/API host |
 | `src/Graft.Client/`, `src/Graft.Contracts/` | Blazor WebAssembly repository browser and source-generated wire contracts |
 | `src/Graft.Operations/`, `src/Graft.Admin/` | Quiescence lease, backup/restore, import inventory and NativeAOT administration CLI |
+| `deploy/` | systemd, optional container and isolated static-musl build definitions |
 | `tests/Graft.Acceptance/` | Disposable MVP-04 persistence and authorization acceptance executable |
 | `tests/Graft.Git.Acceptance/` | Integrated MVP-06 real Git, repository API, browser-session, restart and revocation acceptance executable |
 | `tests/Graft.Operations.Acceptance/` | MVP-07 synthetic import, backup, tamper, restore and rollback acceptance executable |
+| `tests/Graft.Packaging.Acceptance/` | MVP-08 lifecycle, container and resource acceptance executable |
 | `experiments/compatibility/` | Probe source, pinned NuGet dependencies and build scripts |
 | `experiments/managed-git/` | Bounded C# smart HTTP/pack experiment; [runbook](experiments/managed-git/README.md) |
 | `experiments/managed-git-client/` | C# acceptance harness using installed Git as an independent test client |
@@ -52,4 +54,4 @@ Linux static NativeAOT requires the separate toolchain/runbook; a Windows build 
 
 The original discovery notes remain in the sibling [PLAN idea](../PLAN/inbox/local-git-forge.md). This repository is now the canonical implementation/handoff context. Private infrastructure details stay in PLAN; project docs use a neutral target-host description.
 
-Recommended next action - Owner: Implementation agent: begin **MVP-08** packaging and resource validation, starting with interactive and Windows Service lifecycle support plus a measured idle/load baseline. Owner: User/DnaX maintainer: make the tested DnaX packages available from an approved durable feed. Review [the operations runbook](docs/operations.md), [MVP plan](docs/mvp-plan.md) and [MVP-07 evidence](docs/validation/2026-09-19-mvp07-import-recovery.md).
+Recommended next action — Owner: User + implementation agent: run the elevated Windows Service acceptance and the integrated static-musl acceptance on Linux 3.10.108. Owner: Implementation agent: add operator-managed TLS certificate loading. Owner: User/DnaX maintainer: make the tested DnaX packages available from an approved durable feed. Review [the deployment runbook](docs/deployment.md), [MVP plan](docs/mvp-plan.md) and [MVP-08 evidence](docs/validation/2026-09-19-mvp08-packaging-resources.md).

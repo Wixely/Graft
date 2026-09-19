@@ -13,6 +13,7 @@ Set server breakpoints in `experiments/ui-server`. The browser client is publish
 | Debug MVP-04 accounts and permissions | Runs the disposable SQLite acceptance flow for accounts, projects, sessions, tokens, roles and revocation. |
 | Debug MVP-06 repository UI and API | Runs the real Git client, GitLab-style API and browser-session/repository checks against a disposable HTTPS server, SQLite database and durable object/ref directory. |
 | Debug MVP-07 import and recovery | Runs synthetic bundle inventory, repeatable Git HTTPS import, quiescence, backup/tamper/restore and rollback checks through the admin CLI. |
+| Debug MVP-08 interactive packaging checks | Starts the Debug server through the packaging harness and measures startup, working set and loopback health latency against provisional gates. |
 | Debug UI and authentication probe | Interactive UI with server C# breakpoints and browser opening. |
 | Debug compatibility probe | Runs the six compatibility checks and exits. |
 | Debug storage migration probe | Runs the disposable DnaX/SQLite migration checks and exits. |
@@ -29,4 +30,4 @@ Acceptance harnesses start child server processes. Their launch options debug th
 
 These `coreclr` options debug managed DLLs, not published NativeAOT executables. NativeAOT acceptance remains a separate runbook step. Automatic browser opening follows the [official C# debugger configuration](https://code.visualstudio.com/docs/csharp/debugger-settings), using the host's `READY` output in the Debug Console.
 
-Remaining verification: Owner: Developer — run the UI option with F5 and confirm a server breakpoint binds in the local VS Code installation. Configuration/build checks do not establish an interactive debugger session.
+The service, systemd, container and published NativeAOT checks remain command-line acceptance tasks because they require elevation, a Linux service manager or a container engine. Remaining verification: Owner: Developer — run the UI option with F5 and confirm a server breakpoint binds in the local VS Code installation. Configuration/build checks do not establish an interactive debugger session.
