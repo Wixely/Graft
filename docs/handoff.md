@@ -8,7 +8,9 @@ MVP-01 through MVP-07 pass within their recorded scopes. [MVP-08 packaging and r
 
 `src/Graft.Operations` now owns the offline maintenance lease, SHA-256 backup manifest, SQLite snapshot, safe repository-tree copying, verification, restore and Git bundle inventory. `src/Graft.Admin` exposes `bootstrap`, `backup`, `verify`, `restore` and `inspect-bundle` commands and publishes under NativeAOT. The server holds exclusive database and repository leases for its lifetime, so maintenance fails while it is running.
 
-`Graft.Admin bootstrap` now creates the first administrator from a protected password file while holding both maintenance leases. The 41-assertion operations workflow proves live-server exclusion, login, administrator status, hashed-at-rest storage and one-use refusal with both managed and Windows NativeAOT administration binaries. User creation and project membership still exist only in the storage/core policy and acceptance harness; they are the next product workflow gap.
+`Graft.Admin bootstrap` creates the first administrator from a protected password file while holding both maintenance leases. The 41-assertion operations workflow proves live-server exclusion, login, administrator status, hashed-at-rest storage and one-use refusal with both managed and Windows NativeAOT administration binaries.
+
+The authenticated product now exposes administrator-only ordinary-user creation and project-owner membership listing, grant, role change and revoke. The current Git/API/browser harness passes 97 assertions under the runtime and Windows NativeAOT server. MCPHub Chromium also completed the rendered create-user and Developer-to-Maintainer-to-revoke workflow with visible status messages and no console errors. Personal access tokens are still fixture-created, so a real user cannot yet obtain Git credentials through the product.
 
 The import evidence is deliberately repository-only. A C# bundle parser inventories branches/tags and emits eight explicit excluded metadata categories. Git 2.53.0.windows.2 imports the repository through the supported HTTPS route; repeating the import preserves the same refs and object IDs and leaves the source unchanged. This is not a GitLab API/export metadata importer.
 
@@ -22,7 +24,7 @@ No remote is configured. Do not deploy, publish, import production data, expose 
 
 ## Next work
 
-Keep the recorded static-musl server/admin pair available for the deferred Linux 3.10.108 run. Add authenticated administrator user creation and owner-managed project membership to the server and Blazor UI, retaining the shared authorization checks. Validate the intended CA-issued certificate, DNS, client trust and renewal path before non-loopback deployment.
+Keep the recorded static-musl server/admin pair available for the deferred Linux 3.10.108 run. Add personal access-token creation/list/revoke to the authenticated product workflow, returning a new secret exactly once. Validate the intended CA-issued certificate, DNS, client trust and renewal path before non-loopback deployment.
 
 Continue to use the ignored reproducible DnaX feed until the user or DnaX maintainer selects an approved durable package source. Do not substitute a server-side Git executable or native Git library.
 
@@ -30,9 +32,9 @@ Continue to use the ignored reproducible DnaX feed until the user or DnaX mainta
 
 | Work | Owner | Acceptance |
 | --- | --- | --- |
-| User and membership workflow | Implementation agent | Administrator creates an ordinary user; project owner grants, changes and revokes a direct role through the product UI/API |
+| Personal access tokens | Implementation agent | User creates a scoped, expiring token, sees its secret once, uses it for Git, and revokes it |
 | Deployment TLS trust | Operator + implementation agent | Intended CA certificate, DNS/SAN, client trust and renewal rehearsal |
 | Required legacy host | Implementation agent + user | Integrated static-musl artifact inspected and run on Linux 3.10.108 with sanitized evidence |
 | DnaX distribution | User/DnaX maintainer | Clean checkout restores without a sibling source tree or locally prepared feed |
 
-Recommended next action: Owner: Implementation agent — expose administrator user creation and owner-managed project membership through the authenticated product workflow. Remaining release gates: deployment CA/DNS trust, DnaX distribution and the deferred Linux 3.10.108 MVP-08 run.
+Recommended next action: Owner: Implementation agent — expose personal access-token creation and revocation through the authenticated product workflow. Remaining release gates: deployment CA/DNS trust, DnaX distribution and the deferred Linux 3.10.108 MVP-08 run.

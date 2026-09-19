@@ -83,8 +83,8 @@ app.MapGet("/api/session", async context =>
     if (!await OnlyQuery(context)) return;
     (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: false);
     SessionResponse response = browser is null
-        ? new(false, null, "")
-        : new(true, browser.Value.Identity.Username, Csrf(browser.Value.Secret));
+        ? new(false, null, false, "")
+        : new(true, browser.Value.Identity.Username, browser.Value.Identity.IsAdministrator, Csrf(browser.Value.Secret));
     await context.Response.WriteAsJsonAsync(response, ApiJson.Default.SessionResponse, null, context.RequestAborted);
 });
 
@@ -107,7 +107,7 @@ app.MapPost("/api/login", async context =>
     if (grant is null) { await ApiError(context, 401, "credentials"); return; }
     context.Response.Cookies.Append(SessionCookie, grant.Secret, SessionCookieOptions(grant.ExpiresAtUtc));
     AuthenticatedIdentity identity = (await store.ResolveSessionAsync(grant.Secret, context.RequestAborted))!;
-    await context.Response.WriteAsJsonAsync(new SessionResponse(true, identity.Username, Csrf(grant.Secret)),
+    await context.Response.WriteAsJsonAsync(new SessionResponse(true, identity.Username, identity.IsAdministrator, Csrf(grant.Secret)),
         ApiJson.Default.SessionResponse, null, context.RequestAborted);
 });
 
@@ -121,6 +121,29 @@ app.MapPost("/api/logout", async context =>
     await store.LogoutAsync(browser.Value.Secret, context.RequestAborted);
     context.Response.Cookies.Delete(SessionCookie, SessionCookieOptions(null));
     context.Response.StatusCode = StatusCodes.Status204NoContent;
+});
+
+app.MapPost("/api/users", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!browser.Value.Identity.IsAdministrator) { await ApiError(context, 403, "administrator"); return; }
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    UserCreateRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.UserCreateRequest, context.RequestAborted);
+    if (request?.Username is not { Length: >= 2 and <= 39 } || request.Password is not { Length: >= 16 and <= 256 })
+    { await ApiError(context, 400, "user"); return; }
+    try
+    {
+        UserAccount user = await store.CreateUserAsync(browser.Value.Identity, request.Username, request.Password, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status201Created;
+        await context.Response.WriteAsJsonAsync(new UserAccountResponse(user.Id, user.Username, user.IsAdministrator),
+            ApiJson.Default.UserAccountResponse, null, context.RequestAborted);
+    }
+    catch (ArgumentException) { await ApiError(context, 400, "username"); }
+    catch (UserConflictException) { await ApiError(context, 400, "username has already been taken"); }
 });
 
 app.MapGet("/api/projects", async context =>
@@ -146,6 +169,63 @@ app.MapPost("/api/projects", async context =>
     await CreateProject(context, browser.Value.Identity, request);
 });
 
+app.MapGet("/api/projects/{projectId:long}/members", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!await OnlyQuery(context)) return;
+    long projectId = Convert.ToInt64(context.Request.RouteValues["projectId"], System.Globalization.CultureInfo.InvariantCulture);
+    try
+    {
+        IReadOnlyList<ProjectMember> members = await store.ListProjectMembersAsync(browser.Value.Identity, projectId, context.RequestAborted);
+        ProjectMemberResponse[] response = members.Select(member =>
+            new ProjectMemberResponse(member.UserId, member.Username, member.Role.ToString())).ToArray();
+        await context.Response.WriteAsJsonAsync(response, ApiJson.Default.ProjectMemberResponseArray, null, context.RequestAborted);
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "project"); }
+});
+
+app.MapPost("/api/projects/{projectId:long}/members", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    MembershipSetRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.MembershipSetRequest, context.RequestAborted);
+    if (request is null || !Enum.TryParse(request.Role, ignoreCase: true, out ProjectRole role) || !Enum.IsDefined(role))
+    { await ApiError(context, 400, "role"); return; }
+    long projectId = Convert.ToInt64(context.Request.RouteValues["projectId"], System.Globalization.CultureInfo.InvariantCulture);
+    try
+    {
+        UserAccount? user = await store.FindActiveUserAsync(request.Username, context.RequestAborted);
+        if (user is null) { await ApiError(context, 400, "user is unavailable"); return; }
+        await store.SetMembershipAsync(browser.Value.Identity, projectId, user.Id, role, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (ArgumentException) { await ApiError(context, 400, "username"); }
+    catch (InvalidOperationException error) { await ApiError(context, 400, error.Message); }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "project"); }
+});
+
+app.MapDelete("/api/projects/{projectId:long}/members/{userId:long}", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    long projectId = Convert.ToInt64(context.Request.RouteValues["projectId"], System.Globalization.CultureInfo.InvariantCulture);
+    long userId = Convert.ToInt64(context.Request.RouteValues["userId"], System.Globalization.CultureInfo.InvariantCulture);
+    try
+    {
+        await store.RevokeMembershipAsync(browser.Value.Identity, projectId, userId, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "project"); }
+});
+
 app.MapGet("/api/browser/projects/{projectId:long}", async context =>
 {
     (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
@@ -168,6 +248,7 @@ app.MapGet("/api/browser/projects/{projectId:long}", async context =>
         if (filePath.Length > 0 && file is null) { await ApiError(context, 404, "file"); return; }
         ProjectResponse project = await ProjectResponseForLocked(context, details, repository);
         PermissionDecision push = await store.GetPermissionAsync(browser.Value.Identity, projectId, ProjectAction.PushRepository, context.RequestAborted);
+        PermissionDecision manage = await store.GetPermissionAsync(browser.Value.Identity, projectId, ProjectAction.ManageProject, context.RequestAborted);
         BranchResponse[] branches = RepositoryView.Branches(repository).Select(branch => new BranchResponse(
             branch.Name, false, false, branch.Name == "main", true, true, push.Allowed,
             ProjectWebUrl(context, details) + "/-/tree/" + Uri.EscapeDataString(branch.Name),
@@ -176,7 +257,7 @@ app.MapGet("/api/browser/projects/{projectId:long}", async context =>
             .Select(commit => CommitResponseFor(context, details, commit)).ToArray();
         TreeEntryResponse[] entries = tree.Select(entry => new TreeEntryResponse(entry.Id, entry.Name, entry.Type, entry.Path, entry.Mode)).ToArray();
         FileResponse? fileResponse = file is null ? null : FileResponseFor(file, revision);
-        RepositoryPageResponse response = new(project, branches, commits, entries, fileResponse);
+        RepositoryPageResponse response = new(project, manage.Allowed, branches, commits, entries, fileResponse);
         await context.Response.WriteAsJsonAsync(response, ApiJson.Default.RepositoryPageResponse, null, context.RequestAborted);
     });
 });

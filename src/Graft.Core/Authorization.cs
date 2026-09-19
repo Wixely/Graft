@@ -110,6 +110,7 @@ public static class ProjectAuthorization
 }
 
 public sealed record UserAccount(long Id, string Username, bool IsAdministrator, bool Disabled);
+public sealed record ProjectMember(long UserId, string Username, ProjectRole Role);
 public sealed record ProjectInfo(long Id, long OwnerUserId, string Namespace, string Slug, string Name, string StorageId);
 public sealed record ProjectDetails(ProjectInfo Project, string Description, DateTimeOffset CreatedAtUtc);
 public sealed record ProjectPage(IReadOnlyList<ProjectDetails> Projects, long Total);

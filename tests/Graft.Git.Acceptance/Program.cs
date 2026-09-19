@@ -114,6 +114,7 @@ try
 
     await CheckApi(address, aliceApiToken.Secret, aliceReadApiToken.Secret, aliceToken.Secret, bobApiToken.Secret, project.Id, firstHead);
     await CheckBrowser(address, "alice", alicePassword, project.Id);
+    await CheckUserAdministration(address, adminPassword, Password());
 
     File.AppendAllText(Path.Combine(source, "readme.txt"), "second revision\n");
     await Git(source, ["add", "."]);
@@ -536,6 +537,51 @@ async Task CheckBrowser(string address, string username, string password, long p
         Check(projects.IsSuccessStatusCode && json.RootElement.EnumerateArray().Any(item =>
             item.GetProperty("id").GetInt64() == projectId), "browser project visibility");
     }
+    using (HttpRequestMessage createUser = new(HttpMethod.Post, "/api/users")
+    {
+        Content = JsonContent.Create(new { username = "forbidden-user", password = Password() })
+    })
+    {
+        createUser.Headers.Add("Origin", address);
+        createUser.Headers.Add("X-Graft-CSRF", csrf);
+        using HttpResponseMessage response = await client.SendAsync(createUser);
+        Check(response.StatusCode == System.Net.HttpStatusCode.Forbidden, "ordinary browser user cannot create users");
+    }
+    using (HttpRequestMessage grant = new(HttpMethod.Post, $"/api/projects/{projectId}/members")
+    {
+        Content = JsonContent.Create(new { username = "carol", role = "Reporter" })
+    })
+    {
+        grant.Headers.Add("Origin", address);
+        grant.Headers.Add("X-Graft-CSRF", csrf);
+        using HttpResponseMessage response = await client.SendAsync(grant);
+        Check(response.StatusCode == System.Net.HttpStatusCode.NoContent, "browser grants project membership");
+    }
+    long carolId;
+    using (HttpResponseMessage members = await client.GetAsync($"/api/projects/{projectId}/members"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await members.Content.ReadAsStreamAsync());
+        JsonElement carol = json.RootElement.EnumerateArray().Single(item => item.GetProperty("username").GetString() == "carol");
+        carolId = carol.GetProperty("user_id").GetInt64();
+        Check(members.IsSuccessStatusCode && carol.GetProperty("role").GetString() == "Reporter", "browser lists project membership");
+    }
+    using (HttpRequestMessage update = new(HttpMethod.Post, $"/api/projects/{projectId}/members")
+    {
+        Content = JsonContent.Create(new { username = "carol", role = "Developer" })
+    })
+    {
+        update.Headers.Add("Origin", address);
+        update.Headers.Add("X-Graft-CSRF", csrf);
+        using HttpResponseMessage response = await client.SendAsync(update);
+        Check(response.StatusCode == System.Net.HttpStatusCode.NoContent, "browser changes project membership");
+    }
+    using (HttpRequestMessage revoke = new(HttpMethod.Delete, $"/api/projects/{projectId}/members/{carolId}"))
+    {
+        revoke.Headers.Add("Origin", address);
+        revoke.Headers.Add("X-Graft-CSRF", csrf);
+        using HttpResponseMessage response = await client.SendAsync(revoke);
+        Check(response.StatusCode == System.Net.HttpStatusCode.NoContent, "browser revokes project membership");
+    }
     using HttpRequestMessage rejectedCreate = new(HttpMethod.Post, "/api/projects")
     {
         Content = JsonContent.Create(new { name = "Rejected browser", path = "rejected-browser", visibility = "private" })
@@ -576,6 +622,57 @@ async Task CheckBrowser(string address, string username, string password, long p
         Check(response.StatusCode == System.Net.HttpStatusCode.NoContent, "browser logout");
     using (HttpResponseMessage replay = await client.GetAsync("/api/projects"))
         Check(replay.StatusCode == System.Net.HttpStatusCode.Unauthorized, "logged-out browser session rejected");
+}
+
+async Task CheckUserAdministration(string address, string adminPassword, string createdPassword)
+{
+    CookieContainer cookies = new();
+    using HttpClientHandler handler = new()
+    {
+        CookieContainer = cookies,
+        ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
+        UseProxy = false
+    };
+    using HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
+    using HttpRequestMessage login = new(HttpMethod.Post, "/api/login")
+    {
+        Content = JsonContent.Create(new { username = "admin", password = adminPassword })
+    };
+    login.Headers.Add("Origin", address);
+    using (HttpResponseMessage response = await client.SendAsync(login)) Check(response.IsSuccessStatusCode, "administrator browser login");
+    string csrf;
+    using (HttpResponseMessage session = await client.GetAsync("/api/session"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await session.Content.ReadAsStreamAsync());
+        csrf = json.RootElement.GetProperty("csrf").GetString()!;
+        Check(json.RootElement.GetProperty("is_administrator").GetBoolean(), "browser session exposes administrator status");
+    }
+    using (HttpRequestMessage create = new(HttpMethod.Post, "/api/users")
+    {
+        Content = JsonContent.Create(new { username = "webuser", password = createdPassword })
+    })
+    {
+        create.Headers.Add("Origin", address);
+        create.Headers.Add("X-Graft-CSRF", csrf);
+        using HttpResponseMessage response = await client.SendAsync(create);
+        Check(response.StatusCode == System.Net.HttpStatusCode.Created, "administrator creates user in browser API");
+    }
+    using (HttpRequestMessage duplicate = new(HttpMethod.Post, "/api/users")
+    {
+        Content = JsonContent.Create(new { username = "webuser", password = createdPassword })
+    })
+    {
+        duplicate.Headers.Add("Origin", address);
+        duplicate.Headers.Add("X-Graft-CSRF", csrf);
+        using HttpResponseMessage response = await client.SendAsync(duplicate);
+        Check(response.StatusCode == System.Net.HttpStatusCode.BadRequest, "browser user creation rejects duplicate username");
+    }
+    using HttpRequestMessage createdLogin = new(HttpMethod.Post, "/api/login")
+    {
+        Content = JsonContent.Create(new { username = "webuser", password = createdPassword })
+    };
+    createdLogin.Headers.Add("Origin", address);
+    using (HttpResponseMessage response = await client.SendAsync(createdLogin)) Check(response.IsSuccessStatusCode, "browser-created user can log in");
 }
 
 void TestInterruptedCommitsLeaveRefsUnchanged(Repository current, string repositoryPath)
