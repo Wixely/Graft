@@ -56,6 +56,20 @@ else if (Session?.Authenticated == true)
                         <button type="submit" disabled="@Busy">Reset password</button>
                     </form>
                 }
+                @if (DisabledUsers.Length > 0)
+                {
+                    <form @onsubmit="EnableUser" @onsubmit:preventDefault>
+                        <h4>Re-enable an account</h4>
+                        <p>A fresh password is required. Older sessions and tokens stay revoked.</p>
+                        <label for="enable-user">User</label>
+                        <select id="enable-user" @bind="EnableUserId">
+                            @foreach (UserAccountResponse user in DisabledUsers) { <option value="@user.Id">@user.Username</option> }
+                        </select>
+                        <label for="enable-password">Fresh password</label><input id="enable-password" type="password" @bind="EnablePasswordValue" required minlength="16" maxlength="256" autocomplete="new-password" />
+                        <label for="enable-password-confirm">Confirm fresh password</label><input id="enable-password-confirm" type="password" @bind="EnablePasswordConfirmation" required minlength="16" maxlength="256" autocomplete="new-password" />
+                        <button type="submit" disabled="@Busy">Re-enable account</button>
+                    </form>
+                }
             </div>
         }
         <form class="create-project" @onsubmit="ChangePassword" @onsubmit:preventDefault>
@@ -130,6 +144,9 @@ else
     private long ResetUserId;
     private string ResetPasswordValue = "";
     private string ResetPasswordConfirmation = "";
+    private long EnableUserId;
+    private string EnablePasswordValue = "";
+    private string EnablePasswordConfirmation = "";
     private long? PendingDisableUserId;
     private string TokenName = "";
     private int TokenLifetimeDays = 30;
@@ -158,6 +175,7 @@ else
         Users = Session?.IsAdministrator == true
             ? await Http.GetFromJsonAsync("api/users", ApiJson.Default.UserAccountResponseArray) ?? [] : [];
         if (!ResettableUsers.Any(user => user.Id == ResetUserId)) ResetUserId = ResettableUsers.FirstOrDefault()?.Id ?? 0;
+        if (!DisabledUsers.Any(user => user.Id == EnableUserId)) EnableUserId = DisabledUsers.FirstOrDefault()?.Id ?? 0;
         if (Session?.Authenticated != true) CreatedToken = null;
     }
 
@@ -309,7 +327,32 @@ else
         finally { Busy = false; }
     }
 
+    private async Task EnableUser()
+    {
+        if (Busy || Session is null || EnableUserId == 0) return;
+        if (EnablePasswordValue != EnablePasswordConfirmation) { Message = "Fresh passwords do not match."; return; }
+        Busy = true; Message = ""; CreatedToken = null; PendingDisableUserId = null;
+        try
+        {
+            string username = DisabledUsers.FirstOrDefault(user => user.Id == EnableUserId)?.Username ?? "User";
+            using HttpRequestMessage request = new(HttpMethod.Post, $"api/users/{EnableUserId}/enable");
+            request.Headers.Add("X-Graft-CSRF", Session.Csrf);
+            request.Content = JsonContent.Create(new PasswordResetRequest(EnablePasswordValue), ApiJson.Default.PasswordResetRequest);
+            using HttpResponseMessage response = await Http.SendAsync(request);
+            EnablePasswordValue = ""; EnablePasswordConfirmation = "";
+            if (response.IsSuccessStatusCode) { await Refresh(); Message = $"{username} re-enabled with a fresh password. Older sessions and tokens remain revoked."; }
+            else
+            {
+                ErrorResponse? error = await response.Content.ReadFromJsonAsync(ApiJson.Default.ErrorResponse);
+                Message = error?.Message ?? "Account re-enable failed.";
+            }
+        }
+        catch (HttpRequestException) { EnablePasswordValue = ""; EnablePasswordConfirmation = ""; Message = "Account re-enable could not be confirmed."; }
+        finally { Busy = false; }
+    }
+
     private UserAccountResponse[] ResettableUsers => Users.Where(user => !user.Disabled && user.Username != Session?.Username).ToArray();
+    private UserAccountResponse[] DisabledUsers => Users.Where(user => user.Disabled).ToArray();
 
     private async Task CreateToken()
     {

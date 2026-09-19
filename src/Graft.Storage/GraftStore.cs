@@ -183,6 +183,27 @@ public sealed class GraftStore : IAsyncDisposable
         await transaction.CommitAsync(cancellationToken);
     }
 
+    public async Task EnableUserAsync(
+        AuthenticatedIdentity actor,
+        long userId,
+        string newPassword,
+        CancellationToken cancellationToken = default)
+    {
+        if (actor.UserId == userId) throw new InvalidOperationException("Administrators cannot enable their current account.");
+        string passwordHash = PasswordHash.Create(newPassword);
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
+        AuthenticatedIdentity liveActor = await RequireLiveIdentityAsync(db, transaction, actor, cancellationToken);
+        if (!liveActor.IsAdministrator) throw new UnauthorizedAccessException("Administrator access is required.");
+        string now = Now();
+        int changed = await db.ExecuteAsync("UPDATE Users SET PasswordHash = @PasswordHash, Disabled = 0 WHERE Id = @Id AND Disabled = 1;",
+            new PasswordUpdateParameters(userId, passwordHash), transaction);
+        if (changed != 1) throw new InvalidOperationException("User is unavailable or already active.");
+        await RevokeUserCredentialsAsync(db, transaction, userId, now);
+        await AuditAsync(db, transaction, actor.UserId, "enable-user", "user", userId.ToString(CultureInfo.InvariantCulture), "User enabled with a fresh password; older credentials remain revoked.", now);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
     public async Task<SessionGrant?> LoginAsync(
         string username,
         string password,
