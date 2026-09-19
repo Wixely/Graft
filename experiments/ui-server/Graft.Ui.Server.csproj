@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk.Web" TreatAsLocalProperty="_AllowedClientPublishDir">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <PublishAot Condition="'$(UiProbeAot)' == 'true'">true</PublishAot>
+    <PublishIISAssets>false</PublishIISAssets>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <NuGetLockFilePath Condition="'$(UiProbeAot)' == 'true'">packages.$(RuntimeIdentifier).native.lock.json</NuGetLockFilePath>
+    <ClientPublishDir>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)/../../artifacts/ui/client/'))</ClientPublishDir>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../ui-contracts/Graft.Ui.Contracts.csproj" />
+    <Content Update="NuGet.config" CopyToPublishDirectory="Never" />
+  </ItemGroup>
+  <Target Name="PublishProbeClient" BeforeTargets="PrepareForBuild" Condition="'$(DesignTimeBuild)' != 'true'">
+    <PropertyGroup><_AllowedClientPublishDir>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)/../../artifacts/ui/client/'))</_AllowedClientPublishDir></PropertyGroup>
+    <Error Condition="'$(ClientPublishDir)' != '$(_AllowedClientPublishDir)'" Text="Client asset cleanup is restricted to this repository's artifacts/ui/client directory." />
+    <RemoveDir Directories="$(ClientPublishDir)" />
+    <MSBuild Projects="../ui-client/Graft.Ui.Client.csproj" Targets="Restore;Publish" BuildInParallel="false"
+      RemoveProperties="RuntimeIdentifier;SelfContained;PublishAot;PublishTrimmed;OutputPath;TargetFramework;NoBuild;NoRestore;CurrentSolutionConfigurationContents;BuildingSolutionFile"
+      Properties="Configuration=Release;PublishDir=$(ClientPublishDir);BuildProjectReferences=true" />
+    <ItemGroup>
+      <_ProbeAsset Include="$(ClientPublishDir)wwwroot/**/*" Exclude="$(ClientPublishDir)wwwroot/**/*.pdb;$(ClientPublishDir)wwwroot/**/*.map" />
+      <EmbeddedResource Include="@(_ProbeAsset)">
+        <LogicalName>web/%(_ProbeAsset.RecursiveDir)%(_ProbeAsset.Filename)%(_ProbeAsset.Extension)</LogicalName>
+      </EmbeddedResource>
+    </ItemGroup>
+  </Target>
+</Project>

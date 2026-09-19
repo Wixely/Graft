@@ -1,0 +1,99 @@
+@page "/"
+@page "/projects"
+@inject HttpClient Http
+
+<PageTitle>Graft · Projects</PageTitle>
+<header><a class="brand" href="/">Graft<span class="mark" aria-hidden="true">/</span></a><span class="badge">Local experiment</span></header>
+<main>
+    <p class="eyebrow">YOUR WORK, CLOSE TO HOME</p>
+    <h1>A place for your code.</h1>
+    <p class="intro">Private repositories. Clear access. A quieter way to build.</p>
+    @if (Loading)
+    {
+        <p role="status">Connecting…</p>
+    }
+    else if (Session?.Authenticated == true)
+    {
+        <section aria-labelledby="projects-title">
+            <div class="section-heading"><div><h2 id="projects-title">Your projects</h2><p>Signed in as <strong>@Session.User</strong></p></div>
+                <button class="secondary" @onclick="Logout" disabled="@Busy">Sign out</button></div>
+            @foreach (var project in Projects)
+            {
+                <article class="project"><span class="project-icon" aria-hidden="true">G</span><div><h3>@project.Name</h3><p>@project.Description</p></div><span class="private">Private</span></article>
+            }
+            <p class="note">Synthetic project data for this local feasibility check.</p>
+        </section>
+    }
+    else
+    {
+        <section class="sign-in" aria-labelledby="signin-title">
+            <h2 id="signin-title">Welcome back</h2><p>Sign in to see your projects.</p>
+            <form @onsubmit="Login" @onsubmit:preventDefault>
+                <label for="username">Username</label><input id="username" name="username" autocomplete="username" @bind="Username" required maxlength="80" />
+                <label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" @bind="Password" required maxlength="256" />
+                <button type="submit" disabled="@(Busy || Session is null)">@(Busy ? "Signing in…" : "Sign in")</button>
+            </form>
+        </section>
+    }
+    @if (Message.Length > 0) { <p role="status" class="message">@Message</p> }
+</main>
+<footer>Graft <span>Made to run on your terms.</span></footer>
+
+@code {
+    private SessionView? Session;
+    private ProjectView[] Projects = [];
+    private string Username = "";
+    private string Password = "";
+    private string Message = "";
+    private bool Loading = true;
+    private bool Busy;
+
+    protected override async Task OnInitializedAsync()
+    {
+        try { await Refresh(); }
+        catch (HttpRequestException) { Message = "Unable to connect. Refresh the page to try again."; }
+        finally { Loading = false; }
+    }
+
+    private async Task Refresh()
+    {
+        Session = await Http.GetFromJsonAsync("api/session", UiJson.Default.SessionView);
+        Projects = Session?.Authenticated == true
+            ? await Http.GetFromJsonAsync("api/projects", UiJson.Default.ProjectViewArray) ?? [] : [];
+    }
+
+    private async Task Login()
+    {
+        if (Busy || Session is null) return;
+        Busy = true; Message = "";
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, "api/login");
+            request.Headers.Add("X-Graft-CSRF", Session.Csrf);
+            request.Content = JsonContent.Create(new LoginRequest(Username, Password), UiJson.Default.LoginRequest);
+            using var response = await Http.SendAsync(request);
+            Password = "";
+            if (response.IsSuccessStatusCode) { await Refresh(); Message = "Signed in."; }
+            else { Message = response.StatusCode == HttpStatusCode.Unauthorized ? "Username or password was not accepted." : "Sign-in could not be completed. Please try again."; await Refresh(); }
+        }
+        catch (HttpRequestException) { Password = ""; Message = "Unable to connect. Please try again."; }
+        finally { Busy = false; }
+    }
+
+    private async Task Logout()
+    {
+        if (Busy || Session is null) return;
+        Busy = true;
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, "api/logout");
+            request.Headers.Add("X-Graft-CSRF", Session.Csrf);
+            using var response = await Http.SendAsync(request);
+            response.EnsureSuccessStatusCode();
+            Projects = []; Session = null;
+            await Refresh(); Message = "Signed out.";
+        }
+        catch (HttpRequestException) { Message = "Sign-out could not be confirmed. Please try again."; }
+        finally { Busy = false; }
+    }
+}
