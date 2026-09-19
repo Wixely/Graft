@@ -1,4 +1,4 @@
-# Import and recovery operations
+# Operator operations
 
 Updated: 2026-09-19. Owner: Operator. Review when storage layout, schema, import scope or service lifecycle changes.
 
@@ -9,6 +9,20 @@ Updated: 2026-09-19. Owner: Operator. Review when storage layout, schema, import
 Backups are directories containing `database.sqlite`, `repositories/` and `manifest.json`. The manifest inventories all repository directories and records every file's length and SHA-256. Verification rejects missing, extra, changed or linked content and runs SQLite `integrity_check`.
 
 Keep backups on storage with access controls appropriate for password hashes, token/session digests, audit data and private repository content. The backup is not encrypted by Graft.
+
+## First administrator
+
+Before the first server start, create the initial administrator from a protected UTF-8 password file:
+
+```powershell
+dotnet src\Graft.Admin\bin\Release\net10.0\Graft.Admin.dll bootstrap `
+  --database C:\GraftData\graft.db `
+  --repositories C:\GraftData\repositories `
+  --username operator `
+  --password-file C:\GraftSecrets\bootstrap-password.txt
+```
+
+The password must be 16-256 characters on one line; one trailing line ending is accepted. The command stores only the versioned password hash, never prints the password, and succeeds only while the user database is empty. It takes the same exclusive maintenance leases as backup and restore, so stop Graft before running it. Securely remove the password file after verifying the administrator can sign in.
 
 ## Backup and verification
 
