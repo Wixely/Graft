@@ -55,6 +55,7 @@ public sealed class WebAssets
             ".js" or ".mjs" => "text/javascript; charset=utf-8",
             ".json" => "application/json",
             ".wasm" => "application/wasm",
+            ".png" => "image/png",
             _ => "application/octet-stream"
         };
         if (selected is not null) context.Response.Headers.ContentEncoding = selected;
