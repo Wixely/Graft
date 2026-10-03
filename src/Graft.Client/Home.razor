@@ -1,415 +1,124 @@
 @page "/"
 @page "/projects"
-@inject HttpClient Http
+@inject GraftApi Api
+@inject NavigationManager Navigation
 
-<PageTitle>Graft · Projects</PageTitle>
-<p class="eyebrow">YOUR PROJECTS</p>
-<h1>Code, kept close.</h1>
-@if (Loading) { <p role="status">Loading…</p> }
-else if (Session?.Authenticated == true)
+<PageTitle>Projects &middot; Graft</PageTitle>
+
+@if (loading)
 {
-    <section>
-        <div class="section-heading"><div><h2>Private projects</h2><p>Signed in as <strong>@Session.Username</strong></p></div>
-            <button class="secondary" @onclick="Logout" disabled="@Busy">Sign out</button></div>
-        <form class="create-project" @onsubmit="CreateProject" @onsubmit:preventDefault>
-            <h3>Create a private project</h3>
-            <label for="project-name">Name</label><input id="project-name" @bind="ProjectName" required maxlength="200" />
-            <label for="project-path">Path (optional)</label><input id="project-path" @bind="ProjectPath" minlength="2" maxlength="39" pattern="[A-Za-z0-9](?:[A-Za-z0-9]|[._\-][A-Za-z0-9])+" />
-            <label for="project-description">Description</label><input id="project-description" @bind="ProjectDescription" maxlength="2000" />
-            <button type="submit" disabled="@Busy">@(Busy ? "Creating…" : "Create project")</button>
-        </form>
-        @if (Session.IsAdministrator)
-        {
-            <form class="create-project" @onsubmit="CreateUser" @onsubmit:preventDefault>
-                <h3>Create a user</h3>
-                <label for="new-username">Username</label><input id="new-username" @bind="NewUsername" required minlength="2" maxlength="39" pattern="[A-Za-z0-9][A-Za-z0-9._\-]*" autocomplete="off" />
-                <label for="new-password">Temporary password</label><input id="new-password" type="password" @bind="NewPassword" required minlength="16" maxlength="256" autocomplete="new-password" />
-                <button type="submit" disabled="@Busy">@(Busy ? "Creating…" : "Create user")</button>
-            </form>
-        }
-        @if (Session.IsAdministrator)
-        {
-            <div class="create-project account-admin">
-                <h3>Manage users</h3>
-                @foreach (UserAccountResponse user in Users)
-                {
-                    <div class="section-heading user-row">
-                        <p><strong>@user.Username</strong><small>@(user.IsAdministrator ? "Administrator" : "User") · @(user.Disabled ? "Disabled" : "Active")</small></p>
-                        @if (!user.Disabled && user.Username != Session.Username)
-                        {
-                            <button type="button" class="@(PendingDisableUserId == user.Id ? "danger" : "secondary")" @onclick="() => DisableUser(user)" disabled="@Busy">
-                                @(PendingDisableUserId == user.Id ? "Confirm disable" : "Disable")
-                            </button>
-                        }
-                    </div>
-                }
-                @if (ResettableUsers.Length > 0)
-                {
-                    <form @onsubmit="ResetPassword" @onsubmit:preventDefault>
-                        <h4>Reset a password</h4>
-                        <label for="reset-user">User</label>
-                        <select id="reset-user" @bind="ResetUserId">
-                            @foreach (UserAccountResponse user in ResettableUsers) { <option value="@user.Id">@user.Username</option> }
-                        </select>
-                        <label for="reset-password">Temporary password</label><input id="reset-password" type="password" @bind="ResetPasswordValue" required minlength="16" maxlength="256" autocomplete="new-password" />
-                        <label for="reset-password-confirm">Confirm temporary password</label><input id="reset-password-confirm" type="password" @bind="ResetPasswordConfirmation" required minlength="16" maxlength="256" autocomplete="new-password" />
-                        <button type="submit" disabled="@Busy">Reset password</button>
-                    </form>
-                }
-                @if (DisabledUsers.Length > 0)
-                {
-                    <form @onsubmit="EnableUser" @onsubmit:preventDefault>
-                        <h4>Re-enable an account</h4>
-                        <p>A fresh password is required. Older sessions and tokens stay revoked.</p>
-                        <label for="enable-user">User</label>
-                        <select id="enable-user" @bind="EnableUserId">
-                            @foreach (UserAccountResponse user in DisabledUsers) { <option value="@user.Id">@user.Username</option> }
-                        </select>
-                        <label for="enable-password">Fresh password</label><input id="enable-password" type="password" @bind="EnablePasswordValue" required minlength="16" maxlength="256" autocomplete="new-password" />
-                        <label for="enable-password-confirm">Confirm fresh password</label><input id="enable-password-confirm" type="password" @bind="EnablePasswordConfirmation" required minlength="16" maxlength="256" autocomplete="new-password" />
-                        <button type="submit" disabled="@Busy">Re-enable account</button>
-                    </form>
-                }
-            </div>
-        }
-        <form class="create-project" @onsubmit="ChangePassword" @onsubmit:preventDefault>
-            <h3>Change your password</h3>
-            <p>This signs you out everywhere and revokes your personal access tokens.</p>
-            <label for="current-password">Current password</label><input id="current-password" type="password" @bind="CurrentPassword" required minlength="16" maxlength="256" autocomplete="current-password" />
-            <label for="changed-password">New password</label><input id="changed-password" type="password" @bind="ChangedPassword" required minlength="16" maxlength="256" autocomplete="new-password" />
-            <label for="changed-password-confirm">Confirm new password</label><input id="changed-password-confirm" type="password" @bind="ChangedPasswordConfirmation" required minlength="16" maxlength="256" autocomplete="new-password" />
-            <button type="submit" disabled="@Busy">Change password</button>
-        </form>
-        <form class="create-project" @onsubmit="CreateToken" @onsubmit:preventDefault>
-            <h3>Create a personal access token</h3>
-            <label for="token-name">Name</label><input id="token-name" @bind="TokenName" required maxlength="100" />
-            <label for="token-lifetime">Expires after</label>
-            <select id="token-lifetime" @bind="TokenLifetimeDays"><option value="30">30 days</option><option value="90">90 days</option><option value="180">180 days</option><option value="365">365 days</option></select>
-            <fieldset><legend>Scopes</legend>
-                <label class="scope-option"><input type="checkbox" @bind="TokenReadApi" /> Read API</label>
-                <label class="scope-option"><input type="checkbox" @bind="TokenApi" /> API</label>
-                <label class="scope-option"><input type="checkbox" @bind="TokenReadRepository" /> Read repositories</label>
-                <label class="scope-option"><input type="checkbox" @bind="TokenWriteRepository" /> Write repositories</label>
-            </fieldset>
-            <button type="submit" disabled="@Busy">@(Busy ? "Creating…" : "Create token")</button>
-        </form>
-        @if (CreatedToken is not null)
-        {
-            <div class="token-created" role="status"><strong>Copy this token now. It will not be shown again.</strong><code>@CreatedToken.Secret</code></div>
-        }
-        <h3>Active personal access tokens</h3>
-        @if (Tokens.Length == 0) { <p>No active personal access tokens.</p> }
-        @foreach (TokenResponse token in Tokens)
-        {
-            <div class="section-heading token-row"><p><strong>@token.Name</strong><small>@string.Join(", ", token.Scopes) · expires @token.ExpiresAtUtc.ToString("yyyy-MM-dd")</small></p>
-                <button class="secondary" @onclick="() => RevokeToken(token)" disabled="@Busy">Revoke</button></div>
-        }
-        @if (Projects.Length == 0) { <p>No accessible projects.</p> }
-        @foreach (ProjectResponse project in Projects)
-        {
-            <a class="project" href="/@project.PathWithNamespace"><span class="project-icon" aria-hidden="true">G</span>
-                <span><strong>@project.NameWithNamespace</strong><small>@project.Description</small></span><span class="private">Private</span></a>
-        }
-    </section>
+    <p role="status" class="secondary-text">Loading…</p>
+}
+else if (!Api.Reachable)
+{
+    <div class="page-header"><div><h1>Graft is unavailable</h1><p class="subtitle">The server could not be reached.</p></div></div>
 }
 else
 {
-    <section class="sign-in">
-        <h2>Sign in</h2><p>Use your local Graft account.</p>
-        <form @onsubmit="Login" @onsubmit:preventDefault>
-            <label for="username">Username</label><input id="username" autocomplete="username" @bind="Username" required maxlength="39" />
-            <label for="password">Password</label><input id="password" type="password" autocomplete="current-password" @bind="Password" required minlength="16" maxlength="256" />
-            <button type="submit" disabled="@Busy">@(Busy ? "Signing in…" : "Sign in")</button>
-        </form>
-    </section>
+    <div class="page-header">
+        <div><h1>Projects</h1><p class="subtitle">Repositories you can access on this instance.</p></div>
+        <div class="page-header-actions">
+            <button type="button" class="@(creating ? "secondary" : "")" @onclick="() => creating = !creating">
+                <Icon Name="plus" />New project
+            </button>
+        </div>
+    </div>
+
+    <Banner Message="@message" Kind="@messageKind" />
+
+    @if (creating)
+    {
+        <div class="panel">
+            <div class="panel-header"><h2>Create a private project</h2></div>
+            <div class="panel-body">
+                <form class="form" @onsubmit="CreateProject" @onsubmit:preventDefault>
+                    <label for="project-name">Name</label>
+                    <input id="project-name" @bind="name" required maxlength="200" />
+                    <label for="project-path">Path</label>
+                    <input id="project-path" @bind="path" minlength="2" maxlength="39"
+                           pattern="[A-Za-z0-9](?:[A-Za-z0-9]|[._\-][A-Za-z0-9])+" />
+                    <p class="field-hint">Optional. Derived from the name when left empty.</p>
+                    <label for="project-description">Description</label>
+                    <input id="project-description" @bind="description" maxlength="2000" />
+                    <div class="form-actions">
+                        <button type="submit" disabled="@busy">@(busy ? "Creating…" : "Create project")</button>
+                        <button type="button" class="secondary" @onclick="() => creating = false" disabled="@busy">Cancel</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    }
+
+    <div class="panel">
+        <div class="panel-header"><h2>Your projects</h2><span class="spacer"></span><span class="label">@projects.Length</span></div>
+        @if (projects.Length == 0)
+        {
+            <p class="panel-empty">No accessible projects yet.</p>
+        }
+        else
+        {
+            <div class="list">
+                @foreach (ProjectResponse project in projects)
+                {
+                    <a class="list-item" href="/@project.PathWithNamespace">
+                        <span class="avatar" aria-hidden="true">@Initial(project.Name)</span>
+                        <span class="list-item-main">
+                            <strong>@project.NameWithNamespace</strong>
+                            <small>@(project.Description.Length > 0 ? project.Description : "No description")</small>
+                        </span>
+                        <span class="label"><Icon Name="lock" />Private</span>
+                    </a>
+                }
+            </div>
+        }
+    </div>
 }
-@if (Message.Length > 0) { <p role="status" class="message">@Message</p> }
 
 @code {
-    private SessionResponse? Session;
-    private ProjectResponse[] Projects = [];
-    private TokenResponse[] Tokens = [];
-    private UserAccountResponse[] Users = [];
-    private TokenCreatedResponse? CreatedToken;
-    private string Username = "";
-    private string Password = "";
-    private string ProjectName = "";
-    private string ProjectPath = "";
-    private string ProjectDescription = "";
-    private string NewUsername = "";
-    private string NewPassword = "";
-    private string CurrentPassword = "";
-    private string ChangedPassword = "";
-    private string ChangedPasswordConfirmation = "";
-    private long ResetUserId;
-    private string ResetPasswordValue = "";
-    private string ResetPasswordConfirmation = "";
-    private long EnableUserId;
-    private string EnablePasswordValue = "";
-    private string EnablePasswordConfirmation = "";
-    private long? PendingDisableUserId;
-    private string TokenName = "";
-    private int TokenLifetimeDays = 30;
-    private bool TokenReadApi;
-    private bool TokenApi;
-    private bool TokenReadRepository = true;
-    private bool TokenWriteRepository;
-    private string Message = "";
-    private bool Loading = true;
-    private bool Busy;
+    private ProjectResponse[] projects = [];
+    private string name = "";
+    private string path = "";
+    private string description = "";
+    private string message = "";
+    private string messageKind = "info";
+    private bool creating;
+    private bool loading = true;
+    private bool busy;
 
     protected override async Task OnInitializedAsync()
     {
-        try { await Refresh(); }
-        catch (HttpRequestException) { Message = "Graft could not be reached."; }
-        finally { Loading = false; }
-    }
-
-    private async Task Refresh()
-    {
-        Session = await Http.GetFromJsonAsync("api/session", ApiJson.Default.SessionResponse);
-        Projects = Session?.Authenticated == true
-            ? await Http.GetFromJsonAsync("api/projects", ApiJson.Default.ProjectResponseArray) ?? [] : [];
-        Tokens = Session?.Authenticated == true
-            ? await Http.GetFromJsonAsync("api/tokens", ApiJson.Default.TokenResponseArray) ?? [] : [];
-        Users = Session?.IsAdministrator == true
-            ? await Http.GetFromJsonAsync("api/users", ApiJson.Default.UserAccountResponseArray) ?? [] : [];
-        if (!ResettableUsers.Any(user => user.Id == ResetUserId)) ResetUserId = ResettableUsers.FirstOrDefault()?.Id ?? 0;
-        if (!DisabledUsers.Any(user => user.Id == EnableUserId)) EnableUserId = DisabledUsers.FirstOrDefault()?.Id ?? 0;
-        if (Session?.Authenticated != true) CreatedToken = null;
-    }
-
-    private async Task Login()
-    {
-        if (Busy) return;
-        Busy = true; Message = "";
         try
         {
-            using HttpResponseMessage response = await Http.PostAsJsonAsync("api/login", new LoginRequest(Username, Password), ApiJson.Default.LoginRequest);
-            Password = "";
-            if (response.IsSuccessStatusCode) { await Refresh(); Message = "Signed in."; }
-            else Message = response.StatusCode == HttpStatusCode.Unauthorized ? "Username or password was not accepted." : "Sign-in failed.";
+            if (!await Api.EnsureSessionAsync())
+            {
+                if (Api.Reachable) Navigation.NavigateTo("/-/login", replace: true);
+                return;
+            }
+            await LoadProjects();
         }
-        catch (HttpRequestException) { Password = ""; Message = "Graft could not be reached."; }
-        finally { Busy = false; }
+        finally { loading = false; }
     }
 
-    private async Task Logout()
-    {
-        if (Busy || Session is null) return;
-        Busy = true;
-        try
-        {
-            using HttpRequestMessage request = new(HttpMethod.Post, "api/logout");
-            request.Headers.Add("X-Graft-CSRF", Session.Csrf);
-            using HttpResponseMessage response = await Http.SendAsync(request);
-            response.EnsureSuccessStatusCode();
-            await Refresh(); Message = "Signed out.";
-        }
-        catch (HttpRequestException) { Message = "Sign-out could not be confirmed."; }
-        finally { Busy = false; }
-    }
+    private async Task LoadProjects() =>
+        projects = await Api.GetAsync("api/projects", ApiJson.Default.ProjectResponseArray) ?? [];
 
     private async Task CreateProject()
     {
-        if (Busy || Session is null) return;
-        Busy = true; Message = "";
+        if (busy) return;
+        busy = true;
+        message = "";
         try
         {
-            using HttpRequestMessage request = new(HttpMethod.Post, "api/projects");
-            request.Headers.Add("X-Graft-CSRF", Session.Csrf);
-            string? path = string.IsNullOrWhiteSpace(ProjectPath) ? null : ProjectPath;
-            request.Content = JsonContent.Create(new ProjectCreateRequest(ProjectName, path, ProjectDescription, "private"),
-                ApiJson.Default.ProjectCreateRequest);
-            using HttpResponseMessage response = await Http.SendAsync(request);
-            if (response.IsSuccessStatusCode)
-            {
-                ProjectName = ""; ProjectPath = ""; ProjectDescription = "";
-                await Refresh(); Message = "Project created.";
-            }
-            else
-            {
-                ErrorResponse? error = await response.Content.ReadFromJsonAsync(ApiJson.Default.ErrorResponse);
-                Message = error?.Message ?? "Project creation failed.";
-            }
+            ProjectCreateRequest request = new(name, string.IsNullOrWhiteSpace(path) ? null : path, description, "private");
+            ApiResult result = await Api.PostAsync("api/projects", request, ApiJson.Default.ProjectCreateRequest, "Project created.");
+            message = result.Message;
+            messageKind = result.Ok ? "success" : "error";
+            if (!result.Ok) return;
+            name = ""; path = ""; description = ""; creating = false;
+            await LoadProjects();
         }
-        catch (HttpRequestException) { Message = "Project creation could not be confirmed."; }
-        finally { Busy = false; }
+        finally { busy = false; }
     }
 
-    private async Task CreateUser()
-    {
-        if (Busy || Session is null) return;
-        Busy = true; Message = "";
-        try
-        {
-            using HttpRequestMessage request = new(HttpMethod.Post, "api/users");
-            request.Headers.Add("X-Graft-CSRF", Session.Csrf);
-            request.Content = JsonContent.Create(new UserCreateRequest(NewUsername, NewPassword), ApiJson.Default.UserCreateRequest);
-            using HttpResponseMessage response = await Http.SendAsync(request);
-            NewPassword = "";
-            if (response.IsSuccessStatusCode) { NewUsername = ""; await Refresh(); Message = "User created."; }
-            else
-            {
-                ErrorResponse? error = await response.Content.ReadFromJsonAsync(ApiJson.Default.ErrorResponse);
-                Message = error?.Message ?? "User creation failed.";
-            }
-        }
-        catch (HttpRequestException) { NewPassword = ""; Message = "User creation could not be confirmed."; }
-        finally { Busy = false; }
-    }
-
-    private async Task ChangePassword()
-    {
-        if (Busy || Session is null) return;
-        if (ChangedPassword != ChangedPasswordConfirmation) { Message = "New passwords do not match."; return; }
-        Busy = true; Message = ""; CreatedToken = null;
-        try
-        {
-            using HttpRequestMessage request = new(HttpMethod.Post, "api/password");
-            request.Headers.Add("X-Graft-CSRF", Session.Csrf);
-            request.Content = JsonContent.Create(new PasswordChangeRequest(CurrentPassword, ChangedPassword), ApiJson.Default.PasswordChangeRequest);
-            using HttpResponseMessage response = await Http.SendAsync(request);
-            CurrentPassword = ""; ChangedPassword = ""; ChangedPasswordConfirmation = "";
-            if (response.IsSuccessStatusCode) { await Refresh(); Message = "Password changed. Sign in again."; }
-            else
-            {
-                ErrorResponse? error = await response.Content.ReadFromJsonAsync(ApiJson.Default.ErrorResponse);
-                Message = error?.Message ?? "Password change failed.";
-            }
-        }
-        catch (HttpRequestException) { CurrentPassword = ""; ChangedPassword = ""; ChangedPasswordConfirmation = ""; Message = "Password change could not be confirmed."; }
-        finally { Busy = false; }
-    }
-
-    private async Task ResetPassword()
-    {
-        if (Busy || Session is null || ResetUserId == 0) return;
-        if (ResetPasswordValue != ResetPasswordConfirmation) { Message = "Temporary passwords do not match."; return; }
-        Busy = true; Message = ""; CreatedToken = null; PendingDisableUserId = null;
-        try
-        {
-            using HttpRequestMessage request = new(HttpMethod.Post, $"api/users/{ResetUserId}/reset-password");
-            request.Headers.Add("X-Graft-CSRF", Session.Csrf);
-            request.Content = JsonContent.Create(new PasswordResetRequest(ResetPasswordValue), ApiJson.Default.PasswordResetRequest);
-            using HttpResponseMessage response = await Http.SendAsync(request);
-            ResetPasswordValue = ""; ResetPasswordConfirmation = "";
-            if (response.IsSuccessStatusCode) Message = "Password reset. The user was signed out and their tokens were revoked.";
-            else
-            {
-                ErrorResponse? error = await response.Content.ReadFromJsonAsync(ApiJson.Default.ErrorResponse);
-                Message = error?.Message ?? "Password reset failed.";
-            }
-        }
-        catch (HttpRequestException) { ResetPasswordValue = ""; ResetPasswordConfirmation = ""; Message = "Password reset could not be confirmed."; }
-        finally { Busy = false; }
-    }
-
-    private async Task DisableUser(UserAccountResponse user)
-    {
-        if (Busy || Session is null) return;
-        if (PendingDisableUserId != user.Id) { PendingDisableUserId = user.Id; Message = $"Select Confirm disable to disable {user.Username}."; return; }
-        Busy = true; Message = ""; CreatedToken = null;
-        try
-        {
-            using HttpRequestMessage request = new(HttpMethod.Post, $"api/users/{user.Id}/disable");
-            request.Headers.Add("X-Graft-CSRF", Session.Csrf);
-            using HttpResponseMessage response = await Http.SendAsync(request);
-            PendingDisableUserId = null;
-            if (response.IsSuccessStatusCode) { await Refresh(); Message = $"{user.Username} disabled. Their sessions and tokens were revoked."; }
-            else
-            {
-                ErrorResponse? error = await response.Content.ReadFromJsonAsync(ApiJson.Default.ErrorResponse);
-                Message = error?.Message ?? "User disable failed.";
-            }
-        }
-        catch (HttpRequestException) { Message = "User disable could not be confirmed."; }
-        finally { Busy = false; }
-    }
-
-    private async Task EnableUser()
-    {
-        if (Busy || Session is null || EnableUserId == 0) return;
-        if (EnablePasswordValue != EnablePasswordConfirmation) { Message = "Fresh passwords do not match."; return; }
-        Busy = true; Message = ""; CreatedToken = null; PendingDisableUserId = null;
-        try
-        {
-            string username = DisabledUsers.FirstOrDefault(user => user.Id == EnableUserId)?.Username ?? "User";
-            using HttpRequestMessage request = new(HttpMethod.Post, $"api/users/{EnableUserId}/enable");
-            request.Headers.Add("X-Graft-CSRF", Session.Csrf);
-            request.Content = JsonContent.Create(new PasswordResetRequest(EnablePasswordValue), ApiJson.Default.PasswordResetRequest);
-            using HttpResponseMessage response = await Http.SendAsync(request);
-            EnablePasswordValue = ""; EnablePasswordConfirmation = "";
-            if (response.IsSuccessStatusCode) { await Refresh(); Message = $"{username} re-enabled with a fresh password. Older sessions and tokens remain revoked."; }
-            else
-            {
-                ErrorResponse? error = await response.Content.ReadFromJsonAsync(ApiJson.Default.ErrorResponse);
-                Message = error?.Message ?? "Account re-enable failed.";
-            }
-        }
-        catch (HttpRequestException) { EnablePasswordValue = ""; EnablePasswordConfirmation = ""; Message = "Account re-enable could not be confirmed."; }
-        finally { Busy = false; }
-    }
-
-    private UserAccountResponse[] ResettableUsers => Users.Where(user => !user.Disabled && user.Username != Session?.Username).ToArray();
-    private UserAccountResponse[] DisabledUsers => Users.Where(user => user.Disabled).ToArray();
-
-    private async Task CreateToken()
-    {
-        if (Busy || Session is null) return;
-        string[] scopes = TokenScopes();
-        if (scopes.Length == 0) { Message = "Select at least one token scope."; return; }
-        Busy = true; Message = ""; CreatedToken = null;
-        try
-        {
-            using HttpRequestMessage request = new(HttpMethod.Post, "api/tokens");
-            request.Headers.Add("X-Graft-CSRF", Session.Csrf);
-            request.Content = JsonContent.Create(new TokenCreateRequest(TokenName, scopes, TokenLifetimeDays), ApiJson.Default.TokenCreateRequest);
-            using HttpResponseMessage response = await Http.SendAsync(request);
-            if (response.IsSuccessStatusCode)
-            {
-                CreatedToken = await response.Content.ReadFromJsonAsync(ApiJson.Default.TokenCreatedResponse);
-                TokenName = "";
-                Tokens = await Http.GetFromJsonAsync("api/tokens", ApiJson.Default.TokenResponseArray) ?? [];
-                Message = "Token created.";
-            }
-            else
-            {
-                ErrorResponse? error = await response.Content.ReadFromJsonAsync(ApiJson.Default.ErrorResponse);
-                Message = error?.Message ?? "Token creation failed.";
-            }
-        }
-        catch (HttpRequestException) { Message = "Token creation could not be confirmed."; }
-        finally { Busy = false; }
-    }
-
-    private async Task RevokeToken(TokenResponse token)
-    {
-        if (Busy || Session is null) return;
-        Busy = true; Message = ""; CreatedToken = null;
-        try
-        {
-            using HttpRequestMessage request = new(HttpMethod.Delete, $"api/tokens/{token.Id}");
-            request.Headers.Add("X-Graft-CSRF", Session.Csrf);
-            using HttpResponseMessage response = await Http.SendAsync(request);
-            if (response.IsSuccessStatusCode)
-            {
-                Tokens = await Http.GetFromJsonAsync("api/tokens", ApiJson.Default.TokenResponseArray) ?? [];
-                Message = "Token revoked.";
-            }
-            else Message = "Token revocation failed.";
-        }
-        catch (HttpRequestException) { Message = "Token revocation could not be confirmed."; }
-        finally { Busy = false; }
-    }
-
-    private string[] TokenScopes()
-    {
-        List<string> scopes = [];
-        if (TokenReadApi) scopes.Add("read_api");
-        if (TokenApi) scopes.Add("api");
-        if (TokenReadRepository) scopes.Add("read_repository");
-        if (TokenWriteRepository) scopes.Add("write_repository");
-        return scopes.ToArray();
-    }
+    private static string Initial(string value) => value.Length == 0 ? "?" : value[..1];
 }

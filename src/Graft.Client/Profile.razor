@@ -1,0 +1,227 @@
+@page "/-/profile"
+@inject GraftApi Api
+@inject NavigationManager Navigation
+
+<PageTitle>Profile &middot; Graft</PageTitle>
+
+@if (loading)
+{
+    <p role="status" class="secondary-text">Loading…</p>
+}
+else if (Api.Authenticated)
+{
+    <div class="page-header">
+        <div class="row">
+            <span class="avatar avatar-large" aria-hidden="true">@Initial(Api.Username)</span>
+            <div>
+                <h1>@Api.Username</h1>
+                <p class="subtitle">@(Api.IsAdministrator ? "Administrator" : "User") on this instance.</p>
+            </div>
+        </div>
+    </div>
+
+    <Banner Message="@message" Kind="@messageKind" />
+
+    <div class="tabs">
+        <button type="button" class="@(tab == "tokens" ? "active" : "")" @onclick='() => tab = "tokens"'>Access tokens</button>
+        <button type="button" class="@(tab == "password" ? "active" : "")" @onclick='() => tab = "password"'>Password</button>
+    </div>
+
+    @if (tab == "tokens")
+    {
+        @if (created is not null)
+        {
+            <div class="secret" role="status">
+                <strong>Copy this token now. It will not be shown again.</strong>
+                <code>@created.Secret</code>
+            </div>
+        }
+
+        <div class="panel">
+            <div class="panel-header"><h2>Create a personal access token</h2></div>
+            <div class="panel-body">
+                <form class="form" @onsubmit="CreateToken" @onsubmit:preventDefault>
+                    <label for="token-name">Name</label>
+                    <input id="token-name" @bind="tokenName" required maxlength="100" />
+                    <label for="token-lifetime">Expires after</label>
+                    <select id="token-lifetime" @bind="tokenLifetimeDays">
+                        <option value="30">30 days</option>
+                        <option value="90">90 days</option>
+                        <option value="180">180 days</option>
+                        <option value="365">365 days</option>
+                    </select>
+                    <fieldset>
+                        <legend>Scopes</legend>
+                        <label class="checkbox"><input type="checkbox" @bind="scopeReadApi" /> Read API</label>
+                        <label class="checkbox"><input type="checkbox" @bind="scopeApi" /> API</label>
+                        <label class="checkbox"><input type="checkbox" @bind="scopeReadRepository" /> Read repositories</label>
+                        <label class="checkbox"><input type="checkbox" @bind="scopeWriteRepository" /> Write repositories</label>
+                    </fieldset>
+                    <div class="form-actions">
+                        <button type="submit" disabled="@busy">@(busy ? "Creating…" : "Create token")</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="panel-header"><h2>Active tokens</h2><span class="spacer"></span><span class="label">@tokens.Length</span></div>
+            @if (tokens.Length == 0)
+            {
+                <p class="panel-empty">No active personal access tokens.</p>
+            }
+            else
+            {
+                <div class="list">
+                    @foreach (TokenResponse token in tokens)
+                    {
+                        <div class="list-item">
+                            <Icon Name="key" />
+                            <span class="list-item-main">
+                                <strong>@token.Name</strong>
+                                <small>@string.Join(", ", token.Scopes) &middot; expires @token.ExpiresAtUtc.ToString("yyyy-MM-dd")</small>
+                            </span>
+                            <span class="list-item-actions">
+                                <button type="button" class="secondary" @onclick="() => RevokeToken(token)" disabled="@busy">Revoke</button>
+                            </span>
+                        </div>
+                    }
+                </div>
+            }
+        </div>
+    }
+    else
+    {
+        <div class="panel">
+            <div class="panel-header"><h2>Change your password</h2></div>
+            <div class="panel-body">
+                <div class="banner warning">
+                    <Icon Name="alert" />
+                    <span>This signs you out everywhere and revokes your personal access tokens.</span>
+                </div>
+                <form class="form" @onsubmit="ChangePassword" @onsubmit:preventDefault>
+                    <label for="current-password">Current password</label>
+                    @* Existing credential, so no minlength: only the new-password fields state the policy. *@
+                    <input id="current-password" type="password" @bind="currentPassword" required maxlength="256" autocomplete="current-password" />
+                    <label for="new-password">New password</label>
+                    <input id="new-password" type="password" @bind="newPassword" required minlength="16" maxlength="256" autocomplete="new-password" />
+                    <label for="confirm-password">Confirm new password</label>
+                    <input id="confirm-password" type="password" @bind="confirmPassword" required minlength="16" maxlength="256" autocomplete="new-password" />
+                    <div class="form-actions">
+                        <button type="submit" class="danger" disabled="@busy">Change password</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    }
+}
+
+@code {
+    private TokenResponse[] tokens = [];
+    private TokenCreatedResponse? created;
+    private string tab = "tokens";
+    private string tokenName = "";
+    private int tokenLifetimeDays = 30;
+    private bool scopeReadApi;
+    private bool scopeApi;
+    private bool scopeReadRepository = true;
+    private bool scopeWriteRepository;
+    private string currentPassword = "";
+    private string newPassword = "";
+    private string confirmPassword = "";
+    private string message = "";
+    private string messageKind = "info";
+    private bool loading = true;
+    private bool busy;
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            if (!await Api.EnsureSessionAsync())
+            {
+                if (Api.Reachable) Navigation.NavigateTo("/-/login", replace: true);
+                return;
+            }
+            await LoadTokens();
+        }
+        finally { loading = false; }
+    }
+
+    private async Task LoadTokens() => tokens = await Api.GetAsync("api/tokens", ApiJson.Default.TokenResponseArray) ?? [];
+
+    private async Task CreateToken()
+    {
+        if (busy) return;
+        string[] scopes = Scopes();
+        if (scopes.Length == 0) { Report(ApiResult.Refused("Select at least one token scope.")); return; }
+        busy = true;
+        message = "";
+        created = null;
+        try
+        {
+            ApiResult<TokenCreatedResponse> result = await Api.SendAsync(HttpMethod.Post, "api/tokens",
+                new TokenCreateRequest(tokenName, scopes, tokenLifetimeDays),
+                ApiJson.Default.TokenCreateRequest, ApiJson.Default.TokenCreatedResponse, "Token created.");
+            Report(new ApiResult(result.Ok, result.Message));
+            if (!result.Ok) return;
+            created = result.Value;
+            tokenName = "";
+            await LoadTokens();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task RevokeToken(TokenResponse token)
+    {
+        if (busy) return;
+        busy = true;
+        message = "";
+        created = null;
+        try
+        {
+            Report(await Api.DeleteAsync($"api/tokens/{token.Id}", "Token revoked."));
+            await LoadTokens();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task ChangePassword()
+    {
+        if (busy) return;
+        if (newPassword != confirmPassword) { Report(ApiResult.Refused("New passwords do not match.")); return; }
+        busy = true;
+        message = "";
+        created = null;
+        try
+        {
+            ApiResult result = await Api.PostAsync("api/password", new PasswordChangeRequest(currentPassword, newPassword),
+                ApiJson.Default.PasswordChangeRequest, "Password changed. Sign in again.");
+            currentPassword = ""; newPassword = ""; confirmPassword = "";
+            Report(result);
+            if (!result.Ok) return;
+            // The server revoked this session, so the only coherent next step is signing in again.
+            await Api.RefreshSessionAsync();
+            Navigation.NavigateTo("/-/login?notice=password", replace: true);
+        }
+        finally { busy = false; }
+    }
+
+    private void Report(ApiResult result)
+    {
+        message = result.Message;
+        messageKind = result.Ok ? "success" : "error";
+    }
+
+    private string[] Scopes()
+    {
+        List<string> scopes = [];
+        if (scopeReadApi) scopes.Add("read_api");
+        if (scopeApi) scopes.Add("api");
+        if (scopeReadRepository) scopes.Add("read_repository");
+        if (scopeWriteRepository) scopes.Add("write_repository");
+        return [.. scopes];
+    }
+
+    private static string Initial(string value) => value.Length == 0 ? "?" : value[..1];
+}

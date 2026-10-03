@@ -1,4 +1,7 @@
 <Router AppAssembly="typeof(App).Assembly">
     <Found Context="routeData"><RouteView RouteData="routeData" DefaultLayout="typeof(MainLayout)" /><FocusOnNavigate RouteData="routeData" Selector="h1" /></Found>
-    <NotFound><LayoutView Layout="typeof(MainLayout)"><h1>Page not found</h1><p>The requested Graft page does not exist.</p></LayoutView></NotFound>
+    <NotFound><LayoutView Layout="typeof(MainLayout)">
+        <div class="page-header"><div><h1>Page not found</h1><p class="subtitle">The requested Graft page does not exist.</p></div></div>
+        <a class="button secondary" href="/"><Icon Name="chevron-left" />Back to projects</a>
+    </LayoutView></NotFound>
 </Router>

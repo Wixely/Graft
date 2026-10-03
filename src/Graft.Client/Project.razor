@@ -1,142 +1,309 @@
 @page "/{Namespace}/{Slug}"
-@inject HttpClient Http
+@inject GraftApi Api
+@inject NavigationManager Navigation
 
-<PageTitle>Graft · @Slug</PageTitle>
-@if (Loading) { <p role="status">Loading repository…</p> }
-else if (Page is null) { <h1>Repository unavailable</h1><p>@Message</p> }
+<PageTitle>@Slug &middot; Graft</PageTitle>
+
+@if (loading)
+{
+    <p role="status" class="secondary-text">Loading repository…</p>
+}
+else if (repo is null)
+{
+    <div class="page-header"><div><h1>Repository unavailable</h1><p class="subtitle">@message</p></div></div>
+    <a class="button secondary" href="/"><Icon Name="chevron-left" />Back to projects</a>
+}
 else
 {
-    <p class="eyebrow">@Page.Project.Namespace.Name / PRIVATE</p>
-    <h1>@Page.Project.Name</h1><p class="intro">@Page.Project.Description</p>
-    @if (Message.Length > 0) { <p role="status" class="message">@Message</p> }
-    <div class="repository-grid">
-        <section><h2>Files</h2>
-            @if (Path.Length > 0) { <button class="link-button" @onclick="Up">← @Path</button> }
-            @foreach (TreeEntryResponse entry in Page.Tree)
-            {
-                <button class="tree-entry" @onclick="() => Open(entry)"><span>@(entry.Type == "tree" ? "▣" : "□")</span><strong>@entry.Name</strong><small>@entry.Mode</small></button>
-            }
-        </section>
-        <aside><section><h2>Branches</h2>@foreach (BranchResponse branch in Page.Branches) { <p><strong>@branch.Name</strong><br /><small>@branch.Commit.ShortId</small></p> }</section></aside>
+    <div class="repo-header">
+        <span class="avatar avatar-large" aria-hidden="true">@Initial(repo.Project.Name)</span>
+        <div>
+            <h1><span class="namespace">@repo.Project.Namespace.Name /</span> @repo.Project.Name</h1>
+            <p class="subtitle">@(repo.Project.Description.Length > 0 ? repo.Project.Description : "No description")</p>
+        </div>
+        <span class="label"><Icon Name="lock" />Private</span>
     </div>
-    @if (Page.File is not null)
+
+    <Banner Message="@message" Kind="@messageKind" />
+
+    <div class="tabs">
+        <button type="button" class="@(tab == "code" ? "active" : "")" @onclick='() => tab = "code"'>Code</button>
+        <button type="button" class="@(tab == "commits" ? "active" : "")" @onclick='() => tab = "commits"'>Commits</button>
+        @if (repo.CanManage)
+        {
+            <button type="button" class="@(tab == "settings" ? "active" : "")" @onclick='() => tab = "settings"'>Members</button>
+        }
+    </div>
+
+    @if (tab == "code")
     {
-        <section class="file"><h2>@Page.File.FilePath</h2>
-            @if (FileText is null) { <p>Binary file · @Page.File.Size bytes</p> }
-            else { <pre>@FileText</pre> }
-        </section>
-    }
-    <section><h2>Recent commits</h2>@foreach (CommitResponse commit in Page.Commits)
-        { <article class="commit"><code>@commit.ShortId</code><span><strong>@commit.Title</strong><small>@commit.AuthorName · @commit.AuthoredDate.ToString("u")</small></span></article> }</section>
-    @if (Page.CanManage)
-    {
-        <section>
-            <h2>Project members</h2>
-            <form class="create-project" @onsubmit="SetMember" @onsubmit:preventDefault>
-                <label for="member-username">Username</label><input id="member-username" @bind="MemberUsername" required minlength="2" maxlength="39" />
-                <label for="member-role">Role</label><select id="member-role" @bind="MemberRole"><option>Reporter</option><option>Developer</option><option>Maintainer</option></select>
-                <button type="submit" disabled="@MemberBusy">@(MemberBusy ? "Saving…" : "Add or update member")</button>
-            </form>
-            @if (Members.Length == 0) { <p>No direct project members.</p> }
-            @foreach (ProjectMemberResponse member in Members)
+        <div class="panel">
+            <div class="panel-header">
+                <Icon Name="branch" />
+                <strong>@(repo.Project.DefaultBranch ?? "main")</strong>
+                <span class="label">@repo.Branches.Count @(repo.Branches.Count == 1 ? "branch" : "branches")</span>
+                <span class="spacer"></span>
+                <div class="clone-url">
+                    <label class="visually-hidden" for="clone">Clone URL</label>
+                    <input id="clone" readonly value="@repo.Project.HttpUrlToRepo" />
+                </div>
+            </div>
+        </div>
+
+        <nav class="row" aria-label="Path">
+            <button type="button" class="link" @onclick="() => Navigate(string.Empty)">@repo.Project.Name</button>
+            @foreach ((string label, string target) in Crumbs())
             {
-                <div class="section-heading"><p><strong>@member.Username</strong> · @member.Role</p>
-                    <button class="secondary" @onclick="() => RemoveMember(member)" disabled="@MemberBusy">Remove</button></div>
+                <span class="muted">/</span>
+                <button type="button" class="link" @onclick="() => Navigate(target)">@label</button>
             }
-        </section>
+        </nav>
+
+        <div class="file-table">
+            <div class="file-table-header">
+                <Icon Name="file" />
+                <span>@repo.Tree.Count @(repo.Tree.Count == 1 ? "entry" : "entries")</span>
+            </div>
+            @if (path.Length > 0)
+            {
+                <button type="button" class="file-row" @onclick="Up">
+                    <Icon Name="chevron-left" />
+                    <span class="name">..</span>
+                    <span class="meta">parent directory</span>
+                </button>
+            }
+            @foreach (TreeEntryResponse entry in Ordered(repo.Tree))
+            {
+                <button type="button" class="file-row @(entry.Type == "tree" ? "tree" : "blob")" @onclick="() => Open(entry)">
+                    <Icon Name="@(entry.Type == "tree" ? "folder" : "file")" />
+                    <span class="name">@entry.Name</span>
+                    <span class="meta mono">@entry.Mode</span>
+                </button>
+            }
+            @if (repo.Tree.Count == 0)
+            {
+                <p class="panel-empty">This directory is empty.</p>
+            }
+        </div>
+
+        @if (repo.File is not null)
+        {
+            <div class="panel blob-view">
+                <div class="panel-header">
+                    <Icon Name="file" />
+                    <strong class="mono">@repo.File.FilePath</strong>
+                    <span class="spacer"></span>
+                    <span class="label">@repo.File.Size bytes</span>
+                </div>
+                @if (fileText is null)
+                {
+                    <p class="panel-empty">Binary file. Graft does not render its contents.</p>
+                }
+                else
+                {
+                    <pre>@fileText</pre>
+                }
+            </div>
+        }
+    }
+    else if (tab == "commits")
+    {
+        <div class="panel">
+            <div class="panel-header"><h2>Recent commits</h2></div>
+            <div class="list">
+                @foreach (CommitResponse commit in repo.Commits)
+                {
+                    <article class="commit-row">
+                        <code class="sha">@commit.ShortId</code>
+                        <span class="list-item-main">
+                            <strong>@commit.Title</strong>
+                            <small>@commit.AuthorName &middot; @commit.AuthoredDate.ToString("u")</small>
+                        </span>
+                    </article>
+                }
+            </div>
+            @if (repo.Commits.Count == 0) { <p class="panel-empty">No commits yet.</p> }
+        </div>
+
+        <div class="panel">
+            <div class="panel-header"><h2>Branches</h2></div>
+            <div class="list">
+                @foreach (BranchResponse branch in repo.Branches)
+                {
+                    <div class="branch-row">
+                        <Icon Name="branch" />
+                        <span class="list-item-main"><strong>@branch.Name</strong><small class="mono">@branch.Commit.ShortId</small></span>
+                        @if (branch.Default) { <span class="label accent">default</span> }
+                    </div>
+                }
+            </div>
+        </div>
+    }
+    else
+    {
+        <div class="panel">
+            <div class="panel-header"><h2>Add or update a member</h2></div>
+            <div class="panel-body">
+                <form class="form" @onsubmit="SetMember" @onsubmit:preventDefault>
+                    <label for="member-username">Username</label>
+                    <input id="member-username" @bind="memberUsername" required minlength="2" maxlength="39" />
+                    <label for="member-role">Role</label>
+                    <select id="member-role" @bind="memberRole">
+                        <option>Reporter</option>
+                        <option>Developer</option>
+                        <option>Maintainer</option>
+                    </select>
+                    <div class="form-actions">
+                        <button type="submit" disabled="@busy">@(busy ? "Saving…" : "Save member")</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="panel-header"><h2>Project members</h2><span class="spacer"></span><span class="label">@members.Length</span></div>
+            @if (members.Length == 0)
+            {
+                <p class="panel-empty">No direct project members.</p>
+            }
+            else
+            {
+                <div class="list">
+                    @foreach (ProjectMemberResponse member in members)
+                    {
+                        <div class="list-item">
+                            <span class="avatar" aria-hidden="true">@Initial(member.Username)</span>
+                            <span class="list-item-main"><strong>@member.Username</strong><small>@member.Role</small></span>
+                            <span class="list-item-actions">
+                                <button type="button" class="secondary" @onclick="() => RemoveMember(member)" disabled="@busy">Remove</button>
+                            </span>
+                        </div>
+                    }
+                </div>
+            }
+        </div>
     }
 }
 
 @code {
     [Parameter] public string Namespace { get; set; } = "";
     [Parameter] public string Slug { get; set; } = "";
-    private RepositoryPageResponse? Page;
-    private SessionResponse? Session;
-    private ProjectMemberResponse[] Members = [];
-    private string Path = "";
-    private string FilePath = "";
-    private string? FileText;
-    private string Message = "";
-    private string MemberUsername = "";
-    private string MemberRole = "Developer";
-    private bool Loading = true;
-    private bool MemberBusy;
+
+    private RepositoryPageResponse? repo;
+    private ProjectMemberResponse[] members = [];
+    private string tab = "code";
+    private string path = "";
+    private string filePath = "";
+    private string? fileText;
+    private string message = "";
+    private string messageKind = "info";
+    private string memberUsername = "";
+    private string memberRole = "Developer";
+    private bool loading = true;
+    private bool busy;
 
     protected override async Task OnParametersSetAsync()
     {
+        loading = true;
         try
         {
-            Session = await Http.GetFromJsonAsync("api/session", ApiJson.Default.SessionResponse);
-            if (Session?.Authenticated != true) { Message = "Sign in from the projects page."; return; }
-            ProjectResponse[] projects = await Http.GetFromJsonAsync("api/projects", ApiJson.Default.ProjectResponseArray) ?? [];
+            if (!await Api.EnsureSessionAsync())
+            {
+                if (Api.Reachable) Navigation.NavigateTo("/-/login", replace: true);
+                else message = "Graft could not be reached.";
+                return;
+            }
+            ProjectResponse[] projects = await Api.GetAsync("api/projects", ApiJson.Default.ProjectResponseArray) ?? [];
             ProjectResponse? project = projects.SingleOrDefault(item => item.PathWithNamespace == Namespace + "/" + Slug);
-            if (project is null) { Message = "You do not have access to this project."; return; }
+            if (project is null) { message = "You do not have access to this project."; return; }
             await Load(project.Id);
         }
-        catch (HttpRequestException) { Message = "Repository data could not be loaded."; }
-        finally { Loading = false; }
+        finally { loading = false; }
     }
 
     private async Task Load(long id)
     {
-        string query = $"api/browser/projects/{id}?ref=main&path={Uri.EscapeDataString(Path)}" +
-            (FilePath.Length == 0 ? "" : "&file=" + Uri.EscapeDataString(FilePath));
-        Page = await Http.GetFromJsonAsync(query, ApiJson.Default.RepositoryPageResponse);
-        FileText = Page?.File is null ? null : DecodeText(Page.File.Content);
-        if (Page?.CanManage == true) await LoadMembers(id);
+        string query = $"api/browser/projects/{id}?ref=main&path={Uri.EscapeDataString(path)}" +
+            (filePath.Length == 0 ? "" : "&file=" + Uri.EscapeDataString(filePath));
+        repo = await Api.GetAsync(query, ApiJson.Default.RepositoryPageResponse);
+        fileText = repo?.File is null ? null : DecodeText(repo.File.Content);
+        if (repo?.CanManage == true) await LoadMembers(id);
     }
 
     private async Task Open(TreeEntryResponse entry)
     {
-        if (entry.Type == "tree") { Path = entry.Path; FilePath = ""; }
-        else { FilePath = entry.Path; }
-        if (Page is not null) await Load(Page.Project.Id);
+        if (entry.Type == "tree") { path = entry.Path; filePath = ""; }
+        else { filePath = entry.Path; }
+        if (repo is not null) await Load(repo.Project.Id);
+    }
+
+    private async Task Navigate(string target)
+    {
+        path = target;
+        filePath = "";
+        if (repo is not null) await Load(repo.Project.Id);
     }
 
     private async Task Up()
     {
-        int separator = Path.LastIndexOf('/');
-        Path = separator < 0 ? "" : Path[..separator];
-        FilePath = "";
-        if (Page is not null) await Load(Page.Project.Id);
+        int separator = path.LastIndexOf('/');
+        await Navigate(separator < 0 ? "" : path[..separator]);
     }
 
-    private async Task LoadMembers(long projectId) => Members =
-        await Http.GetFromJsonAsync($"api/projects/{projectId}/members", ApiJson.Default.ProjectMemberResponseArray) ?? [];
+    /// <summary>Breadcrumb segments with the path each one navigates to.</summary>
+    private IEnumerable<(string Label, string Target)> Crumbs()
+    {
+        if (path.Length == 0) yield break;
+        string[] segments = path.Split('/');
+        for (int index = 0; index < segments.Length; index++)
+            yield return (segments[index], string.Join('/', segments[..(index + 1)]));
+    }
+
+    /// <summary>Directories before files, then by name, which is how both GitLab and GitHub order a tree.</summary>
+    private static IEnumerable<TreeEntryResponse> Ordered(IReadOnlyList<TreeEntryResponse> tree) => tree
+        .OrderByDescending(entry => entry.Type == "tree")
+        .ThenBy(entry => entry.Name, StringComparer.OrdinalIgnoreCase);
+
+    private async Task LoadMembers(long projectId) => members =
+        await Api.GetAsync($"api/projects/{projectId}/members", ApiJson.Default.ProjectMemberResponseArray) ?? [];
 
     private async Task SetMember()
     {
-        if (MemberBusy || Page is null || Session is null) return;
-        MemberBusy = true; Message = "";
+        if (busy || repo is null) return;
+        busy = true;
+        message = "";
         try
         {
-            using HttpRequestMessage request = new(HttpMethod.Post, $"api/projects/{Page.Project.Id}/members");
-            request.Headers.Add("X-Graft-CSRF", Session.Csrf);
-            request.Content = JsonContent.Create(new MembershipSetRequest(MemberUsername, MemberRole), ApiJson.Default.MembershipSetRequest);
-            using HttpResponseMessage response = await Http.SendAsync(request);
-            if (response.IsSuccessStatusCode) { MemberUsername = ""; await LoadMembers(Page.Project.Id); Message = "Membership saved."; }
-            else { ErrorResponse? error = await response.Content.ReadFromJsonAsync(ApiJson.Default.ErrorResponse); Message = error?.Message ?? "Membership update failed."; }
+            ApiResult result = await Api.PostAsync($"api/projects/{repo.Project.Id}/members",
+                new MembershipSetRequest(memberUsername, memberRole), ApiJson.Default.MembershipSetRequest, "Membership saved.");
+            Report(result);
+            if (!result.Ok) return;
+            memberUsername = "";
+            await LoadMembers(repo.Project.Id);
         }
-        catch (HttpRequestException) { Message = "Membership update could not be confirmed."; }
-        finally { MemberBusy = false; }
+        finally { busy = false; }
     }
 
     private async Task RemoveMember(ProjectMemberResponse member)
     {
-        if (MemberBusy || Page is null || Session is null) return;
-        MemberBusy = true; Message = "";
+        if (busy || repo is null) return;
+        busy = true;
+        message = "";
         try
         {
-            using HttpRequestMessage request = new(HttpMethod.Delete, $"api/projects/{Page.Project.Id}/members/{member.UserId}");
-            request.Headers.Add("X-Graft-CSRF", Session.Csrf);
-            using HttpResponseMessage response = await Http.SendAsync(request);
-            if (response.IsSuccessStatusCode) { await LoadMembers(Page.Project.Id); Message = "Membership removed."; }
-            else Message = "Membership removal failed.";
+            Report(await Api.DeleteAsync($"api/projects/{repo.Project.Id}/members/{member.UserId}", "Membership removed."));
+            await LoadMembers(repo.Project.Id);
         }
-        catch (HttpRequestException) { Message = "Membership removal could not be confirmed."; }
-        finally { MemberBusy = false; }
+        finally { busy = false; }
     }
 
+    private void Report(ApiResult result)
+    {
+        message = result.Message;
+        messageKind = result.Ok ? "success" : "error";
+    }
+
+    /// <summary>Returns null for anything that is not valid UTF-8 text, so binary blobs are never rendered.</summary>
     private static string? DecodeText(string content)
     {
         byte[] bytes = Convert.FromBase64String(content);
@@ -144,4 +311,6 @@ else
         try { return new UTF8Encoding(false, true).GetString(bytes); }
         catch (DecoderFallbackException) { return null; }
     }
+
+    private static string Initial(string value) => value.Length == 0 ? "?" : value[..1];
 }

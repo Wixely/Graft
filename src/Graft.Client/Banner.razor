@@ -1,0 +1,15 @@
+@* Status and error messaging. Announced through role="status" so a screen reader hears the outcome of a
+   mutation without the page moving focus. *@
+
+@if (Message.Length > 0)
+{
+    <div class="banner @Kind" role="status">
+        <Icon Name="@(Kind == "error" ? "alert" : Kind == "success" ? "check" : "settings")" />
+        <span>@Message</span>
+    </div>
+}
+
+@code {
+    [Parameter] public string Message { get; set; } = "";
+    [Parameter] public string Kind { get; set; } = "info";
+}

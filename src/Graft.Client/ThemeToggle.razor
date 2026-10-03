@@ -1,0 +1,23 @@
+@* Light/dark switch. theme.js owns the stored preference and applies it before first paint; this control
+   only flips it and relabels itself. The icon shows the theme you would switch to. *@
+@inject IJSRuntime JS
+
+<button type="button" class="quiet icon-button" title="@Label" aria-label="@Label" @onclick="Toggle">
+    <Icon Name="@(dark ? "sun" : "moon")" />
+</button>
+
+@code {
+    private bool dark;
+    private string Label => dark ? "Switch to the light theme" : "Switch to the dark theme";
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+        bool effective = await JS.InvokeAsync<string>("graftTheme.effective") == "dark";
+        if (effective == dark) return;
+        dark = effective;
+        StateHasChanged();
+    }
+
+    private async Task Toggle() => dark = await JS.InvokeAsync<string>("graftTheme.toggle") == "dark";
+}
