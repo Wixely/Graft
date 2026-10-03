@@ -12,8 +12,11 @@ using Graft.Git;
 using Graft.Operations;
 using Graft.Server;
 using Graft.Storage;
+using DnaX.Uploads;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
+using Microsoft.AspNetCore.Http.Features;
 
 if (!Arguments.TryParse(args, out Arguments? parsedSettings))
 {
@@ -32,6 +35,18 @@ LoginThrottle loginThrottle = new();
 string? serverOrigin = null;
 const string SessionCookie = "__Host-graft-session";
 
+// Browser uploads are mounted under Graft's own API namespace, never GitLab's. GitLab owns "/uploads/..."
+// and "/api/v4/projects/:id/uploads", so squatting either would block later compatibility work. Unmatched
+// paths beneath "/api/" already return 404 rather than the SPA shell.
+const string UploadPrefix = "/api/graft/uploads";
+string stateDirectory = Path.GetDirectoryName(Path.GetFullPath(settings.Database))!;
+string uploadRoot = Path.Combine(stateDirectory, "uploads");
+string keyRingDirectory = Path.Combine(stateDirectory, "data-protection-keys");
+string ingestDirectory = Path.Combine(stateDirectory, "ingest");
+CreatePrivateDirectory(uploadRoot);
+CreatePrivateDirectory(keyRingDirectory);
+CreatePrivateDirectory(ingestDirectory);
+
 using X509Certificate2 certificate = LoadCertificate(settings);
 
 WebApplicationBuilder builder = WebApplication.CreateSlimBuilder(new WebApplicationOptions { Args = [] });
@@ -39,11 +54,34 @@ builder.Host.UseWindowsService(options => options.ServiceName = "Graft");
 builder.Host.UseSystemd();
 builder.Logging.ClearProviders();
 builder.Services.ConfigureHttpJsonOptions(options => options.SerializerOptions.TypeInfoResolverChain.Insert(0, ApiJson.Default));
+
+// Upload transport. DnaX.Uploads owns the browser-side queue in JavaScript with resumable chunked transfer,
+// which is what survives a mobile browser being backgrounded while the native file picker is open. It is the
+// browser transport only: API clients post ordinary request bodies to the application's own endpoints.
+builder.Services.AddSingleton(new GraftSessionResolver(store.ResolveSessionAsync));
+builder.Services.AddDataProtection()
+    .PersistKeysToFileSystem(new DirectoryInfo(keyRingDirectory))
+    .SetApplicationName("Graft");
+builder.Services.AddAuthentication(GraftSessionAuthenticationHandler.SchemeName)
+    .AddScheme<GraftSessionAuthenticationOptions, GraftSessionAuthenticationHandler>(
+        GraftSessionAuthenticationHandler.SchemeName, options => options.CookieName = SessionCookie);
+builder.Services.AddAuthorization();
+builder.Services.AddDnaXUploads(options =>
+{
+    options.Root = uploadRoot;
+    options.MaximumReservedBytes = UploadLimits.ReservedBytes;
+    options.MaximumSessions = UploadLimits.Sessions;
+    options.Profiles[UploadLimits.ArchiveProfile] = UploadLimits.Archive;
+    options.Profiles[UploadLimits.AvatarProfile] = UploadLimits.Avatar;
+    options.Profiles[UploadLimits.RepositoryFileProfile] = UploadLimits.RepositoryFile;
+});
 builder.WebHost.ConfigureKestrel(options =>
 {
     options.Listen(settings.ListenAddress, settings.ListenPort, listen => listen.UseHttps(certificate));
     options.Limits.MaxRequestBodySize = Limits.RequestBytes;
-    options.Limits.MaxConcurrentConnections = 16;
+    // Raised from 16: an upload holds its connection for the length of the transfer, so the previous ceiling
+    // let a few concurrent uploads starve Git and API traffic. Still bounded for low-resource hosts.
+    options.Limits.MaxConcurrentConnections = 64;
     options.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(5);
 });
 
@@ -54,8 +92,17 @@ app.Use(async (context, next) =>
     context.Response.Headers.XContentTypeOptions = "nosniff";
     context.Response.Headers["Referrer-Policy"] = "no-referrer";
     context.Response.Headers.ContentSecurityPolicy = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'";
+    // Uploads are the one route group where a long request body is the point, so they get a longer bound and
+    // a raised body limit. Everything else keeps the original 30 second deadline and the Kestrel-wide cap;
+    // the Git routes additionally enforce Limits.RequestBytes while reading, so they are bounded regardless.
+    bool uploading = context.Request.Path.StartsWithSegments(UploadPrefix);
+    if (uploading)
+    {
+        IHttpMaxRequestBodySizeFeature? bodySize = context.Features.Get<IHttpMaxRequestBodySizeFeature>();
+        if (bodySize is { IsReadOnly: false }) bodySize.MaxRequestBodySize = UploadLimits.MaximumRequestBytes;
+    }
     using CancellationTokenSource deadline = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted);
-    deadline.CancelAfter(TimeSpan.FromSeconds(30));
+    deadline.CancelAfter(uploading ? TimeSpan.FromMinutes(30) : TimeSpan.FromSeconds(30));
     context.RequestAborted = deadline.Token;
     try { await next(context); }
     catch (GitInputException error)
@@ -77,6 +124,14 @@ app.Use(async (context, next) =>
         await context.Response.WriteAsync("Repository storage failed.", CancellationToken.None);
     }
 });
+
+// Only the upload group opts into the authentication stack. UseAntiforgery validates automatically for
+// endpoints that bind a form; Graft binds no forms, so existing routes keep their own Origin + X-Graft-CSRF
+// checks untouched and DnaX validates its own X-DnaX-Antiforgery header inside its handlers.
+app.UseAuthentication();
+app.UseAuthorization();
+app.UseAntiforgery();
+app.MapDnaXUploads(UploadPrefix);
 
 app.MapGet("/api/session", async context =>
 {
@@ -101,7 +156,7 @@ app.MapPost("/api/login", async context =>
     if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
     if (!loginThrottle.TryEnter(DateTimeOffset.UtcNow)) { await ApiError(context, 429, "login-rate-limit"); return; }
     LoginRequest? login = await context.Request.ReadFromJsonAsync(ApiJson.Default.LoginRequest, context.RequestAborted);
-    if (login?.Username is not { Length: >= 2 and <= 39 } || login.Password is not { Length: >= 16 and <= 256 })
+    if (login?.Username is not { Length: >= 2 and <= 39 } || !PasswordPolicy.IsAcceptableLength(login.Password))
     { await ApiError(context, 400, "credentials"); return; }
     SessionGrant? grant = await store.LoginAsync(login.Username, login.Password, context.RequestAborted);
     if (grant is null) { await ApiError(context, 401, "credentials"); return; }
@@ -132,7 +187,7 @@ app.MapPost("/api/password", async context =>
     { await ApiError(context, 403, "csrf"); return; }
     if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
     PasswordChangeRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.PasswordChangeRequest, context.RequestAborted);
-    if (request?.CurrentPassword is not { Length: >= 16 and <= 256 } || request.NewPassword is not { Length: >= 16 and <= 256 })
+    if (request is null || !PasswordPolicy.IsAcceptableLength(request.CurrentPassword) || !PasswordPolicy.IsAcceptableLength(request.NewPassword))
     { await ApiError(context, 400, "password"); return; }
     try
     {
@@ -166,7 +221,7 @@ app.MapPost("/api/users", async context =>
     { await ApiError(context, 403, "csrf"); return; }
     if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
     UserCreateRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.UserCreateRequest, context.RequestAborted);
-    if (request?.Username is not { Length: >= 2 and <= 39 } || request.Password is not { Length: >= 16 and <= 256 })
+    if (request?.Username is not { Length: >= 2 and <= 39 } || !PasswordPolicy.IsAcceptableLength(request.Password))
     { await ApiError(context, 400, "user"); return; }
     try
     {
@@ -189,7 +244,7 @@ app.MapPost("/api/users/{userId:long}/reset-password", async context =>
     { await ApiError(context, 403, "csrf"); return; }
     if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
     PasswordResetRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.PasswordResetRequest, context.RequestAborted);
-    if (request?.NewPassword is not { Length: >= 16 and <= 256 }) { await ApiError(context, 400, "password"); return; }
+    if (request is null || !PasswordPolicy.IsAcceptableLength(request.NewPassword)) { await ApiError(context, 400, "password"); return; }
     long userId = Convert.ToInt64(context.Request.RouteValues["userId"], System.Globalization.CultureInfo.InvariantCulture);
     try
     {
@@ -227,7 +282,7 @@ app.MapPost("/api/users/{userId:long}/enable", async context =>
     { await ApiError(context, 403, "csrf"); return; }
     if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
     PasswordResetRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.PasswordResetRequest, context.RequestAborted);
-    if (request?.NewPassword is not { Length: >= 16 and <= 256 }) { await ApiError(context, 400, "password"); return; }
+    if (request is null || !PasswordPolicy.IsAcceptableLength(request.NewPassword)) { await ApiError(context, 400, "password"); return; }
     long userId = Convert.ToInt64(context.Request.RouteValues["userId"], System.Globalization.CultureInfo.InvariantCulture);
     try
     {
@@ -236,6 +291,49 @@ app.MapPost("/api/users/{userId:long}/enable", async context =>
     }
     catch (ArgumentException) { await ApiError(context, 400, "password"); }
     catch (InvalidOperationException error) { await ApiError(context, 400, error.Message); }
+});
+
+// Inspect a Git bundle that an administrator uploaded through the browser. This is the application half of
+// the upload: DnaX moved the bytes, and nothing about that transport authorizes anything here. The caller is
+// re-authenticated, re-authorized, and only ever reaches an upload it owns.
+app.MapPost("/api/graft/admin/import/inspect", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    if (!browser.Value.Identity.IsAdministrator) { await ApiError(context, 403, "administrator"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+
+    UploadIngestRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.UploadIngestRequest, context.RequestAborted);
+    if (request is null || !Guid.TryParse(request.UploadId, out Guid uploadId))
+    { await ApiError(context, 400, "upload-id"); return; }
+
+    DiskUploadStore uploads = context.RequestServices.GetRequiredService<DiskUploadStore>();
+    string owner = GraftSessionAuthenticationHandler.Owner(browser.Value.Identity);
+    string staged = Path.Combine(ingestDirectory, "bundle-" + Guid.NewGuid().ToString("N") + ".tmp");
+    try
+    {
+        UploadStatus status = uploads.Get(owner, uploadId);
+        // Reject before copying rather than after: the inventory reader has its own 1 GiB ceiling.
+        if (status.Length > 1024L * 1024 * 1024) { await ApiError(context, 413, "bundle exceeds the 1 GiB inventory limit"); return; }
+        await uploads.ReadCompletedAsync(owner, uploadId, async (source, cancellationToken) =>
+        {
+            await using FileStream target = new(staged, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+            await source.CopyToAsync(target, cancellationToken);
+            await target.FlushAsync(cancellationToken);
+        }, context.RequestAborted);
+
+        GitBundleInventory inventory = GitBundleInventory.Read(staged);
+        BundleInventoryResponse response = new(status.FileName, inventory.Format, inventory.Sha256, inventory.Bytes,
+            [.. inventory.Refs.Select(item => new ImportRefResponse(item.Name, item.ObjectId))],
+            [.. inventory.Excluded.Select(item => new ImportExclusionResponse(item.Area, item.Reason))]);
+        await context.Response.WriteAsJsonAsync(response, ApiJson.Default.BundleInventoryResponse, null, context.RequestAborted);
+    }
+    catch (UploadException error) { await ApiError(context, error.StatusCode, error.Message); }
+    catch (InvalidDataException error) { await ApiError(context, 400, error.Message); }
+    finally { try { if (File.Exists(staged)) File.Delete(staged); } catch (IOException) { } }
 });
 
 app.MapGet("/api/tokens", async context =>
@@ -610,6 +708,9 @@ app.Lifetime.ApplicationStopping.Register(() =>
     catch (SocketException) { }
 });
 Console.WriteLine("MODE: " + (RuntimeFeature.IsDynamicCodeSupported ? "JIT" : "NativeAOT"));
+if (PasswordPolicy.RelaxedForLocalDebug)
+    Console.WriteLine($"WARNING: debug build; passwords of {PasswordPolicy.MinimumLength} characters are accepted. " +
+        "Do not expose this build. Release builds require 16.");
 Console.WriteLine($"ASSETS: {assets.Count}; bytes={assets.Bytes}");
 Console.WriteLine("READY: " + address);
 await app.WaitForShutdownAsync();
@@ -950,6 +1051,18 @@ static async Task ApiError(HttpContext context, int status, string message)
 }
 
 static string Origin(HttpContext context) => context.Request.Scheme + "://" + context.Request.Host.Value;
+
+/// <summary>
+/// Creates a directory holding state that only the service account should read. Staged upload bytes and the
+/// data-protection key ring both qualify: the key ring signs antiforgery tokens, and staged bytes are another
+/// account's content until they are ingested.
+/// </summary>
+static void CreatePrivateDirectory(string path)
+{
+    Directory.CreateDirectory(path);
+    if (OperatingSystem.IsWindows()) return;
+    File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+}
 
 static void NotifySystemd(string message)
 {

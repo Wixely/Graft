@@ -1,0 +1,113 @@
+@page "/-/admin/import"
+@inject GraftApi Api
+@inject NavigationManager Navigation
+
+<PageTitle>Import &middot; Graft</PageTitle>
+
+@if (loading)
+{
+    <p role="status" class="secondary-text">Loading…</p>
+}
+else if (!Api.IsAdministrator)
+{
+    <div class="page-header"><div><h1>Import</h1><p class="subtitle">This page requires an administrator account.</p></div></div>
+}
+else
+{
+    <div class="page-header">
+        <div><h1>Import</h1><p class="subtitle">Inspect a Git bundle before importing its repository.</p></div>
+    </div>
+
+    <Banner Message="@message" Kind="@messageKind" />
+
+    <div class="panel">
+        <div class="panel-header"><Icon Name="upload" /><h2>Upload a Git bundle</h2></div>
+        <div class="panel-body">
+            <p class="secondary-text">
+                The transfer is owned by the browser and resumes by itself. You can leave this page or lose the
+                connection mid-upload without starting again.
+            </p>
+            <UploadField Profile="archive" Id="import-bundle" OnCompleted="Inspect" />
+        </div>
+    </div>
+
+    @if (inventory is not null)
+    {
+        <div class="panel">
+            <div class="panel-header">
+                <Icon Name="archive" />
+                <h2>@inventory.FileName</h2>
+                <span class="spacer"></span>
+                <span class="label accent">bundle @inventory.Format</span>
+            </div>
+            <div class="panel-body">
+                <p class="secondary-text">@inventory.Bytes bytes</p>
+                <p class="mono">sha256 @inventory.Sha256</p>
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="panel-header"><Icon Name="branch" /><h2>References</h2><span class="spacer"></span><span class="label">@inventory.Refs.Length</span></div>
+            <div class="list">
+                @foreach (ImportRefResponse reference in inventory.Refs)
+                {
+                    <div class="list-item">
+                        <Icon Name="branch" />
+                        <span class="list-item-main"><strong>@reference.Name</strong><small class="mono">@reference.ObjectId</small></span>
+                    </div>
+                }
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="panel-header"><Icon Name="alert" /><h2>Not carried across</h2></div>
+            <div class="panel-body">
+                <p class="secondary-text">
+                    A Git bundle holds repository objects and references only. Importing it does not migrate
+                    anything below, which needs a separate metadata importer.
+                </p>
+            </div>
+            <div class="list">
+                @foreach (ImportExclusionResponse exclusion in inventory.Excluded)
+                {
+                    <div class="list-item">
+                        <Icon Name="close" />
+                        <span class="list-item-main"><strong>@exclusion.Area</strong><small>@exclusion.Reason</small></span>
+                    </div>
+                }
+            </div>
+        </div>
+    }
+}
+
+@code {
+    private BundleInventoryResponse? inventory;
+    private string message = "";
+    private string messageKind = "info";
+    private bool loading = true;
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            if (!await Api.EnsureSessionAsync() && Api.Reachable) Navigation.NavigateTo("/-/login", replace: true);
+        }
+        finally { loading = false; }
+    }
+
+    /// <summary>
+    /// Runs when the browser reports a completed transfer. Completion means the bytes arrived durably, not
+    /// that they are a valid bundle, so the server reads and validates the content before anything is shown.
+    /// </summary>
+    private async Task Inspect(string uploadId)
+    {
+        message = "";
+        ApiResult<BundleInventoryResponse> result = await Api.SendAsync(HttpMethod.Post,
+            "api/graft/admin/import/inspect", new UploadIngestRequest(uploadId),
+            ApiJson.Default.UploadIngestRequest, ApiJson.Default.BundleInventoryResponse, "Bundle inspected.");
+        inventory = result.Value;
+        message = result.Ok ? "" : result.Message;
+        messageKind = "error";
+        StateHasChanged();
+    }
+}

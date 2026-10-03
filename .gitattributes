@@ -6,3 +6,6 @@
 *.md text eol=lf
 *.json text eol=lf
 *.slnx text eol=lf
+
+# Vendored third-party assets keep upstream bytes so their recorded hash stays verifiable.
+src/Graft.Client/wwwroot/vendor/** -text

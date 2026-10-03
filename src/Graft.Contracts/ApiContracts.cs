@@ -92,6 +92,24 @@ public sealed record TokenResponse(long Id, string Name, string[] Scopes, DateTi
 public sealed record ProjectCreateRequest(string? Name, string? Path, string? Description, string? Visibility);
 public sealed record MembershipSetRequest(string Username, string Role);
 public sealed record ProjectMemberResponse(long UserId, string Username, string Role);
+/// <summary>
+/// Names a completed browser upload for an application operation to ingest. The upload id is a transport
+/// receipt, not an authorization: the server re-checks the caller's permission and that the caller owns it.
+/// </summary>
+public sealed record UploadIngestRequest(string UploadId);
+
+public sealed record ImportRefResponse(string Name, [property: JsonPropertyName("object_id")] string ObjectId);
+public sealed record ImportExclusionResponse(string Area, string Reason);
+
+/// <summary>What an uploaded Git bundle contains, and what it explicitly does not carry across.</summary>
+public sealed record BundleInventoryResponse(
+    string FileName,
+    string Format,
+    string Sha256,
+    long Bytes,
+    ImportRefResponse[] Refs,
+    ImportExclusionResponse[] Excluded);
+
 public sealed record RepositoryPageResponse(
     ProjectResponse Project,
     bool CanManage,
@@ -123,4 +141,6 @@ public sealed record RepositoryPageResponse(
 [JsonSerializable(typeof(MembershipSetRequest))]
 [JsonSerializable(typeof(ProjectMemberResponse[]))]
 [JsonSerializable(typeof(RepositoryPageResponse))]
+[JsonSerializable(typeof(UploadIngestRequest))]
+[JsonSerializable(typeof(BundleInventoryResponse))]
 public partial class ApiJson : JsonSerializerContext;

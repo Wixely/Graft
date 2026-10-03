@@ -30,6 +30,7 @@
     <ProjectReference Include="../Graft.Git/Graft.Git.csproj" />
     <ProjectReference Include="../Graft.Operations/Graft.Operations.csproj" />
     <ProjectReference Include="../Graft.Storage/Graft.Storage.csproj" />
+    <PackageReference Include="DnaX.Uploads" Version="10.0.0-alpha.7" />
     <PackageReference Include="Microsoft.Extensions.Hosting.Systemd" Version="10.0.12" />
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.12" />
   </ItemGroup>
