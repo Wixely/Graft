@@ -4,7 +4,6 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
-    <RunAOTCompilation>false</RunAOTCompilation>
     <WasmBuildNative>false</WasmBuildNative>
     <RuntimeFrameworkVersion>10.0.8</RuntimeFrameworkVersion>
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>

@@ -30,7 +30,21 @@ Dapper.AOT generated interceptors for all eight application Dapper call sites in
 
 The tested dependency is `DnaX.Data.Migrations.Sqlite` 10.0.0-alpha.7 and its `DnaX.Data.Migrations` dependency, produced from public tag `v10.0.0-alpha.7` / commit `73826d731cef903083f2a4ae15ba6ac284e83ce3`. Alpha.7 was selected over the earlier planning candidate because its migration checksums normalize line endings consistently across platforms and report structured drift details. The project locks package content hashes.
 
-The locally packed `.nupkg` SHA-256 values were `83f225fcfd86bfc078a5d887238114dba5ea3ec91ddb767c76e5155879345e53` for `DnaX.Data.Migrations` and `b7b677609a7215df7e25fba9471df009e5ecc20e94ff02a068ab65f2a5457cc7` for the SQLite adapter. A repeated pack from the same clean tag produced identical hashes.
+The locally packed `.nupkg` SHA-256 values on 2026-09-19 were `83f225fcfd86bfc078a5d887238114dba5ea3ec91ddb767c76e5155879345e53` for `DnaX.Data.Migrations` and `b7b677609a7215df7e25fba9471df009e5ecc20e94ff02a068ab65f2a5457cc7` for the SQLite adapter. A repeated pack from the same clean tag, on the same machine and SDK, produced identical hashes.
+
+### Repack on 2026-10-03: pack output is not reproducible across SDK patch versions
+
+The ignored feed was absent from the working checkout, so the packages were rebuilt from the same public tag `v10.0.0-alpha.7` / commit `73826d731cef903083f2a4ae15ba6ac284e83ce3`, extracted read-only with `git archive`. **The resulting `.nupkg` bytes differ from the 2026-09-19 values** because SDK 10.0.300 is no longer installed on the development machine and 10.0.302 produced the pack. Package *content* and source provenance are unchanged; only the archive framing differs. The previously cached originals were overwritten during restore and could not be recovered, so the committed `contentHash` values were updated to the repacked packages in nine lock files.
+
+Current locked SHA-512 `contentHash` values, produced by .NET SDK 10.0.302 from commit `73826d7`:
+
+| Package | contentHash |
+| --- | --- |
+| `DnaX.Data.Migrations` 10.0.0-alpha.7 | `zzsP/SjAm7AHykp7FSDLwQOcdT1Ir6g66VTLJu+CXSBtRgW8nzT3u/zRoGsm8wan/PXtNkGrx9kCOP+Z/jbCfw==` |
+| `DnaX.Data.Migrations.Sqlite` 10.0.0-alpha.7 | `Q0X6mkGYxwTZPNYrLWJxvoMAwENZHRyA07Pb25i82P4JtFYgSb5dHZXXwDht5JgKZxWtTud9qHPeNSAE6HoELg==` |
+| `DnaX.Uploads` 10.0.0-alpha.7 | `6AZ2tO/Pk0bG06Mh4RTEZTXZ9J2Mvz2YPlVTGQqJLVtqm+8qYj/dj1aJUDc60rzmlY67k3HwJ8kphM5W9mRVTA==` |
+
+This reinforces rather than weakens the durable-feed gate: a locally packed feed cannot hold a stable hash across toolchain updates, so the recorded hash only identifies a package built by a specific SDK. Treat a hash change after an SDK update as expected, and verify the source commit instead. A published feed would make the bytes, and therefore the hash, authoritative.
 
 A clean isolated restore from NuGet.org failed with NU1101 because these package IDs were unavailable there on 2026-09-19. The public GitHub release had no package assets. For feasibility only, the clean local checkout at the exact public tag was packed into an ignored local feed. A locked restore using a fresh empty package cache passed from that feed, and the isolated static build consumed the same exact `.nupkg` files. No sibling-project reference entered Graft.
 
