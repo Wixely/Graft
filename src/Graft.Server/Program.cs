@@ -316,6 +316,8 @@ app.MapPost("/api/graft/admin/import/inspect", async context =>
     try
     {
         UploadStatus status = uploads.Get(owner, uploadId);
+        if (!string.Equals(status.Profile, UploadLimits.ArchiveProfile, StringComparison.Ordinal))
+        { await ApiError(context, 400, "upload was not created for archives"); return; }
         // Reject before copying rather than after: the inventory reader has its own 1 GiB ceiling.
         if (status.Length > 1024L * 1024 * 1024) { await ApiError(context, 413, "bundle exceeds the 1 GiB inventory limit"); return; }
         await uploads.ReadCompletedAsync(owner, uploadId, async (source, cancellationToken) =>
@@ -467,6 +469,69 @@ app.MapDelete("/api/projects/{projectId:long}/members/{userId:long}", async cont
     catch (UnauthorizedAccessException) { await ApiError(context, 404, "project"); }
 });
 
+// Commit uploaded files into a repository. The browser moved the bytes through DnaX; this is the
+// application half, so the caller is re-authenticated, re-authorized for push, and only ever reaches
+// uploads it owns and that were created under the repository-file profile.
+app.MapPost("/api/graft/projects/{projectId:long}/repository/files", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+
+    RepositoryCommitRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.RepositoryCommitRequest, context.RequestAborted);
+    if (request?.Files is not { Length: > 0 and <= 20 } || request.Branch is not { Length: > 0 })
+    { await ApiError(context, 400, "files"); return; }
+
+    long projectId = Convert.ToInt64(context.Request.RouteValues["projectId"], System.Globalization.CultureInfo.InvariantCulture);
+    ProjectDetails? details = await store.GetReadyProjectAsync(projectId, context.RequestAborted);
+    if (details is null ||
+        !(await store.GetPermissionAsync(browser.Value.Identity, projectId, ProjectAction.PushRepository, context.RequestAborted)).Allowed)
+    { await ApiError(context, 404, "project"); return; }
+
+    DiskUploadStore uploads = context.RequestServices.GetRequiredService<DiskUploadStore>();
+    string owner = GraftSessionAuthenticationHandler.Owner(browser.Value.Identity);
+    List<FileChange> changes = [];
+    try
+    {
+        foreach (RepositoryFileUpload file in request.Files)
+        {
+            if (!Guid.TryParse(file.UploadId, out Guid uploadId)) { await ApiError(context, 400, "upload-id"); return; }
+            UploadStatus status = uploads.Get(owner, uploadId);
+            // A session created under another profile carries another profile's limits, so a 20 GiB archive
+            // must never be committable as a blob.
+            if (!string.Equals(status.Profile, UploadLimits.RepositoryFileProfile, StringComparison.Ordinal))
+            { await ApiError(context, 400, "upload was not created for repository files"); return; }
+            if (status.Length > Limits.ObjectBytes) { await ApiError(context, 413, "file exceeds the repository object limit"); return; }
+            byte[] content = [];
+            await uploads.ReadCompletedAsync(owner, uploadId, async (source, cancellationToken) =>
+            {
+                using MemoryStream buffer = new();
+                await source.CopyToAsync(buffer, cancellationToken);
+                content = buffer.ToArray();
+            }, context.RequestAborted);
+            changes.Add(new(file.Path, content, file.Executable));
+        }
+    }
+    catch (UploadException error) { await ApiError(context, error.StatusCode, error.Message); return; }
+
+    // Graft accounts carry no email address, so attribution uses the reserved .invalid domain rather than
+    // inventing a deliverable one. The identity still round-trips through the commit reader.
+    GitIdentity author = new(browser.Value.Identity.Username,
+        browser.Value.Identity.Username + "@graft.invalid", DateTimeOffset.UtcNow);
+
+    RepositoryEndpoint endpoint = EndpointFor(details.Project);
+    await WithRepository(endpoint, context, async repository =>
+    {
+        AuthoredCommit authored = repository.CommitFiles(request.Branch, changes, author, request.Message, context.RequestAborted);
+        await context.Response.WriteAsJsonAsync(
+            new RepositoryCommitResponse(authored.CommitId, authored.TreeId, authored.Branch, authored.CreatedBranch),
+            ApiJson.Default.RepositoryCommitResponse, null, context.RequestAborted);
+    });
+});
+
 app.MapGet("/api/browser/projects/{projectId:long}", async context =>
 {
     (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
@@ -488,8 +553,8 @@ app.MapGet("/api/browser/projects/{projectId:long}", async context =>
         GitFile? file = filePath.Length == 0 ? null : RepositoryView.File(repository, revision, filePath);
         if (filePath.Length > 0 && file is null) { await ApiError(context, 404, "file"); return; }
         ProjectResponse project = await ProjectResponseForLocked(context, details, repository);
-        PermissionDecision push = await store.GetPermissionAsync(browser.Value.Identity, projectId, ProjectAction.PushRepository, context.RequestAborted);
         PermissionDecision manage = await store.GetPermissionAsync(browser.Value.Identity, projectId, ProjectAction.ManageProject, context.RequestAborted);
+        PermissionDecision push = await store.GetPermissionAsync(browser.Value.Identity, projectId, ProjectAction.PushRepository, context.RequestAborted);
         BranchResponse[] branches = RepositoryView.Branches(repository).Select(branch => new BranchResponse(
             branch.Name, false, false, branch.Name == "main", true, true, push.Allowed,
             ProjectWebUrl(context, details) + "/-/tree/" + Uri.EscapeDataString(branch.Name),
@@ -498,7 +563,7 @@ app.MapGet("/api/browser/projects/{projectId:long}", async context =>
             .Select(commit => CommitResponseFor(context, details, commit)).ToArray();
         TreeEntryResponse[] entries = tree.Select(entry => new TreeEntryResponse(entry.Id, entry.Name, entry.Type, entry.Path, entry.Mode)).ToArray();
         FileResponse? fileResponse = file is null ? null : FileResponseFor(file, revision);
-        RepositoryPageResponse response = new(project, manage.Allowed, branches, commits, entries, fileResponse);
+        RepositoryPageResponse response = new(project, manage.Allowed, push.Allowed, branches, commits, entries, fileResponse);
         await context.Response.WriteAsJsonAsync(response, ApiJson.Default.RepositoryPageResponse, null, context.RequestAborted);
     });
 });

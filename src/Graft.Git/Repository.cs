@@ -43,6 +43,21 @@ public sealed class Repository
         Refs = state.Refs;
     }
 
+    /// <summary>
+    /// Publishes an already-validated batch through the same durable path a push uses: objects and refs are
+    /// committed to storage before either becomes visible to readers. Callers own the validation; see
+    /// <see cref="RepositoryAuthor"/> for the server-authored case.
+    /// </summary>
+    internal void Apply(
+        Dictionary<string, GitObject> objects,
+        Dictionary<string, string> refs,
+        CancellationToken cancellationToken)
+    {
+        persistence?.Commit(objects, refs, cancellationToken);
+        Objects = objects;
+        Refs = refs;
+    }
+
     public byte[] Advertise(string service)
     {
         var receive = service == "git-receive-pack";

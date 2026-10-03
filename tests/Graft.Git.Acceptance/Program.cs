@@ -166,6 +166,7 @@ try
     Check(reopened.Objects.ContainsKey(durableHead), "latest accepted object persisted");
 
     TestInterruptedCommitsLeaveRefsUnchanged(reopened, repositoryPath);
+    TestServerAuthoredObjectsMatchGit();
 
     await using (GraftStore pending = await GraftStore.OpenAsync(databasePath))
     {
@@ -973,6 +974,109 @@ void TestInterruptedCommitsLeaveRefsUnchanged(Repository current, string reposit
         Check(guarded.Refs["refs/heads/main"] == before, phase + " leaves memory ref unchanged");
         Check(disk.Refs["refs/heads/main"] == before, phase + " leaves disk ref unchanged");
     }
+}
+
+/// <summary>
+/// Server-authored objects must be byte-identical to what Git itself would have written, or a repository
+/// built through the browser would not round-trip through its own transport.
+///
+/// <para>
+/// The expected ids below are not computed by this code: each was produced by running Git 2.53 over the same
+/// content with the same identity, message and fixed timestamp, then recorded. Comparing object ids compares
+/// every byte of every blob, tree and commit at once, including the tree ordering rule that sorts a directory
+/// as though its name ended in a slash. Regenerate them with real Git if the fixture content ever changes.
+/// </para>
+/// </summary>
+void TestServerAuthoredObjectsMatchGit()
+{
+    GitIdentity who = new("Graft Fixture", "fixture@example.invalid",
+        DateTimeOffset.FromUnixTimeSeconds(1_700_000_000).ToOffset(TimeSpan.Zero));
+
+    Repository authored = new();
+    AuthoredCommit first = authored.CommitFiles("main",
+    [
+        new("readme.txt", "hello graft\n"u8.ToArray()),
+        new("a.txt", "top level a\n"u8.ToArray()),
+        new("a/b.txt", "nested b\n"u8.ToArray()),
+        new("a/c/d.txt", "deep d\n"u8.ToArray()),
+        new("run.sh", "#!/bin/sh\necho hi\n"u8.ToArray(), Executable: true),
+        new("zz.txt", "last\n"u8.ToArray())
+    ], who, "Author the initial tree");
+    Check(first.CommitId == "52ecd2c9fc239449212956723f3a8f3a434a31de", "authored commit matches Git");
+    Check(first.TreeId == "52a54943ef50c44a3cc1ea55c32f05476d5b1983", "authored tree matches Git");
+    Check(first.CreatedBranch && authored.Refs["refs/heads/main"] == first.CommitId, "authoring creates the branch");
+
+    // Replacing one file and adding another proves untouched subtrees are reused by id rather than rebuilt,
+    // and that the parent link is correct.
+    AuthoredCommit second = authored.CommitFiles("main",
+        [new("a/b.txt", "nested b changed\n"u8.ToArray()), new("a/c/e.txt", "new e\n"u8.ToArray())],
+        who, "Change one file and add another");
+    Check(second.CommitId == "1902889d625b664eb059152944127e86e08486dd", "authored follow-up commit matches Git");
+    Check(second.TreeId == "3203ecd726d169b59110df7df4d4fcd3dea96356", "authored follow-up tree matches Git");
+    Check(!second.CreatedBranch, "authoring onto an existing branch does not report creation");
+    Check(RepositoryView.ReadCommit(authored, second.CommitId).ParentIds.Single() == first.CommitId, "authored parent link");
+    Check(RepositoryView.File(authored, "main", "a/c/d.txt") is not null, "untouched file survives a later commit");
+
+    // Names straddling the directory-sorts-as-if-it-ended-in-slash rule, plus non-ASCII, which must sort as
+    // raw UTF-8 bytes. Case-only variants are excluded: the reference repository was built on a
+    // case-insensitive filesystem, where they would have collided into one file.
+    Repository ordering = new();
+    AuthoredCommit sorted = ordering.CommitFiles("main",
+    [
+        new("a-", "dash\n"u8.ToArray()),
+        new("ab", "bee\n"u8.ToArray()),
+        new("a.txt", "dot\n"u8.ToArray()),
+        new("a/x", "in a\n"u8.ToArray()),
+        new("a0", "zero\n"u8.ToArray()),
+        new("é.txt", "e acute\n"u8.ToArray()),
+        new("é/inner", "e acute dir\n"u8.ToArray()),
+        new("Z", "upper\n"u8.ToArray())
+    ], who, "Sort order edge cases");
+    Check(sorted.TreeId == "989afa6f4d9fbebf156ed6ea4d5215b37d5c76b3", "authored tree ordering matches Git");
+    Check(sorted.CommitId == "49227f858fed623224800c000bcb5129eb0f5984", "authored ordering commit matches Git");
+
+    // Nothing that would produce a hostile or unusable path may reach a tree.
+    foreach (string rejected in new[]
+    {
+        "../escape.txt", "a/../../escape.txt", "./here.txt", ".git/config", "nested/.GIT/config",
+        "/absolute.txt", "trailing/", "double//slash.txt", "back\\slash.txt", "control.txt", ""
+    })
+    {
+        Repository guard = new();
+        ThrowsSync<GitInputException>(() => guard.CommitFiles("main",
+            [new(rejected, "x"u8.ToArray())], who, "rejected"), "rejects path " + rejected);
+    }
+
+    Repository limits = new();
+    ThrowsSync<GitInputException>(() => limits.CommitFiles("main",
+        [new("big.bin", new byte[Limits.ObjectBytes + 1])], who, "too large"), "rejects an oversized blob");
+    ThrowsSync<GitInputException>(() => limits.CommitFiles("main",
+        [new("same.txt", "a"u8.ToArray()), new("same.txt", "b"u8.ToArray())], who, "duplicate"), "rejects duplicate paths");
+    ThrowsSync<GitInputException>(() => limits.CommitFiles("main", [], who, "empty"), "rejects an empty change set");
+    ThrowsSync<GitInputException>(() => limits.CommitFiles("..", [new("a.txt", "a"u8.ToArray())], who, "bad branch"), "rejects an invalid branch");
+    ThrowsSync<GitInputException>(() => limits.CommitFiles("main", [new("a.txt", "a"u8.ToArray())], who, "  "), "rejects an empty message");
+
+    // A file and a directory cannot occupy the same name, in either order.
+    Repository conflict = new();
+    conflict.CommitFiles("main", [new("thing/inner.txt", "a"u8.ToArray())], who, "make a directory");
+    ThrowsSync<GitInputException>(() => conflict.CommitFiles("main",
+        [new("thing", "a"u8.ToArray())], who, "file over directory"), "rejects a file replacing a directory");
+    ThrowsSync<GitInputException>(() => conflict.CommitFiles("main",
+        [new("thing/inner.txt/deeper", "a"u8.ToArray())], who, "directory over file"), "rejects a directory replacing a file");
+
+    // A rejected batch must leave nothing behind.
+    string head = conflict.Refs["refs/heads/main"];
+    int objects = conflict.Objects.Count;
+    ThrowsSync<GitInputException>(() => conflict.CommitFiles("main",
+        [new("ok.txt", "a"u8.ToArray()), new("../bad.txt", "b"u8.ToArray())], who, "partial"), "rejects a batch with one bad path");
+    Check(conflict.Refs["refs/heads/main"] == head && conflict.Objects.Count == objects, "a rejected batch leaves no partial state");
+}
+
+void ThrowsSync<TException>(Action action, string name) where TException : Exception
+{
+    try { action(); }
+    catch (TException) { assertions++; return; }
+    throw new InvalidOperationException("Expected " + typeof(TException).Name + ": " + name);
 }
 
 void Check(bool condition, string name)

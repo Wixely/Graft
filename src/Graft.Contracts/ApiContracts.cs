@@ -110,9 +110,37 @@ public sealed record BundleInventoryResponse(
     ImportRefResponse[] Refs,
     ImportExclusionResponse[] Excluded);
 
+/// <summary>One uploaded file and where it should land in the repository.</summary>
+public sealed record RepositoryFileUpload(
+    [property: JsonPropertyName("upload_id")] string UploadId,
+    string Path,
+    bool Executable);
+
+public sealed record RepositoryCommitRequest(string Branch, string Message, RepositoryFileUpload[] Files);
+
+public sealed record RepositoryCommitResponse(
+    [property: JsonPropertyName("commit_id")] string CommitId,
+    [property: JsonPropertyName("tree_id")] string TreeId,
+    string Branch,
+    [property: JsonPropertyName("created_branch")] bool CreatedBranch);
+
+/// <summary>
+/// A DnaX upload session as the server reports it. This is the authoritative reconciliation path: the
+/// browser completion event is only a hint, so the page reads the session back before acting on it.
+/// DnaX serializes camelCase, hence the explicit name.
+/// </summary>
+public sealed record UploadStatusResponse(
+    string Id,
+    string Profile,
+    [property: JsonPropertyName("fileName")] string FileName,
+    long Length,
+    long Offset,
+    string State);
+
 public sealed record RepositoryPageResponse(
     ProjectResponse Project,
     bool CanManage,
+    bool CanPush,
     IReadOnlyList<BranchResponse> Branches,
     IReadOnlyList<CommitResponse> Commits,
     IReadOnlyList<TreeEntryResponse> Tree,
@@ -143,4 +171,7 @@ public sealed record RepositoryPageResponse(
 [JsonSerializable(typeof(RepositoryPageResponse))]
 [JsonSerializable(typeof(UploadIngestRequest))]
 [JsonSerializable(typeof(BundleInventoryResponse))]
+[JsonSerializable(typeof(RepositoryCommitRequest))]
+[JsonSerializable(typeof(RepositoryCommitResponse))]
+[JsonSerializable(typeof(UploadStatusResponse))]
 public partial class ApiJson : JsonSerializerContext;

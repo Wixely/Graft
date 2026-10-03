@@ -29,6 +29,10 @@ else
     <div class="tabs">
         <button type="button" class="@(tab == "code" ? "active" : "")" @onclick='() => tab = "code"'>Code</button>
         <button type="button" class="@(tab == "commits" ? "active" : "")" @onclick='() => tab = "commits"'>Commits</button>
+        @if (repo.CanPush)
+        {
+            <button type="button" class="@(tab == "upload" ? "active" : "")" @onclick='() => tab = "upload"'>Add files</button>
+        }
         @if (repo.CanManage)
         {
             <button type="button" class="@(tab == "settings" ? "active" : "")" @onclick='() => tab = "settings"'>Members</button>
@@ -105,6 +109,48 @@ else
                 }
             </div>
         }
+    }
+    else if (tab == "upload")
+    {
+        <div class="panel">
+            <div class="panel-header"><Icon Name="upload" /><h2>Add files to @(repo.Project.DefaultBranch ?? "main")</h2></div>
+            <div class="panel-body">
+                <p class="secondary-text">
+                    Files are uploaded first and committed when you choose. The server caps each file at the
+                    limit its Git engine places on a single object, so a larger file is refused before it is staged.
+                </p>
+                <UploadField Profile="repository-file" Id="repository-files" OnCompleted="Staged" />
+
+                @if (staged.Count > 0)
+                {
+                    <div class="list">
+                        @foreach (StagedFile file in staged)
+                        {
+                            <div class="list-item">
+                                <Icon Name="file" />
+                                <span class="list-item-main">
+                                    <label class="visually-hidden" for="@("path-" + file.UploadId)">Path in the repository</label>
+                                    <input id="@("path-" + file.UploadId)" @bind="file.Path" maxlength="1024" />
+                                    <small>@file.Name</small>
+                                </span>
+                                <span class="list-item-actions">
+                                    <label class="checkbox"><input type="checkbox" @bind="file.Executable" /> Executable</label>
+                                    <button type="button" class="secondary" @onclick="() => staged.Remove(file)" disabled="@committing">Remove</button>
+                                </span>
+                            </div>
+                        }
+                    </div>
+
+                    <form class="form" @onsubmit="Commit" @onsubmit:preventDefault>
+                        <label for="commit-message">Commit message</label>
+                        <input id="commit-message" @bind="commitMessage" required maxlength="10000" />
+                        <div class="form-actions">
+                            <button type="submit" disabled="@committing">@(committing ? "Committing…" : "Commit " + staged.Count + (staged.Count == 1 ? " file" : " files"))</button>
+                        </div>
+                    </form>
+                }
+            </div>
+        </div>
     }
     else if (tab == "commits")
     {
@@ -201,6 +247,59 @@ else
     private string memberRole = "Developer";
     private bool loading = true;
     private bool busy;
+
+    /// <summary>A completed upload waiting to be committed. Mutable so the path field can be edited.</summary>
+    private sealed class StagedFile
+    {
+        public required string UploadId { get; init; }
+        public required string Name { get; init; }
+        public string Path { get; set; } = "";
+        public bool Executable { get; set; }
+    }
+
+    private readonly List<StagedFile> staged = [];
+    private string commitMessage = "";
+    private bool committing;
+
+    /// <summary>
+    /// Called when the browser reports a finished transfer. The event is a hint, so the session is read back
+    /// from the server and only an upload the server agrees is complete is staged.
+    /// </summary>
+    private async Task Staged(string uploadId)
+    {
+        if (staged.Any(file => file.UploadId == uploadId)) return;
+        UploadStatusResponse? status = await Api.GetAsync(
+            $"api/graft/uploads/sessions/{uploadId}", ApiJson.Default.UploadStatusResponse);
+        if (status is null || status.State != "complete") return;
+        staged.Add(new StagedFile { UploadId = uploadId, Name = status.FileName, Path = status.FileName });
+        StateHasChanged();
+    }
+
+    private async Task Commit()
+    {
+        if (committing || repo is null || staged.Count == 0) return;
+        committing = true;
+        message = "";
+        try
+        {
+            RepositoryCommitRequest request = new(repo.Project.DefaultBranch ?? "main", commitMessage,
+                [.. staged.Select(file => new RepositoryFileUpload(file.UploadId, file.Path, file.Executable))]);
+            ApiResult<RepositoryCommitResponse> result = await Api.SendAsync(HttpMethod.Post,
+                $"api/graft/projects/{repo.Project.Id}/repository/files", request,
+                ApiJson.Default.RepositoryCommitRequest, ApiJson.Default.RepositoryCommitResponse, "Committed.");
+            Report(new ApiResult(result.Ok, result.Ok && result.Value is not null
+                ? $"Committed {staged.Count} {(staged.Count == 1 ? "file" : "files")} as {result.Value.CommitId[..7]}."
+                : result.Message));
+            if (!result.Ok) return;
+            staged.Clear();
+            commitMessage = "";
+            path = "";
+            filePath = "";
+            tab = "code";
+            await Load(repo.Project.Id);
+        }
+        finally { committing = false; }
+    }
 
     protected override async Task OnParametersSetAsync()
     {
