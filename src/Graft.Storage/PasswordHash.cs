@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Security.Cryptography;
+using Graft.Core;
 
 namespace Graft.Storage;
 
@@ -40,7 +41,9 @@ internal static class PasswordHash
     public static void ValidatePassword(string password)
     {
         ArgumentNullException.ThrowIfNull(password);
-        if (password.Length is < 16 or > 256)
-            throw new ArgumentException("Passwords must be between 16 and 256 characters.", nameof(password));
+        if (!PasswordPolicy.IsAcceptableLength(password))
+            throw new ArgumentException(
+                $"Passwords must be between {PasswordPolicy.MinimumLength} and {PasswordPolicy.MaximumLength} characters.",
+                nameof(password));
     }
 }

@@ -1,0 +1,63 @@
+@* Browser upload field.
+
+   The queue inside this element is owned by JavaScript, not by .NET. That is the point: when a mobile
+   browser is backgrounded while the native file picker is open, the page and anything .NET was holding can
+   be discarded, and a queue owned by the Blazor runtime would lose the transfer. The vendored DnaX module
+   keeps its own state, persists it, and resumes from the offset the server has already committed.
+
+   So this component mounts the module once and then leaves it alone. It never re-renders the queue, and it
+   deliberately has no Blazor-side progress state to go stale. Completion arrives as a DOM event, which is
+   only a hint: the page that cares reconciles against the server's own session record. *@
+@implements IAsyncDisposable
+@inject IJSRuntime JS
+
+<div @ref="host" id="@Id" class="dnax-uploads" data-permanent></div>
+
+@code {
+    /// <summary>Server-side profile name, which fixes the limits and transfer mode for each session.</summary>
+    [Parameter, EditorRequired] public string Profile { get; set; } = "";
+
+    /// <summary>Stable element id. Keep it stable across renders: the module mounts against it.</summary>
+    [Parameter] public string Id { get; set; } = "graft-upload";
+
+    /// <summary>Raised with the upload id when the browser reports a transfer finished.</summary>
+    [Parameter] public EventCallback<string> OnCompleted { get; set; }
+
+    private const string Endpoint = "/api/graft/uploads";
+    private ElementReference host;
+    private IJSObjectReference? module;
+    private DotNetObjectReference<UploadField>? self;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+        module = await JS.InvokeAsync<IJSObjectReference>("import", "./vendor/dnax-uploads/uploads.js");
+        await module.InvokeVoidAsync("mount", host, Endpoint, Profile);
+        if (!OnCompleted.HasDelegate) return;
+        self = DotNetObjectReference.Create(this);
+        await JS.InvokeVoidAsync("graftUploads.listen", host, self);
+    }
+
+    /// <summary>
+    /// Called from the browser when a transfer completes. Treated as a notification that something changed,
+    /// never as proof: completion means the bytes arrived durably, not that the content was accepted.
+    /// </summary>
+    [JSInvokable]
+    public Task Completed(string uploadId) => OnCompleted.InvokeAsync(uploadId);
+
+    public async ValueTask DisposeAsync()
+    {
+        if (self is not null)
+        {
+            try { await JS.InvokeVoidAsync("graftUploads.forget", host); }
+            catch (JSDisconnectedException) { }
+            catch (InvalidOperationException) { }
+            self.Dispose();
+        }
+        if (module is not null)
+        {
+            try { await module.DisposeAsync(); }
+            catch (JSDisconnectedException) { }
+        }
+    }
+}

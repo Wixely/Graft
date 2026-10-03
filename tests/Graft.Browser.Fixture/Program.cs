@@ -9,10 +9,23 @@ if (args.Length != 1 || !File.Exists(args[0]))
     return 2;
 }
 
-string? password = Environment.GetEnvironmentVariable("GRAFT_BROWSER_FIXTURE_PASSWORD");
-if (password is null || password.Length is < 16 or > 256)
+// This fixture builds a throwaway instance in a new temporary directory and destroys it on exit, so it
+// defaults to credentials nobody has to type. GRAFT_BROWSER_FIXTURE_PASSWORD still overrides them. The
+// default only works against a Debug server: Release keeps the 16-character minimum and would reject it.
+const string DefaultUsername = "admin";
+const string DefaultPassword = "admin";
+string username = Environment.GetEnvironmentVariable("GRAFT_BROWSER_FIXTURE_USERNAME") ?? DefaultUsername;
+string password = Environment.GetEnvironmentVariable("GRAFT_BROWSER_FIXTURE_PASSWORD") ?? DefaultPassword;
+if (!PasswordPolicy.IsAcceptableLength(password))
 {
-    Console.Error.WriteLine("Set GRAFT_BROWSER_FIXTURE_PASSWORD to a temporary value between 16 and 256 characters.");
+    Console.Error.WriteLine($"GRAFT_BROWSER_FIXTURE_PASSWORD must be between {PasswordPolicy.MinimumLength} and " +
+        $"{PasswordPolicy.MaximumLength} characters for this build.");
+    return 2;
+}
+if (password == DefaultPassword && !PasswordPolicy.RelaxedForLocalDebug)
+{
+    Console.Error.WriteLine("This is a Release build, which requires a 16-character password. " +
+        "Set GRAFT_BROWSER_FIXTURE_PASSWORD, or run the Debug server for local debugging.");
     return 2;
 }
 
@@ -32,7 +45,7 @@ try
     TokenGrant token;
     await using (GraftStore fixture = await GraftStore.OpenAsync(databasePath))
     {
-        UserAccount user = await fixture.BootstrapAdministratorAsync("fixture", password);
+        UserAccount user = await fixture.BootstrapAdministratorAsync(username, password);
         SessionGrant session = (await fixture.LoginAsync(user.Username, password))!;
         AuthenticatedIdentity identity = (await fixture.ResolveSessionAsync(session.Secret))!;
         ProjectInfo project = await fixture.CreateProjectWithRepositoryAsync(identity, "seeded", "Seeded repository",
@@ -55,10 +68,13 @@ try
     File.WriteAllBytes(Path.Combine(source, "binary.dat"), [0, 1, 2, 0, 255]);
     await Git(source, ["add", "."]);
     await Git(source, ["commit", "-m", "Seed browser fixture"]);
-    await Git(source, ["remote", "add", "origin", AuthenticatedUrl(address, "fixture", token.Secret, "fixture/seeded.git")]);
+    await Git(source, ["remote", "add", "origin", AuthenticatedUrl(address, username, token.Secret, username + "/seeded.git")]);
     await Git(source, ["push", "origin", "main"]);
 
-    Console.WriteLine("FIXTURE: username=fixture; project=fixture/seeded");
+    // Echo the credentials only when they are the throwaway defaults, so a supplied password is never logged.
+    Console.WriteLine(password == DefaultPassword
+        ? $"FIXTURE: username={username}; password={password}; project={username}/seeded"
+        : $"FIXTURE: username={username}; password=(from GRAFT_BROWSER_FIXTURE_PASSWORD); project={username}/seeded");
     Console.WriteLine("READY: " + address + "/projects");
     Console.WriteLine("Press Enter to stop and remove the disposable fixture.");
     await Console.In.ReadLineAsync();

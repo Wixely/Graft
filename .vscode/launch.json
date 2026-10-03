@@ -4,7 +4,7 @@
     {
       "id": "graftFixturePassword",
       "type": "promptString",
-      "description": "Temporary UI probe password (16-256 characters; username fixture)",
+      "description": "Temporary password for the legacy UI probe (16-256 characters)",
       "password": true
     }
   ],
@@ -20,9 +20,6 @@
       ],
       "cwd": "${workspaceFolder}",
       "console": "internalConsole",
-      "env": {
-        "GRAFT_BROWSER_FIXTURE_PASSWORD": "${input:graftFixturePassword}"
-      },
       "serverReadyAction": {
         "action": "openExternally",
         "pattern": "READY:\\s+(https://127\\.0\\.0\\.1:[0-9]+/projects)",

@@ -48,15 +48,25 @@ See [MVP-06 evidence](validation/2026-09-19-mvp06-repository-api-ui.md) for cove
 
 The current extension adds administrator user creation and account lifecycle, owner-managed project roles, and user-managed personal access tokens while retaining this harness. It passes 135 assertions against both managed and Windows NativeAOT servers; see [user/membership evidence](validation/2026-09-19-user-membership.md), [token evidence](validation/2026-09-19-personal-access-tokens.md), and [account credential evidence](validation/2026-09-20-account-credentials.md).
 
-For rendered UI work, start the disposable production fixture with a temporary password. It creates a `fixture` administrator, seeds `fixture/seeded` with text, hostile HTML and binary files, prints the random loopback URL, and removes all state on Enter:
+For rendered UI work, start the disposable production fixture. It creates an administrator, seeds `<username>/seeded` with text, hostile HTML and binary files, prints the random loopback URL, and removes all state on Enter:
 
 ```powershell
 dotnet build tests\Graft.Browser.Fixture\Graft.Browser.Fixture.csproj -c Debug
-$env:GRAFT_BROWSER_FIXTURE_PASSWORD = '<temporary-16-to-256-character-password>'
 dotnet tests\Graft.Browser.Fixture\bin\Debug\net10.0\Graft.Browser.Fixture.dll src\Graft.Server\bin\Debug\net10.0\Graft.Server.dll
 ```
 
-The **Debug production browser fixture** VS Code option supplies the password through a masked prompt and opens `/projects`. The generated loopback certificate is untrusted; use only a temporary browser exception or test-instance trust and remove it after the run. See [rendered-browser evidence](validation/2026-09-19-browser-ui.md).
+Against a **Debug** server this signs in as `admin` / `admin` with nothing to type, and the fixture prints those credentials. `GRAFT_BROWSER_FIXTURE_USERNAME` and `GRAFT_BROWSER_FIXTURE_PASSWORD` override them; a supplied password is never echoed.
+
+The short default works only because Debug builds relax `Graft.Core.PasswordPolicy.MinimumLength` from 16 to 5 for exactly this purpose. A Debug server prints a `WARNING:` line on startup saying so. **Release builds keep the 16-character minimum**, every packaged and deployed artifact is published Release, and the fixture refuses its own default against a Release server:
+
+```powershell
+dotnet build tests\Graft.Browser.Fixture\Graft.Browser.Fixture.csproj -c Release
+dotnet build src\Graft.Server\Graft.Server.csproj -c Release
+# Refuses: "GRAFT_BROWSER_FIXTURE_PASSWORD must be between 16 and 256 characters for this build."
+dotnet tests\Graft.Browser.Fixture\bin\Release\net10.0\Graft.Browser.Fixture.dll src\Graft.Server\bin\Release\net10.0\Graft.Server.dll
+```
+
+The **Debug production browser fixture** VS Code option now launches without a prompt and opens `/projects`. The generated loopback certificate is untrusted; use only a temporary browser exception or test-instance trust and remove it after the run. See [rendered-browser evidence](validation/2026-09-19-browser-ui.md).
 
 The GitLab 18 reference harness executes the same checked-in project-creation fixture against an approved, disposable GitLab instance. Supply synthetic token files for an administrator `api` token and a `read_api` token; the harness reads but never prints their values:
 
