@@ -15,7 +15,7 @@
       "DnaX.Data.Migrations": {
         "type": "Transitive",
         "resolved": "10.0.0-alpha.7",
-        "contentHash": "2k9/mjIY8Uj1fRJ4mC+txbFOak7920X7J5cuVuGwnnoVJ0xNaVePsQuvmuh8hDogvCMK2ZbcWV++Z8rU56HR6w==",
+        "contentHash": "zzsP/SjAm7AHykp7FSDLwQOcdT1Ir6g66VTLJu+CXSBtRgW8nzT3u/zRoGsm8wan/PXtNkGrx9kCOP+Z/jbCfw==",
         "dependencies": {
           "Microsoft.Extensions.DependencyInjection.Abstractions": "10.0.5",
           "Microsoft.Extensions.Hosting.Abstractions": "10.0.5",
@@ -25,7 +25,7 @@
       "DnaX.Data.Migrations.Sqlite": {
         "type": "Transitive",
         "resolved": "10.0.0-alpha.7",
-        "contentHash": "wLTMLGXShpvGK8I/STmKe35ko5drabXpk2TMsTMgJgJWh0lLJjKvehbfUpLBY1zMxwLzflDGVT4XaWIGWaVMiQ==",
+        "contentHash": "Q0X6mkGYxwTZPNYrLWJxvoMAwENZHRyA07Pb25i82P4JtFYgSb5dHZXXwDht5JgKZxWtTud9qHPeNSAE6HoELg==",
         "dependencies": {
           "DnaX.Data.Migrations": "10.0.0-alpha.7",
           "Microsoft.Data.Sqlite": "10.0.11"
