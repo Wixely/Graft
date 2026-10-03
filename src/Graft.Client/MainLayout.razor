@@ -1,4 +1,84 @@
+@* The application frame: a sticky top bar, a context sidebar once signed in, and the routed page. The
+   session is loaded here and shared through GraftApi so pages do not each re-fetch it. *@
 @inherits LayoutComponentBase
-<header><a class="brand" href="/"><img src="graft-app-blue.png" alt="" width="44" height="44" />Graft</a><span class="badge">Private forge</span></header>
-<main>@Body</main>
-<footer>Graft <span>Built for local ownership.</span></footer>
+@implements IDisposable
+@inject GraftApi Api
+@inject NavigationManager Navigation
+
+<div class="shell">
+    <header class="topbar">
+        <a class="brand" href="/"><img src="graft-app-blue.png" alt="" width="24" height="24" />Graft</a>
+        <span class="label">Private forge</span>
+        <div class="topbar-actions">
+            <ThemeToggle />
+            @if (Api.Authenticated)
+            {
+                <a class="button secondary" href="/-/profile"><Icon Name="user" />@Api.Username</a>
+                <button type="button" class="secondary" @onclick="SignOut" disabled="@busy">Sign out</button>
+            }
+        </div>
+    </header>
+
+    <div class="body">
+        @if (Api.Authenticated)
+        {
+            <aside class="sidebar">
+                <span class="sidebar-title">Graft</span>
+                <nav>
+                    <a href="/" class="@Active("")"><Icon Name="repository" />Projects</a>
+                    <a href="/-/profile" class="@Active("-/profile")"><Icon Name="key" />Profile and tokens</a>
+                </nav>
+                @if (Api.IsAdministrator)
+                {
+                    <span class="sidebar-title section">Administration</span>
+                    <nav>
+                        <a href="/-/admin/users" class="@Active("-/admin/users")"><Icon Name="user" />Users</a>
+                        <a href="/-/admin/import" class="@Active("-/admin/import")"><Icon Name="upload" />Import</a>
+                    </nav>
+                }
+            </aside>
+        }
+        <main class="content @(Api.Authenticated ? "content-wide" : "content-narrow")">@Body</main>
+    </div>
+
+    <footer>Graft &middot; built for local ownership.</footer>
+</div>
+
+@code {
+    private bool busy;
+
+    protected override void OnInitialized()
+    {
+        Api.SessionChanged += OnSessionChanged;
+        Navigation.LocationChanged += OnLocationChanged;
+    }
+
+    protected override Task OnInitializedAsync() => Api.EnsureSessionAsync();
+
+    private async Task SignOut()
+    {
+        if (busy) return;
+        busy = true;
+        try { await Api.LogoutAsync(); Navigation.NavigateTo("/-/login?notice=signed-out"); }
+        finally { busy = false; }
+    }
+
+    /// <summary>Marks the sidebar entry whose route the browser is on. Nested routes keep their section active.</summary>
+    private string Active(string path)
+    {
+        string current = Navigation.ToBaseRelativePath(Navigation.Uri).TrimEnd('/');
+        int query = current.IndexOfAny(['?', '#']);
+        if (query >= 0) current = current[..query];
+        bool active = path.Length == 0 ? current.Length == 0 : current == path || current.StartsWith(path + "/", StringComparison.Ordinal);
+        return active ? "active" : "";
+    }
+
+    private void OnSessionChanged() => StateHasChanged();
+    private void OnLocationChanged(object? sender, LocationChangedEventArgs args) => StateHasChanged();
+
+    public void Dispose()
+    {
+        Api.SessionChanged -= OnSessionChanged;
+        Navigation.LocationChanged -= OnLocationChanged;
+    }
+}

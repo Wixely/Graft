@@ -1,0 +1,253 @@
+@page "/-/admin/users"
+@inject GraftApi Api
+@inject NavigationManager Navigation
+
+<PageTitle>Users &middot; Graft</PageTitle>
+
+@if (loading)
+{
+    <p role="status" class="secondary-text">Loading…</p>
+}
+else if (!Api.IsAdministrator)
+{
+    <div class="page-header"><div><h1>Administration</h1><p class="subtitle">This page requires an administrator account.</p></div></div>
+}
+else
+{
+    <div class="page-header">
+        <div><h1>Users</h1><p class="subtitle">Accounts on this instance.</p></div>
+        <div class="page-header-actions">
+            <button type="button" class="@(creating ? "secondary" : "")" @onclick="() => creating = !creating">
+                <Icon Name="plus" />New user
+            </button>
+        </div>
+    </div>
+
+    <Banner Message="@message" Kind="@messageKind" />
+
+    @if (creating)
+    {
+        <div class="panel">
+            <div class="panel-header"><h2>Create a user</h2></div>
+            <div class="panel-body">
+                <form class="form" @onsubmit="CreateUser" @onsubmit:preventDefault>
+                    <label for="new-username">Username</label>
+                    <input id="new-username" @bind="newUsername" required minlength="2" maxlength="39"
+                           pattern="[A-Za-z0-9][A-Za-z0-9._\-]*" autocomplete="off" />
+                    <label for="new-password">Temporary password</label>
+                    <input id="new-password" type="password" @bind="newPassword" required minlength="16" maxlength="256" autocomplete="new-password" />
+                    <p class="field-hint">At least 16 characters. The user should change it after signing in.</p>
+                    <div class="form-actions">
+                        <button type="submit" disabled="@busy">@(busy ? "Creating…" : "Create user")</button>
+                        <button type="button" class="secondary" @onclick="() => creating = false" disabled="@busy">Cancel</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    }
+
+    <div class="panel">
+        <div class="panel-header"><h2>Accounts</h2><span class="spacer"></span><span class="label">@users.Length</span></div>
+        <div class="list">
+            @foreach (UserAccountResponse user in users)
+            {
+                <div class="list-item">
+                    <span class="avatar" aria-hidden="true">@Initial(user.Username)</span>
+                    <span class="list-item-main">
+                        <strong>@user.Username</strong>
+                        <small>@(user.IsAdministrator ? "Administrator" : "User")</small>
+                    </span>
+                    <span class="label @(user.Disabled ? "danger" : "success")">@(user.Disabled ? "Disabled" : "Active")</span>
+                    <span class="list-item-actions">
+                        @if (!user.Disabled && user.Username != Api.Username)
+                        {
+                            <button type="button" class="@(pendingDisable == user.Id ? "danger" : "secondary")"
+                                    @onclick="() => DisableUser(user)" disabled="@busy">
+                                @(pendingDisable == user.Id ? "Confirm disable" : "Disable")
+                            </button>
+                        }
+                    </span>
+                </div>
+            }
+        </div>
+    </div>
+
+    @if (Resettable.Length > 0)
+    {
+        <div class="panel">
+            <div class="panel-header"><h2>Reset a password</h2></div>
+            <div class="panel-body">
+                <div class="banner warning">
+                    <Icon Name="alert" />
+                    <span>A reset signs the user out everywhere and revokes their personal access tokens.</span>
+                </div>
+                <form class="form" @onsubmit="ResetPassword" @onsubmit:preventDefault>
+                    <label for="reset-user">User</label>
+                    <select id="reset-user" @bind="resetUserId">
+                        @foreach (UserAccountResponse user in Resettable) { <option value="@user.Id">@user.Username</option> }
+                    </select>
+                    <label for="reset-password">Temporary password</label>
+                    <input id="reset-password" type="password" @bind="resetPassword" required minlength="16" maxlength="256" autocomplete="new-password" />
+                    <label for="reset-password-confirm">Confirm temporary password</label>
+                    <input id="reset-password-confirm" type="password" @bind="resetPasswordConfirm" required minlength="16" maxlength="256" autocomplete="new-password" />
+                    <div class="form-actions">
+                        <button type="submit" class="danger" disabled="@busy">Reset password</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    }
+
+    @if (Disabled.Length > 0)
+    {
+        <div class="panel">
+            <div class="panel-header"><h2>Re-enable an account</h2></div>
+            <div class="panel-body">
+                <p class="secondary-text">A fresh password is required. Older sessions and tokens stay revoked.</p>
+                <form class="form" @onsubmit="EnableUser" @onsubmit:preventDefault>
+                    <label for="enable-user">User</label>
+                    <select id="enable-user" @bind="enableUserId">
+                        @foreach (UserAccountResponse user in Disabled) { <option value="@user.Id">@user.Username</option> }
+                    </select>
+                    <label for="enable-password">Fresh password</label>
+                    <input id="enable-password" type="password" @bind="enablePassword" required minlength="16" maxlength="256" autocomplete="new-password" />
+                    <label for="enable-password-confirm">Confirm fresh password</label>
+                    <input id="enable-password-confirm" type="password" @bind="enablePasswordConfirm" required minlength="16" maxlength="256" autocomplete="new-password" />
+                    <div class="form-actions">
+                        <button type="submit" disabled="@busy">Re-enable account</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    }
+}
+
+@code {
+    private UserAccountResponse[] users = [];
+    private string newUsername = "";
+    private string newPassword = "";
+    private long resetUserId;
+    private string resetPassword = "";
+    private string resetPasswordConfirm = "";
+    private long enableUserId;
+    private string enablePassword = "";
+    private string enablePasswordConfirm = "";
+    private long? pendingDisable;
+    private string message = "";
+    private string messageKind = "info";
+    private bool creating;
+    private bool loading = true;
+    private bool busy;
+
+    private UserAccountResponse[] Resettable => [.. users.Where(user => !user.Disabled && user.Username != Api.Username)];
+    private UserAccountResponse[] Disabled => [.. users.Where(user => user.Disabled)];
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            if (!await Api.EnsureSessionAsync())
+            {
+                if (Api.Reachable) Navigation.NavigateTo("/-/login", replace: true);
+                return;
+            }
+            if (Api.IsAdministrator) await LoadUsers();
+        }
+        finally { loading = false; }
+    }
+
+    private async Task LoadUsers()
+    {
+        users = await Api.GetAsync("api/users", ApiJson.Default.UserAccountResponseArray) ?? [];
+        if (!Resettable.Any(user => user.Id == resetUserId)) resetUserId = Resettable.FirstOrDefault()?.Id ?? 0;
+        if (!Disabled.Any(user => user.Id == enableUserId)) enableUserId = Disabled.FirstOrDefault()?.Id ?? 0;
+    }
+
+    private async Task CreateUser()
+    {
+        if (busy) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync("api/users", new UserCreateRequest(newUsername, newPassword),
+                ApiJson.Default.UserCreateRequest, "User created.");
+            newPassword = "";
+            Report(result);
+            if (!result.Ok) return;
+            newUsername = "";
+            creating = false;
+            await LoadUsers();
+        }
+        finally { busy = false; }
+    }
+
+    /// <summary>Disabling needs a second click: the first arms it, so a stray click cannot revoke an account.</summary>
+    private async Task DisableUser(UserAccountResponse user)
+    {
+        if (busy) return;
+        if (pendingDisable != user.Id)
+        {
+            pendingDisable = user.Id;
+            Report(ApiResult.Refused($"Select Confirm disable to disable {user.Username}."));
+            return;
+        }
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/users/{user.Id}/disable",
+                $"{user.Username} disabled. Their sessions and tokens were revoked.");
+            pendingDisable = null;
+            Report(result);
+            await LoadUsers();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task ResetPassword()
+    {
+        if (busy || resetUserId == 0) return;
+        if (resetPassword != resetPasswordConfirm) { Report(ApiResult.Refused("Temporary passwords do not match.")); return; }
+        busy = true;
+        message = "";
+        pendingDisable = null;
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/users/{resetUserId}/reset-password",
+                new PasswordResetRequest(resetPassword), ApiJson.Default.PasswordResetRequest,
+                "Password reset. The user was signed out and their tokens were revoked.");
+            resetPassword = ""; resetPasswordConfirm = "";
+            Report(result);
+        }
+        finally { busy = false; }
+    }
+
+    private async Task EnableUser()
+    {
+        if (busy || enableUserId == 0) return;
+        if (enablePassword != enablePasswordConfirm) { Report(ApiResult.Refused("Fresh passwords do not match.")); return; }
+        busy = true;
+        message = "";
+        pendingDisable = null;
+        try
+        {
+            string username = Disabled.FirstOrDefault(user => user.Id == enableUserId)?.Username ?? "The account";
+            ApiResult result = await Api.PostAsync($"api/users/{enableUserId}/enable",
+                new PasswordResetRequest(enablePassword), ApiJson.Default.PasswordResetRequest,
+                $"{username} re-enabled with a fresh password. Older sessions and tokens remain revoked.");
+            enablePassword = ""; enablePasswordConfirm = "";
+            Report(result);
+            await LoadUsers();
+        }
+        finally { busy = false; }
+    }
+
+    private void Report(ApiResult result)
+    {
+        message = result.Message;
+        messageKind = result.Ok ? "success" : "error";
+    }
+
+    private static string Initial(string value) => value.Length == 0 ? "?" : value[..1];
+}
