@@ -60,6 +60,7 @@ Linux static NativeAOT requires the separate toolchain/runbook; a Windows build 
 | `experiments/ui-server/` | NativeAOT API, embedded Blazor delivery and session probe; [runbook](experiments/ui-server/README.md) |
 | `experiments/ui-client/`, `ui-contracts/`, `ui-checks/` | Standalone C#/Razor client, JSON contracts, HTTP and browser checks |
 | `artifacts/reference/` | Ignored local copy of the accepted archive and checksum; not committed |
+| `THIRD-PARTY-NOTICES.md` | Attribution for every redistributed component; embedded in the server and served at `/-/licences` |
 
 The original discovery notes remain in the sibling [PLAN idea](../PLAN/inbox/local-git-forge.md). This repository is now the canonical implementation/handoff context. Private infrastructure details stay in PLAN; project docs use a neutral target-host description.
 

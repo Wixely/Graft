@@ -1,6 +1,7 @@
 @page "/{Namespace}/{Slug}"
 @inject GraftApi Api
 @inject NavigationManager Navigation
+@inject IJSRuntime JS
 
 <PageTitle>@Slug &middot; Graft</PageTitle>
 
@@ -99,6 +100,17 @@ else
                 <p class="panel-empty">This directory is empty.</p>
             }
         </div>
+
+        @if (repo.Readme is not null && repo.File is null)
+        {
+            <div class="panel readme">
+                <div class="panel-header"><Icon Name="file" /><strong>@repo.Readme.Path</strong></div>
+                @* The HTML comes from the server's renderer, which parses with raw HTML disabled, validates
+                   every link and image destination on the parsed tree, and refuses to emit markup at all if
+                   its own output check fails. It is never repository HTML passed through. *@
+                <div class="panel-body markdown">@((MarkupString)repo.Readme.Html)</div>
+            </div>
+        }
 
         @if (repo.File is not null)
         {
@@ -371,6 +383,18 @@ else
             await Load(repo.Project.Id);
         }
         finally { committing = false; }
+    }
+
+    /// <summary>
+    /// Swaps mermaid code blocks for isolated diagram frames once the README is in the DOM. Done after
+    /// render rather than during it because the diagram renderer lives in a sandboxed frame, and only when a
+    /// README actually contains one, so a page without diagrams never fetches it.
+    /// </summary>
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (repo?.Readme?.HasDiagrams != true) return;
+        try { await JS.InvokeVoidAsync("graftMarkdown.render"); }
+        catch (JSException) { }
     }
 
     protected override async Task OnParametersSetAsync()

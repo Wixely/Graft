@@ -8,6 +8,12 @@
         "resolved": "10.0.0-alpha.7",
         "contentHash": "6AZ2tO/Pk0bG06Mh4RTEZTXZ9J2Mvz2YPlVTGQqJLVtqm+8qYj/dj1aJUDc60rzmlY67k3HwJ8kphM5W9mRVTA=="
       },
+      "Markdig": {
+        "type": "Direct",
+        "requested": "[1.4.0, )",
+        "resolved": "1.4.0",
+        "contentHash": "lLhaiI/mNDTNzgLqnmknhf4LjgTqOAyjx5+GNz0X3AxYMxUhmFppF2WVMdER+SDqwhE5wUF1pzs/cuLwFxs7xA=="
+      },
       "Microsoft.Extensions.Hosting.Systemd": {
         "type": "Direct",
         "requested": "[10.0.12, )",

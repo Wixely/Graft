@@ -66,6 +66,11 @@ try
     File.WriteAllText(Path.Combine(source, "readme.txt"), "Graft browser fixture\n");
     File.WriteAllText(Path.Combine(source, "hostile.html"), "<script>throw new Error('must remain text')</script>\n");
     File.WriteAllBytes(Path.Combine(source, "binary.dat"), [0, 1, 2, 0, 255]);
+    // A README exercising every piece of syntax the renderer supports, with a real image beside it so the
+    // relative-image path is shown resolving out of the repository rather than being described.
+    File.WriteAllBytes(Path.Combine(source, "README.md"), Fixture("fixture/README.md"));
+    Directory.CreateDirectory(Path.Combine(source, "docs"));
+    File.WriteAllBytes(Path.Combine(source, "docs", "graft-readme-blue.png"), Fixture("fixture/graft-readme-blue.png"));
     await Git(source, ["add", "."]);
     await Git(source, ["commit", "-m", "Seed browser fixture"]);
     await Git(source, ["remote", "add", "origin", AuthenticatedUrl(address, username, token.Secret, username + "/seeded.git")]);
@@ -176,6 +181,16 @@ async Task Git(string directory, string[] arguments)
     {
         if (!process.HasExited) { process.Kill(entireProcessTree: true); await process.WaitForExitAsync(); }
     }
+}
+
+/// <summary>Reads one of the seeded fixture files embedded in this executable.</summary>
+static byte[] Fixture(string name)
+{
+    using Stream stream = typeof(Program).Assembly.GetManifestResourceStream(name)
+        ?? throw new InvalidOperationException("The fixture resource " + name + " was not embedded in this build.");
+    using MemoryStream copy = new();
+    stream.CopyTo(copy);
+    return copy.ToArray();
 }
 
 static string AuthenticatedUrl(string address, string username, string token, string path) =>
