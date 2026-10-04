@@ -180,6 +180,50 @@ try
         Check(await avatars.GetAvatarAsync(AvatarOwner.Project, project.Id) is null, "a refused project avatar was not stored");
     }
 
+    await using (GraftStore ownership = await GraftStore.OpenAsync(databasePath))
+    {
+        AuthenticatedIdentity owner = Required(await ownership.ResolveSessionAsync(
+            Required(await ownership.LoginAsync("alice", alicePassword), "alice re-login").Secret), "alice identity");
+        AuthenticatedIdentity administrator = Required(await ownership.ResolveSessionAsync(
+            Required(await ownership.LoginAsync("admin", adminPassword), "admin re-login").Secret), "admin identity");
+        AuthenticatedIdentity member = Required(await ownership.ResolveSessionAsync(
+            Required(await ownership.LoginAsync("carol", carolPassword), "carol re-login").Secret), "carol identity");
+
+        // A project has one owner and only that owner or an administrator can manage it, so disabling an
+        // owner would leave it unmanageable by anyone else and unrecoverable: there would be no way to
+        // appoint a replacement. The account must hand its projects over first.
+        await Throws<ProjectOwnershipException>(() => ownership.DisableUserAsync(administrator, owner.UserId),
+            "an account owning projects cannot be disabled");
+        Check((await ownership.GetPermissionAsync(owner, project.Id, ProjectAction.ManageProject)).Allowed,
+            "the refused disable left the owner intact");
+
+        // A Maintainer membership grants management, not the right to give the project away.
+        await ownership.SetMembershipAsync(owner, project.Id, carol.Id, ProjectRole.Maintainer);
+        await Throws<UnauthorizedAccessException>(() => ownership.TransferProjectOwnershipAsync(member, project.Id, carol.Id),
+            "a maintainer cannot transfer ownership");
+        await Throws<InvalidOperationException>(() => ownership.TransferProjectOwnershipAsync(owner, project.Id, 999_999),
+            "ownership cannot move to an unknown account");
+        await Throws<InvalidOperationException>(() => ownership.TransferProjectOwnershipAsync(owner, project.Id, owner.UserId),
+            "ownership cannot move to the current owner");
+
+        await ownership.TransferProjectOwnershipAsync(owner, project.Id, carol.Id);
+        assertions++;
+        Check((await ownership.GetPermissionAsync(member, project.Id, ProjectAction.ManageProject)).Allowed,
+            "the new owner can manage the project");
+        PermissionDecision previous = await ownership.GetPermissionAsync(owner, project.Id, ProjectAction.ManageProject);
+        Check(previous.Allowed && previous.Source == "Direct membership",
+            "the previous owner keeps access as a member rather than losing the project");
+
+        // The project moved namespace with its owner, because a namespace is its owner's username.
+        Check(await ownership.FindReadyProjectAsync("alice", "private-project") is null, "the old project path stops resolving");
+        Check(await ownership.FindReadyProjectAsync("carol", "private-project") is not null, "the project resolves under its new owner");
+
+        // Transferring away unblocks the disable that was refused above.
+        await ownership.DisableUserAsync(administrator, owner.UserId);
+        assertions++;
+        Check(await ownership.LoginAsync("alice", alicePassword) is null, "the former owner is disabled once it owns nothing");
+    }
+
     Console.WriteLine($"RESULT: PASS; assertions: {assertions}");
     Console.WriteLine("BOUNDARY: shared authorization decisions are exercised for REST, browse, fetch and push capabilities; actual HTTP/Git transport is MVP-05.");
     return 0;

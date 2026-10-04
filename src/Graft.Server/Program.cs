@@ -278,6 +278,9 @@ app.MapPost("/api/users/{userId:long}/disable", async context =>
         await store.DisableUserAsync(browser.Value.Identity, userId, context.RequestAborted);
         context.Response.StatusCode = StatusCodes.Status204NoContent;
     }
+    // 409: the account is fine, but it still owns projects. The message names them so the administrator
+    // knows what to transfer rather than being told only that it failed.
+    catch (ProjectOwnershipException error) { await ApiError(context, 409, error.Message); }
     catch (InvalidOperationException error) { await ApiError(context, 400, error.Message); }
 });
 
@@ -459,6 +462,31 @@ app.MapPost("/api/projects/{projectId:long}/members", async context =>
     catch (ArgumentException) { await ApiError(context, 400, "username"); }
     catch (InvalidOperationException error) { await ApiError(context, 400, error.Message); }
     catch (UnauthorizedAccessException) { await ApiError(context, 404, "project"); }
+});
+
+// Hand a project to a new owner. Only the current owner or an administrator may do this; a Maintainer
+// membership grants management, not the right to give the project away. The project path changes with it.
+app.MapPost("/api/projects/{projectId:long}/owner", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    OwnershipTransferRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.OwnershipTransferRequest, context.RequestAborted);
+    if (request?.Username is not { Length: >= 2 and <= 39 }) { await ApiError(context, 400, "username"); return; }
+    long projectId = Convert.ToInt64(context.Request.RouteValues["projectId"], System.Globalization.CultureInfo.InvariantCulture);
+    try
+    {
+        UserAccount? target = await store.FindActiveUserAsync(request.Username, context.RequestAborted);
+        if (target is null) { await ApiError(context, 400, "user is unavailable"); return; }
+        await store.TransferProjectOwnershipAsync(browser.Value.Identity, projectId, target.Id, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "project"); }
+    catch (ProjectOwnershipException error) { await ApiError(context, 409, error.Message); }
+    catch (InvalidOperationException error) { await ApiError(context, 400, error.Message); }
 });
 
 app.MapDelete("/api/projects/{projectId:long}/members/{userId:long}", async context =>

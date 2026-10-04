@@ -188,6 +188,27 @@ else
     else
     {
         <div class="panel">
+            <div class="panel-header"><Icon Name="user" /><h2>Transfer ownership</h2></div>
+            <div class="panel-body">
+                <div class="banner warning">
+                    <Icon Name="alert" />
+                    <span>
+                        A project lives under its owner's name, so transferring moves it to
+                        <strong>@(transferUsername.Length > 0 ? transferUsername : "the new owner")/@repo.Project.Path</strong>
+                        and the current clone URL stops working. You keep access as a Maintainer.
+                    </span>
+                </div>
+                <form class="form" @onsubmit="TransferOwnership" @onsubmit:preventDefault>
+                    <label for="transfer-username">New owner</label>
+                    <input id="transfer-username" @bind="transferUsername" @bind:event="oninput" required minlength="2" maxlength="39" />
+                    <div class="form-actions">
+                        <button type="submit" class="danger" disabled="@busy">@(busy ? "Transferring…" : "Transfer this project")</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <div class="panel">
             <div class="panel-header"><Icon Name="repository" /><h2>Project avatar</h2></div>
             <div class="panel-body">
                 <p class="secondary-text">
@@ -255,6 +276,7 @@ else
     private string messageKind = "info";
     private string memberUsername = "";
     private string memberRole = "Developer";
+    private string transferUsername = "";
     private bool loading = true;
     private bool busy;
 
@@ -372,6 +394,27 @@ else
     private static IEnumerable<TreeEntryResponse> Ordered(IReadOnlyList<TreeEntryResponse> tree) => tree
         .OrderByDescending(entry => entry.Type == "tree")
         .ThenBy(entry => entry.Name, StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Hands the project to another account. On success the project has moved, so this navigates to the new
+    /// path rather than reloading: the page the browser is on no longer resolves.
+    /// </summary>
+    private async Task TransferOwnership()
+    {
+        if (busy || repo is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            string target = transferUsername.Trim();
+            ApiResult result = await Api.PostAsync($"api/projects/{repo.Project.Id}/owner",
+                new OwnershipTransferRequest(target), ApiJson.Default.OwnershipTransferRequest,
+                $"Project transferred to {target}.");
+            Report(result);
+            if (result.Ok) Navigation.NavigateTo($"/{target}/{repo.Project.Path}", forceLoad: false);
+        }
+        finally { busy = false; }
+    }
 
     /// <summary>Stores a completed upload as the project avatar, then reloads so the new image shows.</summary>
     private async Task SetProjectAvatar(string uploadId)

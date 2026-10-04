@@ -99,6 +99,9 @@ public sealed record TokenCreatedResponse(long Id, string Name, string Secret, s
 public sealed record TokenResponse(long Id, string Name, string[] Scopes, DateTimeOffset ExpiresAtUtc, DateTimeOffset CreatedAtUtc);
 public sealed record ProjectCreateRequest(string? Name, string? Path, string? Description, string? Visibility);
 public sealed record MembershipSetRequest(string Username, string Role);
+
+/// <summary>Names the account a project should be handed to. The project path changes with its owner.</summary>
+public sealed record OwnershipTransferRequest(string Username);
 public sealed record ProjectMemberResponse(long UserId, string Username, string Role);
 /// <summary>
 /// Names a completed browser upload for an application operation to ingest. The upload id is a transport
@@ -175,6 +178,7 @@ public sealed record RepositoryPageResponse(
 [JsonSerializable(typeof(TokenResponse[]))]
 [JsonSerializable(typeof(ProjectCreateRequest))]
 [JsonSerializable(typeof(MembershipSetRequest))]
+[JsonSerializable(typeof(OwnershipTransferRequest))]
 [JsonSerializable(typeof(ProjectMemberResponse[]))]
 [JsonSerializable(typeof(RepositoryPageResponse))]
 [JsonSerializable(typeof(UploadIngestRequest))]

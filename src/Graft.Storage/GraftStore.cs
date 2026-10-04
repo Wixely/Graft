@@ -562,6 +562,68 @@ public sealed class GraftStore : IAsyncDisposable
         return rows.Select(row => new ProjectMember(row.UserId, row.Username, (ProjectRole)row.Role)).ToArray();
     }
 
+    /// <summary>
+    /// Moves a project to a new owner. Only the current owner or an administrator may do this: a Maintainer
+    /// membership grants management, not the right to give the project away.
+    ///
+    /// <para>
+    /// <b>This changes the project's URL.</b> A project's namespace is its owner's username, so transferring
+    /// <c>alice/thing</c> to bob makes it <c>bob/thing</c>, and the previous clone URL stops resolving. Graft
+    /// has no redirect for the old path. The previous owner is left a Maintainer membership so they keep
+    /// access rather than silently losing the project they just handed over.
+    /// </para>
+    /// </summary>
+    public async Task TransferProjectOwnershipAsync(
+        AuthenticatedIdentity actor,
+        long projectId,
+        long newOwnerUserId,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(actor);
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
+        AuthenticatedIdentity liveActor = await RequireLiveIdentityAsync(db, transaction, actor, cancellationToken);
+
+        ProjectOwnerRow? current = await db.QuerySingleOrDefaultAsync<ProjectOwnerRow>(
+            "SELECT OwnerUserId FROM Projects WHERE Id = @Id;", new IdParameters(projectId), transaction);
+        if (current is null) throw new UnauthorizedAccessException("Project is unavailable.");
+        if (!liveActor.IsAdministrator && liveActor.UserId != current.OwnerUserId)
+            throw new UnauthorizedAccessException("Only the project owner or an administrator can transfer ownership.");
+        if (current.OwnerUserId == newOwnerUserId)
+            throw new InvalidOperationException("The project already has this owner.");
+
+        long active = await db.QuerySingleAsync<long>("SELECT COUNT(*) FROM Users WHERE Id = @Id AND Disabled = 0;",
+            new IdParameters(newOwnerUserId), transaction);
+        if (active != 1) throw new InvalidOperationException("Transfer target is unavailable.");
+
+        string now = Now();
+        try
+        {
+            await db.ExecuteAsync("UPDATE Projects SET OwnerUserId = @UserId WHERE Id = @ProjectId;",
+                new ProjectUserParameters(projectId, newOwnerUserId), transaction);
+        }
+        catch (SqliteException error) when (error.SqliteErrorCode == 19)
+        {
+            // UNIQUE (OwnerUserId, NormalizedSlug): the new owner already has a project of this name.
+            throw new ProjectOwnershipException("The new owner already has a project with this path.", error);
+        }
+
+        // The owner is Maintainer-equivalent by virtue of ownership, so a membership row for them would be
+        // redundant and is rejected elsewhere. Drop the incoming owner's row and give the outgoing owner one.
+        await db.ExecuteAsync("DELETE FROM ProjectMemberships WHERE ProjectId = @ProjectId AND UserId = @UserId;",
+            new ProjectUserParameters(projectId, newOwnerUserId), transaction);
+        await db.ExecuteAsync("""
+            INSERT INTO ProjectMemberships (ProjectId, UserId, Role, GrantedByUserId, CreatedAtUtc)
+            VALUES (@ProjectId, @UserId, @Role, @GrantedByUserId, @CreatedAtUtc)
+            ON CONFLICT(ProjectId, UserId) DO UPDATE SET Role = excluded.Role;
+            """, new MembershipParameters(projectId, current.OwnerUserId, (int)ProjectRole.Maintainer, actor.UserId, now), transaction);
+
+        await AuditAsync(db, transaction, actor.UserId, "transfer-ownership", "project",
+            projectId.ToString(CultureInfo.InvariantCulture),
+            $"Ownership moved from user {current.OwnerUserId} to user {newOwnerUserId}; the project path changed.", now);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
     public async Task RevokeMembershipAsync(
         AuthenticatedIdentity actor,
         long projectId,
@@ -589,6 +651,23 @@ public sealed class GraftStore : IAsyncDisposable
         await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
         AuthenticatedIdentity liveActor = await RequireLiveIdentityAsync(db, transaction, actor, cancellationToken);
         if (!liveActor.IsAdministrator) throw new UnauthorizedAccessException("Administrator access is required.");
+
+        // A project has exactly one owner, and only that owner or an administrator can manage it. Disabling an
+        // owner would therefore leave the project with no one but an administrator able to manage it, and no
+        // way to appoint a replacement. Transfer first. For an urgent response to a compromised account,
+        // resetting its password already revokes every session and token immediately.
+        IEnumerable<ProjectPathRow> owned = await db.QueryAsync<ProjectPathRow>("""
+            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.StorageId
+            FROM Projects p
+            JOIN Users u ON u.Id = p.OwnerUserId
+            WHERE p.OwnerUserId = @Id
+            ORDER BY p.NormalizedSlug;
+            """, new IdParameters(userId), transaction);
+        string[] blocking = [.. owned.Select(row => row.Slug)];
+        if (blocking.Length > 0)
+            throw new ProjectOwnershipException(
+                "Transfer ownership before disabling this account. It still owns: " + string.Join(", ", blocking) + ".");
+
         string now = Now();
         int changed = await db.ExecuteAsync("UPDATE Users SET Disabled = 1 WHERE Id = @Id AND Disabled = 0;", new IdParameters(userId), transaction);
         if (changed != 1) throw new InvalidOperationException("User is unavailable or already disabled.");
@@ -831,6 +910,14 @@ public sealed class GraftStore : IAsyncDisposable
 
 public sealed class ProjectConflictException(string message, Exception innerException) : Exception(message, innerException);
 public sealed class UserConflictException(string message, Exception innerException) : Exception(message, innerException);
+
+/// <summary>A project ownership rule refused the operation: an owner still holds projects, or a transfer
+/// would collide with a path the new owner already uses.</summary>
+public sealed class ProjectOwnershipException : Exception
+{
+    public ProjectOwnershipException(string message) : base(message) { }
+    public ProjectOwnershipException(string message, Exception innerException) : base(message, innerException) { }
+}
 
 internal sealed class UserCredentialRow
 {
