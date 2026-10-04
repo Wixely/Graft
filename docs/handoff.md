@@ -14,7 +14,9 @@ Work on branch `feat/ui-overhaul-and-uploads`, not merged to `main`.
 
 **Avatars** for users and projects, stored in the database so backups capture them atomically. Structural image validation without an imaging dependency, and the reason, in [avatar evidence](validation/2026-10-04-avatars.md).
 
-Assertions now: 92 accounts/permissions, 165 Git/API/browser, 41 operations.
+**Project ownership can be transferred, and an account that still owns projects cannot be disabled.** This closes the orphaning gap that was the repository's own outstanding recommendation; see [ownership evidence](validation/2026-10-04-project-ownership.md). Transferring changes the project path, because a namespace is its owner's username.
+
+Assertions now: 110 accounts/permissions, 165 Git/API/browser, 41 operations.
 
 Two corrections to the earlier record. The solution did **not** build on the current toolchain before this work; two independent causes needed fixing together. And a remote **is** configured (`origin`, github.com/Wixely/Graft), contrary to the statement that stood here previously; nothing has been pushed.
 
@@ -59,9 +61,9 @@ Continue to use the ignored reproducible DnaX feed until the user or DnaX mainta
 
 | Work | Owner | Acceptance |
 | --- | --- | --- |
-| Project ownership continuity | Implementation agent | Ownership transfers atomically; disabling a sole active owner is rejected until another active owner exists |
+| ~~Project ownership continuity~~ | Done 2026-10-04 | [Evidence](validation/2026-10-04-project-ownership.md): transfer is owner-or-administrator only, and an account owning projects cannot be disabled |
 | Deployment TLS trust | Operator + implementation agent | Intended CA certificate, DNS/SAN, client trust and renewal rehearsal |
 | Required legacy host | Implementation agent + user | Integrated static-musl artifact inspected and run on Linux 3.10.108 with sanitized evidence |
 | DnaX distribution | User/DnaX maintainer | Clean checkout restores without a sibling source tree or locally prepared feed |
 
-Recommended next action: Owner: Implementation agent — add project ownership transfer and a sole-active-owner disable guard. Remaining release gates: deployment CA/DNS trust, DnaX distribution and the deferred Linux 3.10.108 MVP-08 run.
+Recommended next action: Owner: User + implementation agent — run the Android picker case on a device and publish NativeAOT on a machine with the C++ build tools, since both gate claims this work cannot make. Remaining release gates: deployment CA/DNS trust, DnaX distribution and the deferred Linux 3.10.108 MVP-08 run.
