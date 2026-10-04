@@ -4,26 +4,32 @@
 
 <PageTitle>Sign in &middot; Graft</PageTitle>
 
-<div class="page-header"><div><h1>Sign in to Graft</h1><p class="subtitle">Use your local Graft account.</p></div></div>
+<div class="sign-in">
+    <div class="sign-in-mark">
+        <img src="graft-app-blue.png" alt="" width="36" height="36" />
+        <h1>Sign in to Graft</h1>
+        <p class="secondary-text">Use your local Graft account.</p>
+    </div>
 
-@if (message.Length > 0) { <Banner Message="@message" Kind="error" /> }
-else if (Notice == "password") { <Banner Message="Password changed. Sign in again." Kind="success" /> }
-else if (Notice == "signed-out") { <Banner Message="You were signed out." Kind="info" /> }
+    @if (message.Length > 0) { <Banner Message="@message" Kind="error" /> }
+    else if (Notice == "password") { <Banner Message="Password changed. Sign in again." Kind="success" /> }
+    else if (Notice == "signed-out") { <Banner Message="You were signed out." Kind="info" /> }
 
-<div class="panel">
-    <div class="panel-body">
-        <form class="form" @onsubmit="SignIn" @onsubmit:preventDefault>
-            <label for="username">Username</label>
-            <input id="username" autocomplete="username" @bind="username" required maxlength="39" />
-            <label for="password">Password</label>
-            @* No minlength here. This field submits an existing credential, so the creation policy is not
-               its business, and the server is the authority on whether it is accepted. The create, change
-               and reset forms still state the 16-character minimum, because there it is a real rule. *@
-            <input id="password" type="password" autocomplete="current-password" @bind="password" required maxlength="256" />
-            <div class="form-actions">
-                <button type="submit" disabled="@busy">@(busy ? "Signing in…" : "Sign in")</button>
-            </div>
-        </form>
+    <div class="panel">
+        <div class="panel-body">
+            <form class="form" @onsubmit="SignIn" @onsubmit:preventDefault>
+                <label for="username">Username</label>
+                <input id="username" autocomplete="username" @bind="username" required maxlength="39" />
+                <label for="password">Password</label>
+                @* No minlength here. This field submits an existing credential, so the creation policy is not
+                   its business, and the server is the authority on whether it is accepted. The create, change
+                   and reset forms still state the 16-character minimum, because there it is a real rule. *@
+                <input id="password" type="password" autocomplete="current-password" @bind="password" required maxlength="256" />
+                <div class="form-actions">
+                    <button type="submit" disabled="@busy">@(busy ? "Signing in…" : "Sign in")</button>
+                </div>
+            </form>
+        </div>
     </div>
 </div>
 
