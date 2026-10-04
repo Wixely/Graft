@@ -4,7 +4,7 @@ namespace Graft.Storage;
 
 public static class GraftSchema
 {
-    public static DnaXMigrationManifest Manifest { get; } = new(2,
+    public static DnaXMigrationManifest Manifest { get; } = new(3,
     [
         DnaXMigration.Sql(1, "initial-identity-project-schema", "Create identity and private project schema", """
             CREATE TABLE Users (
@@ -89,6 +89,12 @@ public static class GraftSchema
                 UpdatedAtUtc TEXT NOT NULL,
                 PRIMARY KEY (OwnerType, OwnerId)
             );
+            """),
+        // Nullable on purpose: null means "follow convention", which lets a repository that has only
+        // master, or only some other branch, resolve sensibly without an administrator setting anything.
+        // A stored name is a preference, not a guarantee; the branch can be deleted after it is chosen.
+        DnaXMigration.Sql(3, "project-default-branch", "Let a project choose its default branch", """
+            ALTER TABLE Projects ADD COLUMN DefaultBranch TEXT NULL;
             """)
     ]);
 }

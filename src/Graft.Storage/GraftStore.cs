@@ -393,21 +393,21 @@ public sealed class GraftStore : IAsyncDisposable
 
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
         ProjectPathRow? row = await db.QuerySingleOrDefaultAsync<ProjectPathRow>("""
-            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.StorageId
+            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.StorageId, p.DefaultBranch
             FROM Projects p
             JOIN Users u ON u.Id = p.OwnerUserId
             WHERE u.NormalizedUsername = @NormalizedNamespace
               AND p.NormalizedSlug = @NormalizedSlug
               AND p.State = 'ready';
             """, new ProjectPathParameters(normalizedNamespace, normalizedSlug));
-        return row is null ? null : new(row.Id, row.OwnerUserId, row.Namespace, row.Slug, row.Name, row.StorageId);
+        return row is null ? null : new(row.Id, row.OwnerUserId, row.Namespace, row.Slug, row.Name, row.StorageId, row.DefaultBranch);
     }
 
     public async Task<ProjectDetails?> GetReadyProjectAsync(long projectId, CancellationToken cancellationToken = default)
     {
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
         ProjectDetailsRow? row = await db.QuerySingleOrDefaultAsync<ProjectDetailsRow>("""
-            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.Description, p.StorageId, p.CreatedAtUtc
+            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.Description, p.StorageId, p.CreatedAtUtc, p.DefaultBranch
             FROM Projects p
             JOIN Users u ON u.Id = p.OwnerUserId
             WHERE p.Id = @Id AND p.State = 'ready';
@@ -435,7 +435,7 @@ public sealed class GraftStore : IAsyncDisposable
         AuthenticatedIdentity live = await RequireLiveIdentityAsync(db, null, identity, cancellationToken);
         ProjectListParameters parameters = new(live.UserId, live.IsAdministrator ? 1 : 0, take, skip);
         IEnumerable<ProjectDetailsRow> rows = await db.QueryAsync<ProjectDetailsRow>("""
-            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.Description, p.StorageId, p.CreatedAtUtc
+            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.Description, p.StorageId, p.CreatedAtUtc, p.DefaultBranch
             FROM Projects p
             JOIN Users u ON u.Id = p.OwnerUserId
             WHERE p.State = 'ready' AND (
@@ -624,6 +624,33 @@ public sealed class GraftStore : IAsyncDisposable
         await transaction.CommitAsync(cancellationToken);
     }
 
+    /// <summary>
+    /// Records which branch a project treats as its default. Pass null to clear the preference and let the
+    /// repository fall back to convention. The caller validates that the branch exists: storage keeps a name,
+    /// not a guarantee, because the branch can be deleted afterwards.
+    /// </summary>
+    public async Task SetDefaultBranchAsync(
+        AuthenticatedIdentity actor,
+        long projectId,
+        string? branch,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(actor);
+        if (branch is { Length: > 240 }) throw new ArgumentException("Branch name is too long.", nameof(branch));
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
+        PermissionDecision permission = await DecideAsync(db, transaction, actor, projectId, ProjectAction.ManageProject, cancellationToken);
+        if (!permission.Allowed) throw new UnauthorizedAccessException(permission.Explanation);
+
+        string now = Now();
+        await db.ExecuteAsync("UPDATE Projects SET DefaultBranch = @Value WHERE Id = @Id;",
+            new DefaultBranchParameters(projectId, string.IsNullOrWhiteSpace(branch) ? null : branch), transaction);
+        await AuditAsync(db, transaction, actor.UserId, "set-default-branch", "project",
+            projectId.ToString(CultureInfo.InvariantCulture),
+            branch is null ? "Default branch cleared." : "Default branch set to " + branch + ".", now);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
     public async Task RevokeMembershipAsync(
         AuthenticatedIdentity actor,
         long projectId,
@@ -657,7 +684,7 @@ public sealed class GraftStore : IAsyncDisposable
         // way to appoint a replacement. Transfer first. For an urgent response to a compromised account,
         // resetting its password already revokes every session and token immediately.
         IEnumerable<ProjectPathRow> owned = await db.QueryAsync<ProjectPathRow>("""
-            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.StorageId
+            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.StorageId, p.DefaultBranch
             FROM Projects p
             JOIN Users u ON u.Id = p.OwnerUserId
             WHERE p.OwnerUserId = @Id
@@ -896,9 +923,10 @@ public sealed class GraftStore : IAsyncDisposable
     private static string Now() => DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture);
 
     private static ProjectDetails ToDetails(ProjectDetailsRow row) => new(
-        new(row.Id, row.OwnerUserId, row.Namespace, row.Slug, row.Name, row.StorageId),
+        new(row.Id, row.OwnerUserId, row.Namespace, row.Slug, row.Name, row.StorageId, row.DefaultBranch),
         row.Description,
-        DateTimeOffset.Parse(row.CreatedAtUtc, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind));
+        DateTimeOffset.Parse(row.CreatedAtUtc, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+        row.DefaultBranch);
 
     public async ValueTask DisposeAsync()
     {
@@ -957,6 +985,7 @@ internal class ProjectPathRow
     public string Slug { get; set; } = "";
     public string Name { get; set; } = "";
     public string StorageId { get; set; } = "";
+    public string? DefaultBranch { get; set; }
 }
 internal sealed class ProjectDetailsRow : ProjectPathRow
 {
@@ -991,3 +1020,4 @@ internal sealed class AvatarRow
     public byte[] Bytes { get; set; } = [];
     public string Sha256 { get; set; } = "";
 }
+internal sealed record DefaultBranchParameters(long Id, string? Value);
