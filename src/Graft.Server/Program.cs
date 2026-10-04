@@ -18,9 +18,21 @@ using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.AspNetCore.Http.Features;
 
+// Several bundled components require their attribution to accompany the binary, so the binary can print it
+// without the repository being present. The same text is served at /-/licences by a running server.
+if (args.Length == 1 && args[0] == "--licences")
+{
+    // The copyright symbols in these notices are part of what the licences require to be reproduced, and a
+    // Windows console defaults to a legacy code page that would render them as question marks.
+    try { Console.OutputEncoding = Encoding.UTF8; } catch (IOException) { /* output is redirected */ }
+    Console.WriteLine(ThirdPartyNotices.Text);
+    return 0;
+}
+
 if (!Arguments.TryParse(args, out Arguments? parsedSettings))
 {
     Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>].");
+    Console.Error.WriteLine("       Graft.Server --licences  prints the third-party notices this build redistributes.");
     return 2;
 }
 Arguments settings = parsedSettings!;
@@ -151,11 +163,48 @@ app.MapGet("/api/session", async context =>
     await context.Response.WriteAsJsonAsync(response, ApiJson.Default.SessionResponse, null, context.RequestAborted);
 });
 
+// The isolated frame a README's diagrams render inside. It is served here rather than as a static asset
+// because it needs a policy of its own: mermaid creates style elements while rendering, which the main
+// policy forbids, and loosening that for the whole application would be worst on the page showing somebody
+// else's repository content. The frame is sandboxed without same-origin access, so it cannot reach this
+// site's DOM, cookies or session; the policy below gives it inline styles and nothing else, and names this
+// origin explicitly because 'self' inside an opaque origin matches nothing and would block its own script.
+app.MapGet("/-/mermaid-sandbox", async context =>
+{
+    if (!await OnlyQuery(context)) return;
+    string origin = Origin(context);
+    context.Response.Headers.ContentSecurityPolicy =
+        "default-src 'none'; script-src " + origin + "; style-src 'unsafe-inline'; img-src data:; " +
+        "connect-src 'none'; frame-ancestors " + origin + "; base-uri 'none'; form-action 'none'";
+    context.Response.ContentType = "text/html; charset=utf-8";
+    // The frame paints no background of its own, so the embedding page's surface shows through and a diagram
+    // sits on the theme the reader actually chose rather than on the browser's default white canvas.
+    await context.Response.WriteAsync($$"""
+        <!DOCTYPE html>
+        <html lang="en"><head><meta charset="utf-8" /><title>diagram</title>
+        <style>html, body { background: transparent; margin: 0; } #diagram { overflow: auto; }</style>
+        <meta name="color-scheme" content="light dark" />
+        <script src="{{origin}}/vendor/mermaid/mermaid.min.js"></script>
+        <script src="{{origin}}/mermaid-frame.js"></script>
+        </head><body><div id="diagram"></div></body></html>
+        """, context.RequestAborted);
+});
+
 app.MapGet("/healthz", async context =>
 {
     if (!await OnlyQuery(context)) return;
     context.Response.ContentType = "text/plain; charset=utf-8";
     await context.Response.WriteAsync("healthy", context.RequestAborted);
+});
+
+// Several of the licences this build redistributes under bind the binary rather than the source tree, so the
+// attribution has to be reachable from a running server and not only from the repository. Unauthenticated
+// deliberately: a notice nobody can read without credentials does not discharge the obligation.
+app.MapGet("/-/licences", async context =>
+{
+    if (!await OnlyQuery(context)) return;
+    context.Response.ContentType = "text/plain; charset=utf-8";
+    await context.Response.WriteAsync(ThirdPartyNotices.Text, context.RequestAborted);
 });
 
 app.MapPost("/api/login", async context =>
@@ -618,6 +667,49 @@ app.MapMethods("/api/graft/avatars/{ownerType}/{ownerId:long}", ["GET", "HEAD"],
     await context.Response.Body.WriteAsync(avatar.Bytes, context.RequestAborted);
 });
 
+// Serves an image committed to a repository, so a README can show pictures that live beside it. This is the
+// only route that returns repository bytes to a browser as something other than text, so it runs them
+// through the same validator that guards avatars: the content type is the one the bytes prove they are, the
+// repository never gets to declare it, and anything that is not a recognised raster image is refused. SVG is
+// refused with everything else, which is what stops a repository serving script from this origin.
+app.MapMethods("/api/graft/projects/{projectId:long}/image", ["GET", "HEAD"], async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!await OnlyQuery(context, "ref", "path")) return;
+    long projectId = Convert.ToInt64(context.Request.RouteValues["projectId"], System.Globalization.CultureInfo.InvariantCulture);
+    ProjectDetails? details = await store.GetReadyProjectAsync(projectId, context.RequestAborted);
+    if (details is null ||
+        !(await store.GetPermissionAsync(browser.Value.Identity, projectId, ProjectAction.BrowseRepository, context.RequestAborted)).Allowed)
+    { await ApiError(context, 404, "project"); return; }
+
+    string revision = context.Request.Query["ref"].ToString();
+    if (revision.Length == 0) revision = "HEAD";
+    string path = context.Request.Query["path"].ToString();
+    if (path.Length == 0) { await ApiError(context, 404, "image"); return; }
+
+    await WithRepository(EndpointFor(details.Project), context, async repository =>
+    {
+        GitFile? file;
+        try { file = RepositoryView.File(repository, revision, path); }
+        catch (GitInputException) { await ApiError(context, 404, "image"); return; }
+        if (file is null) { await ApiError(context, 404, "image"); return; }
+
+        ValidatedImage? image = ImageContent.Validate(file.Content);
+        if (image is null) { await ApiError(context, 415, "that file is not a supported image"); return; }
+
+        string etag = '"' + file.BlobId + '"';
+        context.Response.Headers.CacheControl = "no-cache, private";
+        context.Response.Headers.ETag = etag;
+        if (context.Request.GetTypedHeaders().IfNoneMatch?.Any(value => value.Tag.Value == etag || value.Tag.Value == "*") == true)
+        { context.Response.StatusCode = StatusCodes.Status304NotModified; return; }
+        context.Response.ContentType = image.ContentType;
+        context.Response.ContentLength = image.Bytes.Length;
+        if (HttpMethods.IsHead(context.Request.Method)) return;
+        await context.Response.Body.WriteAsync(image.Bytes, context.RequestAborted);
+    });
+});
+
 // Commit uploaded files into a repository. The browser moved the bytes through DnaX; this is the
 // application half, so the caller is re-authenticated, re-authorized for push, and only ever reaches
 // uploads it owns and that were created under the repository-file profile.
@@ -712,7 +804,10 @@ app.MapGet("/api/browser/projects/{projectId:long}", async context =>
             .Select(commit => CommitResponseFor(context, details, commit)).ToArray();
         TreeEntryResponse[] entries = tree.Select(entry => new TreeEntryResponse(entry.Id, entry.Name, entry.Type, entry.Path, entry.Mode)).ToArray();
         FileResponse? fileResponse = file is null ? null : FileResponseFor(file, revision);
-        RepositoryPageResponse response = new(project, manage.Allowed, push.Allowed, branches, commits, entries, fileResponse);
+        // The README is rendered for the root of the branch being viewed, so switching branch shows that
+        // branch's README. Only the root is considered; a README deeper in the tree is an ordinary file.
+        ReadmeResponse? readme = path.Length == 0 ? ReadmeFor(context, details, repository, revision) : null;
+        RepositoryPageResponse response = new(project, manage.Allowed, push.Allowed, branches, commits, entries, fileResponse, readme);
         await context.Response.WriteAsJsonAsync(response, ApiJson.Default.RepositoryPageResponse, null, context.RequestAborted);
     });
 });
@@ -1202,6 +1297,33 @@ async Task<ProjectResponse> ProjectResponseForLocked(HttpContext context, Projec
         defaultBranch, "private", null, webUrl + ".git", webUrl, avatarUrl,
         new(details.Project.OwnerUserId, details.Project.Namespace, details.Project.Namespace, "user", details.Project.Namespace,
             origin + "/" + Uri.EscapeDataString(details.Project.Namespace)));
+}
+
+/// <summary>
+/// Finds and renders the README at the root of a revision. Images inside it resolve to the repository image
+/// route for the same revision, so a README shows the pictures that were committed beside it and nothing
+/// else; anything off-site is downgraded by the renderer rather than fetched.
+/// </summary>
+ReadmeResponse? ReadmeFor(HttpContext context, ProjectDetails details, Repository repository, string revision)
+{
+    foreach (string name in MarkdownContent.Names)
+    {
+        GitFile? file;
+        try { file = RepositoryView.File(repository, revision, name); }
+        catch (GitInputException) { continue; }
+        if (file is null || file.Content.Length == 0 || file.Content.Length > MarkdownContent.MaximumBytes) continue;
+
+        string source;
+        try { source = new UTF8Encoding(false, true).GetString(file.Content); }
+        catch (DecoderFallbackException) { return null; }
+
+        string baseUrl = Origin(context) + "/api/graft/projects/" +
+            details.Project.Id.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/image";
+        RenderedMarkdown rendered = MarkdownContent.Render(source, path =>
+            baseUrl + "?ref=" + Uri.EscapeDataString(revision) + "&path=" + Uri.EscapeDataString(path));
+        return new(file.Path, rendered.Html, rendered.HasDiagrams);
+    }
+    return null;
 }
 
 string AvatarUrl(HttpContext context, AvatarOwner ownerType, long ownerId) =>

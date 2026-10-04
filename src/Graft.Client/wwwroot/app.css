@@ -567,3 +567,76 @@ nav[aria-label="Path"] .link:last-of-type { color: var(--text); font-weight: 600
     width: auto; min-width: 120px; max-width: 260px;
     font-weight: 600; padding: 3px var(--space-2);
 }
+
+/* Rendered README. The HTML is produced by the server's markdown renderer, so these selectors describe a
+   known, closed set of elements rather than arbitrary repository markup. */
+
+.readme .panel-body { padding: var(--space-5) var(--space-6); }
+.markdown { font-size: 14px; line-height: 1.6; }
+.markdown > *:first-child { margin-top: 0; }
+.markdown > *:last-child { margin-bottom: 0; }
+
+.markdown h1, .markdown h2, .markdown h3, .markdown h4, .markdown h5, .markdown h6 {
+    margin: var(--space-6) 0 var(--space-3); line-height: 1.25;
+}
+.markdown h1 { font-size: 24px; padding-bottom: var(--space-2); border-bottom: 1px solid var(--border-muted); }
+.markdown h2 { font-size: 19px; padding-bottom: var(--space-2); border-bottom: 1px solid var(--border-muted); }
+.markdown h3 { font-size: 16px; }
+.markdown h4 { font-size: 14px; }
+.markdown h5, .markdown h6 { font-size: 13px; color: var(--text-secondary); }
+
+.markdown p, .markdown ul, .markdown ol, .markdown blockquote, .markdown table, .markdown pre {
+    margin: 0 0 var(--space-4);
+}
+.markdown ul, .markdown ol { padding-left: var(--space-6); }
+.markdown li { margin: var(--space-1) 0; }
+.markdown li > ul, .markdown li > ol { margin: var(--space-1) 0 0; }
+.markdown li.task-list-item { list-style: none; margin-left: calc(var(--space-6) * -1); }
+.markdown li.task-list-item input { width: auto; margin-right: var(--space-2); }
+
+.markdown blockquote {
+    padding: var(--space-1) var(--space-4); color: var(--text-secondary);
+    border-left: 3px solid var(--border-strong);
+}
+.markdown blockquote > :last-child { margin-bottom: 0; }
+
+.markdown code {
+    padding: 2px 5px; font-size: 12px; border-radius: 4px;
+    background: var(--sunken); border: 1px solid var(--border-muted);
+}
+.markdown pre {
+    padding: var(--space-4); overflow-x: auto;
+    background: var(--sunken); border: 1px solid var(--border); border-radius: var(--radius);
+}
+.markdown pre code { padding: 0; background: none; border: 0; font-size: 12px; line-height: 1.5; }
+
+.markdown table { border-collapse: collapse; display: block; overflow-x: auto; max-width: 100%; }
+.markdown th, .markdown td { padding: var(--space-2) var(--space-3); border: 1px solid var(--border); }
+.markdown th { background: var(--sunken); font-weight: 600; text-align: left; }
+.markdown tbody tr:nth-child(even) { background: var(--sunken); }
+/* Column alignment. The renderer converts it to these classes because the policy forbids the inline style
+   the markdown parser would otherwise emit, which a browser refuses and the table loses silently. */
+.markdown th.align-left, .markdown td.align-left { text-align: left; }
+.markdown th.align-centre, .markdown td.align-centre { text-align: center; }
+.markdown th.align-right, .markdown td.align-right { text-align: right; }
+
+.markdown img { max-width: 100%; height: auto; border-radius: var(--radius); }
+.markdown hr { margin: var(--space-6) 0; }
+
+/* A link standing in for an image that is not in this repository. It was never fetched, so the reader is
+   told what it was rather than shown a broken picture. */
+.markdown a.external-image::before {
+    content: "⧉ "; color: var(--text-muted);
+}
+.markdown a.external-image {
+    font-size: 12px; color: var(--text-secondary); text-decoration: underline dotted;
+}
+
+.markdown .footnotes { margin-top: var(--space-6); padding-top: var(--space-3); border-top: 1px solid var(--border-muted); font-size: 12px; color: var(--text-secondary); }
+
+/* The isolated frame a diagram renders inside. Height is set by the frame once it has drawn. */
+.diagram-frame {
+    display: block; width: 100%; height: 120px; margin: 0 0 var(--space-4);
+    border: 1px solid var(--border); border-radius: var(--radius); background: var(--raised);
+    color-scheme: light dark;
+}

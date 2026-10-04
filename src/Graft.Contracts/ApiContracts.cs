@@ -152,6 +152,12 @@ public sealed record UploadStatusResponse(
     long Offset,
     string State);
 
+/// <summary>A rendered README, with whether it contains diagrams the client must load a renderer for.</summary>
+public sealed record ReadmeResponse(
+    string Path,
+    string Html,
+    [property: JsonPropertyName("has_diagrams")] bool HasDiagrams);
+
 public sealed record RepositoryPageResponse(
     ProjectResponse Project,
     bool CanManage,
@@ -159,7 +165,8 @@ public sealed record RepositoryPageResponse(
     IReadOnlyList<BranchResponse> Branches,
     IReadOnlyList<CommitResponse> Commits,
     IReadOnlyList<TreeEntryResponse> Tree,
-    FileResponse? File);
+    FileResponse? File,
+    ReadmeResponse? Readme);
 
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower)]
 [JsonSerializable(typeof(UserResponse))]
@@ -186,6 +193,7 @@ public sealed record RepositoryPageResponse(
 [JsonSerializable(typeof(DefaultBranchRequest))]
 [JsonSerializable(typeof(ProjectMemberResponse[]))]
 [JsonSerializable(typeof(RepositoryPageResponse))]
+[JsonSerializable(typeof(ReadmeResponse))]
 [JsonSerializable(typeof(UploadIngestRequest))]
 [JsonSerializable(typeof(BundleInventoryResponse))]
 [JsonSerializable(typeof(RepositoryCommitRequest))]

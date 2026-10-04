@@ -48,7 +48,16 @@ See [MVP-06 evidence](validation/2026-09-19-mvp06-repository-api-ui.md) for cove
 
 The current extension adds administrator user creation and account lifecycle, owner-managed project roles, and user-managed personal access tokens while retaining this harness. It passes 135 assertions against both managed and Windows NativeAOT servers; see [user/membership evidence](validation/2026-09-19-user-membership.md), [token evidence](validation/2026-09-19-personal-access-tokens.md), and [account credential evidence](validation/2026-09-20-account-credentials.md).
 
-For rendered UI work, start the disposable production fixture. It creates an administrator, seeds `<username>/seeded` with text, hostile HTML and binary files, prints the random loopback URL, and removes all state on Enter:
+The same harness now also covers README rendering, which is the one place repository content becomes markup. Its corpus is pushed as real repository content on a branch of its own and read back through the browser endpoint, so the assertions run against the whole path rather than against the renderer in isolation. Half the corpus is hostile and must not survive; the other half is ordinary markdown and must not be flattened, because a renderer that escaped everything would satisfy every attack case and still be useless. See [README rendering evidence](validation/2026-10-04-readme-rendering.md).
+
+Every build can produce the attribution it redistributes under, because several of those licences bind the binary rather than the source tree:
+
+```powershell
+.\Graft.Server.exe --licences          # prints the notices and exits
+curl https://<server>/-/licences       # the same text from a running server, unauthenticated
+```
+
+For rendered UI work, start the disposable production fixture. It creates an administrator, seeds `<username>/seeded` with text, hostile HTML and binary files, a `README.md` exercising every piece of markdown syntax the renderer supports, and a real image beside it, prints the random loopback URL, and removes all state on Enter:
 
 ```powershell
 dotnet build tests\Graft.Browser.Fixture\Graft.Browser.Fixture.csproj -c Debug

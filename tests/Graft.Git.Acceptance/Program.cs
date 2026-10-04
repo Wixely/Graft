@@ -6,6 +6,7 @@ using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Graft.Core;
 using Graft.Git;
 using Graft.Storage;
@@ -116,6 +117,22 @@ try
     await CheckBrowser(address, "alice", alicePassword, project.Id);
     await CheckPersonalAccessTokens(address, "alice", alicePassword, project.Id);
     await CheckUserAdministration(address, adminPassword, Password());
+
+    // Rendering a README turns repository content into markup, which is the one place a stored cross-site
+    // scripting bug could live, so the corpus is pushed as real repository content and read back through the
+    // real endpoint rather than being handed to the renderer in isolation. It goes on a branch of its own so
+    // the main-branch assertions above and below it keep testing what they were written to test.
+    await Git(source, ["checkout", "-b", "readme-corpus"]);
+    Directory.CreateDirectory(Path.Combine(source, "docs"));
+    File.WriteAllText(Path.Combine(source, "README.md"), ReadmeCorpus());
+    File.WriteAllBytes(Path.Combine(source, "docs", "pixel.png"), OnePixelPng());
+    File.WriteAllText(Path.Combine(source, "docs", "fake.png"), "<script>alert(1)</script> not an image at all\n");
+    await Git(source, ["add", "."]);
+    await Git(source, ["commit", "-m", "README rendering corpus"]);
+    await Git(source, ["remote", "set-url", "origin", bobUrl]);
+    await Git(source, ["push", "origin", "readme-corpus"]);
+    await CheckReadmeRendering(address, "alice", alicePassword, project.Id);
+    await Git(source, ["checkout", "main"]);
 
     File.AppendAllText(Path.Combine(source, "readme.txt"), "second revision\n");
     await Git(source, ["add", "."]);
@@ -254,18 +271,19 @@ ProcessStartInfo ServerStart()
 
 async Task<string> Git(string directory, string[] arguments)
 {
-    (int exitCode, string output) = await RunGit(directory, arguments);
-    if (exitCode != 0) throw new InvalidOperationException("Git " + arguments[0] + " failed.");
+    (int exitCode, string output, string errors) = await RunGit(directory, arguments);
+    // Git reports why it refused on standard error, and without that a failure here is undiagnosable.
+    if (exitCode != 0) throw new InvalidOperationException("Git " + arguments[0] + " failed: " + Redact(errors.Trim()));
     return output;
 }
 
 async Task GitFails(string directory, string[] arguments, string name)
 {
-    (int exitCode, _) = await RunGit(directory, arguments);
+    (int exitCode, _, _) = await RunGit(directory, arguments);
     Check(exitCode != 0, name);
 }
 
-async Task<(int ExitCode, string Output)> RunGit(string directory, string[] arguments)
+async Task<(int ExitCode, string Output, string Errors)> RunGit(string directory, string[] arguments)
 {
     ProcessStartInfo start = new("git")
     {
@@ -296,8 +314,7 @@ async Task<(int ExitCode, string Output)> RunGit(string directory, string[] argu
     try
     {
         await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(60));
-        _ = await errors;
-        return (process.ExitCode, await output);
+        return (process.ExitCode, await output, await errors);
     }
     finally
     {
@@ -1132,6 +1149,294 @@ void ThrowsSync<TException>(Action action, string name) where TException : Excep
     try { action(); }
     catch (TException) { assertions++; return; }
     throw new InvalidOperationException("Expected " + typeof(TException).Name + ": " + name);
+}
+
+// A 1x1 PNG, the smallest thing the image validator will accept as genuine. Used to prove a relative image
+// in a README resolves to repository content, and to contrast with a file that only claims to be one.
+static byte[] OnePixelPng() => Convert.FromBase64String(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==");
+
+/// <summary>
+/// The README pushed into the repository for the rendering checks. The first half is hostile: every entry is
+/// a construct that must not reach the browser as markup. The second half is ordinary markdown, present
+/// because a renderer that escaped everything would pass every attack case and still be useless -- the
+/// checks assert both that nothing dangerous survives and that nothing legitimate is flattened.
+/// </summary>
+static string ReadmeCorpus() => """
+    # Rendering corpus
+
+    ## Constructs that must not survive
+
+    <script>alert('raw script block')</script>
+    <img src=x onerror=alert('event handler')>
+    <svg onload=alert('svg handler')></svg>
+    <iframe src="https://evil.invalid/frame"></iframe>
+    <object data="https://evil.invalid/x.swf"></object>
+    <embed src="https://evil.invalid/x.swf">
+    <form action="https://evil.invalid/steal"><input name="password"></form>
+    <base href="https://evil.invalid/">
+    <link rel="stylesheet" href="https://evil.invalid/x.css">
+    <style>body { display: none }</style>
+    <a href="#" onclick="alert('inline handler')">handler on an anchor</a>
+    <!-- --><script>alert('comment break out')</script><!-- -->
+    text</a><script>alert('tag break out')</script>
+
+    [plain scheme](javascript:alert('plain'))
+    [mixed case](JaVaScRiPt:alert('mixed'))
+    [entity encoded](&#106;avascript:alert&#40;'entity'&#41;)
+    [named entity](javascript&colon;alert('named'))
+    [tab inside](jav&#x09;ascript:alert('tab'))
+    [null inside](jav&#0;ascript:alert('null'))
+    [percent encoded](%6aavascript:alert('percent'))
+    [leading space]( javascript:alert('space'))
+    [vbscript](vbscript:msgbox('vb'))
+    [data document](data:text/html,<script>alert('data')</script>)
+    [local file](file:///etc/passwd)
+    [protocol relative](//evil.invalid/page)
+    [server absolute](/etc/passwd)
+    [reference style][hostile]
+    ![image scheme](javascript:alert('image'))
+    ![reference image][hostile]
+    ![blob image](blob:https://evil.invalid/x)
+    ![off site image](https://evil.invalid/tracking-pixel.png)
+    [generic attributes](docs/guide.md){onclick="alert('attributes')"}
+    [traversal](../../../etc/passwd)
+    ![traversal image](../../../etc/passwd)
+    <javascript:alert('autolink')>
+    <vbscript:msgbox('autolink')>
+
+    [hostile]: javascript:alert('definition')
+
+    ## Ordinary markdown that must still render
+
+    ### Emphasis
+
+    *emphasis*, **strong**, ~~struck through~~, `inline code`, ++inserted++, ==marked==, ^super^ and ~sub~.
+
+    ### Lists
+
+    - first
+    - second
+      - nested
+
+    1. one
+    2. two
+
+    - [x] a completed task
+    - [ ] an outstanding task
+
+    ### Quoting and rules
+
+    > a block quote
+    >
+    > with two paragraphs
+
+    ---
+
+    ### Code
+
+    ```
+    a fence with no language
+    ```
+
+    ```csharp
+    var rendered = MarkdownContent.Render(source, resolve);
+    ```
+
+    ```html
+    <script>this is a sample, not an attack</script>
+    ```
+
+    ```mermaid
+    graph TD;
+      Push[git push] --> Render[render README];
+      Render --> Sandbox[diagram sandbox];
+    ```
+
+    ### Tables
+
+    | left | centre | right |
+    | :--- | :----: | ----: |
+    | one  |  two   | three |
+
+    ### Definitions
+
+    Graft
+    :   a locally hosted forge
+    :   a graft, in horticulture
+
+    ### Links and images
+
+    [a relative document](docs/guide.md)
+    [an external page](https://example.com/page)
+    [an electronic mail address](mailto:someone@example.invalid)
+    [an in-document anchor](#ordinary-markdown-that-must-still-render)
+    <https://example.com/autolinked>
+    ![a committed image](docs/pixel.png)
+    ![a committed image with a caption](docs/pixel.png "the caption")
+
+    ### Prose that resembles an attack but is not
+
+    The `onerror` handler, the javascript: scheme and an onerror= mention all appear here as text.
+
+    ![an alt text containing onerror=alert(1)](docs/pixel.png)
+
+    [a title containing onerror](docs/guide.md "onerror=alert(1)")
+
+    ### Footnotes
+
+    A claim needing a source[^source].
+
+    [^source]: the footnote text
+    """;
+
+/// <summary>
+/// Reads the rendered README back through the endpoint the browser uses, and exercises the image route it
+/// points at. The assertions come in two halves: nothing dangerous survives, and nothing ordinary is lost.
+/// </summary>
+async Task CheckReadmeRendering(string address, string username, string password, long projectId)
+{
+    CookieContainer cookies = new();
+    using HttpClientHandler handler = new()
+    {
+        CookieContainer = cookies,
+        ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
+        UseProxy = false
+    };
+    using HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
+    using (HttpRequestMessage login = new(HttpMethod.Post, "/api/login"))
+    {
+        login.Headers.Add("Origin", address);
+        login.Content = JsonContent.Create(new { username, password });
+        using HttpResponseMessage response = await client.SendAsync(login);
+        Check(response.IsSuccessStatusCode, "README corpus login");
+    }
+
+    string html;
+    bool hasDiagrams;
+    using (HttpResponseMessage page = await client.GetAsync($"/api/browser/projects/{projectId}?ref=readme-corpus"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await page.Content.ReadAsStreamAsync());
+        Check(page.IsSuccessStatusCode, "README corpus page loads");
+        JsonElement readme = json.RootElement.GetProperty("readme");
+        Check(readme.ValueKind == JsonValueKind.Object, "the branch README is found and rendered");
+        Check(readme.GetProperty("path").GetString() == "README.md", "the rendered README names its own path");
+        html = readme.GetProperty("html").GetString()!;
+        hasDiagrams = readme.GetProperty("has_diagrams").GetBoolean();
+    }
+
+    // Everything the renderer produces is markup and everything it copies from the document is escaped, so
+    // the dangerous-construct assertions run against the tags alone: "javascript:" appearing in prose is
+    // text, and searching the whole document for it would prove nothing either way.
+    string markup = string.Concat(html.Split('<').Skip(1).Select(part => "<" + part.Split('>')[0] + ">"));
+    Check(!markup.Contains("<script", StringComparison.OrdinalIgnoreCase), "no script element survives");
+    Check(!markup.Contains("<iframe", StringComparison.OrdinalIgnoreCase), "no frame element survives");
+    Check(!markup.Contains("<object", StringComparison.OrdinalIgnoreCase) &&
+        !markup.Contains("<embed", StringComparison.OrdinalIgnoreCase), "no plugin element survives");
+    Check(!markup.Contains("<form", StringComparison.OrdinalIgnoreCase) &&
+        !markup.Contains("<input name", StringComparison.OrdinalIgnoreCase), "no form element survives");
+    Check(!markup.Contains("<svg", StringComparison.OrdinalIgnoreCase) &&
+        !markup.Contains("<base", StringComparison.OrdinalIgnoreCase) &&
+        !markup.Contains("<style", StringComparison.OrdinalIgnoreCase) &&
+        !markup.Contains("<link", StringComparison.OrdinalIgnoreCase), "no element outside the allowed set survives");
+    // An attribute's name and its value have to be judged separately. A caption reading "onerror=alert(1)"
+    // is text that happens to sit inside an alt attribute and is perfectly safe; what would not be safe is an
+    // attribute actually named onerror. So the handler check runs with every value blanked out.
+    Check(!Regex.IsMatch(Regex.Replace(markup, "\"[^\"]*\"", "\"\""), @"\son[a-zA-Z]+\s*="),
+        "no event handler attribute survives");
+
+    // Conversely a scheme only matters in an attribute that is a URL, so those values are read out and
+    // judged on their own rather than by searching the document for the word.
+    string[] destinations = Regex.Matches(markup, "(?:href|src)=\"([^\"]*)\"")
+        .Select(match => match.Groups[1].Value).ToArray();
+    Check(destinations.Length > 0, "the rendered README contains destinations to judge");
+    Check(!destinations.Any(destination => Regex.IsMatch(destination,
+        @"^\s*(?:javascript|vbscript|data|file|blob)\s*:", RegexOptions.IgnoreCase)),
+        "no executable or inline scheme survives in a destination");
+    Check(!destinations.Any(destination => destination.Contains("evil.invalid", StringComparison.OrdinalIgnoreCase)
+        && markup.Contains("<img src=\"" + destination, StringComparison.Ordinal)),
+        "no off-site image is requested");
+    Check(markup.Contains("class=\"external-image\"", StringComparison.Ordinal),
+        "an off-site image is downgraded to a link rather than fetched");
+    Check(!destinations.Any(destination => destination.StartsWith("//", StringComparison.Ordinal)
+        || destination.StartsWith("/etc/", StringComparison.Ordinal)),
+        "protocol-relative and server-absolute destinations are dropped");
+
+    // A renderer that escaped everything would satisfy every assertion above and be worthless, so the
+    // ordinary syntax has to be proved present as well.
+    Check(!html.StartsWith("<pre>", StringComparison.Ordinal), "the document is not degraded to plain text");
+    Check(html.Contains("<h1 id=\"rendering-corpus\">", StringComparison.Ordinal), "headings render with anchors");
+    Check(html.Contains("<em>emphasis</em>", StringComparison.Ordinal) &&
+        html.Contains("<strong>strong</strong>", StringComparison.Ordinal) &&
+        html.Contains("<del>struck through</del>", StringComparison.Ordinal), "emphasis renders");
+    Check(html.Contains("<ins>inserted</ins>", StringComparison.Ordinal) &&
+        html.Contains("<mark>marked</mark>", StringComparison.Ordinal) &&
+        html.Contains("<sup>super</sup>", StringComparison.Ordinal) &&
+        html.Contains("<sub>sub</sub>", StringComparison.Ordinal), "emphasis extras render");
+    Check(html.Contains("<ul>", StringComparison.Ordinal) && html.Contains("<ol>", StringComparison.Ordinal),
+        "bulleted and numbered lists render");
+    Check(html.Contains("type=\"checkbox\"", StringComparison.Ordinal), "task lists render as checkboxes");
+    Check(html.Contains("<blockquote>", StringComparison.Ordinal) && html.Contains("<hr", StringComparison.Ordinal),
+        "block quotes and rules render");
+    Check(html.Contains("<code class=\"language-csharp\">", StringComparison.Ordinal),
+        "fenced code keeps its language");
+    Check(html.Contains("&lt;script&gt;this is a sample", StringComparison.Ordinal),
+        "a code sample containing a script tag is shown as text rather than rejecting the document");
+    Check(html.Contains("<table>", StringComparison.Ordinal) && html.Contains("<th", StringComparison.Ordinal),
+        "tables render");
+    // Column alignment has to arrive as a class. Expressed as an inline style, which is what the parser does
+    // by default, the browser refuses it under style-src and the alignment is lost with no visible cause.
+    Check(!markup.Contains("style=", StringComparison.OrdinalIgnoreCase),
+        "nothing is rendered as an inline style, which the page policy would refuse");
+    Check(html.Contains("class=\"align-centre\"", StringComparison.Ordinal) &&
+        html.Contains("class=\"align-right\"", StringComparison.Ordinal),
+        "table column alignment survives as a class the stylesheet can apply");
+    Check(html.Contains("<dl>", StringComparison.Ordinal) && html.Contains("<dd", StringComparison.Ordinal),
+        "definition lists render");
+    Check(html.Contains("class=\"footnotes\"", StringComparison.Ordinal), "footnotes render");
+    Check(html.Contains("<code class=\"language-mermaid\">", StringComparison.Ordinal) && hasDiagrams,
+        "a diagram is reported and left for the sandbox to draw");
+    Check(html.Contains("<a href=\"https://example.com/page\" rel=\"noopener noreferrer nofollow\" target=\"_blank\">", StringComparison.Ordinal),
+        "an external link cannot leak a referrer or a window handle");
+    Check(html.Contains("<a href=\"https://example.com/autolinked\" rel=\"noopener noreferrer nofollow\" target=\"_blank\">", StringComparison.Ordinal),
+        "an autolink is treated as strictly as a written link");
+    Check(html.Contains("alt=\"an alt text containing onerror=alert(1)\"", StringComparison.Ordinal),
+        "text that resembles an attack is kept as text instead of degrading the document");
+
+    // The images a README points at come back through a route of its own, which identifies them by structure.
+    string imageRoute = $"/api/graft/projects/{projectId}/image?ref=readme-corpus&path=";
+    Check(html.Contains("/image?ref=readme-corpus&amp;path=docs%2Fpixel.png", StringComparison.Ordinal),
+        "a committed image resolves to the repository image route");
+    using (HttpResponseMessage image = await client.GetAsync(imageRoute + "docs%2Fpixel.png"))
+        Check(image.IsSuccessStatusCode && image.Content.Headers.ContentType?.MediaType == "image/png",
+            "a committed image is served as the type its bytes prove it to be");
+    using (HttpResponseMessage fake = await client.GetAsync(imageRoute + "docs%2Ffake.png"))
+        Check(fake.StatusCode == HttpStatusCode.UnsupportedMediaType,
+            "a file that only claims to be an image is refused");
+    using (HttpResponseMessage markdown = await client.GetAsync(imageRoute + "README.md"))
+        Check(markdown.StatusCode == HttpStatusCode.UnsupportedMediaType,
+            "the image route cannot be used to serve a repository's text");
+    using (HttpResponseMessage traversal = await client.GetAsync(imageRoute + "..%2F..%2F..%2Fetc%2Fpasswd"))
+        Check(traversal.StatusCode == HttpStatusCode.NotFound,
+            "the image route resolves through the object store, so traversal reaches nothing");
+
+    // A README belongs to the root of a branch. A subdirectory is a different view, and a README found
+    // deeper in the tree is an ordinary file.
+    using (HttpResponseMessage subdirectory = await client.GetAsync($"/api/browser/projects/{projectId}?ref=readme-corpus&path=docs"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await subdirectory.Content.ReadAsStreamAsync());
+        Check(subdirectory.IsSuccessStatusCode &&
+            json.RootElement.GetProperty("readme").ValueKind == JsonValueKind.Null,
+            "a subdirectory listing carries no README");
+    }
+
+    // The default branch has no README at all, which must read as absence rather than as an error.
+    using (HttpResponseMessage main = await client.GetAsync($"/api/browser/projects/{projectId}?ref=main"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await main.Content.ReadAsStreamAsync());
+        Check(main.IsSuccessStatusCode && json.RootElement.GetProperty("readme").ValueKind == JsonValueKind.Null,
+            "a branch without a README reports none");
+    }
 }
 
 void Check(bool condition, string name)

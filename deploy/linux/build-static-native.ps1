@@ -86,6 +86,11 @@ try {
     Invoke-Linux -Command @('mkdir', '-p', ($destination + '/server'), ($destination + '/admin'))
     Invoke-Linux -Command @('cp', ($rootfs + '/out/server/Graft.Server'), ($destination + '/server/'))
     Invoke-Linux -Command @('cp', ($rootfs + '/out/admin/Graft.Admin'), ($destination + '/admin/'))
+    # This static build links OpenSSL, ICU and SQLite into the executables, so each of these directories is a
+    # binary redistribution in its own right and has to carry the attribution with it. The server can also
+    # print it (--licences) and serve it (/-/licences); the file is here for whoever unpacks the directory.
+    Invoke-Linux -Command @('cp', ($rootfs + '/src/THIRD-PARTY-NOTICES.md'), ($destination + '/server/'))
+    Invoke-Linux -Command @('cp', ($rootfs + '/src/THIRD-PARTY-NOTICES.md'), ($destination + '/admin/'))
 } finally {
     Invoke-Linux -Command @('umount', ($rootfs + '/proc'))
 }
