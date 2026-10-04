@@ -27,7 +27,7 @@ Provisional version candidate: **GitLab CE 18.0.0, REST v4**. This remains an ag
 
 Client evidence: installed **Git 2.53.0.windows.2** provides actual transport interoperability. Pinned **glab 1.58.0** passes `auth login` plus `api user`, project list, project create and project read against both the GitLab reference and Graft; see [pinned-client evidence](validation/2026-09-19-glab-graft.md). A C# HttpClient harness verifies additional wire/error behavior independently. GitlabMCPSharp remains a later client candidate. No broad glab support is implied.
 
-The read rows marked **implemented** were first tested by the 64-assertion MVP-06 harness. The GitLab 18.0 project-creation fixture raised that workflow to 87 assertions, user/membership raised it to 97, and personal access-token lifecycle raises the current Windows JIT and NativeAOT workflow to 107. GL-004 is driven by the pinned 18.0.0 source fixture; the other rows still reference rolling official documentation. Git transport uses protocol v0/SHA-1. The live GitLab CE 18.0.0 and pinned `glab` 1.58.0 reports establish the exact bounded reference/client result described above.
+The read rows marked **implemented** were first tested by the 64-assertion MVP-06 harness. The GitLab 18.0 project-creation fixture raised that workflow to 87 assertions, user/membership raised it to 97, and personal access-token lifecycle raised it to 107. Account credentials raised it to 135, and server-authored commits raise the current Windows JIT workflow to 165; the NativeAOT comparison is pending a machine with the C++ build tools. GL-004 is driven by the pinned 18.0.0 source fixture; the other rows still reference rolling official documentation. Git transport uses protocol v0/SHA-1. The live GitLab CE 18.0.0 and pinned `glab` 1.58.0 reports establish the exact bounded reference/client result described above.
 
 | Fixture ID | Surface / request | Required assertions | Official reference |
 | --- | --- | --- | --- |
@@ -44,7 +44,23 @@ The read rows marked **implemented** were first tested by the 64-assertion MVP-0
 | GIT-002 | `POST /:namespace/:project.git/git-upload-pack` | **Implemented bounded subset:** clone/fetch through Git 2.53.0.windows.2, exact content and inaccessible rejection | [Git HTTP](https://git-scm.com/docs/http-protocol) |
 | GIT-003 | `POST /:namespace/:project.git/git-receive-pack` | **Implemented bounded subset:** initial/incremental push, branches/tags, token auth, stale ref and interrupted publication checks | [Git HTTP](https://git-scm.com/docs/http-protocol), [pack format](https://git-scm.com/docs/pack-format) |
 | WEB-001 | `/:namespace/:project` | **Implemented subset:** authenticated project/user/token creation, account password change/reset/disable/re-enable, membership and token revocation, deep-link shell, tree/history/file API, CSRF login/logout; rendered Chromium workflow passes | Graft MVP UX acceptance; no complete GitLab browser URL parity claimed |
+| GL-010 | `avatar_url` on user and project payloads | **Implemented subset:** the field is present and null when no avatar is set, otherwise an absolute URL to a Graft-served image. The URL shape is Graft's own, not GitLab's `/uploads/-/system/...` convention | [Projects](https://docs.gitlab.com/api/projects/), [Users](https://docs.gitlab.com/api/users/) |
+| GL-011 | Avatar upload | **Not implemented.** GitLab accepts an avatar as multipart form data on `PUT /api/v4/user` and `POST /api/v4/projects/:id`; Graft has no multipart handling and uploads avatars only through its browser transport | [Projects](https://docs.gitlab.com/api/projects/) |
+| GL-012 | `POST /api/v4/projects/:id/uploads` | **Not implemented.** Deliberately left unclaimed so the path stays available; Graft's browser uploads live under `/api/graft/uploads` instead | [Projects](https://docs.gitlab.com/api/projects/) |
 
 Git HTTPS token authentication needs its own GitLab-version fixture; API header acceptance does not prove Git credential compatibility. REST unknown routes must return an explicit API error, never the Blazor HTML fallback. Treat unsupported query fields deliberately: document version-matched ignore/reject behavior instead of silently claiming full endpoint support.
+
+## Graft-specific routes
+
+These are Graft's own surface, not GitLab compatibility. They live under `/api/graft/` so they cannot collide with a GitLab path, and they exist because the browser needs capabilities the REST surface does not yet offer. An API client should not depend on them.
+
+| Route | Purpose |
+| --- | --- |
+| `/api/graft/uploads/**` | Browser upload transport; see [ADR 0005](decisions/0005-browser-upload-transport.md) |
+| `POST /api/graft/admin/import/inspect` | Reference inventory and exclusion report for an uploaded Git bundle |
+| `POST /api/graft/projects/:id/repository/files` | Commit uploaded files to a branch |
+| `GET`, `HEAD`, `POST /api/graft/avatars/{user\|project}/:id` | Serve and set avatars |
+
+GitLab owns `/uploads/...` and `/api/v4/projects/:id/uploads`. Neither is served by Graft's upload group, and both remain available for later compatibility work.
 
 Deferred surfaces remain not implemented: GraphQL, additional write-side project/repository REST APIs, raw/archive routes, SSH/LFS, OAuth, CI/runner protocol, webhooks, nested groups and complete browser URL conventions. Repository-only import via an ordinary push preserves Git content; it is not a GitLab data migration.
