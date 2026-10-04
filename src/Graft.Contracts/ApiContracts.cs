@@ -102,6 +102,10 @@ public sealed record MembershipSetRequest(string Username, string Role);
 
 /// <summary>Names the account a project should be handed to. The project path changes with its owner.</summary>
 public sealed record OwnershipTransferRequest(string Username);
+
+/// <summary>Names the branch a project should open at. Null or empty clears the preference and lets the
+/// repository fall back to convention.</summary>
+public sealed record DefaultBranchRequest(string? Branch);
 public sealed record ProjectMemberResponse(long UserId, string Username, string Role);
 /// <summary>
 /// Names a completed browser upload for an application operation to ingest. The upload id is a transport
@@ -179,6 +183,7 @@ public sealed record RepositoryPageResponse(
 [JsonSerializable(typeof(ProjectCreateRequest))]
 [JsonSerializable(typeof(MembershipSetRequest))]
 [JsonSerializable(typeof(OwnershipTransferRequest))]
+[JsonSerializable(typeof(DefaultBranchRequest))]
 [JsonSerializable(typeof(ProjectMemberResponse[]))]
 [JsonSerializable(typeof(RepositoryPageResponse))]
 [JsonSerializable(typeof(UploadIngestRequest))]

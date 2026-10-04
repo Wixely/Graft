@@ -167,6 +167,7 @@ try
 
     TestInterruptedCommitsLeaveRefsUnchanged(reopened, repositoryPath);
     TestServerAuthoredObjectsMatchGit();
+    TestDefaultBranchResolution();
 
     await using (GraftStore pending = await GraftStore.OpenAsync(databasePath))
     {
@@ -1070,6 +1071,60 @@ void TestServerAuthoredObjectsMatchGit()
     ThrowsSync<GitInputException>(() => conflict.CommitFiles("main",
         [new("ok.txt", "a"u8.ToArray()), new("../bad.txt", "b"u8.ToArray())], who, "partial"), "rejects a batch with one bad path");
     Check(conflict.Refs["refs/heads/main"] == head && conflict.Objects.Count == objects, "a rejected batch leaves no partial state");
+}
+
+/// <summary>
+/// A repository's default branch. Graft previously assumed "main" everywhere, so a repository holding only
+/// "master" browsed as empty and advertised a dangling HEAD to clones. The branch is now resolved, with a
+/// stored per-project preference on top.
+/// </summary>
+void TestDefaultBranchResolution()
+{
+    GitIdentity who = new("Graft Fixture", "fixture@example.invalid",
+        DateTimeOffset.FromUnixTimeSeconds(1_700_000_000).ToOffset(TimeSpan.Zero));
+    Repository Build(params string[] branches)
+    {
+        Repository built = new();
+        foreach (string name in branches)
+            built.CommitFiles(name, [new(name + ".txt", "x"u8.ToArray())], who, "on " + name);
+        return built;
+    }
+
+    Check(new Repository().DefaultBranch is null, "an empty repository has no default branch");
+    Check(Build("master").DefaultBranch == "master", "a master-only repository defaults to master");
+    Check(Build("main").DefaultBranch == "main", "a main-only repository defaults to main");
+    Check(Build("master", "main").DefaultBranch == "main", "main wins when both exist");
+    Check(Build("develop").DefaultBranch == "develop", "a repository with neither uses its only branch");
+    Check(Build("zeta", "alpha").DefaultBranch == "alpha", "with no convention match the first branch by name wins");
+
+    // A project's stored choice outranks convention, but only while that branch still exists: a preference
+    // is a name, and the branch behind it can be deleted.
+    Repository preferred = Build("main", "release");
+    preferred.PreferredDefaultBranch = "release";
+    Check(preferred.DefaultBranch == "release", "a stored preference outranks convention");
+    preferred.PreferredDefaultBranch = "no-such-branch";
+    Check(preferred.DefaultBranch == "main", "a preference naming a missing branch falls back to convention");
+    preferred.PreferredDefaultBranch = null;
+    Check(preferred.DefaultBranch == "main", "clearing the preference returns to convention");
+
+    // HEAD and the clone advertisement must agree with that resolution, which is what a real client follows.
+    Repository masterOnly = Build("master");
+    Check(RepositoryView.ResolveCommit(masterOnly, "HEAD") == masterOnly.Refs["refs/heads/master"],
+        "HEAD resolves through the default branch");
+    string advertised = Encoding.UTF8.GetString(masterOnly.Advertise("git-upload-pack"));
+    Check(advertised.Contains("symref=HEAD:refs/heads/master", StringComparison.Ordinal),
+        "the clone advertisement names the real default branch");
+    Check(!advertised.Contains("refs/heads/main", StringComparison.Ordinal), "no phantom main branch is advertised");
+
+    // An empty repository must still advertise something a client can parse rather than a broken symref.
+    string empty = Encoding.UTF8.GetString(new Repository().Advertise("git-upload-pack"));
+    Check(!empty.Contains("symref=", StringComparison.Ordinal), "an empty repository advertises no symref");
+
+    // Browsing a branch that is not the default is the other half of multi-branch support.
+    Repository several = Build("main", "feature");
+    Check(RepositoryView.File(several, "feature", "feature.txt") is not null, "a non-default branch can be browsed");
+    Check(RepositoryView.File(several, "main", "feature.txt") is null, "branches stay isolated from each other");
+    Check(RepositoryView.Branches(several).Count == 2, "every branch is listed");
 }
 
 void ThrowsSync<TException>(Action action, string name) where TException : Exception

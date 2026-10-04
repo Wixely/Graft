@@ -44,8 +44,18 @@ else
         <div class="panel">
             <div class="panel-header">
                 <Icon Name="branch" />
-                <strong>@(repo.Project.DefaultBranch ?? "main")</strong>
+                <label class="visually-hidden" for="branch-select">Branch</label>
+                <select id="branch-select" class="branch-select" value="@Branch" @onchange="SwitchBranch">
+                    @foreach (BranchResponse option in repo.Branches)
+                    {
+                        <option value="@option.Name" selected="@(option.Name == Branch)">@option.Name</option>
+                    }
+                </select>
                 <span class="label">@repo.Branches.Count @(repo.Branches.Count == 1 ? "branch" : "branches")</span>
+                @if (repo.Branches.FirstOrDefault(item => item.Name == Branch)?.Default == true)
+                {
+                    <span class="label accent">default</span>
+                }
                 <span class="spacer"></span>
                 <div class="clone-url">
                     <label class="visually-hidden" for="clone">Clone URL</label>
@@ -113,7 +123,7 @@ else
     else if (tab == "upload")
     {
         <div class="panel">
-            <div class="panel-header"><Icon Name="upload" /><h2>Add files to @(repo.Project.DefaultBranch ?? "main")</h2></div>
+            <div class="panel-header"><Icon Name="upload" /><h2>Add files to @Branch</h2></div>
             <div class="panel-body">
                 <p class="secondary-text">
                     Files are uploaded first and committed when you choose. The server caps each file at the
@@ -187,6 +197,34 @@ else
     }
     else
     {
+        <div class="panel">
+            <div class="panel-header"><Icon Name="branch" /><h2>Default branch</h2></div>
+            <div class="panel-body">
+                <p class="secondary-text">
+                    The branch this project opens at, and the one a clone checks out. Currently
+                    <strong>@(repo.Project.DefaultBranch ?? "none, because the repository has no branches")</strong>.
+                    With no branch chosen, Graft prefers <code>main</code>, then <code>master</code>, then the
+                    first branch by name.
+                </p>
+                @if (repo.Branches.Count > 0)
+                {
+                    <form class="form" @onsubmit="SetDefaultBranch" @onsubmit:preventDefault>
+                        <label for="default-branch">Open this project at</label>
+                        <select id="default-branch" @bind="defaultBranchChoice">
+                            <option value="">Follow convention</option>
+                            @foreach (BranchResponse option in repo.Branches)
+                            {
+                                <option value="@option.Name">@option.Name</option>
+                            }
+                        </select>
+                        <div class="form-actions">
+                            <button type="submit" disabled="@busy">Save default branch</button>
+                        </div>
+                    </form>
+                }
+            </div>
+        </div>
+
         <div class="panel">
             <div class="panel-header"><Icon Name="user" /><h2>Transfer ownership</h2></div>
             <div class="panel-body">
@@ -269,6 +307,8 @@ else
     private RepositoryPageResponse? repo;
     private ProjectMemberResponse[] members = [];
     private string tab = "code";
+    private string branch = "";
+    private string defaultBranchChoice = "";
     private string path = "";
     private string filePath = "";
     private string? fileText;
@@ -314,7 +354,7 @@ else
         message = "";
         try
         {
-            RepositoryCommitRequest request = new(repo.Project.DefaultBranch ?? "main", commitMessage,
+            RepositoryCommitRequest request = new(Branch, commitMessage,
                 [.. staged.Select(file => new RepositoryFileUpload(file.UploadId, file.Path, file.Executable))]);
             ApiResult<RepositoryCommitResponse> result = await Api.SendAsync(HttpMethod.Post,
                 $"api/graft/projects/{repo.Project.Id}/repository/files", request,
@@ -352,13 +392,54 @@ else
         finally { loading = false; }
     }
 
+    /// <summary>
+    /// The branch being viewed. Empty means "whatever the project opens at", which the server resolves, so
+    /// the first load does not have to guess a branch name that may not exist.
+    /// </summary>
+    private string Branch => branch.Length > 0 ? branch : repo?.Project.DefaultBranch ?? "";
+
     private async Task Load(long id)
     {
-        string query = $"api/browser/projects/{id}?ref=main&path={Uri.EscapeDataString(path)}" +
+        string reference = branch.Length > 0 ? branch : "HEAD";
+        string query = $"api/browser/projects/{id}?ref={Uri.EscapeDataString(reference)}&path={Uri.EscapeDataString(path)}" +
             (filePath.Length == 0 ? "" : "&file=" + Uri.EscapeDataString(filePath));
         repo = await Api.GetAsync(query, ApiJson.Default.RepositoryPageResponse);
         fileText = repo?.File is null ? null : DecodeText(repo.File.Content);
+        // The payload reports the branch actually in effect, whether that came from the stored preference
+        // or from convention, so the settings selector starts on what the project is really opening at.
+        defaultBranchChoice = repo?.Project.DefaultBranch ?? "";
         if (repo?.CanManage == true) await LoadMembers(id);
+    }
+
+    /// <summary>Switches branch, dropping the current path because it may not exist on the new one.</summary>
+    private async Task SwitchBranch(ChangeEventArgs args)
+    {
+        if (repo is null) return;
+        branch = args.Value?.ToString() ?? "";
+        path = "";
+        filePath = "";
+        await Load(repo.Project.Id);
+    }
+
+    /// <summary>
+    /// Stores which branch the project opens at. An empty choice clears the preference, which returns the
+    /// project to the convention the repository applies on its own.
+    /// </summary>
+    private async Task SetDefaultBranch()
+    {
+        if (busy || repo is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            string? choice = defaultBranchChoice.Length == 0 ? null : defaultBranchChoice;
+            ApiResult result = await Api.PostAsync($"api/projects/{repo.Project.Id}/default-branch",
+                new DefaultBranchRequest(choice), ApiJson.Default.DefaultBranchRequest,
+                choice is null ? "Default branch now follows convention." : $"{choice} is now the default branch.");
+            Report(result);
+            if (result.Ok) await Load(repo.Project.Id);
+        }
+        finally { busy = false; }
     }
 
     private async Task Open(TreeEntryResponse entry)

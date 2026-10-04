@@ -22,7 +22,10 @@ public static class RepositoryView
         ArgumentException.ThrowIfNullOrWhiteSpace(revision);
         string? id = revision switch
         {
-            "HEAD" => repository.Refs.GetValueOrDefault("refs/heads/main"),
+            // HEAD follows whatever the repository considers its default branch, which is not always "main".
+            "HEAD" => repository.DefaultBranch is { } head
+                ? repository.Refs.GetValueOrDefault("refs/heads/" + head)
+                : null,
             _ when Limits.IsId(revision) => revision,
             _ => repository.Refs.GetValueOrDefault("refs/heads/" + revision)
                 ?? repository.Refs.GetValueOrDefault("refs/tags/" + revision)

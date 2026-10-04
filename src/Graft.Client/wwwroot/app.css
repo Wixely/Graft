@@ -561,3 +561,9 @@ nav[aria-label="Path"] {
 }
 nav[aria-label="Path"] .link { font-size: 12px; font-weight: 500; }
 nav[aria-label="Path"] .link:last-of-type { color: var(--text); font-weight: 600; }
+
+/* Branch selector in the repository header: sized to its content so it reads as a control, not a field. */
+.branch-select {
+    width: auto; min-width: 120px; max-width: 260px;
+    font-weight: 600; padding: 3px var(--space-2);
+}

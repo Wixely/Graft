@@ -8,7 +8,7 @@ Confirmed goal: GitLab APIs/URL conventions and GitLab-style apps, with most Git
 | --- | --- | --- |
 | REST | Method/path, request/response/error shape, auth, scopes, pagination, encoding, status codes, redirects | Bounded read/write subset passes the C# harness; GL-004 has a version-matched source fixture, while live upstream comparison remains pending |
 | GraphQL | Supported schema/queries/mutations, pagination and authorization | Not implemented |
-| Browser/raw/archive URLs | Namespace nesting, refs, filenames, downloads, canonical redirects | Personal namespace project/deep-link route implemented; raw/archive and nesting pending |
+| Browser/raw/archive URLs | Namespace nesting, refs, filenames, downloads, canonical redirects | Personal namespace project/deep-link route implemented; any branch can be browsed and chosen as the default; raw/archive and nesting pending |
 | Git HTTPS/SSH and LFS | Clone/fetch/push, auth and ref permissions, large-object integrity | Bounded Git HTTPS subset passes; SSH and LFS pending |
 | OAuth/tokens/webhooks | Token lifecycle/scopes, application flows, payloads, auth and delivery/retry behavior | Bounded personal access-token creation/list/revoke is implemented; OAuth and webhooks are not |
 | CI configuration | Includes/templates, stages/jobs, expressions, variables, artifacts, caches, environments | Not implemented |
@@ -59,7 +59,9 @@ These are Graft's own surface, not GitLab compatibility. They live under `/api/g
 | `/api/graft/uploads/**` | Browser upload transport; see [ADR 0005](decisions/0005-browser-upload-transport.md) |
 | `POST /api/graft/admin/import/inspect` | Reference inventory and exclusion report for an uploaded Git bundle |
 | `POST /api/graft/projects/:id/repository/files` | Commit uploaded files to a branch |
-| `GET`, `HEAD`, `POST /api/graft/avatars/{user\|project}/:id` | Serve and set avatars |
+| `GET`, `HEAD`, `POST /api/graft/avatars/{user|project}/:id` | Serve and set avatars |
+| `POST /api/projects/:id/default-branch` | Choose which branch a project opens at |
+| `POST /api/projects/:id/owner` | Transfer project ownership |
 
 GitLab owns `/uploads/...` and `/api/v4/projects/:id/uploads`. Neither is served by Graft's upload group, and both remain available for later compatibility work.
 

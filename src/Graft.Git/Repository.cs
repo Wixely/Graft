@@ -25,6 +25,34 @@ public sealed class Repository
     public int OffsetDeltas { get; private set; }
     public int ReferenceDeltas { get; private set; }
 
+    /// <summary>
+    /// The branch an application has chosen as this repository's default, or null to let the repository
+    /// decide. The engine does not persist this; the host sets it from wherever it stores project settings.
+    /// </summary>
+    public string? PreferredDefaultBranch { get; set; }
+
+    /// <summary>
+    /// The branch a clone should check out and a browser should open. A repository that was never told
+    /// otherwise falls back to convention rather than to a single hardcoded name: plenty of repositories
+    /// use <c>master</c>, and an imported one may use neither that nor <c>main</c>. Null only when the
+    /// repository has no branches at all.
+    /// </summary>
+    public string? DefaultBranch
+    {
+        get
+        {
+            if (PreferredDefaultBranch is { Length: > 0 } preferred &&
+                Refs.ContainsKey("refs/heads/" + preferred)) return preferred;
+            if (Refs.ContainsKey("refs/heads/main")) return "main";
+            if (Refs.ContainsKey("refs/heads/master")) return "master";
+            return Refs.Keys
+                .Where(name => name.StartsWith("refs/heads/", StringComparison.Ordinal))
+                .OrderBy(name => name, StringComparer.Ordinal)
+                .Select(name => name[11..])
+                .FirstOrDefault();
+        }
+    }
+
     public Repository(IRepositoryPersistence? persistence = null)
     {
         this.persistence = persistence;
@@ -62,7 +90,13 @@ public sealed class Repository
     {
         var receive = service == "git-receive-pack";
         Limits.Require(receive || service == "git-upload-pack", "service");
-        var capabilities = receive ? "report-status ofs-delta" : "ofs-delta symref=HEAD:refs/heads/main";
+        // A clone follows the advertised symref to decide what to check out. Pointing it at a branch that
+        // does not exist leaves the client complaining about a dangling remote HEAD, so this advertises the
+        // repository's actual default rather than assuming one name.
+        var head = DefaultBranch;
+        var capabilities = receive
+            ? "report-status ofs-delta"
+            : "ofs-delta" + (head is null ? "" : " symref=HEAD:refs/heads/" + head);
         using var output = new MemoryStream();
         Packet.Write(output, "# service=" + service + "\n");
         Packet.Flush(output);
@@ -72,7 +106,7 @@ public sealed class Repository
             Packet.Write(output, id + " " + name + (first ? "\0" + capabilities : "") + "\n");
             first = false;
         }
-        if (!receive && Refs.TryGetValue("refs/heads/main", out var head)) Ref(head, "HEAD");
+        if (!receive && head is not null && Refs.TryGetValue("refs/heads/" + head, out var headId)) Ref(headId, "HEAD");
         foreach (var pair in Refs.OrderBy(p => p.Key, StringComparer.Ordinal)) Ref(pair.Value, pair.Key);
         if (first) Ref(Limits.Zero, "capabilities^{}");
         Packet.Flush(output);

@@ -111,8 +111,11 @@ public static class ProjectAuthorization
 
 public sealed record UserAccount(long Id, string Username, bool IsAdministrator, bool Disabled);
 public sealed record ProjectMember(long UserId, string Username, ProjectRole Role);
-public sealed record ProjectInfo(long Id, long OwnerUserId, string Namespace, string Slug, string Name, string StorageId);
-public sealed record ProjectDetails(ProjectInfo Project, string Description, DateTimeOffset CreatedAtUtc);
+public sealed record ProjectInfo(long Id, long OwnerUserId, string Namespace, string Slug, string Name, string StorageId,
+    string? DefaultBranch = null);
+/// <summary>A project and its stored settings. DefaultBranch is a preference and may be null, or may name
+/// a branch that no longer exists; the Git engine resolves the effective branch.</summary>
+public sealed record ProjectDetails(ProjectInfo Project, string Description, DateTimeOffset CreatedAtUtc, string? DefaultBranch);
 public sealed record ProjectPage(IReadOnlyList<ProjectDetails> Projects, long Total);
 public sealed record SessionGrant(string Secret, DateTimeOffset ExpiresAtUtc);
 public sealed record TokenGrant(long Id, string Secret, TokenScope Scopes, DateTimeOffset ExpiresAtUtc);

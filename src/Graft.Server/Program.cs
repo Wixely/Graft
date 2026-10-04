@@ -489,6 +489,47 @@ app.MapPost("/api/projects/{projectId:long}/owner", async context =>
     catch (InvalidOperationException error) { await ApiError(context, 400, error.Message); }
 });
 
+// Choose which branch a project opens at. Null clears the preference, which returns the project to the
+// convention the repository applies on its own.
+app.MapPost("/api/projects/{projectId:long}/default-branch", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    DefaultBranchRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.DefaultBranchRequest, context.RequestAborted);
+    if (request is null) { await ApiError(context, 400, "branch"); return; }
+
+    long projectId = Convert.ToInt64(context.Request.RouteValues["projectId"], System.Globalization.CultureInfo.InvariantCulture);
+    ProjectDetails? details = await store.GetReadyProjectAsync(projectId, context.RequestAborted);
+    if (details is null) { await ApiError(context, 404, "project"); return; }
+
+    string? branch = string.IsNullOrWhiteSpace(request.Branch) ? null : request.Branch.Trim();
+    if (branch is not null)
+    {
+        // Refuse a branch that is not there. Storage would accept any string, and the engine would silently
+        // fall back to convention, which looks like the setting was ignored.
+        RepositoryEndpoint endpoint = EndpointFor(details.Project);
+        await endpoint.Gate.WaitAsync(context.RequestAborted);
+        try
+        {
+            if (!endpoint.Repository.Refs.ContainsKey("refs/heads/" + branch))
+            { await ApiError(context, 400, "that branch does not exist"); return; }
+        }
+        finally { endpoint.Gate.Release(); }
+    }
+
+    try
+    {
+        await store.SetDefaultBranchAsync(browser.Value.Identity, projectId, branch, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "project"); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+});
+
 app.MapDelete("/api/projects/{projectId:long}/members/{userId:long}", async context =>
 {
     if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
@@ -664,7 +705,7 @@ app.MapGet("/api/browser/projects/{projectId:long}", async context =>
         PermissionDecision manage = await store.GetPermissionAsync(browser.Value.Identity, projectId, ProjectAction.ManageProject, context.RequestAborted);
         PermissionDecision push = await store.GetPermissionAsync(browser.Value.Identity, projectId, ProjectAction.PushRepository, context.RequestAborted);
         BranchResponse[] branches = RepositoryView.Branches(repository).Select(branch => new BranchResponse(
-            branch.Name, false, false, branch.Name == "main", true, true, push.Allowed,
+            branch.Name, false, false, branch.Name == repository.DefaultBranch, true, true, push.Allowed,
             ProjectWebUrl(context, details) + "/-/tree/" + Uri.EscapeDataString(branch.Name),
             CommitResponseFor(context, details, RepositoryView.ReadCommit(repository, branch.Id)))).ToArray();
         CommitResponse[] commits = RepositoryView.Commits(repository, revision, 0, 20)
@@ -731,7 +772,7 @@ app.MapGet("/api/v4/projects/{projectId}/repository/branches", async context =>
         (string Name, string Id)[] branches = RepositoryView.Branches(repository).ToArray();
         PermissionDecision push = await store.GetPermissionAsync(project.Identity, project.Details.Project.Id, ProjectAction.PushRepository, context.RequestAborted);
         BranchResponse[] result = branches.Skip((page - 1) * perPage).Take(perPage).Select(branch =>
-            new BranchResponse(branch.Name, false, false, branch.Name == "main", true, true, push.Allowed,
+            new BranchResponse(branch.Name, false, false, branch.Name == repository.DefaultBranch, true, true, push.Allowed,
                 ProjectWebUrl(context, project.Details) + "/-/tree/" + Uri.EscapeDataString(branch.Name),
                 CommitResponseFor(context, project.Details, RepositoryView.ReadCommit(repository, branch.Id)))).ToArray();
         SetPagination(context, page, perPage, branches.Length);
@@ -1117,9 +1158,14 @@ RepositoryEndpoint EndpointFor(ProjectInfo project)
 {
     if (project.StorageId.Length != 32 || project.StorageId.Any(character => character is not (>= '0' and <= '9' or >= 'a' and <= 'f')))
         throw new InvalidOperationException("Invalid project storage identifier.");
-    return repositories.GetOrAdd(project.StorageId, storageId =>
+    RepositoryEndpoint endpoint = repositories.GetOrAdd(project.StorageId, storageId =>
         new(() => new(new Repository(new DurableRepositoryStorage(Path.Combine(settings.Repositories, storageId)))),
             LazyThreadSafetyMode.ExecutionAndPublication)).Value;
+    // Repositories are cached for the process lifetime while the project row is read per request, so the
+    // stored preference is reapplied on every use rather than only when the repository is first opened.
+    // Doing it here covers the Git transport as well, which needs it to advertise the right HEAD symref.
+    endpoint.Repository.PreferredDefaultBranch = project.DefaultBranch;
+    return endpoint;
 }
 
 async Task WithRepository(RepositoryEndpoint endpoint, HttpContext context, Func<Repository, Task> action)
@@ -1143,7 +1189,7 @@ async Task<ProjectResponse> ProjectResponseFor(HttpContext context, ProjectDetai
 
 async Task<ProjectResponse> ProjectResponseForLocked(HttpContext context, ProjectDetails details, Repository repository)
 {
-    string? defaultBranch = repository.Refs.ContainsKey("refs/heads/main") ? "main" : null;
+    string? defaultBranch = repository.DefaultBranch;
     string origin = Origin(context);
     string path = details.Project.Namespace + "/" + details.Project.Slug;
     string webUrl = origin + "/" + path;
