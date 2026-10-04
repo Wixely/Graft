@@ -1,0 +1,21 @@
+@* Shows an avatar image when one is set, and the first letter of the name when it is not, so a missing
+   avatar never renders as a broken image. *@
+
+<span class="avatar @Class" aria-hidden="true">
+    @if (!string.IsNullOrEmpty(Url))
+    {
+        <img src="@Url" alt="" loading="lazy" />
+    }
+    else
+    {
+        @Initial
+    }
+</span>
+
+@code {
+    [Parameter] public string? Url { get; set; }
+    [Parameter] public string Name { get; set; } = "";
+    [Parameter] public string Class { get; set; } = "";
+
+    private string Initial => Name.Length == 0 ? "?" : Name[..1];
+}

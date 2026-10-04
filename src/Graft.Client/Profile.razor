@@ -12,7 +12,7 @@ else if (Api.Authenticated)
 {
     <div class="page-header">
         <div class="row">
-            <span class="avatar avatar-large" aria-hidden="true">@Initial(Api.Username)</span>
+            <Avatar Url="@Api.Session?.AvatarUrl" Name="@Api.Username" Class="avatar-large" />
             <div>
                 <h1>@Api.Username</h1>
                 <p class="subtitle">@(Api.IsAdministrator ? "Administrator" : "User") on this instance.</p>
@@ -24,8 +24,22 @@ else if (Api.Authenticated)
 
     <div class="tabs">
         <button type="button" class="@(tab == "tokens" ? "active" : "")" @onclick='() => tab = "tokens"'>Access tokens</button>
+        <button type="button" class="@(tab == "avatar" ? "active" : "")" @onclick='() => tab = "avatar"'>Avatar</button>
         <button type="button" class="@(tab == "password" ? "active" : "")" @onclick='() => tab = "password"'>Password</button>
     </div>
+
+    @if (tab == "avatar")
+    {
+        <div class="panel">
+            <div class="panel-header"><Icon Name="user" /><h2>Your avatar</h2></div>
+            <div class="panel-body">
+                <p class="secondary-text">
+                    PNG, JPEG, GIF or WebP, up to 2&nbsp;MB and 4096&nbsp;pixels on a side. SVG is not accepted.
+                </p>
+                <UploadField Profile="avatar" Id="user-avatar" OnCompleted="SetAvatar" />
+            </div>
+        </div>
+    }
 
     @if (tab == "tokens")
     {
@@ -90,7 +104,7 @@ else if (Api.Authenticated)
             }
         </div>
     }
-    else
+    else if (tab == "password")
     {
         <div class="panel">
             <div class="panel-header"><h2>Change your password</h2></div>
@@ -149,6 +163,23 @@ else if (Api.Authenticated)
     }
 
     private async Task LoadTokens() => tokens = await Api.GetAsync("api/tokens", ApiJson.Default.TokenResponseArray) ?? [];
+
+    /// <summary>
+    /// Sends a completed avatar upload to be validated and stored. Refreshing the session afterwards is what
+    /// makes the new image appear: the session carries the avatar URL, so the shell updates with it.
+    /// </summary>
+    private async Task SetAvatar(string uploadId)
+    {
+        if (busy || Api.Session is null) return;
+        busy = true;
+        try
+        {
+            Report(await Api.PostAsync($"api/graft/avatars/user/{Api.Session.UserId}",
+                new UploadIngestRequest(uploadId), ApiJson.Default.UploadIngestRequest, "Avatar updated."));
+            await Api.RefreshSessionAsync();
+        }
+        finally { busy = false; }
+    }
 
     private async Task CreateToken()
     {

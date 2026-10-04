@@ -61,7 +61,7 @@ else
                 @foreach (ProjectResponse project in projects)
                 {
                     <a class="list-item" href="/@project.PathWithNamespace">
-                        <span class="avatar" aria-hidden="true">@Initial(project.Name)</span>
+                        <Avatar Url="@project.AvatarUrl" Name="@project.Name" />
                         <span class="list-item-main">
                             <strong>@project.NameWithNamespace</strong>
                             <small>@(project.Description.Length > 0 ? project.Description : "No description")</small>

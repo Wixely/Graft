@@ -16,7 +16,7 @@ else if (repo is null)
 else
 {
     <div class="repo-header">
-        <span class="avatar avatar-large" aria-hidden="true">@Initial(repo.Project.Name)</span>
+        <Avatar Url="@repo.Project.AvatarUrl" Name="@repo.Project.Name" Class="avatar-large" />
         <div>
             <h1><span class="namespace">@repo.Project.Namespace.Name /</span> @repo.Project.Name</h1>
             <p class="subtitle">@(repo.Project.Description.Length > 0 ? repo.Project.Description : "No description")</p>
@@ -187,6 +187,16 @@ else
     }
     else
     {
+        <div class="panel">
+            <div class="panel-header"><Icon Name="repository" /><h2>Project avatar</h2></div>
+            <div class="panel-body">
+                <p class="secondary-text">
+                    PNG, JPEG, GIF or WebP, up to 2&nbsp;MB and 4096&nbsp;pixels on a side. SVG is not accepted.
+                </p>
+                <UploadField Profile="avatar" Id="project-avatar" OnCompleted="SetProjectAvatar" />
+            </div>
+        </div>
+
         <div class="panel">
             <div class="panel-header"><h2>Add or update a member</h2></div>
             <div class="panel-body">
@@ -362,6 +372,22 @@ else
     private static IEnumerable<TreeEntryResponse> Ordered(IReadOnlyList<TreeEntryResponse> tree) => tree
         .OrderByDescending(entry => entry.Type == "tree")
         .ThenBy(entry => entry.Name, StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Stores a completed upload as the project avatar, then reloads so the new image shows.</summary>
+    private async Task SetProjectAvatar(string uploadId)
+    {
+        if (busy || repo is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/graft/avatars/project/{repo.Project.Id}",
+                new UploadIngestRequest(uploadId), ApiJson.Default.UploadIngestRequest, "Project avatar updated.");
+            Report(result);
+            if (result.Ok) await Load(repo.Project.Id);
+        }
+        finally { busy = false; }
+    }
 
     private async Task LoadMembers(long projectId) => members =
         await Api.GetAsync($"api/projects/{projectId}/members", ApiJson.Default.ProjectMemberResponseArray) ?? [];

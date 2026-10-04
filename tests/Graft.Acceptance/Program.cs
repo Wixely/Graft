@@ -135,6 +135,51 @@ try
         Check(await restarted.ResolveSessionAsync(aliceSession.Secret) is null, "owner logout revokes session");
     }
 
+    await using (GraftStore avatars = await GraftStore.OpenAsync(databasePath))
+    {
+        // Only structurally valid raster images are accepted. SVG is excluded on purpose: it can carry
+        // script, and an avatar is served back to a browser.
+        Check(ImageContent.Validate(Png(64, 48)) is { ContentType: "image/png", Width: 64, Height: 48 }, "a PNG is recognised");
+        Check(ImageContent.Validate(Gif(12, 9)) is { ContentType: "image/gif", Width: 12, Height: 9 }, "a GIF is recognised");
+        Check(ImageContent.Validate(Jpeg(200, 100)) is { ContentType: "image/jpeg", Width: 200, Height: 100 }, "a JPEG is recognised");
+        Check(ImageContent.Validate("<svg xmlns=\"http://www.w3.org/2000/svg\"><script/></svg>"u8.ToArray()) is null, "SVG is refused");
+        Check(ImageContent.Validate("not an image at all"u8.ToArray()) is null, "arbitrary text is refused");
+        Check(ImageContent.Validate([]) is null, "an empty file is refused");
+        Check(ImageContent.Validate(Png(ImageContent.MaximumDimension + 1, 10)) is null, "an oversized image is refused");
+        Check(ImageContent.Validate(new byte[ImageContent.MaximumBytes + 1]) is null, "an overlong file is refused");
+        // A PNG signature followed by rubbish must not be accepted on the strength of its header alone.
+        Check(ImageContent.Validate([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0]) is null, "a truncated PNG is refused");
+
+        AuthenticatedIdentity avatarAdmin = Required(await avatars.ResolveSessionAsync(
+            Required(await avatars.LoginAsync("admin", adminPassword), "admin re-login").Secret), "admin identity");
+        AuthenticatedIdentity carolIdentity = Required(await avatars.ResolveSessionAsync(
+            Required(await avatars.LoginAsync("carol", carolPassword), "carol login").Secret), "carol identity");
+
+        // A real image is several hundred kilobytes. Dapper.AOT expands a byte array into one SQL variable
+        // per element, so this previously failed with "too many SQL variables"; the write uses a provider
+        // command for the BLOB instead. Keep an image large enough here to catch a regression.
+        ValidatedImage large = Required(ImageContent.Validate(Png(1024, 1024, padding: 300_000)), "large image validates");
+        Check(large.Bytes.Length > 250_000, "regression image is large enough to matter");
+        await avatars.SetAvatarAsync(carolIdentity, AvatarOwner.User, carol.Id, large);
+        StoredAvatar stored = Required(await avatars.GetAvatarAsync(AvatarOwner.User, carol.Id), "avatar reads back");
+        Check(stored.Bytes.SequenceEqual(large.Bytes) && stored.ContentType == "image/png", "avatar bytes round-trip intact");
+        Check(await avatars.HasAvatarAsync(AvatarOwner.User, carol.Id), "avatar presence is reported");
+        Check(!await avatars.HasAvatarAsync(AvatarOwner.User, bob.Id), "an unset avatar is reported absent");
+
+        ValidatedImage replacement = Required(ImageContent.Validate(Gif(8, 8)), "replacement validates");
+        await avatars.SetAvatarAsync(carolIdentity, AvatarOwner.User, carol.Id, replacement);
+        StoredAvatar replaced = Required(await avatars.GetAvatarAsync(AvatarOwner.User, carol.Id), "replaced avatar reads back");
+        Check(replaced.ContentType == "image/gif" && replaced.Bytes.Length == replacement.Bytes.Length, "setting an avatar replaces the previous one");
+
+        await Throws<UnauthorizedAccessException>(() => avatars.SetAvatarAsync(carolIdentity, AvatarOwner.User, bob.Id, replacement),
+            "a user cannot set another user's avatar");
+        await avatars.SetAvatarAsync(avatarAdmin, AvatarOwner.User, carol.Id, replacement);
+        assertions++;
+        await Throws<UnauthorizedAccessException>(() => avatars.SetAvatarAsync(carolIdentity, AvatarOwner.Project, project.Id, replacement),
+            "a non-member cannot set a project avatar");
+        Check(await avatars.GetAvatarAsync(AvatarOwner.Project, project.Id) is null, "a refused project avatar was not stored");
+    }
+
     Console.WriteLine($"RESULT: PASS; assertions: {assertions}");
     Console.WriteLine("BOUNDARY: shared authorization decisions are exercised for REST, browse, fetch and push capabilities; actual HTTP/Git transport is MVP-05.");
     return 0;
@@ -166,3 +211,37 @@ async Task Throws<TException>(Func<Task> action, string name) where TException :
 }
 
 static string Password() => Convert.ToHexString(RandomNumberGenerator.GetBytes(24));
+
+// Minimal but structurally real fixtures. These exercise the container parsing the validator performs; they
+// are not decodable images, which is exactly the boundary being tested: structure is checked, pixels are not.
+static byte[] Png(int width, int height, int padding = 0)
+{
+    byte[] header = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, (byte)'I', (byte)'H', (byte)'D', (byte)'R'];
+    byte[] bytes = new byte[header.Length + 17 + padding];
+    header.CopyTo(bytes, 0);
+    System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(bytes.AsSpan(16, 4), (uint)width);
+    System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(bytes.AsSpan(20, 4), (uint)height);
+    return bytes;
+}
+
+static byte[] Gif(int width, int height)
+{
+    byte[] bytes = new byte[14];
+    "GIF89a"u8.CopyTo(bytes);
+    System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(bytes.AsSpan(6, 2), (ushort)width);
+    System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(bytes.AsSpan(8, 2), (ushort)height);
+    return bytes;
+}
+
+static byte[] Jpeg(int width, int height)
+{
+    // Start of image, then a baseline start-of-frame segment carrying the dimensions.
+    byte[] bytes = new byte[20];
+    bytes[0] = 0xFF; bytes[1] = 0xD8;
+    bytes[2] = 0xFF; bytes[3] = 0xC0;
+    System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(4, 2), 11);
+    bytes[6] = 8;
+    System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(7, 2), (ushort)height);
+    System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(9, 2), (ushort)width);
+    return bytes;
+}

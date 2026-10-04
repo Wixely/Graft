@@ -4,7 +4,7 @@ namespace Graft.Storage;
 
 public static class GraftSchema
 {
-    public static DnaXMigrationManifest Manifest { get; } = new(1,
+    public static DnaXMigrationManifest Manifest { get; } = new(2,
     [
         DnaXMigration.Sql(1, "initial-identity-project-schema", "Create identity and private project schema", """
             CREATE TABLE Users (
@@ -73,6 +73,22 @@ public static class GraftSchema
             CREATE INDEX IX_BrowserSessions_UserId ON BrowserSessions(UserId);
             CREATE INDEX IX_AccessTokens_UserId ON AccessTokens(UserId);
             CREATE INDEX IX_AuditEvents_CreatedAtUtc ON AuditEvents(CreatedAtUtc);
+            """),
+        // Avatars live in the database rather than on disk so a backup captures them atomically with the
+        // accounts and projects they belong to, and a restore cannot reinstate one without the other. They
+        // are small by policy, so the row size is bounded well before it becomes a storage concern.
+        DnaXMigration.Sql(2, "avatars", "Store user and project avatars", """
+            CREATE TABLE Avatars (
+                OwnerType TEXT NOT NULL CHECK (OwnerType IN ('user', 'project')),
+                OwnerId INTEGER NOT NULL,
+                ContentType TEXT NOT NULL,
+                Width INTEGER NOT NULL,
+                Height INTEGER NOT NULL,
+                Bytes BLOB NOT NULL,
+                Sha256 TEXT NOT NULL,
+                UpdatedAtUtc TEXT NOT NULL,
+                PRIMARY KEY (OwnerType, OwnerId)
+            );
             """)
     ]);
 }

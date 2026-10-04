@@ -13,7 +13,7 @@
             <ThemeToggle />
             @if (Api.Authenticated)
             {
-                <a class="button secondary" href="/-/profile"><Icon Name="user" />@Api.Username</a>
+                <a class="button secondary" href="/-/profile"><Avatar Url="@Api.Session?.AvatarUrl" Name="@Api.Username" Class="avatar-small" />@Api.Username</a>
                 <button type="button" class="secondary" @onclick="SignOut" disabled="@busy">Sign out</button>
             }
         </div>
