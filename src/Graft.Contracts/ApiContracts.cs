@@ -8,7 +8,8 @@ public sealed record UserResponse(
     string Name,
     string State,
     bool Locked,
-    [property: JsonPropertyName("web_url")] string WebUrl);
+    [property: JsonPropertyName("web_url")] string WebUrl,
+    [property: JsonPropertyName("avatar_url")] string? AvatarUrl);
 
 public sealed record NamespaceResponse(
     long Id,
@@ -31,6 +32,7 @@ public sealed record ProjectResponse(
     [property: JsonPropertyName("ssh_url_to_repo")] string? SshUrlToRepo,
     [property: JsonPropertyName("http_url_to_repo")] string HttpUrlToRepo,
     [property: JsonPropertyName("web_url")] string WebUrl,
+    [property: JsonPropertyName("avatar_url")] string? AvatarUrl,
     NamespaceResponse Namespace);
 
 public sealed record CommitResponse(
@@ -80,7 +82,13 @@ public sealed record FileResponse(
     [property: JsonPropertyName("execute_filemode")] bool ExecuteFilemode);
 
 public sealed record ErrorResponse(string Message);
-public sealed record SessionResponse(bool Authenticated, string? Username, bool IsAdministrator, string Csrf);
+public sealed record SessionResponse(
+    bool Authenticated,
+    string? Username,
+    bool IsAdministrator,
+    string Csrf,
+    long UserId,
+    [property: JsonPropertyName("avatar_url")] string? AvatarUrl);
 public sealed record LoginRequest(string Username, string Password);
 public sealed record UserCreateRequest(string Username, string Password);
 public sealed record UserAccountResponse(long Id, string Username, bool IsAdministrator, bool Disabled);

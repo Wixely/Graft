@@ -597,6 +597,99 @@ public sealed class GraftStore : IAsyncDisposable
         await transaction.CommitAsync(cancellationToken);
     }
 
+    /// <summary>
+    /// Stores an avatar for a user or project, replacing any existing one. A user may set their own and an
+    /// administrator may set anyone's; a project avatar needs the same permission as managing the project.
+    /// </summary>
+    public async Task SetAvatarAsync(
+        AuthenticatedIdentity actor,
+        AvatarOwner ownerType,
+        long ownerId,
+        ValidatedImage image,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(actor);
+        ArgumentNullException.ThrowIfNull(image);
+        if (!Enum.IsDefined(ownerType)) throw new ArgumentOutOfRangeException(nameof(ownerType));
+
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
+        if (ownerType == AvatarOwner.Project)
+        {
+            PermissionDecision permission = await DecideAsync(db, transaction, actor, ownerId, ProjectAction.ManageProject, cancellationToken);
+            if (!permission.Allowed) throw new UnauthorizedAccessException(permission.Explanation);
+        }
+        else if (actor.UserId != ownerId && !actor.IsAdministrator)
+            throw new UnauthorizedAccessException("Only the account holder or an administrator can set this avatar.");
+        else
+        {
+            long active = await db.QuerySingleAsync<long>("SELECT COUNT(*) FROM Users WHERE Id = @Id AND Disabled = 0;",
+                new IdParameters(ownerId), transaction);
+            if (active != 1) throw new InvalidOperationException("Avatar target is unavailable.");
+        }
+
+        string now = Now();
+        string digest = Convert.ToHexStringLower(SHA256.HashData(image.Bytes));
+
+        // This one statement uses a provider command rather than Dapper. Dapper.AOT binds a byte array by
+        // expanding it into one SQL variable per element, which is how it supports IN clauses and cannot
+        // express a BLOB; a 350 KB image became 350,000 variables and SQLite refused it. Reading the column
+        // back through Dapper is fine, so only the write drops down. Verified by the avatar acceptance case.
+        await using (SqliteCommand command = db.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO Avatars (OwnerType, OwnerId, ContentType, Width, Height, Bytes, Sha256, UpdatedAtUtc)
+                VALUES ($ownerType, $ownerId, $contentType, $width, $height, $bytes, $sha256, $updatedAtUtc)
+                ON CONFLICT(OwnerType, OwnerId) DO UPDATE SET
+                    ContentType = excluded.ContentType,
+                    Width = excluded.Width,
+                    Height = excluded.Height,
+                    Bytes = excluded.Bytes,
+                    Sha256 = excluded.Sha256,
+                    UpdatedAtUtc = excluded.UpdatedAtUtc;
+                """;
+            command.Parameters.AddWithValue("$ownerType", Owner(ownerType));
+            command.Parameters.AddWithValue("$ownerId", ownerId);
+            command.Parameters.AddWithValue("$contentType", image.ContentType);
+            command.Parameters.AddWithValue("$width", image.Width);
+            command.Parameters.AddWithValue("$height", image.Height);
+            command.Parameters.Add("$bytes", SqliteType.Blob).Value = image.Bytes;
+            command.Parameters.AddWithValue("$sha256", digest);
+            command.Parameters.AddWithValue("$updatedAtUtc", now);
+            await command.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        await AuditAsync(db, transaction, actor.UserId, "set-avatar", Owner(ownerType),
+            ownerId.ToString(CultureInfo.InvariantCulture), "Avatar replaced.", now);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
+    /// <summary>Reads an avatar, or null when none is set. Callers decide who may see the owner.</summary>
+    public async Task<StoredAvatar?> GetAvatarAsync(
+        AvatarOwner ownerType,
+        long ownerId,
+        CancellationToken cancellationToken = default)
+    {
+        if (!Enum.IsDefined(ownerType)) throw new ArgumentOutOfRangeException(nameof(ownerType));
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        AvatarRow? row = await db.QuerySingleOrDefaultAsync<AvatarRow>("""
+            SELECT ContentType, Bytes, Sha256 FROM Avatars WHERE OwnerType = @OwnerType AND OwnerId = @OwnerId;
+            """, new AvatarReadParameters(Owner(ownerType), ownerId));
+        return row is null ? null : new(row.ContentType, row.Bytes, row.Sha256);
+    }
+
+    /// <summary>Whether an avatar exists, without reading its bytes, for building listing payloads.</summary>
+    public async Task<bool> HasAvatarAsync(AvatarOwner ownerType, long ownerId, CancellationToken cancellationToken = default)
+    {
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        return await db.QuerySingleAsync<long>(
+            "SELECT COUNT(*) FROM Avatars WHERE OwnerType = @OwnerType AND OwnerId = @OwnerId;",
+            new AvatarReadParameters(Owner(ownerType), ownerId)) == 1;
+    }
+
+    private static string Owner(AvatarOwner ownerType) => ownerType == AvatarOwner.Project ? "project" : "user";
+
     public async Task<PermissionDecision> GetPermissionAsync(
         AuthenticatedIdentity? identity,
         long projectId,
@@ -804,3 +897,10 @@ internal sealed record ProjectPathParameters(string NormalizedNamespace, string 
 internal sealed record ProjectListParameters(long UserId, int IsAdministrator, int Take, int Skip);
 internal sealed record RawValueParameters(string Value);
 internal sealed record AuditParameters(long? ActorUserId, string Action, string TargetType, string? TargetId, string Detail, string CreatedAtUtc);
+internal sealed record AvatarReadParameters(string OwnerType, long OwnerId);
+internal sealed class AvatarRow
+{
+    public string ContentType { get; set; } = "";
+    public byte[] Bytes { get; set; } = [];
+    public string Sha256 { get; set; } = "";
+}

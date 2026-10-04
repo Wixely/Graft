@@ -137,9 +137,17 @@ app.MapGet("/api/session", async context =>
 {
     if (!await OnlyQuery(context)) return;
     (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: false);
-    SessionResponse response = browser is null
-        ? new(false, null, false, "")
-        : new(true, browser.Value.Identity.Username, browser.Value.Identity.IsAdministrator, Csrf(browser.Value.Secret));
+    SessionResponse response;
+    if (browser is null) response = new(false, null, false, "", 0, null);
+    else
+    {
+        long userId = browser.Value.Identity.UserId;
+        string? avatarUrl = await store.HasAvatarAsync(AvatarOwner.User, userId, context.RequestAborted)
+            ? AvatarUrl(context, AvatarOwner.User, userId)
+            : null;
+        response = new(true, browser.Value.Identity.Username, browser.Value.Identity.IsAdministrator,
+            Csrf(browser.Value.Secret), userId, avatarUrl);
+    }
     await context.Response.WriteAsJsonAsync(response, ApiJson.Default.SessionResponse, null, context.RequestAborted);
 });
 
@@ -162,7 +170,8 @@ app.MapPost("/api/login", async context =>
     if (grant is null) { await ApiError(context, 401, "credentials"); return; }
     context.Response.Cookies.Append(SessionCookie, grant.Secret, SessionCookieOptions(grant.ExpiresAtUtc));
     AuthenticatedIdentity identity = (await store.ResolveSessionAsync(grant.Secret, context.RequestAborted))!;
-    await context.Response.WriteAsJsonAsync(new SessionResponse(true, identity.Username, identity.IsAdministrator, Csrf(grant.Secret)),
+    await context.Response.WriteAsJsonAsync(new SessionResponse(true, identity.Username, identity.IsAdministrator,
+        Csrf(grant.Secret), identity.UserId, null),
         ApiJson.Default.SessionResponse, null, context.RequestAborted);
 });
 
@@ -469,6 +478,77 @@ app.MapDelete("/api/projects/{projectId:long}/members/{userId:long}", async cont
     catch (UnauthorizedAccessException) { await ApiError(context, 404, "project"); }
 });
 
+// Avatars. The browser moves the bytes through DnaX; this ingests them. Image bytes are validated
+// structurally and only recognised raster formats are kept, so nothing a browser might treat as markup can
+// be stored. SVG is never accepted.
+app.MapPost("/api/graft/avatars/{ownerType}/{ownerId:long}", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    if (!TryReadAvatarOwner(context, out AvatarOwner ownerType, out long ownerId)) { await ApiError(context, 404, "owner"); return; }
+
+    UploadIngestRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.UploadIngestRequest, context.RequestAborted);
+    if (request is null || !Guid.TryParse(request.UploadId, out Guid uploadId)) { await ApiError(context, 400, "upload-id"); return; }
+
+    DiskUploadStore uploads = context.RequestServices.GetRequiredService<DiskUploadStore>();
+    string owner = GraftSessionAuthenticationHandler.Owner(browser.Value.Identity);
+    byte[] content = [];
+    try
+    {
+        UploadStatus status = uploads.Get(owner, uploadId);
+        if (!string.Equals(status.Profile, UploadLimits.AvatarProfile, StringComparison.Ordinal))
+        { await ApiError(context, 400, "upload was not created for avatars"); return; }
+        if (status.Length > ImageContent.MaximumBytes) { await ApiError(context, 413, "avatar exceeds the image limit"); return; }
+        await uploads.ReadCompletedAsync(owner, uploadId, async (source, cancellationToken) =>
+        {
+            using MemoryStream buffer = new();
+            await source.CopyToAsync(buffer, cancellationToken);
+            content = buffer.ToArray();
+        }, context.RequestAborted);
+    }
+    catch (UploadException error) { await ApiError(context, error.StatusCode, error.Message); return; }
+
+    ValidatedImage? image = ImageContent.Validate(content);
+    if (image is null) { await ApiError(context, 400, "file is not a supported image"); return; }
+    try
+    {
+        await store.SetAvatarAsync(browser.Value.Identity, ownerType, ownerId, image, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "owner"); }
+    catch (InvalidOperationException error) { await ApiError(context, 400, error.Message); }
+});
+
+// Serving an avatar. The stored content type is one this server chose at ingest, never one the client
+// supplied, and the global nosniff header keeps the browser from reinterpreting it.
+app.MapMethods("/api/graft/avatars/{ownerType}/{ownerId:long}", ["GET", "HEAD"], async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!await OnlyQuery(context)) return;
+    if (!TryReadAvatarOwner(context, out AvatarOwner ownerType, out long ownerId)) { await ApiError(context, 404, "owner"); return; }
+    if (ownerType == AvatarOwner.Project &&
+        !(await store.GetPermissionAsync(browser.Value.Identity, ownerId, ProjectAction.BrowseRepository, context.RequestAborted)).Allowed)
+    { await ApiError(context, 404, "owner"); return; }
+
+    StoredAvatar? avatar = await store.GetAvatarAsync(ownerType, ownerId, context.RequestAborted);
+    if (avatar is null) { await ApiError(context, 404, "avatar"); return; }
+    string etag = '"' + avatar.Sha256 + '"';
+    context.Response.Headers.CacheControl = "no-cache, private";
+    context.Response.Headers.ETag = etag;
+    if (context.Request.GetTypedHeaders().IfNoneMatch?.Any(value => value.Tag.Value == etag || value.Tag.Value == "*") == true)
+    { context.Response.StatusCode = StatusCodes.Status304NotModified; return; }
+    context.Response.ContentType = avatar.ContentType;
+    context.Response.ContentLength = avatar.Bytes.Length;
+    // HEAD gets the same headers and no body, matching how the embedded static assets behave.
+    if (HttpMethods.IsHead(context.Request.Method)) return;
+    await context.Response.Body.WriteAsync(avatar.Bytes, context.RequestAborted);
+});
+
 // Commit uploaded files into a repository. The browser moved the bytes through DnaX; this is the
 // application half, so the caller is re-authenticated, re-authorized for push, and only ever reaches
 // uploads it owns and that were created under the repository-file profile.
@@ -574,8 +654,12 @@ app.MapGet("/api/v4/user", async context =>
     if (identity is null) return;
     if (!await OnlyQuery(context)) return;
     string origin = Origin(context);
+    string? avatarUrl = await store.HasAvatarAsync(AvatarOwner.User, identity.UserId, context.RequestAborted)
+        ? AvatarUrl(context, AvatarOwner.User, identity.UserId)
+        : null;
     await context.Response.WriteAsJsonAsync(new UserResponse(
-        identity.UserId, identity.Username, identity.Username, "active", false, origin + "/" + Uri.EscapeDataString(identity.Username)),
+        identity.UserId, identity.Username, identity.Username, "active", false,
+        origin + "/" + Uri.EscapeDataString(identity.Username), avatarUrl),
         ApiJson.Default.UserResponse, null, context.RequestAborted);
 });
 
@@ -1029,19 +1113,26 @@ async Task<ProjectResponse> ProjectResponseFor(HttpContext context, ProjectDetai
     finally { endpoint.Gate.Release(); }
 }
 
-Task<ProjectResponse> ProjectResponseForLocked(HttpContext context, ProjectDetails details, Repository repository)
+async Task<ProjectResponse> ProjectResponseForLocked(HttpContext context, ProjectDetails details, Repository repository)
 {
     string? defaultBranch = repository.Refs.ContainsKey("refs/heads/main") ? "main" : null;
     string origin = Origin(context);
     string path = details.Project.Namespace + "/" + details.Project.Slug;
     string webUrl = origin + "/" + path;
-    ProjectResponse response = new(details.Project.Id, details.Description, details.Project.Name,
+    // GitLab reports a null avatar_url when none is set, so the field is only populated once one exists.
+    string? avatarUrl = await store.HasAvatarAsync(AvatarOwner.Project, details.Project.Id, context.RequestAborted)
+        ? AvatarUrl(context, AvatarOwner.Project, details.Project.Id)
+        : null;
+    return new(details.Project.Id, details.Description, details.Project.Name,
         details.Project.Namespace + " / " + details.Project.Name, details.Project.Slug, path, details.CreatedAtUtc,
-        defaultBranch, "private", null, webUrl + ".git", webUrl,
+        defaultBranch, "private", null, webUrl + ".git", webUrl, avatarUrl,
         new(details.Project.OwnerUserId, details.Project.Namespace, details.Project.Namespace, "user", details.Project.Namespace,
             origin + "/" + Uri.EscapeDataString(details.Project.Namespace)));
-    return Task.FromResult(response);
 }
+
+string AvatarUrl(HttpContext context, AvatarOwner ownerType, long ownerId) =>
+    Origin(context) + "/api/graft/avatars/" + (ownerType == AvatarOwner.Project ? "project/" : "user/") +
+    ownerId.ToString(System.Globalization.CultureInfo.InvariantCulture);
 
 CommitResponse CommitResponseFor(HttpContext context, ProjectDetails project, GitCommit commit) => new(
     commit.Id, commit.Id[..8], commit.Committer.When, commit.ParentIds, commit.Title, commit.Message,
@@ -1122,6 +1213,18 @@ static string Origin(HttpContext context) => context.Request.Scheme + "://" + co
 /// data-protection key ring both qualify: the key ring signs antiforgery tokens, and staged bytes are another
 /// account's content until they are ingested.
 /// </summary>
+/// <summary>Reads the avatar owner from the route, accepting only the two kinds the schema allows.</summary>
+static bool TryReadAvatarOwner(HttpContext context, out AvatarOwner ownerType, out long ownerId)
+{
+    ownerType = AvatarOwner.User;
+    ownerId = 0;
+    string value = context.Request.RouteValues["ownerType"]?.ToString() ?? "";
+    if (value == "project") ownerType = AvatarOwner.Project;
+    else if (value != "user") return false;
+    return long.TryParse(context.Request.RouteValues["ownerId"]?.ToString(),
+        System.Globalization.CultureInfo.InvariantCulture, out ownerId) && ownerId > 0;
+}
+
 static void CreatePrivateDirectory(string path)
 {
     Directory.CreateDirectory(path);
