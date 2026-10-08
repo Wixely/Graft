@@ -35,7 +35,7 @@ Two corrections to the earlier record. The solution did **not** build on the cur
 
 Merged to `main`. The Git/API/browser suite is now 302 assertions.
 
-**A commit page shows what changed.** Every commit the API reports already carried a `/-/commit/<sha>` web
+**A [commit page](validation/2026-10-09-commit-diff.md) shows what changed.** Every commit the API reports already carried a `/-/commit/<sha>` web
 URL and nothing was behind it. `RepositoryDiff` compares two trees on the object model rather than by
 invoking Git, with Myers line comparison, three lines of context, and caps for binary and oversized files.
 

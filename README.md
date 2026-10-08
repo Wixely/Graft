@@ -25,8 +25,8 @@ and watching the suite fail. Images resolve against the repository or do not loa
 than stripping a referrer because no request to the third party is made. Diagrams draw inside a sandboxed
 frame with a policy of its own; the main document's policy is unchanged.
 
-A commit page shows what changed, behind the `/-/commit/<sha>` links the API had been handing out with
-nothing behind them. The diff is computed on the object model rather than by invoking Git, and is measured
+A [commit page](docs/validation/2026-10-09-commit-diff.md) shows what changed, behind the
+`/-/commit/<sha>` links the API had been handing out with nothing behind them. The diff is computed on the object model rather than by invoking Git, and is measured
 against Git rather than assumed to match it: `tests/Graft.Diff.Fuzz` generates file pairs and compares every
 result, currently agreeing on **99%** of cases with `git diff -c diff.indentHeuristic=false` and **95%** with
 Git's default output. The difference between those two figures is Git's indent heuristic, which Graft does
