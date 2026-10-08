@@ -134,6 +134,8 @@ try
     await CheckReadmeRendering(address, "alice", alicePassword, project.Id);
     await Git(source, ["checkout", "main"]);
 
+    await CheckDiffMatchesGit(source, Path.Combine(repositoriesRoot, project.StorageId), bobUrl);
+
     File.AppendAllText(Path.Combine(source, "readme.txt"), "second revision\n");
     await Git(source, ["add", "."]);
     await Git(source, ["commit", "-m", "Second durable commit"]);
@@ -1437,6 +1439,159 @@ async Task CheckReadmeRendering(string address, string username, string password
         Check(main.IsSuccessStatusCode && json.RootElement.GetProperty("readme").ValueKind == JsonValueKind.Null,
             "a branch without a README reports none");
     }
+}
+
+/// <summary>
+/// Proves Graft's diff against the one real Git produces for the same commits.
+///
+/// <para>
+/// A diff that is merely valid is not good enough: for any pair of files many correct edit scripts exist,
+/// and a reader comparing Graft to Git would see them disagree. Git uses Myers by default and so does this
+/// engine, so the hunks should match exactly, and this asserts that rather than assuming it. Rename
+/// detection is off on both sides because this engine does not implement it.
+/// </para>
+/// </summary>
+async Task CheckDiffMatchesGit(string worktree, string repositoryPath, string pushUrl)
+{
+    const string EmptyTree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+    await Git(worktree, ["checkout", "-b", "diff-corpus"]);
+
+    // Each step exercises a different shape the renderer and the engine have to get right.
+    string alpha = string.Join("\n", Enumerable.Range(1, 20).Select(line => "alpha line " + line)) + "\n";
+    Directory.CreateDirectory(Path.Combine(worktree, "nested"));
+    File.WriteAllText(Path.Combine(worktree, "alpha.txt"), alpha);
+    File.WriteAllText(Path.Combine(worktree, "nested", "beta.txt"), "one\ntwo\nthree\n");
+    File.WriteAllBytes(Path.Combine(worktree, "image.bin"), [0x89, 0x50, 0x00, 0x01, 0x02, 0x00, 0xFF]);
+    await Commit("diff: add files");
+
+    // Two separate edits far enough apart to produce two hunks rather than one.
+    string[] lines = alpha.Split('\n');
+    lines[1] = "alpha line 2 changed";
+    lines[17] = "alpha line 18 changed";
+    File.WriteAllText(Path.Combine(worktree, "alpha.txt"), string.Join("\n", lines));
+    File.WriteAllText(Path.Combine(worktree, "nested", "beta.txt"), "completely\ndifferent\ncontent\nentirely\n");
+    await Commit("diff: two hunks and a rewrite");
+
+    // A file with no newline at its end, which Git marks explicitly and a naive line split loses.
+    File.Delete(Path.Combine(worktree, "nested", "beta.txt"));
+    File.WriteAllText(Path.Combine(worktree, "gamma.txt"), "no trailing newline here");
+    await Commit("diff: delete one file and add one without a trailing newline");
+
+    // Giving that file a trailing newline changes the last line even though its text is unchanged.
+    File.WriteAllText(Path.Combine(worktree, "gamma.txt"), "no trailing newline here\n");
+    await Commit("diff: add the trailing newline");
+
+    // A mode-only change carries no text at all.
+    await Git(worktree, ["update-index", "--chmod=+x", "alpha.txt"]);
+    await Commit("diff: make a file executable");
+
+    File.WriteAllBytes(Path.Combine(worktree, "image.bin"), [0x89, 0x50, 0x00, 0x09, 0x08, 0x00, 0x01]);
+    await Commit("diff: change a binary file");
+
+    await Git(worktree, ["remote", "set-url", "origin", pushUrl]);
+    await Git(worktree, ["push", "origin", "diff-corpus"]);
+
+    string[] shas = (await Git(worktree, ["rev-list", "--reverse", "diff-corpus"])).Trim()
+        .Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(value => value.Trim()).ToArray();
+    Check(shas.Length >= 7, "the diff corpus produced a history to compare");
+
+    Repository graft = new(new DurableRepositoryStorage(repositoryPath));
+    int compared = 0;
+    foreach (string sha in shas)
+    {
+        GitCommit commit = RepositoryView.ReadCommit(graft, sha);
+        string baseline = commit.ParentIds.Count > 0 ? commit.ParentIds[0] : EmptyTree;
+        string expected = await Git(worktree,
+            ["diff", "--no-color", "--no-renames", "--unified=3", baseline, sha]);
+
+        Dictionary<string, List<string>> fromGit = ParseGitDiff(expected);
+        CommitDiff actual = RepositoryDiff.ForCommit(graft, sha);
+        Dictionary<string, List<string>> fromGraft = actual.Files.ToDictionary(
+            file => file.Path,
+            file => file.IsBinary
+                ? ["BINARY"]
+                : file.Hunks.SelectMany(hunk => new[] { HunkHeader(hunk) }.Concat(
+                    hunk.Lines.SelectMany(line => line.NoNewline
+                        ? new[] { line.Kind + line.Text, @"\ No newline at end of file" }
+                        : [line.Kind + line.Text]))).ToList(),
+            StringComparer.Ordinal);
+
+        Check(fromGit.Keys.OrderBy(path => path, StringComparer.Ordinal)
+            .SequenceEqual(fromGraft.Keys.OrderBy(path => path, StringComparer.Ordinal), StringComparer.Ordinal),
+            "the same paths change as Git reports for " + commit.Title);
+
+        foreach (string path in fromGit.Keys)
+        {
+            Check(fromGit[path].SequenceEqual(fromGraft[path], StringComparer.Ordinal),
+                "the diff of " + path + " matches Git for " + commit.Title);
+            compared++;
+        }
+    }
+    Check(compared >= 8, "every changed file in the corpus was compared against Git");
+
+    await Git(worktree, ["checkout", "main"]);
+
+    async Task Commit(string message)
+    {
+        await Git(worktree, ["add", "--all"]);
+        await Git(worktree, ["commit", "-m", message]);
+    }
+}
+
+/// <summary>Formats a hunk header the way a unified diff writes one, so the two sides compare as text.</summary>
+static string HunkHeader(DiffHunk hunk) =>
+    "@@ -" + Range(hunk.OldStart, hunk.OldLines) + " +" + Range(hunk.NewStart, hunk.NewLines) + " @@";
+
+static string Range(int start, int count) => count == 1
+    ? start.ToString(System.Globalization.CultureInfo.InvariantCulture)
+    : start.ToString(System.Globalization.CultureInfo.InvariantCulture) + "," +
+        count.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+/// <summary>
+/// Reduces Git's own diff output to the same shape Graft produces: a path, then its hunk headers and the
+/// lines under them. Everything else Git prints is formatting this engine does not claim to reproduce.
+/// </summary>
+static Dictionary<string, List<string>> ParseGitDiff(string output)
+{
+    Dictionary<string, List<string>> files = new(StringComparer.Ordinal);
+    List<string>? current = null;
+    bool binary = false;
+    string path = "";
+    foreach (string raw in output.Split('\n'))
+    {
+        string line = raw.TrimEnd('\r');
+        if (line.StartsWith("diff --git ", StringComparison.Ordinal))
+        {
+            if (current is not null) files[path] = binary ? ["BINARY"] : current;
+            // "diff --git a/<path> b/<path>"; the b-side name is the one Graft reports.
+            int marker = line.IndexOf(" b/", StringComparison.Ordinal);
+            path = line[(marker + 3)..];
+            current = [];
+            binary = false;
+            continue;
+        }
+        if (current is null) continue;
+        if (line.StartsWith("Binary files ", StringComparison.Ordinal) ||
+            line.StartsWith("GIT binary patch", StringComparison.Ordinal)) { binary = true; continue; }
+        if (line.StartsWith("@@ ", StringComparison.Ordinal))
+        {
+            // Git may append the enclosing function after the second "@@"; only the ranges are compared.
+            int end = line.IndexOf("@@", 3, StringComparison.Ordinal);
+            current.Add(line[..(end + 2)]);
+            continue;
+        }
+        if (line.StartsWith("index ", StringComparison.Ordinal) ||
+            line.StartsWith("--- ", StringComparison.Ordinal) ||
+            line.StartsWith("+++ ", StringComparison.Ordinal) ||
+            line.StartsWith("new file mode", StringComparison.Ordinal) ||
+            line.StartsWith("deleted file mode", StringComparison.Ordinal) ||
+            line.StartsWith("old mode", StringComparison.Ordinal) ||
+            line.StartsWith("new mode", StringComparison.Ordinal) ||
+            line.Length == 0) continue;
+        current.Add(line);
+    }
+    if (current is not null) files[path] = binary ? ["BINARY"] : current;
+    return files;
 }
 
 void Check(bool condition, string name)
