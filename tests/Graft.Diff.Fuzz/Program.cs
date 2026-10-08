@@ -17,6 +17,17 @@ if (args.Length == 3 && args[0] == "file")
     return 0;
 }
 
+const char SPLIT = '\n';
+const string JOIN = "\n";
+const string FILE = "f.txt";
+const string GIT = "git";
+
+// Git has applied its indent heuristic by default since 2.14. Turning it off is how this harness
+// separates "Graft places a change differently" from "Graft does not implement that heuristic".
+string[] GitDiff = Environment.GetEnvironmentVariable("GRAFT_FUZZ_NO_INDENT") == "1"
+    ? ["-c", "diff.indentHeuristic=false", "diff", "--no-color", "--no-renames", "--unified=3", "--", FILE]
+    : ["diff", "--no-color", "--no-renames", "--unified=3", "--", FILE];
+
 int seed = args.Length > 0 ? int.Parse(args[0]) : 1;
 int cases = args.Length > 1 ? int.Parse(args[1]) : 300;
 bool showFirst = args.Length > 2 && args[2] == "show";
@@ -46,7 +57,7 @@ for (int round = 0; round < cases; round++)
     Run("git", root, "commit", "-q", "-m", "x", "--allow-empty");
     File.WriteAllText(path, after);
 
-    string expected = Normalise(Run("git", root, "diff", "--no-color", "--no-renames", "--unified=3", "--", "f.txt"));
+    string expected = Normalise(Run(GIT, root, GitDiff));
     string actual = Normalise(Render(RepositoryDiff.CompareText(
         Encoding.UTF8.GetBytes(before), Encoding.UTF8.GetBytes(after))));
 
@@ -55,8 +66,10 @@ for (int round = 0; round < cases; round++)
     {
         mismatched++;
         if (firstFailure.Length == 0)
-            firstFailure = "--- before ---\n" + before + "--- after ---\n" + after +
-                "--- git ---\n" + expected + "\n--- graft ---\n" + actual + "\n";
+        {
+            (string small, string smaller) = Shrink(root, before, after);
+            firstFailure = Report(root, small, smaller);
+        }
     }
 }
 
@@ -64,6 +77,75 @@ Console.WriteLine($"seed {seed}: matched {matched}, mismatched {mismatched}");
 if (showFirst && firstFailure.Length > 0) Console.WriteLine(firstFailure);
 try { Directory.Delete(root, recursive: true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
 return mismatched == 0 ? 0 : 1;
+
+// A seventeen-line failure is hard to reason about. Repeatedly drop a line from either side and keep the
+// result whenever it still disagrees, which usually leaves something small enough to read in one go.
+(string Before, string After) Shrink(string root, string before, string after)
+{
+    bool reduced = true;
+    while (reduced)
+    {
+        reduced = false;
+        foreach (bool fromBefore in new[] { true, false })
+        {
+            string[] lines = (fromBefore ? before : after).TrimEnd(SPLIT).Split(SPLIT);
+            if (lines.Length <= 1) continue;
+            for (int drop = 0; drop < lines.Length; drop++)
+            {
+                string candidate = string.Join(JOIN, lines.Where((_, index) => index != drop));
+                if (candidate.Length > 0) candidate += JOIN;
+                string candidateBefore = fromBefore ? candidate : before;
+                string candidateAfter = fromBefore ? after : candidate;
+                if (candidateBefore == candidateAfter) continue;
+                if (!Disagrees(root, candidateBefore, candidateAfter)) continue;
+                before = candidateBefore;
+                after = candidateAfter;
+                reduced = true;
+                break;
+            }
+            if (reduced) break;
+        }
+    }
+    return (before, after);
+}
+
+/// <summary>Runs both diffs for one pair and reports only whether they differ.</summary>
+bool Disagrees(string root, string before, string after)
+{
+    (string expected, string actual) = Both(root, before, after);
+    return expected != actual;
+}
+
+(string Expected, string Actual) Both(string root, string before, string after)
+{
+    string path = Path.Combine(root, FILE);
+    File.WriteAllText(path, before);
+    Run(GIT, root, "add", "-A");
+    Run(GIT, root, "commit", "-q", "-m", "step", "--allow-empty");
+    File.WriteAllText(path, after);
+    string expected = Normalise(Run(GIT, root, GitDiff));
+    string actual = Normalise(Render(RepositoryDiff.CompareText(
+        Encoding.UTF8.GetBytes(before), Encoding.UTF8.GetBytes(after))));
+    return (expected, actual);
+}
+
+string Report(string root, string before, string after)
+{
+    (string expected, string actual) = Both(root, before, after);
+    return "--- before ---" + JOIN + Numbered(before) + "--- after ---" + JOIN + Numbered(after) +
+        "--- git ---" + JOIN + expected + "--- graft ---" + JOIN + actual;
+}
+
+/// <summary>Numbers the lines and names the blank ones, which are the ones that make placement ambiguous.</summary>
+static string Numbered(string text)
+{
+    StringBuilder result = new();
+    string[] lines = text.TrimEnd(SPLIT).Split(SPLIT);
+    for (int index = 0; index < lines.Length; index++)
+        result.Append((index + 1).ToString(System.Globalization.CultureInfo.InvariantCulture))
+              .Append(": ").Append(lines[index].Length == 0 ? "(blank)" : lines[index]).Append(JOIN);
+    return result.ToString();
+}
 
 static string Generate(Random random, string[] alphabet)
 {

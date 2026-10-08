@@ -59,11 +59,16 @@ public sealed record CommitDiff(
 ///
 /// <para>
 /// Measured against real Git over generated file pairs built from a deliberately repetitive alphabet, the
-/// two passes together raise agreement from 87% to 91%; each alone does materially worse. The differences
-/// that remain are not placement: they are cases where Git's own variant of the algorithm picks a different
-/// script of the same length, choosing to rewrite one line rather than another. Both are correct and both
-/// reconstruct the file exactly, which is the property the acceptance suite asserts for every file it
-/// compares, alongside hunk-for-hunk equality with Git across the shapes it pins.
+/// two passes agree with Git on 99% of cases once Git's indent heuristic is turned off, which is the
+/// like-for-like comparison because this does not implement that heuristic. Against Git's default output
+/// agreement is about 95%, and the difference between those two figures is the heuristic: a scoring pass
+/// Git has applied since 2.14 that prefers to split a run of changes at a line whose indentation makes the
+/// result easier to read. Implementing it is recorded as follow-on work.
+/// </para>
+///
+/// <para>
+/// Both figures are reproducible rather than asserted: <c>tests/Graft.Diff.Fuzz</c> generates the pairs and
+/// compares every one against <c>git diff</c>.
 /// </para>
 /// </summary>
 public static class RepositoryDiff
@@ -412,18 +417,29 @@ public static class RepositoryDiff
         return false;
     }
 
-    /// <summary>Moves a group up by at most <paramref name="steps"/> lines, as far as the content allows.</summary>
+    /// <summary>
+    /// Moves a group up by exactly <paramref name="steps"/> lines, or not at all.
+    ///
+    /// <para>
+    /// All or nothing matters. Moving part of the way leaves the two groups still apart, so nothing has been
+    /// joined, and the group has been dragged off the position sliding chose for it. A partial move made the
+    /// output disagree with Git on edits that were never related in the first place: a deletion near the top
+    /// of a file would tug an unrelated insertion several lines up towards it.
+    /// </para>
+    /// </summary>
     private static bool SlideUp(string[] keys, bool[] changed, int start, int end, int steps)
     {
-        int moved = 0;
-        while (moved < steps && start > 0 && !changed[start - 1] &&
-            string.Equals(keys[start - 1], keys[end - 1], StringComparison.Ordinal))
+        for (int step = 1; step <= steps; step++)
+        {
+            if (start - step < 0 || changed[start - step]) return false;
+            if (!string.Equals(keys[start - step], keys[end - step], StringComparison.Ordinal)) return false;
+        }
+        for (int step = 0; step < steps; step++)
         {
             changed[--start] = true;
             changed[--end] = false;
-            moved++;
         }
-        return moved > 0;
+        return steps > 0;
     }
 
     /// <summary>
