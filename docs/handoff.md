@@ -1,6 +1,6 @@
 # Next-agent handoff
 
-Updated: 2026-10-04. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
+Updated: 2026-10-08. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
 
 ## Added on 2026-10-04
 
@@ -30,6 +30,20 @@ Two corrections to the earlier record. The solution did **not** build on the cur
 | Antiforgery keys in backups | Implementation agent | A restore onto a fresh host invalidates outstanding tokens; browsers recover, but the keys should travel with the backup |
 | GitLab multipart avatar route | Implementation agent | Recorded as GL-011, not implemented |
 | Pixel-level image sanitising | User | A licensing choice, not an engineering one; see the avatar evidence |
+
+## Added on 2026-10-08
+
+Work on branch `readme-rendering`, not merged to `main`.
+
+**A repository README now renders on the project page.** This is the first place Graft turns repository content into markup rather than text, so it is the first place a stored cross-site scripting bug could live. Three layers hold it closed and each was proved by removing it and watching the suite fail: raw HTML is escaped rather than parsed, link and image destinations are judged on the parsed tree while still structured, and the output is checked against an allowlist of elements and attributes before it is sent. See [README rendering evidence](validation/2026-10-04-readme-rendering.md).
+
+Images resolve against the repository or they do not load, which is stronger than stripping a referrer because no request to the third party is made at all. A proxy of the kind public forges run would be weaker here: it would mean this server fetching attacker-chosen URLs on a private network. Diagrams draw inside a sandboxed frame with an opaque origin and a policy of its own; the main document's policy is unchanged.
+
+The Git/API/browser harness is now 221 assertions. Half the rendering corpus is hostile and must not survive, and half is ordinary markdown that must not be flattened, because a renderer that escaped everything would satisfy every attack case and still be useless.
+
+**Attribution now travels with the binary.** Several bundled licences bind the binary rather than the source tree, so `THIRD-PARTY-NOTICES.md` is embedded in the server and reachable through `--licences` and `/-/licences`, covering Markdig, mermaid, Dapper, the Microsoft packages, DnaX, and the OpenSSL, ICU and SQLite that the static Linux build links in.
+
+**One verification gap is open.** Markdig's behaviour under NativeAOT is unverified: this machine has no C++ Desktop workload, so ILC never runs. A trimmed publish crashes ILLink identically on the commit before this work, so that crash is environmental rather than caused by it. The new assertions sit inside the harness that is already run against published AOT binaries, so they will be exercised wherever AOT can be built.
 
 ## Current state
 
@@ -62,6 +76,7 @@ Continue to use the ignored reproducible DnaX feed until the user or DnaX mainta
 | Work | Owner | Acceptance |
 | --- | --- | --- |
 | ~~Project ownership continuity~~ | Done 2026-10-04 | [Evidence](validation/2026-10-04-project-ownership.md): transfer is owner-or-administrator only, and an account owning projects cannot be disabled |
+| Markdig under NativeAOT | User + implementation agent | `tests/Graft.Git.Acceptance` passes against a published NativeAOT server built where the C++ workload exists |
 | Deployment TLS trust | Operator + implementation agent | Intended CA certificate, DNS/SAN, client trust and renewal rehearsal |
 | Required legacy host | Implementation agent + user | Integrated static-musl artifact inspected and run on Linux 3.10.108 with sanitized evidence |
 | DnaX distribution | User/DnaX maintainer | Clean checkout restores without a sibling source tree or locally prepared feed |
