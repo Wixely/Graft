@@ -129,7 +129,7 @@ public static class RepositoryView
         return new(entry.Id, commitId, normalized, entry.Mode, blob!.Data);
     }
 
-    private static IReadOnlyList<GitTreeEntry> ReadTree(Repository repository, string treeId, string parent)
+    internal static IReadOnlyList<GitTreeEntry> ReadTree(Repository repository, string treeId, string parent)
     {
         Limits.Require(repository.Objects.TryGetValue(treeId, out GitObject? tree) && tree.Type == 2, "tree");
         Cursor cursor = new(tree!.Data);
