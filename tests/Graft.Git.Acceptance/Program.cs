@@ -135,6 +135,7 @@ try
     await Git(source, ["checkout", "main"]);
 
     await CheckDiffMatchesGit(source, Path.Combine(repositoriesRoot, project.StorageId), bobUrl);
+    await CheckCommitDiffApi(address, "alice", alicePassword, project.Id, source);
 
     File.AppendAllText(Path.Combine(source, "readme.txt"), "second revision\n");
     await Git(source, ["add", "."]);
@@ -1528,6 +1529,45 @@ async Task CheckDiffMatchesGit(string worktree, string repositoryPath, string pu
         }
     }
     Check(compared >= 8, "every changed file in the corpus was compared against Git");
+    CheckDiffReconstructsContent(graft, shas, "diff corpus");
+
+    // The placement of a change beside identical lines is ambiguous: several equally minimal scripts exist,
+    // Git slides its groups to a preferred one and this engine does not. A real repository produced exactly
+    // this, so it is pinned here, asserted by the property that does hold rather than by hunk equality.
+    await Git(worktree, ["checkout", "-b", "diff-ambiguous"]);
+    File.WriteAllText(Path.Combine(worktree, "fences.md"), """
+        opening
+
+        ```yaml
+        key: value
+
+
+        ## heading
+
+        ```yaml
+        other: value
+        """);
+    await Commit("diff: a file with ambiguous blank runs");
+    File.WriteAllText(Path.Combine(worktree, "fences.md"), """
+        opening
+
+        ```yaml
+        key: value
+        ```
+
+        ## heading
+
+        ```yaml
+        other: value
+        ```
+        """);
+    await Commit("diff: close both fences, changing two separated places");
+    await Git(worktree, ["push", "origin", "diff-ambiguous"]);
+
+    Repository withAmbiguity = new(new DurableRepositoryStorage(repositoryPath));
+    string[] ambiguous = (await Git(worktree, ["rev-list", "--reverse", "main..diff-ambiguous"])).Trim()
+        .Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(value => value.Trim()).ToArray();
+    CheckDiffReconstructsContent(withAmbiguity, ambiguous, "ambiguous placement");
 
     await Git(worktree, ["checkout", "main"]);
 
@@ -1592,6 +1632,160 @@ static Dictionary<string, List<string>> ParseGitDiff(string output)
     }
     if (current is not null) files[path] = binary ? ["BINARY"] : current;
     return files;
+}
+
+/// <summary>
+/// Reads a commit back through the endpoint the browser uses, and compares it to what Git reports for the
+/// same commit. The engine is already proved against Git in process; this proves the route, the contract and
+/// the serialisation carry that result out intact rather than losing it on the way.
+/// </summary>
+async Task CheckCommitDiffApi(string address, string username, string password, long projectId, string worktree)
+{
+    CookieContainer cookies = new();
+    using HttpClientHandler handler = new()
+    {
+        CookieContainer = cookies,
+        ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
+        UseProxy = false
+    };
+    using HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
+    using (HttpRequestMessage login = new(HttpMethod.Post, "/api/login"))
+    {
+        login.Headers.Add("Origin", address);
+        login.Content = JsonContent.Create(new { username, password });
+        using HttpResponseMessage response = await client.SendAsync(login);
+        Check(response.IsSuccessStatusCode, "commit diff login");
+    }
+
+    string head = (await Git(worktree, ["rev-parse", "diff-corpus"])).Trim();
+    string root = (await Git(worktree, ["rev-list", "--max-parents=0", "diff-corpus"])).Trim()
+        .Split('\n', StringSplitOptions.RemoveEmptyEntries)[0].Trim();
+
+    using (HttpResponseMessage response = await client.GetAsync($"/api/browser/projects/{projectId}/commit/{head}"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await response.Content.ReadAsStreamAsync());
+        Check(response.IsSuccessStatusCode, "a commit diff is served");
+        JsonElement body = json.RootElement;
+        Check(body.GetProperty("commit").GetProperty("id").GetString() == head, "the diff names the commit asked for");
+
+        string expected = await Git(worktree, ["diff", "--no-color", "--no-renames", "--unified=3", head + "^", head]);
+        Dictionary<string, List<string>> fromGit = ParseGitDiff(expected);
+        string[] paths = body.GetProperty("files").EnumerateArray()
+            .Select(file => file.GetProperty("path").GetString()!).ToArray();
+        Check(paths.OrderBy(path => path, StringComparer.Ordinal)
+            .SequenceEqual(fromGit.Keys.OrderBy(path => path, StringComparer.Ordinal), StringComparer.Ordinal),
+            "the served diff names the same files as Git");
+
+        // The binary change in the corpus must arrive as a flag rather than as bytes nobody can read.
+        JsonElement binary = body.GetProperty("files").EnumerateArray()
+            .Single(file => file.GetProperty("path").GetString() == "image.bin");
+        Check(binary.GetProperty("is_binary").GetBoolean() && binary.GetProperty("hunks").GetArrayLength() == 0,
+            "a binary file is reported as binary and carries no hunks");
+    }
+
+    // A root commit has no parent, which has to read as a whole tree added rather than as an error.
+    using (HttpResponseMessage response = await client.GetAsync($"/api/browser/projects/{projectId}/commit/{root}"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await response.Content.ReadAsStreamAsync());
+        Check(response.IsSuccessStatusCode, "the first commit has a diff");
+        Check(json.RootElement.GetProperty("parent_id").ValueKind == JsonValueKind.Null, "the first commit reports no parent");
+        Check(json.RootElement.GetProperty("files").EnumerateArray()
+            .All(file => file.GetProperty("status").GetString() == "added"),
+            "every file in the first commit is an addition");
+        Check(json.RootElement.GetProperty("added").GetInt32() > 0 && json.RootElement.GetProperty("removed").GetInt32() == 0,
+            "the first commit adds lines and removes none");
+    }
+
+    using (HttpResponseMessage missing = await client.GetAsync(
+        $"/api/browser/projects/{projectId}/commit/0123456789012345678901234567890123456789"))
+        Check(missing.StatusCode == HttpStatusCode.NotFound, "an unknown commit is not found");
+    using (HttpResponseMessage malformed = await client.GetAsync($"/api/browser/projects/{projectId}/commit/not-a-sha"))
+        Check(malformed.StatusCode == HttpStatusCode.NotFound, "a malformed commit id is refused");
+    using (HttpResponseMessage blob = await client.GetAsync(
+        $"/api/browser/projects/{projectId}/commit/{(await Git(worktree, ["rev-parse", "diff-corpus:alpha.txt"])).Trim()}"))
+        Check(blob.StatusCode == HttpStatusCode.NotFound, "an object that is not a commit is refused");
+    using (HttpResponseMessage parent = await client.GetAsync($"/api/browser/projects/{projectId}/commit/{head}?parent=99"))
+        Check(parent.StatusCode == HttpStatusCode.BadRequest, "an out-of-range parent is refused");
+}
+
+/// <summary>
+/// Applies a commit's diff to the parent's content and checks the result is the commit's own content, for
+/// every text file it touches.
+///
+/// <para>
+/// This is the property that actually has to hold. Matching Git hunk for hunk is a stronger statement but a
+/// narrower one: where a change sits beside identical lines there are several equally minimal scripts, Git
+/// slides its groups to a preferred one and this engine does not, so the two can legitimately disagree about
+/// placement. They cannot disagree about the result, and that is what this asserts.
+/// </para>
+/// </summary>
+void CheckDiffReconstructsContent(Repository graft, IEnumerable<string> commitIds, string label)
+{
+    int checkedFiles = 0;
+    int ambiguous = 0;
+    foreach (string sha in commitIds)
+    {
+        CommitDiff diff = RepositoryDiff.ForCommit(graft, sha);
+        foreach (DiffFile file in diff.Files)
+        {
+            if (file.IsBinary || file.TooLarge) continue;
+
+            string? oldText = file.OldBlobId is null ? null : BlobText(graft, file.OldBlobId);
+            string expected = file.NewBlobId is null ? "" : BlobText(graft, file.NewBlobId);
+            string rebuilt = ApplyHunks(oldText ?? "", file.Hunks);
+            Check(string.Equals(rebuilt, expected, StringComparison.Ordinal),
+                label + ": applying the diff of " + file.Path + " reproduces the file");
+            checkedFiles++;
+            if (file.Hunks.Count > 1) ambiguous++;
+        }
+    }
+    Check(checkedFiles > 0, label + ": there were files to reconstruct");
+    Check(ambiguous > 0, label + ": at least one file needed more than a single hunk");
+}
+
+static string BlobText(Repository repository, string blobId) =>
+    System.Text.Encoding.UTF8.GetString(repository.Objects[blobId].Data);
+
+/// <summary>
+/// Rebuilds a file from its previous content and the hunks describing the change. The hunks carry absolute
+/// line numbers, so each one replaces a known range and everything between hunks is carried across
+/// untouched, which is exactly how a patch tool applies one.
+/// </summary>
+static string ApplyHunks(string oldText, IReadOnlyList<DiffHunk> hunks)
+{
+    bool oldEndsWithNewline = oldText.Length == 0 || oldText.EndsWith('\n');
+    string[] oldLines = oldText.Length == 0
+        ? []
+        : (oldEndsWithNewline ? oldText[..^1] : oldText).Split('\n');
+
+    List<string> result = [];
+    bool endsWithNewline = true;
+    int consumed = 0;
+    foreach (DiffHunk hunk in hunks)
+    {
+        int from = hunk.OldLines == 0 ? hunk.OldStart : hunk.OldStart - 1;
+        for (int index = consumed; index < from && index < oldLines.Length; index++) result.Add(oldLines[index]);
+        consumed = Math.Max(consumed, from);
+
+        foreach (DiffLine line in hunk.Lines)
+        {
+            if (line.Kind is ' ' or '+')
+            {
+                result.Add(line.Text);
+                // Only a line that survives into the new file decides whether that file ends with a newline.
+                endsWithNewline = !line.NoNewline || line.Kind == '-';
+            }
+            if (line.Kind is ' ' or '-') consumed++;
+        }
+    }
+    for (int index = consumed; index < oldLines.Length; index++)
+    {
+        result.Add(oldLines[index]);
+        endsWithNewline = oldEndsWithNewline;
+    }
+
+    if (result.Count == 0) return "";
+    return string.Join("\n", result) + (endsWithNewline ? "\n" : "");
 }
 
 void Check(bool condition, string name)

@@ -181,13 +181,13 @@ else
             <div class="list">
                 @foreach (CommitResponse commit in repo.Commits)
                 {
-                    <article class="commit-row">
+                    <a class="commit-row" href="@($"/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}/-/commit/{commit.Id}")">
                         <code class="sha">@commit.ShortId</code>
                         <span class="list-item-main">
                             <strong>@commit.Title</strong>
                             <small>@commit.AuthorName &middot; @commit.AuthoredDate.ToString("u")</small>
                         </span>
-                    </article>
+                    </a>
                 }
             </div>
             @if (repo.Commits.Count == 0) { <p class="panel-empty">No commits yet.</p> }

@@ -44,11 +44,19 @@ public sealed record CommitDiff(
 /// </para>
 ///
 /// <para>
-/// The line comparison is Myers' greedy algorithm, which is the one Git uses by default, so the hunks this
-/// produces are the same hunks <c>git diff</c> shows rather than merely a valid diff of the same two files.
-/// That matters because many correct edit scripts exist for any pair of files, and a reader comparing the
-/// two would see them disagree. Common leading and trailing lines are trimmed before it runs, which is what
-/// keeps an ordinary one-line edit in a large file cheap.
+/// The line comparison is Myers' greedy algorithm, the one Git uses by default, so the edit script is
+/// minimal and in the ordinary case the hunks are the ones <c>git diff</c> shows. Common leading and
+/// trailing lines are trimmed before it runs, which is what keeps a one-line edit in a large file cheap.
+/// </para>
+///
+/// <para>
+/// Where this can still differ from Git is placement, not content. When a change sits next to lines
+/// identical to the ones it touches, several equally minimal scripts exist and Git runs a further pass
+/// (<c>xdl_change_compact</c>) that slides each group to a preferred position among them. This does not
+/// implement that pass, so a diff of such a region can show the same edit one line above or below where
+/// Git would put it. Both are correct and both reconstruct the new file exactly, which is the property the
+/// acceptance suite asserts for every file it compares; the suite also asserts hunk-for-hunk equality with
+/// Git across the shapes where no such ambiguity arises.
 /// </para>
 /// </summary>
 public static class RepositoryDiff

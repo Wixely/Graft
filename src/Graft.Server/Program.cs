@@ -812,6 +812,50 @@ app.MapGet("/api/browser/projects/{projectId:long}", async context =>
     });
 });
 
+// What a commit changed. Every commit the API reports already carries a web URL pointing here, so this is
+// the page behind a link the product has been handing out all along.
+app.MapGet("/api/browser/projects/{projectId:long}/commit/{sha}", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!await OnlyQuery(context, "parent")) return;
+    long projectId = Convert.ToInt64(context.Request.RouteValues["projectId"], System.Globalization.CultureInfo.InvariantCulture);
+    ProjectDetails? details = await store.GetReadyProjectAsync(projectId, context.RequestAborted);
+    if (details is null || !(await store.GetPermissionAsync(browser.Value.Identity, projectId, ProjectAction.BrowseRepository, context.RequestAborted)).Allowed)
+    { await ApiError(context, 404, "project"); return; }
+
+    string sha = context.Request.RouteValues["sha"]?.ToString() ?? "";
+    // A merge has more than one parent and no single answer to "what changed", so the caller says which
+    // side it wants rather than the server picking one silently.
+    int parent = int.TryParse(context.Request.Query["parent"].ToString(),
+        System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out int requested)
+        ? requested : 0;
+    if (parent is < 0 or > 15) { await ApiError(context, 400, "parent"); return; }
+
+    await WithRepository(EndpointFor(details.Project), context, async repository =>
+    {
+        string? commitId = Limits.IsId(sha) && repository.Objects.ContainsKey(sha) ? sha : null;
+        if (commitId is null) { await ApiError(context, 404, "commit"); return; }
+
+        CommitDiff diff;
+        try { diff = RepositoryDiff.ForCommit(repository, commitId, parent); }
+        catch (GitInputException) { await ApiError(context, 404, "commit"); return; }
+
+        ProjectResponse project = await ProjectResponseForLocked(context, details, repository);
+        DiffFileResponse[] files = diff.Files.Select(file => new DiffFileResponse(
+            file.Path, file.Status, file.OldMode, file.NewMode, file.IsBinary, file.TooLarge,
+            file.Added, file.Removed,
+            file.Hunks.Select(hunk => new DiffHunkResponse(HunkHeader(hunk),
+                hunk.Lines.Select(line => new DiffLineResponse(
+                    line.Kind.ToString(), line.Text, line.OldLine, line.NewLine, line.NoNewline)).ToArray()))
+                .ToArray())).ToArray();
+
+        CommitDiffResponse response = new(project, CommitResponseFor(context, details, diff.Commit),
+            diff.ParentId, files, diff.Truncated, files.Sum(file => file.Added), files.Sum(file => file.Removed));
+        await context.Response.WriteAsJsonAsync(response, ApiJson.Default.CommitDiffResponse, null, context.RequestAborted);
+    });
+});
+
 app.MapGet("/api/v4/user", async context =>
 {
     AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
@@ -1324,6 +1368,17 @@ ReadmeResponse? ReadmeFor(HttpContext context, ProjectDetails details, Repositor
         return new(file.Path, rendered.Html, rendered.HasDiagrams);
     }
     return null;
+}
+
+/// <summary>The header a unified diff prints above a hunk. A range of one line omits its count, and a range
+/// of none is numbered by the line it would follow, which is zero at the start of a file.</summary>
+static string HunkHeader(DiffHunk hunk)
+{
+    static string Range(int start, int count) => count == 1
+        ? start.ToString(System.Globalization.CultureInfo.InvariantCulture)
+        : start.ToString(System.Globalization.CultureInfo.InvariantCulture) + "," +
+            count.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    return "@@ -" + Range(hunk.OldStart, hunk.OldLines) + " +" + Range(hunk.NewStart, hunk.NewLines) + " @@";
 }
 
 string AvatarUrl(HttpContext context, AvatarOwner ownerType, long ownerId) =>
