@@ -56,8 +56,7 @@ a change's placement ambiguous, and compares every resulting diff with `git diff
 
 ```powershell
 dotnet build tests\Graft.Diff.Fuzz\Graft.Diff.Fuzz.csproj -c Debug
-dotnet tests\Graft.Diff.Fuzzin\Debug
-et10.0\Graft.Diff.Fuzz.dll <seed> <cases> [show]
+dotnet tests\Graft.Diff.Fuzz\bin\Debug\net10.0\Graft.Diff.Fuzz.dll <seed> <cases> [show]
 ```
 
 It exits non-zero when any case disagrees and `show` prints the first one. Agreement currently sits around
