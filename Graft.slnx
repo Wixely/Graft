@@ -12,6 +12,7 @@
   <Folder Name="/tests/">
     <Project Path="tests/Graft.Acceptance/Graft.Acceptance.csproj" />
     <Project Path="tests/Graft.Browser.Fixture/Graft.Browser.Fixture.csproj" />
+    <Project Path="tests/Graft.Diff.Fuzz/Graft.Diff.Fuzz.csproj" />
     <Project Path="tests/Graft.Git.Acceptance/Graft.Git.Acceptance.csproj" />
     <Project Path="tests/Graft.Glab.Acceptance/Graft.Glab.Acceptance.csproj" />
     <Project Path="tests/Graft.GitLab.Reference/Graft.GitLab.Reference.csproj" />

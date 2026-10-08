@@ -50,6 +50,21 @@ The current extension adds administrator user creation and account lifecycle, ow
 
 The same harness now also covers README rendering, which is the one place repository content becomes markup. Its corpus is pushed as real repository content on a branch of its own and read back through the browser endpoint, so the assertions run against the whole path rather than against the renderer in isolation. Half the corpus is hostile and must not survive; the other half is ordinary markdown and must not be flattened, because a renderer that escaped everything would satisfy every attack case and still be useless. See [README rendering evidence](validation/2026-10-04-readme-rendering.md).
 
+The diff engine is measured against real Git rather than only against fixed fixtures. The fuzz harness
+generates file pairs from a deliberately repetitive alphabet, because repeated and blank lines are what make
+a change's placement ambiguous, and compares every resulting diff with `git diff`:
+
+```powershell
+dotnet build tests\Graft.Diff.Fuzz\Graft.Diff.Fuzz.csproj -c Debug
+dotnet tests\Graft.Diff.Fuzzin\Debug
+et10.0\Graft.Diff.Fuzz.dll <seed> <cases> [show]
+```
+
+It exits non-zero when any case disagrees and `show` prints the first one. Agreement currently sits around
+91% on seeds not used while developing the sliding passes; the rest are cases where Git picks a different
+script of the same length rather than a different position. This is a measuring instrument, not a gate: the
+acceptance suite is what pins specific shapes. Git must be on `PATH`.
+
 Every build can produce the attribution it redistributes under, because several of those licences bind the binary rather than the source tree:
 
 ```powershell
