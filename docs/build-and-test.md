@@ -62,7 +62,8 @@ dotnet tests\Graft.Diff.Fuzz\bin\Debug\net10.0\Graft.Diff.Fuzz.dll <seed> <cases
 It exits non-zero when any case disagrees and `show` prints the first one. Agreement currently sits around
 91% on seeds not used while developing the sliding passes; the rest are cases where Git picks a different
 script of the same length rather than a different position. This is a measuring instrument, not a gate: the
-acceptance suite is what pins specific shapes. Git must be on `PATH`.
+acceptance suite is what pins specific shapes. Git must be on `PATH`. See
+[commit diff evidence](validation/2026-10-09-commit-diff.md) for the measurements and what they exclude.
 
 Every build can produce the attribution it redistributes under, because several of those licences bind the binary rather than the source tree:
 
