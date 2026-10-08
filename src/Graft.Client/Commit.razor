@@ -1,0 +1,194 @@
+@page "/{Namespace}/{Slug}/-/commit/{Sha}"
+@inject GraftApi Api
+@inject NavigationManager Navigation
+
+<PageTitle>@(Sha.Length >= 8 ? Sha[..8] : Sha) &middot; Graft</PageTitle>
+
+@if (loading)
+{
+    <p role="status" class="secondary-text">Loading commit…</p>
+}
+else if (diff is null)
+{
+    <div class="page-header"><div><h1>Commit unavailable</h1><p class="subtitle">@message</p></div></div>
+    <a class="button secondary" href="@ProjectUrl"><Icon Name="chevron-left" />Back to the repository</a>
+}
+else
+{
+    <div class="page-header">
+        <div>
+            <h1 class="commit-title">@diff.Commit.Title</h1>
+            <p class="subtitle">
+                <a href="@ProjectUrl">@diff.Project.Namespace.Name / @diff.Project.Name</a>
+            </p>
+        </div>
+        <a class="button secondary" href="@ProjectUrl"><Icon Name="chevron-left" />Back</a>
+    </div>
+
+    @if (diff.Commit.Message.Length > diff.Commit.Title.Length)
+    {
+        @* The body is repository content and is bound as text, never as markup. *@
+        <pre class="commit-message">@diff.Commit.Message[diff.Commit.Title.Length..].TrimStart('\n')</pre>
+    }
+
+    <div class="panel">
+        <div class="panel-header"><Icon Name="commit" /><strong>Details</strong></div>
+        <dl class="commit-details">
+            <dt>Commit</dt><dd><code class="sha">@diff.Commit.Id</code></dd>
+            <dt>Parent</dt>
+            <dd>
+                @if (diff.ParentId is null)
+                {
+                    <span class="secondary-text">None; this is the first commit</span>
+                }
+                else
+                {
+                    <a href="@CommitUrl(diff.ParentId)"><code class="sha">@diff.ParentId[..8]</code></a>
+                }
+            </dd>
+            <dt>Author</dt><dd>@diff.Commit.AuthorName &middot; @diff.Commit.AuthoredDate.ToString("u")</dd>
+            @if (diff.Commit.CommitterName != diff.Commit.AuthorName)
+            {
+                <dt>Committer</dt><dd>@diff.Commit.CommitterName &middot; @diff.Commit.CommittedDate.ToString("u")</dd>
+            }
+        </dl>
+    </div>
+
+    <div class="panel">
+        <div class="panel-header">
+            <strong>@diff.Files.Count @(diff.Files.Count == 1 ? "file" : "files") changed</strong>
+            <span class="diff-total">
+                <span class="diff-added">+@diff.Added</span>
+                <span class="diff-removed">&minus;@diff.Removed</span>
+            </span>
+        </div>
+        @if (diff.Files.Count == 0)
+        {
+            <p class="panel-empty">This commit changed no files.</p>
+        }
+        @if (diff.Truncated)
+        {
+            <p class="panel-empty">Only the first @diff.Files.Count files are shown.</p>
+        }
+    </div>
+
+    @foreach (DiffFileResponse file in diff.Files)
+    {
+        <div class="panel diff-file">
+            <div class="panel-header">
+                <Icon Name="file" />
+                <strong class="mono">@file.Path</strong>
+                <span class="label @StatusClass(file.Status)">@file.Status</span>
+                @if (!file.IsBinary && !file.TooLarge)
+                {
+                    <span class="diff-total">
+                        <span class="diff-added">+@file.Added</span>
+                        <span class="diff-removed">&minus;@file.Removed</span>
+                    </span>
+                }
+            </div>
+
+            @if (file.IsBinary)
+            {
+                <p class="panel-empty">Binary file; no line comparison is shown.</p>
+            }
+            else if (file.TooLarge)
+            {
+                <p class="panel-empty">This file is too large to compare line by line.</p>
+            }
+            else if (file.Hunks.Count == 0)
+            {
+                <p class="panel-empty">
+                    @if (file.OldMode is not null && file.NewMode is not null && file.OldMode != file.NewMode)
+                    {
+                        @($"Mode changed from {file.OldMode} to {file.NewMode}; the content is unchanged.")
+                    }
+                    else
+                    {
+                        @("No content changes.")
+                    }
+                </p>
+            }
+            else
+            {
+                @* Every cell below binds repository content as text, so it is escaped by the renderer and
+                   never interpreted as markup. *@
+                <table class="diff">
+                    <tbody>
+                        @foreach (DiffHunkResponse hunk in file.Hunks)
+                        {
+                            <tr class="diff-hunk">
+                                <td class="diff-number" colspan="2"></td>
+                                <td class="diff-text">@hunk.Header</td>
+                            </tr>
+                            @foreach (DiffLineResponse line in hunk.Lines)
+                            {
+                                <tr class="@LineClass(line.Kind)">
+                                    <td class="diff-number">@(line.OldLine?.ToString() ?? "")</td>
+                                    <td class="diff-number">@(line.NewLine?.ToString() ?? "")</td>
+                                    <td class="diff-text"><span class="diff-sign">@line.Kind</span>@line.Text</td>
+                                </tr>
+                                @if (line.NoNewline)
+                                {
+                                    <tr class="diff-note">
+                                        <td class="diff-number" colspan="2"></td>
+                                        <td class="diff-text">\ No newline at end of file</td>
+                                    </tr>
+                                }
+                            }
+                        }
+                    </tbody>
+                </table>
+            }
+        </div>
+    }
+}
+
+@code {
+    [Parameter] public string Namespace { get; set; } = "";
+    [Parameter] public string Slug { get; set; } = "";
+    [Parameter] public string Sha { get; set; } = "";
+
+    private CommitDiffResponse? diff;
+    private bool loading = true;
+    private string message = "";
+
+    private string ProjectUrl => $"/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
+    private string CommitUrl(string sha) => $"{ProjectUrl}/-/commit/{sha}";
+
+    private static string StatusClass(string status) => status switch
+    {
+        "added" => "accent",
+        "deleted" => "danger",
+        _ => ""
+    };
+
+    private static string LineClass(string kind) => kind switch
+    {
+        "+" => "diff-line diff-line-added",
+        "-" => "diff-line diff-line-removed",
+        _ => "diff-line"
+    };
+
+    protected override async Task OnParametersSetAsync()
+    {
+        loading = true;
+        diff = null;
+        message = "";
+        try
+        {
+            // The project has to be resolved by path before the commit can be asked for by id, because the
+            // diff route is addressed by project id like the rest of the browser API.
+            ProjectResponse[]? projects = await Api.GetAsync("api/projects", ApiJson.Default.ProjectResponseArray);
+            ProjectResponse? project = projects?.FirstOrDefault(item =>
+                string.Equals(item.Path, Slug, StringComparison.Ordinal) &&
+                string.Equals(item.Namespace.Path, Namespace, StringComparison.Ordinal));
+            if (project is null) { message = "That repository could not be found."; return; }
+
+            diff = await Api.GetAsync($"api/browser/projects/{project.Id}/commit/{Uri.EscapeDataString(Sha)}",
+                ApiJson.Default.CommitDiffResponse);
+            if (diff is null) message = "That commit could not be found in this repository.";
+        }
+        finally { loading = false; }
+    }
+}

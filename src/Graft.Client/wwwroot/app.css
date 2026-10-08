@@ -442,6 +442,39 @@ a.list-item:hover, button.list-item:hover { background: var(--sunken); text-deco
 .commit-row .sha { color: var(--accent); flex: none; }
 .commit-row strong { display: block; font-weight: 600; }
 .commit-row small { display: block; margin-top: 1px; color: var(--text-secondary); font-size: 12px; }
+a.commit-row { color: inherit; text-decoration: none; }
+a.commit-row:hover { background: var(--sunken); }
+a.commit-row:hover strong { text-decoration: underline; }
+
+/* A commit and what it changed. The diff is a table so line numbers stay in their own columns and cannot
+   be selected along with the code when a reader copies a hunk. */
+.commit-title { font-size: 20px; }
+.commit-message {
+    margin: 0 0 var(--space-4); padding: var(--space-3) var(--space-4);
+    background: var(--sunken); border: 1px solid var(--border-muted); border-radius: var(--radius);
+    font-family: var(--font-mono); font-size: 12px; white-space: pre-wrap; overflow-x: auto;
+}
+.commit-details { display: grid; grid-template-columns: max-content 1fr; gap: var(--space-2) var(--space-4); margin: 0; padding: var(--space-3) var(--space-4); }
+.commit-details dt { color: var(--text-secondary); font-size: 12px; }
+.commit-details dd { margin: 0; font-size: 13px; }
+
+.diff-total { margin-left: auto; display: flex; gap: var(--space-2); font-family: var(--font-mono); font-size: 12px; }
+.diff-added { color: var(--success); }
+.diff-removed { color: var(--danger); }
+
+.diff-file .panel-header strong { overflow-wrap: anywhere; }
+table.diff { width: 100%; border-collapse: collapse; font-family: var(--font-mono); font-size: 12px; line-height: 1.5; }
+table.diff td { padding: 0 var(--space-2); vertical-align: top; }
+.diff-number {
+    width: 1%; min-width: 44px; text-align: right; color: var(--text-secondary);
+    user-select: none; border-right: 1px solid var(--border-muted); white-space: nowrap;
+}
+.diff-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.diff-sign { display: inline-block; width: 1ch; user-select: none; }
+.diff-hunk td { background: var(--sunken); color: var(--text-secondary); padding-top: 2px; padding-bottom: 2px; }
+.diff-note td { color: var(--text-secondary); }
+.diff-line-added { background: color-mix(in srgb, var(--success) 14%, transparent); }
+.diff-line-removed { background: color-mix(in srgb, var(--danger) 14%, transparent); }
 
 .branch-row { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-4); }
 

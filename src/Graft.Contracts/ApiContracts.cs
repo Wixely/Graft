@@ -152,6 +152,45 @@ public sealed record UploadStatusResponse(
     long Offset,
     string State);
 
+/// <summary>One line of a diff. <c>Kind</c> is " ", "+" or "-"; a line numbered on only one side is a
+/// change on that side. <c>NoNewline</c> marks a line that ends its file without a trailing newline.</summary>
+public sealed record DiffLineResponse(
+    string Kind,
+    string Text,
+    [property: JsonPropertyName("old_line")] int? OldLine,
+    [property: JsonPropertyName("new_line")] int? NewLine,
+    [property: JsonPropertyName("no_newline")] bool NoNewline);
+
+/// <summary>A run of changed lines with its context, carrying the header a unified diff would print.</summary>
+public sealed record DiffHunkResponse(
+    string Header,
+    IReadOnlyList<DiffLineResponse> Lines);
+
+/// <summary>
+/// What happened to one path. <c>Hunks</c> is empty when there is no text to show, which covers a binary
+/// file, a file too large to compare, and a change that only altered the file's mode.
+/// </summary>
+public sealed record DiffFileResponse(
+    string Path,
+    string Status,
+    [property: JsonPropertyName("old_mode")] string? OldMode,
+    [property: JsonPropertyName("new_mode")] string? NewMode,
+    [property: JsonPropertyName("is_binary")] bool IsBinary,
+    [property: JsonPropertyName("too_large")] bool TooLarge,
+    int Added,
+    int Removed,
+    IReadOnlyList<DiffHunkResponse> Hunks);
+
+/// <summary>A commit and what it changed, for the page a commit link opens.</summary>
+public sealed record CommitDiffResponse(
+    ProjectResponse Project,
+    CommitResponse Commit,
+    [property: JsonPropertyName("parent_id")] string? ParentId,
+    IReadOnlyList<DiffFileResponse> Files,
+    bool Truncated,
+    int Added,
+    int Removed);
+
 /// <summary>A rendered README, with whether it contains diagrams the client must load a renderer for.</summary>
 public sealed record ReadmeResponse(
     string Path,
@@ -194,6 +233,7 @@ public sealed record RepositoryPageResponse(
 [JsonSerializable(typeof(ProjectMemberResponse[]))]
 [JsonSerializable(typeof(RepositoryPageResponse))]
 [JsonSerializable(typeof(ReadmeResponse))]
+[JsonSerializable(typeof(CommitDiffResponse))]
 [JsonSerializable(typeof(UploadIngestRequest))]
 [JsonSerializable(typeof(BundleInventoryResponse))]
 [JsonSerializable(typeof(RepositoryCommitRequest))]
