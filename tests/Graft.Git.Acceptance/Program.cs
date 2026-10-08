@@ -1507,43 +1507,13 @@ async Task CheckDiffMatchesGit(string worktree, string repositoryPath, string pu
     Check(shas.Length >= 7, "the diff corpus produced a history to compare");
 
     Repository graft = new(new DurableRepositoryStorage(repositoryPath));
-    int compared = 0;
-    foreach (string sha in shas)
-    {
-        GitCommit commit = RepositoryView.ReadCommit(graft, sha);
-        string baseline = commit.ParentIds.Count > 0 ? commit.ParentIds[0] : EmptyTree;
-        string expected = await Git(worktree,
-            ["diff", "--no-color", "--no-renames", "--unified=3", baseline, sha]);
-
-        Dictionary<string, List<string>> fromGit = ParseGitDiff(expected);
-        CommitDiff actual = RepositoryDiff.ForCommit(graft, sha);
-        Dictionary<string, List<string>> fromGraft = actual.Files.ToDictionary(
-            file => file.Path,
-            file => file.IsBinary
-                ? ["BINARY"]
-                : file.Hunks.SelectMany(hunk => new[] { HunkHeader(hunk) }.Concat(
-                    hunk.Lines.SelectMany(line => line.NoNewline
-                        ? new[] { line.Kind + line.Text, @"\ No newline at end of file" }
-                        : [line.Kind + line.Text]))).ToList(),
-            StringComparer.Ordinal);
-
-        Check(fromGit.Keys.OrderBy(path => path, StringComparer.Ordinal)
-            .SequenceEqual(fromGraft.Keys.OrderBy(path => path, StringComparer.Ordinal), StringComparer.Ordinal),
-            "the same paths change as Git reports for " + commit.Title);
-
-        foreach (string path in fromGit.Keys)
-        {
-            Check(fromGit[path].SequenceEqual(fromGraft[path], StringComparer.Ordinal),
-                "the diff of " + path + " matches Git for " + commit.Title);
-            compared++;
-        }
-    }
+    int compared = await CompareWithGit(graft, worktree, shas);
     Check(compared >= 8, "every changed file in the corpus was compared against Git");
     CheckDiffReconstructsContent(graft, shas, "diff corpus");
 
-    // The placement of a change beside identical lines is ambiguous: several equally minimal scripts exist,
-    // Git slides its groups to a preferred one and this engine does not. A real repository produced exactly
-    // this, so it is pinned here, asserted by the property that does hold rather than by hunk equality.
+    // A change sitting beside identical lines can be placed several equally minimal ways. A real repository
+    // produced exactly this and Graft disagreed with Git about it, so the shape is pinned here and now held
+    // to the same standard as the rest: the same hunks Git produces, and content that rebuilds exactly.
     await Git(worktree, ["checkout", "-b", "diff-ambiguous"]);
     File.WriteAllText(Path.Combine(worktree, "fences.md"), """
         opening
@@ -1577,9 +1547,47 @@ async Task CheckDiffMatchesGit(string worktree, string repositoryPath, string pu
     Repository withAmbiguity = new(new DurableRepositoryStorage(repositoryPath));
     string[] ambiguous = (await Git(worktree, ["rev-list", "--reverse", "main..diff-ambiguous"])).Trim()
         .Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(value => value.Trim()).ToArray();
+    Check(await CompareWithGit(withAmbiguity, worktree, ambiguous) > 0,
+        "the ambiguous corpus was compared against Git");
     CheckDiffReconstructsContent(withAmbiguity, ambiguous, "ambiguous placement");
 
     await Git(worktree, ["checkout", "main"]);
+
+    async Task<int> CompareWithGit(Repository graft, string tree, string[] commits)
+    {
+        int compared = 0;
+        foreach (string sha in commits)
+        {
+            GitCommit commit = RepositoryView.ReadCommit(graft, sha);
+            string baseline = commit.ParentIds.Count > 0 ? commit.ParentIds[0] : EmptyTree;
+            string expected = await Git(tree,
+                ["diff", "--no-color", "--no-renames", "--unified=3", baseline, sha]);
+
+            Dictionary<string, List<string>> fromGit = ParseGitDiff(expected);
+            CommitDiff actual = RepositoryDiff.ForCommit(graft, sha);
+            Dictionary<string, List<string>> fromGraft = actual.Files.ToDictionary(
+                file => file.Path,
+                file => file.IsBinary
+                    ? ["BINARY"]
+                    : file.Hunks.SelectMany(hunk => new[] { HunkHeader(hunk) }.Concat(
+                        hunk.Lines.SelectMany(line => line.NoNewline
+                            ? new[] { line.Kind + line.Text, @"\ No newline at end of file" }
+                            : [line.Kind + line.Text]))).ToList(),
+                StringComparer.Ordinal);
+
+            Check(fromGit.Keys.OrderBy(path => path, StringComparer.Ordinal)
+                .SequenceEqual(fromGraft.Keys.OrderBy(path => path, StringComparer.Ordinal), StringComparer.Ordinal),
+                "the same paths change as Git reports for " + commit.Title);
+
+            foreach (string path in fromGit.Keys)
+            {
+                Check(fromGit[path].SequenceEqual(fromGraft[path], StringComparer.Ordinal),
+                    "the diff of " + path + " matches Git for " + commit.Title);
+                compared++;
+            }
+        }
+        return compared;
+    }
 
     async Task Commit(string message)
     {
