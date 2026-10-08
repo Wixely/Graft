@@ -1,0 +1,114 @@
+@inject IJSRuntime JS
+
+@* The clone options for a repository.
+   A <details> element rather than a scripted popover: it opens and closes by itself, is reachable and
+   operable from the keyboard with no handlers of our own, and still works if scripting is unavailable.
+   Only the copy buttons need script, and they report failure rather than claiming a copy that never
+   happened. The inputs select their contents on focus through interop, because an inline handler would be
+   refused by this page's content security policy. *@
+<details class="clone-menu">
+    <summary class="button primary" title="Clone this repository">
+        <Icon Name="download" />Clone<span class="caret" aria-hidden="true"></span>
+    </summary>
+
+    <div class="clone-panel">
+        <div class="clone-section">
+            <label class="clone-label" for="clone-https">Clone with HTTPS</label>
+            <div class="clone-row">
+                <input id="clone-https" readonly value="@Url" @ref="urlField" @onfocus="() => SelectAll(urlField)" />
+                <button type="button" class="icon-button" title="Copy the clone URL"
+                        aria-label="Copy the clone URL" @onclick="() => Copy(Url, nameof(Url))">
+                    <Icon Name="@(copied == nameof(Url) ? "check" : "copy")" />
+                </button>
+            </div>
+            <div class="clone-row">
+                <label class="visually-hidden" for="clone-command">Clone command</label>
+                <input id="clone-command" readonly value="@Command" @ref="commandField" @onfocus="() => SelectAll(commandField)" />
+                <button type="button" class="icon-button" title="Copy the git clone command"
+                        aria-label="Copy the git clone command" @onclick="() => Copy(Command, nameof(Command))">
+                    <Icon Name="@(copied == nameof(Command) ? "check" : "copy")" />
+                </button>
+            </div>
+        </div>
+
+        <div class="clone-section">
+            <span class="clone-label">Open in an editor</span>
+            @* These are the handler URLs each editor registers with the operating system. Nothing here can
+               tell whether that registration exists, so the note says what a reader should expect. *@
+            <a class="clone-app" href="@VisualStudioCodeUrl">
+                <Icon Name="repository" />
+                <span class="list-item-main"><strong>Visual Studio Code</strong><small class="mono">vscode://</small></span>
+                <Icon Name="chevron-right" />
+            </a>
+            <a class="clone-app" href="@VisualStudioUrl">
+                <Icon Name="repository" />
+                <span class="list-item-main"><strong>Visual Studio</strong><small class="mono">git-client://</small></span>
+                <Icon Name="chevron-right" />
+            </a>
+            <p class="clone-note">Opens the editor if it is installed and has registered its handler.</p>
+        </div>
+
+        @if (Branch.Length > 0)
+        {
+            <div class="clone-section">
+                <label class="clone-label" for="clone-branch">Clone only @Branch</label>
+                <div class="clone-row">
+                    <input id="clone-branch" readonly value="@BranchCommand" @ref="branchField"
+                           @onfocus="() => SelectAll(branchField)" />
+                    <button type="button" class="icon-button" title="Copy the single-branch clone command"
+                            aria-label="Copy the single-branch clone command"
+                            @onclick="() => Copy(BranchCommand, nameof(BranchCommand))">
+                        <Icon Name="@(copied == nameof(BranchCommand) ? "check" : "copy")" />
+                    </button>
+                </div>
+            </div>
+        }
+
+        @if (failed)
+        {
+            <p class="clone-note danger-text">The clipboard refused the copy. Select the text and copy it yourself.</p>
+        }
+    </div>
+</details>
+
+@code {
+    /// <summary>The repository's HTTPS clone URL, as the server reports it.</summary>
+    [Parameter, EditorRequired] public string Url { get; set; } = "";
+
+    /// <summary>The branch in view, offered as a single-branch clone. Empty hides that option.</summary>
+    [Parameter] public string Branch { get; set; } = "";
+
+    private ElementReference urlField;
+    private ElementReference commandField;
+    private ElementReference branchField;
+    private string copied = "";
+    private bool failed;
+
+    private string Command => $"git clone {Url}";
+
+    // A single-branch clone is the common reason to want a command rather than the bare URL, and quoting
+    // the branch keeps a name containing a slash or a dash from being read as anything else.
+    private string BranchCommand => $"git clone --branch \"{Branch}\" --single-branch {Url}";
+
+    // The handler URLs the two editors register. The repository URL is a query value inside another URL, so
+    // it is escaped as data rather than pasted in raw.
+    private string VisualStudioCodeUrl => $"vscode://vscode.git/clone?url={Uri.EscapeDataString(Url)}";
+    private string VisualStudioUrl => $"git-client://clone?repo={Uri.EscapeDataString(Url)}";
+
+    private async Task Copy(string text, string which)
+    {
+        bool ok;
+        try { ok = await JS.InvokeAsync<bool>("graftClipboard.copy", text); }
+        catch (JSException) { ok = false; }
+        copied = ok ? which : "";
+        failed = !ok;
+    }
+
+    /// <summary>Selects the whole value on focus, so a reader who prefers to copy by hand can do it in one
+    /// gesture rather than dragging across a field wider than its box.</summary>
+    private async Task SelectAll(ElementReference field)
+    {
+        try { await JS.InvokeVoidAsync("graftClipboard.selectAll", field); }
+        catch (JSException) { }
+    }
+}

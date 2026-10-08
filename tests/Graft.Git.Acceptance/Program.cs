@@ -534,6 +534,16 @@ async Task CheckBrowser(string address, string username, string password, long p
         Check(asset.IsSuccessStatusCode && asset.Content.Headers.ContentEncoding.Contains("br") && asset.Headers.ETag is not null,
             "compressed embedded asset with cache validator");
     }
+    // The clone menu's copy buttons are the only part of it that needs script. If this asset stopped being
+    // embedded they would fail silently, so its delivery is asserted rather than assumed.
+    using (HttpResponseMessage clipboard = await client.GetAsync("/graft-clipboard.js"))
+    {
+        string body = await clipboard.Content.ReadAsStringAsync();
+        Check(clipboard.IsSuccessStatusCode &&
+            clipboard.Content.Headers.ContentType?.MediaType == "text/javascript" &&
+            body.Contains("graftClipboard", StringComparison.Ordinal),
+            "the clipboard helper the clone menu depends on is served");
+    }
     using (HttpResponseMessage deep = await client.GetAsync("/alice/durable"))
         Check(deep.IsSuccessStatusCode && deep.Content.Headers.ContentType?.MediaType == "text/html", "browser deep link shell");
     using (HttpResponseMessage anonymous = await client.GetAsync("/api/session"))

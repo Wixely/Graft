@@ -42,7 +42,7 @@ else
 
     @if (tab == "code")
     {
-        <div class="panel">
+        <div class="panel overflowing">
             <div class="panel-header">
                 <Icon Name="branch" />
                 <label class="visually-hidden" for="branch-select">Branch</label>
@@ -58,10 +58,7 @@ else
                     <span class="label accent">default</span>
                 }
                 <span class="spacer"></span>
-                <div class="clone-url">
-                    <label class="visually-hidden" for="clone">Clone URL</label>
-                    <input id="clone" readonly value="@repo.Project.HttpUrlToRepo" />
-                </div>
+                <CloneMenu Url="@repo.Project.HttpUrlToRepo" Branch="@Branch" />
             </div>
         </div>
 
