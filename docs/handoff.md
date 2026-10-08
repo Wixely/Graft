@@ -1,6 +1,6 @@
 # Next-agent handoff
 
-Updated: 2026-10-08. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
+Updated: 2026-10-09. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
 
 ## Added on 2026-10-04
 
@@ -30,6 +30,35 @@ Two corrections to the earlier record. The solution did **not** build on the cur
 | Antiforgery keys in backups | Implementation agent | A restore onto a fresh host invalidates outstanding tokens; browsers recover, but the keys should travel with the backup |
 | GitLab multipart avatar route | Implementation agent | Recorded as GL-011, not implemented |
 | Pixel-level image sanitising | User | A licensing choice, not an engineering one; see the avatar evidence |
+
+## Added on 2026-10-09
+
+Merged to `main`. The Git/API/browser suite is now 302 assertions.
+
+**A commit page shows what changed.** Every commit the API reports already carried a `/-/commit/<sha>` web
+URL and nothing was behind it. `RepositoryDiff` compares two trees on the object model rather than by
+invoking Git, with Myers line comparison, three lines of context, and caps for binary and oversized files.
+
+**The diff is measured against Git, not assumed to match it.** `tests/Graft.Diff.Fuzz` generates file pairs
+from a deliberately repetitive alphabet, because repeated and blank lines are what make a change's placement
+ambiguous, and compares every result with `git diff`. Agreement is 99% against
+`git diff -c diff.indentHeuristic=false` and 95% against Git's default. The gap between those two is Git's
+indent heuristic, which this does not implement; it is in the queue below with a concrete acceptance test.
+
+Writing that harness paid for itself three times. It found that a minimal diff is not enough to agree with
+Git, which led to the two normalisation passes now in the engine. It then showed that an early version of
+the alignment pass slid groups *partway* towards unrelated changes, which looked fine on the seeds it was
+written against and was actually dragging edits off the right position; making the move all-or-nothing took
+like-for-like agreement from 95% to 99%. And it corrected a claim made in a commit message along the way:
+the residual is not Git choosing a different script of the same length, it is the indent heuristic.
+
+**A clone menu** offers the HTTPS URL, a `git clone` command, a single-branch command for the branch in
+view, and handoff to Visual Studio Code and Visual Studio through the handler URLs each registers. It is a
+`<details>` disclosure so it needs no scripting to open, close or take focus; only copying does, and that
+reports a refusal rather than claiming a copy that never happened.
+
+**Still open and unchanged:** nothing has been pushed to `origin`. The demo fixture is disposable by design,
+so anything pushed into it is destroyed when it stops.
 
 ## Added on 2026-10-08
 
