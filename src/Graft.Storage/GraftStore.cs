@@ -365,16 +365,22 @@ public sealed class GraftStore : IAsyncDisposable
         CancellationToken cancellationToken = default) =>
         await CreateProjectCoreAsync(actor, slug, name, description, null, cancellationToken);
 
+    /// <summary>
+    /// Creates a project and its repository. <paramref name="origin"/> is recorded in the audit trail and
+    /// nowhere else: a project that appeared because somebody pushed to a path that did not exist should be
+    /// distinguishable afterwards from one somebody deliberately created.
+    /// </summary>
     public async Task<ProjectInfo> CreateProjectWithRepositoryAsync(
         AuthenticatedIdentity actor,
         string slug,
         string name,
         Func<ProjectInfo, CancellationToken, Task> initializeRepository,
         string description = "",
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string origin = "the API or browser")
     {
         ArgumentNullException.ThrowIfNull(initializeRepository);
-        return await CreateProjectCoreAsync(actor, slug, name, description, initializeRepository, cancellationToken);
+        return await CreateProjectCoreAsync(actor, slug, name, description, initializeRepository, cancellationToken, origin);
     }
 
     public async Task<ProjectInfo?> FindReadyProjectAsync(
@@ -464,7 +470,8 @@ public sealed class GraftStore : IAsyncDisposable
         string name,
         string description,
         Func<ProjectInfo, CancellationToken, Task>? initializeRepository,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string origin = "the API or browser")
     {
         string normalizedSlug = NormalizeName(slug, nameof(slug));
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
@@ -499,7 +506,7 @@ public sealed class GraftStore : IAsyncDisposable
         int changed = await readyDb.ExecuteAsync("UPDATE Projects SET State = 'ready' WHERE Id = @Id AND State = 'pending';",
             new IdParameters(id), readyTransaction);
         if (changed != 1) throw new InvalidOperationException("Pending project could not be made ready.");
-        await AuditAsync(readyDb, readyTransaction, actor.UserId, "create-project", "project", id.ToString(CultureInfo.InvariantCulture), "Private project and repository are ready.", Now());
+        await AuditAsync(readyDb, readyTransaction, actor.UserId, "create-project", "project", id.ToString(CultureInfo.InvariantCulture), "Private project and repository are ready, created through " + origin + ".", Now());
         await readyTransaction.CommitAsync(cancellationToken);
         return project;
     }

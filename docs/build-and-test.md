@@ -67,6 +67,18 @@ With it off, a project cannot be made public, the listing at `/api/browse` answe
 row is inert. The browser fixture passes `true` so the public listing and the visibility controls can be
 looked at; a fixture is not a deployment.
 
+A second operator switch, `--push-to-create true|false`, also off by default, lets a push to a path holding
+no project create one. The created project is private, owned by the pusher, and only in the pusher's own
+namespace. The suite covers both states, and most of its assertions there are about the cases that must not
+create. See [push-to-create evidence](validation/2026-10-13-push-to-create.md) and
+[ADR 0007](decisions/0007-push-to-create.md).
+
+The suite also pushes an incompressible two-mebibyte repository at the client's default settings. That is
+not a size test. A push above the client's `http.postBuffer` is streamed with chunked encoding, and Git
+probes authentication with an empty request first because it cannot replay a chunked body after a
+challenge. Answering that probe wrongly broke every large push while leaving small ones working, so the
+assertion exists to keep that path exercised.
+
 The diff engine is measured against real Git rather than only against fixed fixtures. The fuzz harness
 generates file pairs from a deliberately repetitive alphabet, because repeated and blank lines are what make
 a change's placement ambiguous, and compares every resulting diff with `git diff`:
