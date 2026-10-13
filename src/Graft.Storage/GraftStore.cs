@@ -19,15 +19,39 @@ public sealed class GraftStore : IAsyncDisposable
     private readonly ServiceProvider services;
     private readonly string connectionString;
 
-    private GraftStore(ServiceProvider services, string connectionString)
+    /// <summary>
+    /// How long a browser session stays valid without being used. Using it past the halfway point pushes it
+    /// out again, so a session does not expire underneath somebody who is working, while an abandoned one
+    /// still lapses.
+    /// </summary>
+    public TimeSpan SessionWindow { get; }
+
+    /// <summary>
+    /// The longest a session may live however much it is used. Renewal never reaches past this, so a
+    /// cookie that has been copied cannot be kept alive forever by using it; eventually its holder has to
+    /// present a password again.
+    /// </summary>
+    public static readonly TimeSpan SessionMaximum = TimeSpan.FromDays(30);
+
+    private GraftStore(ServiceProvider services, string connectionString, TimeSpan sessionWindow)
     {
         this.services = services;
         this.connectionString = connectionString;
+        SessionWindow = sessionWindow;
     }
 
-    public static async Task<GraftStore> OpenAsync(string databasePath, CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Opens the store. <paramref name="sessionWindow"/> is how long a browser session survives without
+    /// being used; it is clamped to <see cref="SessionMaximum"/>, because a window longer than the absolute
+    /// ceiling would be a setting that silently did nothing.
+    /// </summary>
+    public static async Task<GraftStore> OpenAsync(string databasePath, CancellationToken cancellationToken = default,
+        TimeSpan? sessionWindow = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(databasePath);
+        TimeSpan window = sessionWindow ?? TimeSpan.FromHours(12);
+        if (window <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(sessionWindow));
+        if (window > SessionMaximum) window = SessionMaximum;
         string fullPath = Path.GetFullPath(databasePath);
         Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
         string connectionString = new SqliteConnectionStringBuilder
@@ -55,7 +79,7 @@ public sealed class GraftStore : IAsyncDisposable
         {
             await provider.GetRequiredService<IDnaXDatabaseMigrator>()
                 .MigrateAsync("Graft", cancellationToken);
-            return new(provider, connectionString);
+            return new(provider, connectionString, window);
         }
         catch
         {
@@ -221,7 +245,7 @@ public sealed class GraftStore : IAsyncDisposable
         if (user is null || user.Disabled != 0 || !PasswordHash.Verify(password, user.PasswordHash)) return null;
 
         string secret = NewSecret("graft_session_");
-        DateTimeOffset expires = DateTimeOffset.UtcNow.AddMinutes(15);
+        DateTimeOffset expires = DateTimeOffset.UtcNow + SessionWindow;
         string now = Now();
         await db.ExecuteAsync("""
             INSERT INTO BrowserSessions (UserId, SecretDigest, ExpiresAtUtc, RevokedAtUtc, CreatedAtUtc)
@@ -230,21 +254,68 @@ public sealed class GraftStore : IAsyncDisposable
         return new(secret, expires);
     }
 
-    public async Task<AuthenticatedIdentity?> ResolveSessionAsync(string secret, CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Resolves a session without touching it. This is the one the ASP.NET authentication handler uses, and
+    /// it must stay a pure read: that handler runs on every request through <c>UseAuthentication</c>, well
+    /// before any route, and it has no way to send the browser a refreshed cookie. If renewal happened here
+    /// the stored expiry would creep forward while the cookie's stayed where it was, and the session would
+    /// die in the browser while the server still considered it good.
+    /// </summary>
+    public async Task<AuthenticatedIdentity?> ResolveSessionAsync(string secret, CancellationToken cancellationToken = default) =>
+        (await LookUpSessionAsync(secret, renew: false, cancellationToken))?.Identity;
+
+    /// <summary>
+    /// Resolves a session and renews it when it is past the halfway point of its window, reporting the
+    /// expiry the caller should now put on the cookie.
+    ///
+    /// <para>
+    /// Renewal is what makes a session an idle timeout rather than a countdown from sign-in. Without it a
+    /// window of any length throws the user out mid-sentence once it elapses, however hard they were
+    /// working, which is what this used to do with a window of fifteen minutes.
+    /// </para>
+    ///
+    /// <para>
+    /// It renews only past halfway because resolving happens on nearly every request. Extending on each one
+    /// would mean a database write per request against a store with a single writer; this bounds it to one
+    /// write per half window per session and changes nothing a user could notice.
+    /// </para>
+    /// </summary>
+    public async Task<ResolvedSession?> ResolveSessionDetailedAsync(string secret, CancellationToken cancellationToken = default) =>
+        await LookUpSessionAsync(secret, renew: true, cancellationToken);
+
+    private async Task<ResolvedSession?> LookUpSessionAsync(string secret, bool renew, CancellationToken cancellationToken)
     {
         if (!ValidSecret(secret, "graft_session_")) return null;
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
-        IdentityRow? row = await db.QuerySingleOrDefaultAsync<IdentityRow>("""
-            SELECT u.Id, u.Username, u.IsAdministrator, u.Disabled
+        SessionIdentityRow? row = await db.QuerySingleOrDefaultAsync<SessionIdentityRow>("""
+            SELECT u.Id, u.Username, u.IsAdministrator, u.Disabled, s.CreatedAtUtc, s.ExpiresAtUtc
             FROM BrowserSessions s
             JOIN Users u ON u.Id = s.UserId
             WHERE s.SecretDigest = @SecretDigest
               AND s.RevokedAtUtc IS NULL
               AND s.ExpiresAtUtc > @NowUtc;
             """, new ResolveSecretParameters(Digest(secret), Now()));
-        return row is null || row.Disabled != 0
-            ? null
-            : new(row.Id, row.Username, row.IsAdministrator != 0, IdentityKind.BrowserSession);
+        if (row is null || row.Disabled != 0) return null;
+
+        AuthenticatedIdentity identity = new(row.Id, row.Username, row.IsAdministrator != 0, IdentityKind.BrowserSession);
+        DateTimeOffset expires = DateTimeOffset.Parse(row.ExpiresAtUtc, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
+        DateTimeOffset created = DateTimeOffset.Parse(row.CreatedAtUtc, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+
+        if (!renew || expires - now > SessionWindow / 2) return new(identity, expires, false);
+
+        // Never past the absolute ceiling, and never backwards: a window shortened by an operator must not
+        // extend a session that already runs longer than the new setting allows.
+        DateTimeOffset renewed = now + SessionWindow;
+        DateTimeOffset ceiling = created + SessionMaximum;
+        if (renewed > ceiling) renewed = ceiling;
+        if (renewed <= expires) return new(identity, expires, false);
+
+        await db.ExecuteAsync("""
+            UPDATE BrowserSessions SET ExpiresAtUtc = @ExpiresAtUtc
+            WHERE SecretDigest = @SecretDigest AND RevokedAtUtc IS NULL;
+            """, new RenewSessionParameters(Digest(secret), renewed.ToString("O")));
+        return new(identity, renewed, true);
     }
 
     public async Task LogoutAsync(string secret, CancellationToken cancellationToken = default)
@@ -1129,6 +1200,11 @@ internal class IdentityRow
 }
 
 internal sealed class TokenIdentityRow : IdentityRow { public long Scopes { get; set; } }
+internal sealed class SessionIdentityRow : IdentityRow
+{
+    public string CreatedAtUtc { get; set; } = "";
+    public string ExpiresAtUtc { get; set; } = "";
+}
 internal sealed class TokenOwnerRow { public long UserId { get; set; } }
 internal sealed class TokenRow
 {
@@ -1169,6 +1245,7 @@ internal sealed record CreateUserParameters(string Username, string NormalizedUs
 internal sealed record NormalizedNameParameters(string NormalizedUsername);
 internal sealed record SessionParameters(long UserId, string SecretDigest, string ExpiresAtUtc, string CreatedAtUtc);
 internal sealed record ResolveSecretParameters(string SecretDigest, string NowUtc);
+internal sealed record RenewSessionParameters(string SecretDigest, string ExpiresAtUtc);
 internal sealed record RevokeSecretParameters(string SecretDigest, string RevokedAtUtc);
 internal sealed record TokenParameters(long UserId, string Name, string SecretDigest, int Scopes, string ExpiresAtUtc, string CreatedAtUtc);
 internal sealed record IdParameters(long Id);

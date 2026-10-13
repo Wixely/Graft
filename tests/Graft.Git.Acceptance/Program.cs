@@ -119,6 +119,7 @@ try
 
     await CheckApi(address, aliceApiToken.Secret, aliceReadApiToken.Secret, aliceToken.Secret, bobApiToken.Secret, project.Id, firstHead);
     await CheckBrowser(address, "alice", alicePassword, project.Id);
+    await CheckSessionRenewal(address, "alice", alicePassword);
     await CheckPersonalAccessTokens(address, "alice", alicePassword, project.Id);
     await CheckUserAdministration(address, adminPassword, Password());
 
@@ -776,6 +777,71 @@ async Task CheckChunkedPush(string address, AuthenticatedIdentity alice)
     await Git(clone, ["fsck", "--full", "--strict"]);
     Check(new FileInfo(Path.Combine(clone, "noise.bin")).Length == 2 * 1024 * 1024,
         "the chunked push landed the whole file");
+}
+
+/// <summary>
+/// A session that renews has to tell the browser so. The browser drops the cookie at exactly the moment the
+/// server stops honouring it, so a stored expiry that moves without a refreshed cookie leaves the next
+/// request anonymous against a session that is still perfectly good. The store suite cannot see that half
+/// of it, which is where this went wrong the first time.
+/// </summary>
+async Task CheckSessionRenewal(string address, string username, string password)
+{
+    CookieContainer cookies = new();
+    using HttpClientHandler handler = new()
+    {
+        CookieContainer = cookies,
+        ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
+        UseProxy = false
+    };
+    using HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
+
+    using (HttpRequestMessage login = new(HttpMethod.Post, "/api/login"))
+    {
+        login.Headers.Add("Origin", address.TrimEnd('/'));
+        login.Content = JsonContent.Create(new { username, password });
+        using HttpResponseMessage response = await client.SendAsync(login);
+        Check(response.IsSuccessStatusCode, "session renewal fixture signs in");
+    }
+
+    static bool SetsSessionCookie(HttpResponseMessage response) =>
+        response.Headers.TryGetValues("Set-Cookie", out IEnumerable<string>? values) &&
+        values.Any(value => value.StartsWith("__Host-graft-session=", StringComparison.Ordinal));
+
+    using (HttpResponseMessage fresh = await client.GetAsync("/api/session"))
+        Check(!SetsSessionCookie(fresh),
+            "a session well inside its window is not rewritten on every request");
+
+    // Age the stored row past the halfway point rather than waiting out the window.
+    await using (Microsoft.Data.Sqlite.SqliteConnection db = new($"Data Source={databasePath};Pooling=False"))
+    {
+        await db.OpenAsync();
+        await using Microsoft.Data.Sqlite.SqliteCommand command = db.CreateCommand();
+        command.CommandText = "UPDATE BrowserSessions SET ExpiresAtUtc = $expires WHERE RevokedAtUtc IS NULL;";
+        command.Parameters.AddWithValue("$expires", DateTimeOffset.UtcNow.AddMinutes(1).ToString("O"));
+        await command.ExecuteNonQueryAsync();
+    }
+
+    using (HttpResponseMessage renewed = await client.GetAsync("/api/session"))
+    {
+        Check(renewed.IsSuccessStatusCode, "an aged session still authenticates");
+        Check(SetsSessionCookie(renewed), "a renewed session arrives with a refreshed cookie");
+        string cookie = renewed.Headers.GetValues("Set-Cookie")
+            .First(value => value.StartsWith("__Host-graft-session=", StringComparison.Ordinal));
+        Check(cookie.Contains("expires=", StringComparison.OrdinalIgnoreCase) &&
+            cookie.Contains("httponly", StringComparison.OrdinalIgnoreCase) &&
+            cookie.Contains("secure", StringComparison.OrdinalIgnoreCase),
+            "the refreshed cookie keeps the protections the original had");
+    }
+
+    // The refreshed cookie carries the new expiry, so the browser holds a session good for a full window
+    // again rather than one about to lapse.
+    Cookie stored = cookies.GetCookies(new(address))["__Host-graft-session"]!;
+    Check(stored.Expires.ToUniversalTime() > DateTime.UtcNow.AddMinutes(2),
+        "the browser's copy of the session now outlives the minute it had left");
+
+    using (HttpResponseMessage after = await client.GetAsync("/api/projects"))
+        Check(after.IsSuccessStatusCode, "the session keeps working after renewal");
 }
 
 async Task<HttpResponseMessage> ApiGet(string address, string path, string? token)

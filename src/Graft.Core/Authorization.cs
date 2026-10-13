@@ -213,5 +213,10 @@ public sealed record ProjectInfo(long Id, long OwnerUserId, string Namespace, st
 public sealed record ProjectDetails(ProjectInfo Project, string Description, DateTimeOffset CreatedAtUtc, string? DefaultBranch);
 public sealed record ProjectPage(IReadOnlyList<ProjectDetails> Projects, long Total);
 public sealed record SessionGrant(string Secret, DateTimeOffset ExpiresAtUtc);
+
+/// <summary>A resolved browser session. <c>Renewed</c> means the stored expiry just moved, so the caller
+/// owes the browser a refreshed cookie: the browser drops the cookie at the moment the server stops
+/// honouring it, and the two disagreeing is how a live session turns into an anonymous request.</summary>
+public sealed record ResolvedSession(AuthenticatedIdentity Identity, DateTimeOffset ExpiresAtUtc, bool Renewed);
 public sealed record TokenGrant(long Id, string Secret, TokenScope Scopes, DateTimeOffset ExpiresAtUtc);
 public sealed record PersonalAccessToken(long Id, string Name, TokenScope Scopes, DateTimeOffset ExpiresAtUtc, DateTimeOffset CreatedAtUtc);

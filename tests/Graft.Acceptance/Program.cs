@@ -224,6 +224,73 @@ try
         Check(await ownership.LoginAsync("alice", alicePassword) is null, "the former owner is disabled once it owns nothing");
     }
 
+    // Session renewal. A window that never moves is a countdown from sign-in rather than an idle timeout,
+    // which is what threw people out mid-sentence after fifteen minutes however hard they were working.
+    {
+        string sessionDatabase = Path.Combine(root, "sessions.db");
+        await using GraftStore sessions = await GraftStore.OpenAsync(sessionDatabase, default, TimeSpan.FromMinutes(60));
+        UserAccount owner = await sessions.BootstrapAdministratorAsync("sessionowner", adminPassword);
+        SessionGrant grant = Required(await sessions.LoginAsync(owner.Username, adminPassword), "session login");
+
+        Check(Math.Abs((grant.ExpiresAtUtc - DateTimeOffset.UtcNow).TotalMinutes - 60) < 1,
+            "a new session expires one window from now");
+
+        ResolvedSession fresh = Required(await sessions.ResolveSessionDetailedAsync(grant.Secret), "fresh session");
+        Check(!fresh.Renewed, "a session well inside its window is not renewed");
+        Check(fresh.ExpiresAtUtc == grant.ExpiresAtUtc, "a session that is not renewed keeps its expiry");
+
+        // Age the row rather than waiting for half an hour. Past the halfway point the next use must push
+        // the expiry back out to a full window.
+        async Task AgeTo(DateTimeOffset expires, DateTimeOffset? created = null)
+        {
+            await using Microsoft.Data.Sqlite.SqliteConnection db = new($"Data Source={sessionDatabase};Pooling=False");
+            await db.OpenAsync();
+            await using Microsoft.Data.Sqlite.SqliteCommand command = db.CreateCommand();
+            command.CommandText = created is null
+                ? "UPDATE BrowserSessions SET ExpiresAtUtc = $expires;"
+                : "UPDATE BrowserSessions SET ExpiresAtUtc = $expires, CreatedAtUtc = $created;";
+            command.Parameters.AddWithValue("$expires", expires.ToString("O"));
+            if (created is not null) command.Parameters.AddWithValue("$created", created.Value.ToString("O"));
+            await command.ExecuteNonQueryAsync();
+        }
+
+        await AgeTo(DateTimeOffset.UtcNow.AddMinutes(10));
+        ResolvedSession renewed = Required(await sessions.ResolveSessionDetailedAsync(grant.Secret), "aged session");
+        Check(renewed.Renewed, "a session past the halfway point is renewed by using it");
+        Check((renewed.ExpiresAtUtc - DateTimeOffset.UtcNow).TotalMinutes > 59,
+            "renewal restores a full window");
+        Check(Required(await sessions.ResolveSessionDetailedAsync(grant.Secret), "reread").ExpiresAtUtc > DateTimeOffset.UtcNow.AddMinutes(59),
+            "renewal is persisted, not just reported");
+
+        // The read-only resolve is what the authentication middleware uses on every request, and it has no
+        // way to hand the browser a refreshed cookie. If it renewed, the stored expiry would creep forward
+        // while the cookie's stayed put, and the session would die in the browser while the server still
+        // honoured it.
+        await AgeTo(DateTimeOffset.UtcNow.AddMinutes(10));
+        Check(await sessions.ResolveSessionAsync(grant.Secret) is not null, "the read-only resolve still authenticates");
+        await using (Microsoft.Data.Sqlite.SqliteConnection db = new($"Data Source={sessionDatabase};Pooling=False"))
+        {
+            await db.OpenAsync();
+            await using Microsoft.Data.Sqlite.SqliteCommand read = db.CreateCommand();
+            read.CommandText = "SELECT ExpiresAtUtc FROM BrowserSessions;";
+            DateTimeOffset after = DateTimeOffset.Parse((string)(await read.ExecuteScalarAsync())!,
+                System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.RoundtripKind);
+            Check((after - DateTimeOffset.UtcNow).TotalMinutes < 11, "the read-only resolve does not renew");
+        }
+
+        // The absolute ceiling. However much a session is used, it cannot be kept alive past it, so a copied
+        // cookie eventually has to be replaced by a password.
+        await AgeTo(DateTimeOffset.UtcNow.AddMinutes(10), DateTimeOffset.UtcNow - GraftStore.SessionMaximum + TimeSpan.FromMinutes(20));
+        ResolvedSession capped = Required(await sessions.ResolveSessionDetailedAsync(grant.Secret), "old session");
+        Check((capped.ExpiresAtUtc - DateTimeOffset.UtcNow).TotalMinutes < 21,
+            "renewal never reaches past the absolute session ceiling");
+
+        // Past the ceiling entirely, and expired: no renewal brings it back.
+        await AgeTo(DateTimeOffset.UtcNow.AddMinutes(-1));
+        Check(await sessions.ResolveSessionDetailedAsync(grant.Secret) is null, "an expired session is gone");
+        Check(await sessions.ResolveSessionAsync(grant.Secret) is null, "an expired session cannot be renewed back to life");
+    }
+
     Console.WriteLine($"RESULT: PASS; assertions: {assertions}");
     Console.WriteLine("BOUNDARY: shared authorization decisions are exercised for REST, browse, fetch and push capabilities; actual HTTP/Git transport is MVP-05.");
     return 0;

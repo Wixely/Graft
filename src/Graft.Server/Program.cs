@@ -31,7 +31,7 @@ if (args.Length == 1 && args[0] == "--licences")
 
 if (!Arguments.TryParse(args, out Arguments? parsedSettings))
 {
-    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false].");
+    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>].");
     Console.Error.WriteLine("       Graft.Server --licences  prints the third-party notices this build redistributes.");
     return 2;
 }
@@ -39,7 +39,8 @@ Arguments settings = parsedSettings!;
 
 Directory.CreateDirectory(settings.Repositories);
 using MaintenanceLease maintenanceLease = MaintenanceLease.Acquire(settings.Database, settings.Repositories);
-await using GraftStore store = await GraftStore.OpenAsync(settings.Database);
+await using GraftStore store = await GraftStore.OpenAsync(settings.Database, default,
+    TimeSpan.FromMinutes(settings.SessionMinutes));
 WebAssets assets = new();
 ConcurrentDictionary<string, Lazy<RepositoryEndpoint>> repositories = new(StringComparer.Ordinal);
 byte[] csrfKey = RandomNumberGenerator.GetBytes(32);
@@ -1651,8 +1652,16 @@ static FileResponse FileResponseFor(GitFile file, string revision) => new(
 async Task<(AuthenticatedIdentity Identity, string Secret)?> AuthenticateBrowser(HttpContext context, bool writeError)
 {
     string? secret = context.Request.Cookies[SessionCookie];
-    AuthenticatedIdentity? identity = secret is null ? null : await store.ResolveSessionAsync(secret, context.RequestAborted);
-    if (identity is not null) return (identity, secret!);
+    ResolvedSession? session = secret is null ? null : await store.ResolveSessionDetailedAsync(secret, context.RequestAborted);
+    if (session is not null)
+    {
+        // A renewed session owes the browser a refreshed cookie. The browser drops the cookie at exactly the
+        // moment the server stops honouring it, so if the stored expiry moves and the cookie's does not, the
+        // next request arrives anonymous against a session that is still perfectly good.
+        if (session.Renewed && !context.Response.HasStarted)
+            context.Response.Cookies.Append(SessionCookie, secret!, SessionCookieOptions(session.ExpiresAtUtc));
+        return (session.Identity, secret!);
+    }
     if (writeError) await ApiError(context, 401, "session");
     return null;
 }
@@ -1845,12 +1854,12 @@ sealed class RequestThrottle(int perMinute)
 }
 
 sealed record Arguments(string Database, string Repositories, IPAddress ListenAddress, int ListenPort, string? Origin,
-    string? Certificate, string? CertificatePasswordFile, bool PublicBrowsing, bool PushToCreate)
+    string? Certificate, string? CertificatePasswordFile, bool PublicBrowsing, bool PushToCreate, int SessionMinutes)
 {
     public static bool TryParse(string[] values, out Arguments? result)
     {
         result = null;
-        if (values.Length is < 4 or > 16 || values.Length % 2 != 0) return false;
+        if (values.Length is < 4 or > 18 || values.Length % 2 != 0) return false;
         string? database = null;
         string? repositories = null;
         string? listen = null;
@@ -1859,6 +1868,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         string? certificatePasswordFile = null;
         string? publicBrowsing = null;
         string? pushToCreate = null;
+        string? sessionMinutes = null;
         HashSet<string> seen = new(StringComparer.Ordinal);
         for (int index = 0; index < values.Length; index += 2)
         {
@@ -1871,6 +1881,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             else if (values[index] == "--certificate-password-file") certificatePasswordFile = values[index + 1];
             else if (values[index] == "--public-browsing") publicBrowsing = values[index + 1];
             else if (values[index] == "--push-to-create") pushToCreate = values[index + 1];
+            else if (values[index] == "--session-minutes") sessionMinutes = values[index + 1];
             else return false;
         }
         if (string.IsNullOrWhiteSpace(database) || string.IsNullOrWhiteSpace(repositories)) return false;
@@ -1878,6 +1889,13 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         // operator can state the closed answer explicitly in a unit file or container command.
         if (publicBrowsing is not null and not "true" and not "false") return false;
         if (pushToCreate is not null and not "true" and not "false") return false;
+        // How long a signed-in browser stays signed in without being used. Bounded at both ends: below five
+        // minutes nobody could get anything done, and the ceiling is the absolute lifetime a session can
+        // reach however much it is used, so a larger number here would be a setting that did nothing.
+        int window = 720;
+        if (sessionMinutes is not null && (!int.TryParse(sessionMinutes, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out window) ||
+            window is < 5 or > 43200))
+            return false;
         IPAddress address = IPAddress.Loopback;
         int port = 0;
         if (listen is not null)
@@ -1903,7 +1921,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         result = new(Path.GetFullPath(database), Path.GetFullPath(repositories), address, port,
             origin is null ? null : origin.TrimEnd('/'), certificate is null ? null : Path.GetFullPath(certificate),
             certificatePasswordFile is null ? null : Path.GetFullPath(certificatePasswordFile),
-            publicBrowsing == "true", pushToCreate == "true");
+            publicBrowsing == "true", pushToCreate == "true", window);
         return true;
     }
 }
