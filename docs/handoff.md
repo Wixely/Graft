@@ -2,6 +2,35 @@
 
 Updated: 2026-10-13. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
 
+## Added on 2026-10-13, later
+
+**Every push larger than one mebibyte had been failing, and now does not.** Git cannot replay a chunked
+request body after a `401`, so before streaming one it settles authentication with a probe whose body is a
+single flush packet. Graft answered that probe `400 Rejected: empty-update`, and the client gave up. Small
+pushes fit in the client's buffer, go out with a content length, are never probed, and so always worked.
+A lone flush packet is now answered with an empty result, as Git's own server does. See
+[push-to-create evidence](validation/2026-10-13-push-to-create.md).
+
+The suite had missed this for as long as every repository it pushed was a few kilobytes. It now pushes an
+incompressible two-mebibyte repository at default client settings and reads it back. Removing the fix makes
+that assertion fail, which is how it was confirmed to test something.
+
+Two of the newer suite sections also restart the server, which moves its port, and were handing the stale
+address back to the caller; a later assertion expecting a refusal was partly satisfied by nothing
+listening. Both now return the live address.
+
+**Pushing to a path that does not exist can create the project.** `--push-to-create true|false`, off by
+default, recorded in [ADR 0007](decisions/0007-push-to-create.md). Created private, owned by the pusher,
+and only in the pusher's own namespace, with no exception for administrators. Creation happens on the ref
+advertisement rather than the pack upload, because the advertisement is the first request Git makes.
+
+It is gated on being allowed to push rather than on the `api` scope the REST create route requires. That is
+a deliberate concession: a `write_repository` token can create projects when this is on, which it cannot do
+anywhere else. What it can create is a private project under its own account, which that person can already
+make in the browser. An operator unwilling to accept that leaves the setting off.
+
+Suites: 365 Git/API/browser, 113 accounts, 41 operations.
+
 ## Added on 2026-10-13
 
 Merged to `main`. The Git/API/browser suite is now 340 assertions, accounts 113, operations 41.
@@ -162,4 +191,4 @@ Continue to use the ignored reproducible DnaX feed until the user or DnaX mainta
 | Required legacy host | Implementation agent + user | Integrated static-musl artifact inspected and run on Linux 3.10.108 with sanitized evidence |
 | DnaX distribution | User/DnaX maintainer | Clean checkout restores without a sibling source tree or locally prepared feed |
 
-Recommended next action: Owner: Implementation agent — build `.graft/project.json` and the file allowlist, which is the remaining half of the project-page request and the only queued item that is fully buildable here. The user-gated items are unchanged: the Android picker needs a device and NativeAOT needs the C++ build tools. Remaining release gates: deployment CA/DNS trust, DnaX distribution and the deferred Linux 3.10.108 MVP-08 run.
+Recommended next action: Owner: Implementation agent — build `.graft/project.json` and the file allowlist, which is the remaining half of the project-page request and the only queued item that is fully buildable here. Worth pairing with a look at the Git transport for other requests Git makes that Graft has never been sent, since the chunked-push probe was one of those and went unnoticed for the life of the project. The user-gated items are unchanged: the Android picker needs a device and NativeAOT needs the C++ build tools. Remaining release gates: deployment CA/DNS trust, DnaX distribution and the deferred Linux 3.10.108 MVP-08 run.

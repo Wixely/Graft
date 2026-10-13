@@ -31,7 +31,7 @@ if (args.Length == 1 && args[0] == "--licences")
 
 if (!Arguments.TryParse(args, out Arguments? parsedSettings))
 {
-    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false].");
+    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false].");
     Console.Error.WriteLine("       Graft.Server --licences  prints the third-party notices this build redistributes.");
     return 2;
 }
@@ -1155,9 +1155,26 @@ app.MapPost("/{projectNamespace}/{project}.git/{service}", async context =>
             Limits.Require(input.Length + count <= Limits.RequestBytes, "request-limit");
             input.Write(buffer, 0, count);
         }
+        byte[] body = input.ToArray();
+
+        // A lone flush packet is the client settling authentication, not a request to act on. Git sends one
+        // before any body it would be unable to send twice: once the body is streamed with chunked encoding
+        // it cannot be replayed after a 401, so the client spends an empty request on the challenge first
+        // and only then streams the real one.
+        //
+        // Answering that probe with an error ends the operation before it begins. It is why a push larger
+        // than the client's http.postBuffer, a megabyte by default, failed here while a smaller one went
+        // through: only the large one is chunked, and only the chunked one is probed. Real Git answers an
+        // empty request with an empty result, so this does too.
+        if (body is [(byte)'0', (byte)'0', (byte)'0', (byte)'0'])
+        {
+            context.Response.ContentType = "application/x-" + service + "-result";
+            return;
+        }
+
         byte[] data = service == "git-receive-pack"
-            ? authorized.Endpoint.Repository.Receive(input.ToArray(), context.RequestAborted)
-            : authorized.Endpoint.Repository.Upload(input.ToArray(), context.RequestAborted);
+            ? authorized.Endpoint.Repository.Receive(body, context.RequestAborted)
+            : authorized.Endpoint.Repository.Upload(body, context.RequestAborted);
         context.Response.ContentType = "application/x-" + service + "-result";
         await context.Response.Body.WriteAsync(data, context.RequestAborted);
     }
@@ -1208,6 +1225,14 @@ async Task<AuthorizedRepository?> Authorize(HttpContext context, ProjectAction a
     ProjectInfo? project = await store.FindReadyProjectAsync(projectNamespace, projectSlug, context.RequestAborted);
     AuthenticatedIdentity? identity = await Authenticate(context);
 
+    // Push to a path that does not exist yet, and the project is created to receive it. Only on a push:
+    // a fetch of a missing repository stays a miss, because creating something in order to report that it
+    // is empty would be absurd. Creation happens on the ref advertisement rather than on the pack upload,
+    // because the advertisement is the first request Git makes and it would otherwise fail before the push
+    // began.
+    if (project is null && identity is not null && action == ProjectAction.PushRepository && settings.PushToCreate)
+        project = await CreateOnPush(context, identity, projectNamespace, projectSlug);
+
     // A public or unlisted repository clones without credentials, so the decision is taken before any
     // challenge rather than after one. Push is never granted by visibility, so a write still reaches the
     // challenge below and the client retries with a token.
@@ -1225,6 +1250,55 @@ async Task<AuthorizedRepository?> Authorize(HttpContext context, ProjectAction a
     }
     context.Response.StatusCode = StatusCodes.Status404NotFound;
     return null;
+}
+
+/// <summary>
+/// Creates the project a push is aimed at, when the operator has enabled it. Returns null to leave the push
+/// refused exactly as a missing project would be, so every refusal below reads the same from outside.
+///
+/// <para>
+/// The project is created private, owned by the caller, in the caller's own namespace. None of those is
+/// configurable, and the reasons differ. Private, because publishing is a deliberate act and a side effect
+/// of a push is the opposite of one. Owned by the caller, because a namespace in Graft is an account's
+/// username. And the caller's own namespace only, because creating in someone else's would hand them a
+/// project they never asked for, under their name, on the say-so of a stranger who knew their username.
+/// </para>
+/// </summary>
+async Task<ProjectInfo?> CreateOnPush(HttpContext context, AuthenticatedIdentity identity, string projectNamespace, string slug)
+{
+    if (!string.Equals(identity.Username, projectNamespace, StringComparison.OrdinalIgnoreCase)) return null;
+
+    // The same rules the REST create route applies. A path it would reject must not become creatable just
+    // because it arrived over Git.
+    if (!ValidProjectPath(slug)) return null;
+
+    // A credential that may not push may not create by pushing. Creation is not treated as the larger
+    // permission that the REST route's `api` scope guards, because what it produces here is a private
+    // project owned by the caller in their own namespace, which is exactly what that account can already
+    // make in the browser. An operator who does not want write_repository to imply that leaves this off.
+    if (identity.Kind == IdentityKind.PersonalAccessToken &&
+        !identity.TokenScopes.HasFlag(TokenScope.Api) && !identity.TokenScopes.HasFlag(TokenScope.WriteRepository))
+        return null;
+
+    try
+    {
+        return await store.CreateProjectWithRepositoryAsync(identity, slug, slug,
+            (created, cancellationToken) =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                _ = EndpointFor(created);
+                return Task.CompletedTask;
+            }, "", context.RequestAborted, "a push to a path that did not exist");
+    }
+    catch (ProjectConflictException)
+    {
+        // Two pushes raced for the same new path, or an earlier interrupted attempt left a pending row
+        // holding it. Read back rather than fail: if the other attempt published, this push joins it, and
+        // if it did not, this is an ordinary miss and the caller is refused.
+        return await store.FindReadyProjectAsync(projectNamespace, slug, context.RequestAborted);
+    }
+    catch (UnauthorizedAccessException) { return null; }
+    catch (ArgumentException) { return null; }
 }
 
 async Task<AuthenticatedIdentity?> Authenticate(HttpContext context)
@@ -1771,12 +1845,12 @@ sealed class RequestThrottle(int perMinute)
 }
 
 sealed record Arguments(string Database, string Repositories, IPAddress ListenAddress, int ListenPort, string? Origin,
-    string? Certificate, string? CertificatePasswordFile, bool PublicBrowsing)
+    string? Certificate, string? CertificatePasswordFile, bool PublicBrowsing, bool PushToCreate)
 {
     public static bool TryParse(string[] values, out Arguments? result)
     {
         result = null;
-        if (values.Length is < 4 or > 14 || values.Length % 2 != 0) return false;
+        if (values.Length is < 4 or > 16 || values.Length % 2 != 0) return false;
         string? database = null;
         string? repositories = null;
         string? listen = null;
@@ -1784,6 +1858,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         string? certificate = null;
         string? certificatePasswordFile = null;
         string? publicBrowsing = null;
+        string? pushToCreate = null;
         HashSet<string> seen = new(StringComparer.Ordinal);
         for (int index = 0; index < values.Length; index += 2)
         {
@@ -1795,12 +1870,14 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             else if (values[index] == "--certificate") certificate = values[index + 1];
             else if (values[index] == "--certificate-password-file") certificatePasswordFile = values[index + 1];
             else if (values[index] == "--public-browsing") publicBrowsing = values[index + 1];
+            else if (values[index] == "--push-to-create") pushToCreate = values[index + 1];
             else return false;
         }
         if (string.IsNullOrWhiteSpace(database) || string.IsNullOrWhiteSpace(repositories)) return false;
         // Takes a value rather than being a bare switch, so the grammar stays one option per pair, and so an
         // operator can state the closed answer explicitly in a unit file or container command.
         if (publicBrowsing is not null and not "true" and not "false") return false;
+        if (pushToCreate is not null and not "true" and not "false") return false;
         IPAddress address = IPAddress.Loopback;
         int port = 0;
         if (listen is not null)
@@ -1826,7 +1903,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         result = new(Path.GetFullPath(database), Path.GetFullPath(repositories), address, port,
             origin is null ? null : origin.TrimEnd('/'), certificate is null ? null : Path.GetFullPath(certificate),
             certificatePasswordFile is null ? null : Path.GetFullPath(certificatePasswordFile),
-            publicBrowsing == "true");
+            publicBrowsing == "true", pushToCreate == "true");
         return true;
     }
 }

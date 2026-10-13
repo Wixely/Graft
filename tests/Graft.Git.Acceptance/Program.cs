@@ -28,6 +28,7 @@ int assertions = 0;
 // Flipped between server restarts, because the operator switch is not something a running server can be
 // asked to change: the point of it is that it is decided before the process starts.
 bool publicBrowsing = false;
+bool pushToCreate = false;
 Process? server = null;
 Task? outputReader = null;
 Task<string>? errorReader = null;
@@ -199,7 +200,9 @@ try
         Check(await pending.FindReadyProjectAsync("alice", "interrupted") is null, "pending project is not exposed");
     }
 
-    await CheckPublicBrowsing(address, aliceIdentity);
+    address = await CheckPublicBrowsing(address, aliceIdentity);
+    await CheckChunkedPush(address, aliceIdentity);
+    address = await CheckPushToCreate(address, aliceIdentity, bob.Username, bobPassword);
 
     Console.WriteLine($"RESULT: PASS; assertions: {assertions}");
     Console.WriteLine("BOUNDARY: loopback HTTPS with an ephemeral untrusted certificate; one writer process and bounded repositories.");
@@ -276,6 +279,8 @@ ProcessStartInfo ServerStart()
     start.ArgumentList.Add(repositoriesRoot);
     start.ArgumentList.Add("--public-browsing");
     start.ArgumentList.Add(publicBrowsing ? "true" : "false");
+    start.ArgumentList.Add("--push-to-create");
+    start.ArgumentList.Add(pushToCreate ? "true" : "false");
     return start;
 }
 
@@ -452,7 +457,7 @@ async Task CheckApi(string address, string apiToken, string readApiToken, string
 /// nothing that walks the object graph. Both are asserted from the outside, with no session and no token,
 /// because that is the only vantage point from which "not available" can be believed.
 /// </summary>
-async Task CheckPublicBrowsing(string address, AuthenticatedIdentity alice)
+async Task<string> CheckPublicBrowsing(string address, AuthenticatedIdentity alice)
 {
     long cardId;
     TokenGrant pushToken;
@@ -622,6 +627,155 @@ async Task CheckPublicBrowsing(string address, AuthenticatedIdentity alice)
     // or not the account is real.
     using (HttpResponseMessage ownerAvatar = await ApiGet(address, "/api/graft/avatars/user/" + alice.UserId, null))
         Check(ownerAvatar.StatusCode == HttpStatusCode.NotFound, "an owner with no avatar set is still a 404");
+
+    return address;
+}
+
+/// <summary>
+/// Push to a path that does not exist, and the project is created to receive it. Most of these assertions
+/// are about the cases that must <em>not</em> create, because a feature whose job is to make things appear
+/// is only safe if the list of ways to make it appear is short and checked.
+/// </summary>
+async Task<string> CheckPushToCreate(string address, AuthenticatedIdentity alice, string bobUsername, string bobPassword)
+{
+    TokenGrant alicePush;
+    TokenGrant aliceReadOnly;
+    TokenGrant bobPush;
+
+    await using (GraftStore fixture = await GraftStore.OpenAsync(databasePath))
+    {
+        alicePush = await fixture.CreateTokenAsync(alice, "create-push", TokenScope.WriteRepository, DateTimeOffset.UtcNow.AddHours(1));
+        aliceReadOnly = await fixture.CreateTokenAsync(alice, "create-read", TokenScope.ReadRepository, DateTimeOffset.UtcNow.AddHours(1));
+        SessionGrant bobSession = Required(await fixture.LoginAsync(bobUsername, bobPassword), "bob login for push-to-create");
+        AuthenticatedIdentity bobIdentity = Required(await fixture.ResolveSessionAsync(bobSession.Secret), "bob identity for push-to-create");
+        bobPush = await fixture.CreateTokenAsync(bobIdentity, "bob-create-push", TokenScope.WriteRepository, DateTimeOffset.UtcNow.AddHours(1));
+    }
+
+    string source = Path.Combine(root, "create-source");
+    Directory.CreateDirectory(source);
+    await Git(source, ["init", "--initial-branch=main"]);
+    File.WriteAllText(Path.Combine(source, "created.txt"), "created by a push\n");
+    await Git(source, ["add", "."]);
+    await Git(source, ["commit", "-m", "Commit that creates its own project"]);
+
+    async Task<bool> Exists(string slug)
+    {
+        await using GraftStore check = await GraftStore.OpenAsync(databasePath);
+        return await check.FindReadyProjectAsync("alice", slug) is not null;
+    }
+
+    // Off by default. A push to a path that does not exist is a miss, and nothing appears.
+    await GitFails(source, ["push", AuthenticatedUrl(address, "alice", alicePush.Secret, "alice/absent.git"), "main"],
+        "a push to a missing project is refused while push-to-create is disabled");
+    Check(!await Exists("absent"), "a refused push creates nothing while push-to-create is disabled");
+
+    await StopServer();
+    pushToCreate = true;
+    address = await StartServer();
+
+    // The feature itself.
+    await Git(source, ["push", AuthenticatedUrl(address, "alice", alicePush.Secret, "alice/created.git"), "main"]);
+    Check(await Exists("created"), "a push to a path that does not exist creates the project");
+
+    await using (GraftStore check = await GraftStore.OpenAsync(databasePath))
+    {
+        ProjectInfo created = Required(await check.FindReadyProjectAsync("alice", "created"), "created project");
+        Check(created.OwnerUserId == alice.UserId, "the pusher owns what their push created");
+        Check(created.Visibility == ProjectVisibility.Private,
+            "a project created by a push is private, because publishing is never a side effect");
+        Check(!created.PagePublished, "a project created by a push publishes no page");
+        PermissionDecision anonymous = await check.GetPermissionAsync(null, created.Id, ProjectAction.BrowseRepository);
+        Check(!anonymous.Allowed, "a project created by a push is not readable by a stranger");
+    }
+
+    // Pushing again to the same path is an ordinary push to an existing project, not a second creation.
+    File.AppendAllText(Path.Combine(source, "created.txt"), "second revision\n");
+    await Git(source, ["add", "."]);
+    await Git(source, ["commit", "-m", "Second commit"]);
+    await Git(source, ["push", AuthenticatedUrl(address, "alice", alicePush.Secret, "alice/created.git"), "main"]);
+    Check(true, "a second push to the same path is an ordinary push");
+
+    // Everything below must refuse, and must leave nothing behind.
+    await GitFails(source, ["push", AuthenticatedUrl(address, "bob", bobPush.Secret, "alice/bobs-attempt.git"), "main"],
+        "a push cannot create a project in somebody else's namespace");
+    Check(!await Exists("bobs-attempt"), "a refused cross-namespace push creates nothing");
+
+    await GitFails(source, ["push", AuthenticatedUrl(address, "alice", aliceReadOnly.Secret, "alice/read-only.git"), "main"],
+        "a token that cannot push cannot create by pushing");
+    Check(!await Exists("read-only"), "a refused read-only push creates nothing");
+
+    await GitFails(source, ["push", address.TrimEnd('/') + "/alice/anonymous.git", "main"],
+        "an anonymous push creates nothing");
+    Check(!await Exists("anonymous"), "a refused anonymous push creates nothing");
+
+    // A path the REST route would reject must not become creatable because it arrived over Git. Two
+    // consecutive separators rather than dots or traversal, so the case is decided by Graft's own path rule
+    // and not by a client or a router normalising the URL before it arrives.
+    await GitFails(source, ["push", AuthenticatedUrl(address, "alice", alicePush.Secret, "alice/bad--name.git"), "main"],
+        "a push cannot create a project at a path the API would reject");
+    Check(!await Exists("bad--name"), "a refused invalid path creates nothing");
+
+    // Fetch is not a creation verb. The clone below must fail and must leave nothing behind, or every
+    // mistyped clone URL would litter the namespace with empty projects.
+    await GitFails(root, ["clone", AuthenticatedUrl(address, "alice", alicePush.Secret, "alice/never-fetched.git"), "never-fetched"],
+        "a fetch of a missing project is still a miss");
+    Check(!await Exists("never-fetched"), "a fetch creates nothing");
+
+    // The audit trail distinguishes the two ways a project can come into being.
+    await using (GraftStore audit = await GraftStore.OpenAsync(databasePath))
+        Check(await audit.CountAuditEventsAsync() > 0, "project creation is audited");
+
+    return address;
+}
+
+/// <summary>
+/// A push large enough that the client streams it instead of sending it in one buffer. Git cannot replay a
+/// chunked body after a challenge, so it spends an empty request on authentication first and only then
+/// streams the pack. A server that answers that probe with an error refuses every push above the client's
+/// default buffer while every smaller push keeps working.
+///
+/// <para>
+/// This suite missed exactly that for as long as every repository it pushed was a few kilobytes. The
+/// repository below is deliberately incompressible so the pack stays over the threshold and the transfer is
+/// really chunked, and the push runs at the client's default settings because raising
+/// <c>http.postBuffer</c> is what hides the bug.
+/// </para>
+/// </summary>
+async Task CheckChunkedPush(string address, AuthenticatedIdentity alice)
+{
+    TokenGrant token;
+    await using (GraftStore fixture = await GraftStore.OpenAsync(databasePath))
+    {
+        await fixture.CreateProjectWithRepositoryAsync(alice, "chunked", "Chunked push",
+            (created, cancellationToken) =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, created.StorageId));
+                return Task.CompletedTask;
+            }, "A repository too large to send in one buffer.");
+        token = await fixture.CreateTokenAsync(alice, "chunked-push", TokenScope.WriteRepository, DateTimeOffset.UtcNow.AddHours(1));
+    }
+
+    string source = Path.Combine(root, "chunked-source");
+    Directory.CreateDirectory(source);
+    await Git(source, ["init", "--initial-branch=main"]);
+    File.WriteAllBytes(Path.Combine(source, "noise.bin"), RandomNumberGenerator.GetBytes(2 * 1024 * 1024));
+    await Git(source, ["add", "."]);
+    await Git(source, ["commit", "-m", "A commit larger than the client's buffer"]);
+    string head = (await Git(source, ["rev-parse", "HEAD"])).Trim();
+
+    string remote = AuthenticatedUrl(address, "alice", token.Secret, "alice/chunked.git");
+    await Git(source, ["remote", "add", "origin", remote]);
+    await Git(source, ["push", "origin", "main"]);
+    Check(true, "a push larger than the client's buffer succeeds at default settings");
+
+    // Read it back rather than trusting the push's own report, and check the bytes survived the transfer.
+    string clone = Path.Combine(root, "chunked-clone");
+    await Git(root, ["clone", remote, "chunked-clone"]);
+    Check((await Git(clone, ["rev-parse", "HEAD"])).Trim() == head, "the chunked push landed the commit it sent");
+    await Git(clone, ["fsck", "--full", "--strict"]);
+    Check(new FileInfo(Path.Combine(clone, "noise.bin")).Length == 2 * 1024 * 1024,
+        "the chunked push landed the whole file");
 }
 
 async Task<HttpResponseMessage> ApiGet(string address, string path, string? token)
