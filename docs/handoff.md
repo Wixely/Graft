@@ -4,9 +4,17 @@ Updated: 2026-10-13. Review: at the start and end of the next work session. Owne
 
 ## Added on 2026-10-13, the MCP layer
 
-**Graft has a Model Context Protocol server**, `src/Graft.Mcp`, as a separate executable over stdio. Ten
-tools, seven reads and three writes, all calling the ordinary REST API with a personal access token. See
-[MCP evidence](validation/2026-10-13-mcp-layer.md) and [ADR 0008](decisions/0008-mcp-layer.md).
+**Graft has a Model Context Protocol server**, `src/Graft.Mcp`, as a separate executable speaking both
+stdio and Streamable HTTP. Ten tools, seven reads and three writes, all calling the ordinary REST API with a
+personal access token. See [MCP evidence](validation/2026-10-13-mcp-layer.md) and
+[ADR 0008](decisions/0008-mcp-layer.md).
+
+**The two transports differ in who holds the credential, and that is the design rather than an accident.**
+Over stdio there is no caller to carry one, so the process holds a token from a file. Over HTTP each request
+carries its own token and the server stores none, which makes the endpoint a protocol translator rather than
+a credential vault: two callers get exactly the access their own credentials carry. `--token-file` is
+refused in HTTP mode rather than ignored, because a stored token there would be lent to anyone who reached
+the port. A request with no token is refused before the protocol is spoken.
 
 **It is not built on DnaX, and the request asked for DnaX.** Both DnaX MCP packages were read at the pinned
 commit first. `DnaX.MCPFab` is an application template, not a library: it creates its own WebApplication,
@@ -32,7 +40,7 @@ insufficient scope is reported as such while an inaccessible project still answe
 Writes are off by default: the MCP server refuses every mutating tool unless started with
 `--allow-writes true`, and names the switch that would permit it.
 
-Suites: 389 Git/API/browser, 129 accounts, 41 operations.
+Suites: 389 Git/API/browser, 129 accounts, 41 operations, and a new 16-assertion `tests/Graft.Mcp.Acceptance` driving both MCP transports against a real forge.
 
 ## Added on 2026-10-13, sessions
 
