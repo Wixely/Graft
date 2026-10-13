@@ -3,7 +3,7 @@
 - Date: 2026-10-13
 - Status: Accepted user request, implemented, with one substitution the request did not specify
 - Source: "can you build this using DNAX? so it remains backwards compatible with the gitlab API layer but we have our own MCP layer?"
-- Review trigger: A DnaX release that makes MCPFab embeddable, a NativeAOT publish of `Graft.Mcp` actually running, or any proposal to move MCP into the forge process
+- Review trigger: A DnaX release that makes MCPFab embeddable, a NativeAOT publish of `Graft.Mcp` actually running, any proposal to move MCP into the forge process, or an OAuth story for the HTTP transport
 
 ## What was asked, and what was built
 
@@ -97,6 +97,34 @@ still checked either way.
 The token is read from a file and never taken on the command line, matching `Graft.Admin bootstrap`. A
 command line is visible to every process on the machine and lands in shell history.
 
+## Decision: two transports, and the credential belongs to a different party in each
+
+Both stdio and Streamable HTTP are implemented. They are not the same server with a different socket,
+because who holds the credential differs.
+
+**Over stdio the credential belongs to the process.** There is no caller to carry one: the client is
+whoever launched the executable, so `--token-file` names a token the process uses for everything. The token
+is read from a file and never taken on the command line, matching `Graft.Admin bootstrap`, because a command
+line is visible to every process on the machine and lands in shell history.
+
+**Over HTTP the credential belongs to the caller, and this server stores none.** Each request carries a
+Graft token as `PRIVATE-TOKEN` or `Authorization: Bearer`, and the client built for that request uses it.
+`--token-file` is refused rather than ignored in this mode: a stored token would be lent to anyone who
+reached the port, so accepting the option and quietly not using it would be the dangerous reading.
+
+That makes two callers on one endpoint get exactly the access their own credentials carry, and makes the
+endpoint a protocol translator rather than a credential vault. It also means the usual question about an
+HTTP MCP server, what authenticates it, has the same answer as the rest of Graft: a personal access token
+an administrator can see and revoke.
+
+A request with no token is refused with `401` before the protocol is spoken, so the tool list is not a free
+description of the forge for somebody who has shown nothing. Graft still re-checks the token on every call
+this server forwards; the refusal is in front, not instead.
+
+Off loopback the endpoint must be HTTPS and must have a certificate to be it, the same rule the forge
+applies to itself. On loopback plain HTTP is allowed, which is what a local supervisor launching a managed
+server expects.
+
 ## What is not settled
 
 **NativeAOT for `Graft.Mcp` itself is unverified**, the same environmental gap as the rest of the
@@ -105,7 +133,3 @@ nothing. The project builds clean with `IsAotCompatible`, the AOT, trim and sing
 and reflection-based JSON off. Those analyzers caught a real hazard while this was written, a generic
 `JsonArray.Add<T>` that reflects over its argument, and failed the build until it was fixed. An AOT publish
 reaches the native linker and stops there on the missing toolchain, not on anything in the code.
-
-**The transport is stdio only.** That is what a local MCP client launches directly. Streamable HTTP is the
-other half of the SDK and is not wired up; a server reachable over HTTP needs an authentication story of its
-own, and that is a larger decision than this one.

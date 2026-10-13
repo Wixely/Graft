@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- The binaries under test are launched as child processes, exactly as an MCP client would launch
+         them, so neither is referenced for its types. -->
+    <ProjectReference Include="../../src/Graft.Server/Graft.Server.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="../../src/Graft.Mcp/Graft.Mcp.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="../../src/Graft.Core/Graft.Core.csproj" />
+    <ProjectReference Include="../../src/Graft.Storage/Graft.Storage.csproj" />
+  </ItemGroup>
+</Project>

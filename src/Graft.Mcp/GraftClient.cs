@@ -1,6 +1,6 @@
 using System.Net.Http.Headers;
-using System.Security.Cryptography.X509Certificates;
 using System.Net.Http.Json;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -9,28 +9,20 @@ using System.Text.Json.Serialization.Metadata;
 namespace Graft.Mcp;
 
 /// <summary>
-/// How this server reaches Graft: the ordinary HTTP API, with a personal access token, exactly as any other
-/// API client would. It holds no database handle and no in-process authorization.
-///
-/// <para>
-/// That is the point. The tools cannot reach anything the token's owner could not reach themselves, so the
-/// blast radius of pointing an agent at a Graft instance is bounded by a credential an administrator can
-/// see and revoke, rather than by how carefully these tools were written.
-/// </para>
+/// The shared connection to one Graft instance: where it is, how its certificate is trusted, and whether
+/// this server is permitted to change anything. It holds no credential.
 /// </summary>
-public sealed class GraftClient : IDisposable
+public sealed class GraftConnection : IDisposable
 {
-    private readonly HttpClient http;
-
-    public GraftClient(Uri server, string token, bool allowWrites, X509Certificate2? trustedRoot = null)
+    public GraftConnection(Uri server, bool allowWrites, X509Certificate2? trustedRoot = null)
     {
         ArgumentNullException.ThrowIfNull(server);
         AllowWrites = allowWrites;
 
         // A self-hosted forge often presents a certificate from a private authority, or its own self-signed
         // one. The answer to that is to name the certificate to trust, not to stop checking: there is no
-        // flag here that accepts any certificate, because a tool that carries a credential to a host it did
-        // not verify is handing the credential to whoever answered.
+        // option here that accepts any certificate, because a tool that carries a credential to a host it
+        // did not verify is handing the credential to whoever answered.
         //
         // Naming a root replaces the system store rather than adding to it, which pins this client to that
         // one authority. For a tool pointed at a single known forge that is the stronger position, and the
@@ -47,10 +39,11 @@ public sealed class GraftClient : IDisposable
             handler.SslOptions.CertificateChainPolicy = policy;
         }
 
-        http = new HttpClient(handler) { BaseAddress = server, Timeout = TimeSpan.FromSeconds(30) };
-        http.DefaultRequestHeaders.Add("PRIVATE-TOKEN", token);
-        http.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("Graft.Mcp", "1.0"));
+        Http = new HttpClient(handler) { BaseAddress = server, Timeout = TimeSpan.FromSeconds(30) };
+        Http.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("Graft.Mcp", "1.0"));
     }
+
+    internal HttpClient Http { get; }
 
     /// <summary>
     /// Whether the tools that change something are permitted. Off unless an operator turned it on, so an
@@ -58,18 +51,40 @@ public sealed class GraftClient : IDisposable
     /// </summary>
     public bool AllowWrites { get; }
 
+    public void Dispose() => Http.Dispose();
+}
+
+/// <summary>
+/// How a single caller reaches Graft: the ordinary HTTP API, with that caller's personal access token,
+/// exactly as any other API client would. It holds no database handle and no in-process authorization.
+///
+/// <para>
+/// That is the point. The tools cannot reach anything the token's owner could not reach themselves, so the
+/// blast radius of pointing an agent at a Graft instance is bounded by a credential an administrator can
+/// see and revoke, rather than by how carefully these tools were written.
+/// </para>
+///
+/// <para>
+/// The token lives here rather than on the shared <see cref="GraftConnection"/> because over HTTP each
+/// caller brings their own, and one connection serves them all.
+/// </para>
+/// </summary>
+public sealed class GraftClient(GraftConnection connection, string token)
+{
+    public bool AllowWrites => connection.AllowWrites;
+
     public async Task<(bool Ok, string Body, int Status)> SendAsync(
         HttpMethod method,
         string path,
         JsonObject? body = null,
         CancellationToken cancellationToken = default)
     {
-        using HttpRequestMessage request = new(method, path);
+        using HttpRequestMessage request = Build(method, path);
         if (body is not null)
             request.Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
         try
         {
-            using HttpResponseMessage response = await http.SendAsync(request, cancellationToken);
+            using HttpResponseMessage response = await connection.Http.SendAsync(request, cancellationToken);
             string text = await response.Content.ReadAsStringAsync(cancellationToken);
             return (response.IsSuccessStatusCode, text, (int)response.StatusCode);
         }
@@ -92,7 +107,8 @@ public sealed class GraftClient : IDisposable
     {
         try
         {
-            using HttpResponseMessage response = await http.GetAsync(path, cancellationToken);
+            using HttpRequestMessage request = Build(HttpMethod.Get, path);
+            using HttpResponseMessage response = await connection.Http.SendAsync(request, cancellationToken);
             if (!response.IsSuccessStatusCode)
                 return (default, Describe((int)response.StatusCode, await response.Content.ReadAsStringAsync(cancellationToken)));
             return (await response.Content.ReadFromJsonAsync(type, cancellationToken), null);
@@ -100,6 +116,15 @@ public sealed class GraftClient : IDisposable
         catch (HttpRequestException error) { return (default, "Graft could not be reached: " + error.Message); }
         catch (TaskCanceledException) { return (default, "Graft did not answer within the timeout."); }
         catch (JsonException error) { return (default, "Graft returned something this client could not read: " + error.Message); }
+    }
+
+    /// <summary>The token travels on the request rather than on the shared client, so one connection can
+    /// serve many callers without any of them inheriting another's credential.</summary>
+    private HttpRequestMessage Build(HttpMethod method, string path)
+    {
+        HttpRequestMessage request = new(method, path);
+        request.Headers.Add("PRIVATE-TOKEN", token);
+        return request;
     }
 
     /// <summary>
@@ -118,6 +143,4 @@ public sealed class GraftClient : IDisposable
     };
 
     private static string Trim(string body) => body.Length <= 400 ? body : body[..400] + "…";
-
-    public void Dispose() => http.Dispose();
 }
