@@ -2,10 +2,17 @@ FROM mcr.microsoft.com/dotnet/runtime-deps:10.0-noble-chiseled-extra
 
 WORKDIR /app
 COPY --chown=1654:1654 --chmod=0755 artifacts/mvp08/server-linux-x64/ /app/
+
+# The MCP server ships in the same image and is not started unless an operator asks for it, so enabling it
+# is a compose profile rather than a different build. It lives in its own directory because the two are
+# separate publications and would otherwise collide on shared file names.
+COPY --chown=1654:1654 --chmod=0755 artifacts/mvp08/mcp-linux-x64/ /app/mcp/
+
 COPY --chown=1654:1654 deploy/container/data/ /data/
 COPY --chown=1654:1654 deploy/container/secrets/ /run/secrets/
 
 USER 1654:1654
-EXPOSE 8443
+# 8443 is the forge. 8444 is the MCP endpoint, which nothing listens on unless the profile is enabled.
+EXPOSE 8443 8444
 VOLUME ["/data"]
 ENTRYPOINT ["/app/Graft.Server"]

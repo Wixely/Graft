@@ -16,13 +16,66 @@ services:
       - /run/secrets/graft-tls.pfx
       - --certificate-password-file
       - /run/secrets/graft-tls-password
+      - --public-browsing
+      - ${GRAFT_PUBLIC_BROWSING:-false}
+      - --push-to-create
+      - ${GRAFT_PUSH_TO_CREATE:-false}
     ports:
       - "127.0.0.1:8443:8443"
+    networks:
+      default:
+        # The MCP service reaches the forge by the name on its certificate, not by the service name, because
+        # the certificate is checked and a service name would not match a subject alternative name.
+        aliases:
+          - ${GRAFT_INTERNAL_HOST:-graft.internal}
     volumes:
       - graft-data:/data
     secrets:
       - graft-tls.pfx
       - graft-tls-password
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    restart: unless-stopped
+
+  # Off unless asked for: `docker compose --profile mcp up`. A profile rather than a flag inside the server,
+  # because the MCP server is a separate process and an operator who does not want agent access should have
+  # nothing listening rather than a route switched off.
+  graft-mcp:
+    profiles:
+      - mcp
+    build:
+      context: ../..
+      dockerfile: deploy/container/Containerfile
+    entrypoint:
+      - /app/mcp/Graft.Mcp
+    command:
+      - --server
+      - https://${GRAFT_INTERNAL_HOST:-graft.internal}:8443
+      - --transport
+      - http
+      - --listen
+      - https://0.0.0.0:8444
+      - --certificate
+      - /run/secrets/graft-tls.pfx
+      - --certificate-password-file
+      - /run/secrets/graft-tls-password
+      # The forge's own certificate, so this verifies it rather than trusting whatever answers. There is no
+      # option anywhere that skips the check.
+      - --ca-certificate
+      - /run/secrets/graft-ca.pem
+      # Reads only unless an operator says otherwise. This holds no credential of its own: every caller
+      # sends their own Graft token, so this bounds what any of them can do through it.
+      - --allow-writes
+      - ${GRAFT_MCP_ALLOW_WRITES:-false}
+    ports:
+      - "127.0.0.1:8444:8444"
+    depends_on:
+      - graft
+    secrets:
+      - graft-tls.pfx
+      - graft-tls-password
+      - graft-ca.pem
     read_only: true
     tmpfs:
       - /tmp:size=64m,mode=1777
@@ -36,3 +89,8 @@ secrets:
     file: ${GRAFT_TLS_CERTIFICATE}
   graft-tls-password:
     file: ${GRAFT_TLS_PASSWORD_FILE}
+  # Only read by the MCP service. Compose resolves every secret's source whichever profile is active, so
+  # this points at the certificate file by default and an operator who never enables MCP never needs a
+  # second file.
+  graft-ca.pem:
+    file: ${GRAFT_CA_CERTIFICATE:-${GRAFT_TLS_CERTIFICATE}}

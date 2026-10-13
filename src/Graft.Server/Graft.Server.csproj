@@ -44,7 +44,7 @@
     <RemoveDir Directories="$(ClientPublishDir)" Condition="'$(GraftSkipClientPublish)' != 'true'" />
     <MSBuild Projects="../Graft.Client/Graft.Client.csproj" Targets="Restore;Publish" BuildInParallel="false"
       Condition="'$(GraftSkipClientPublish)' != 'true'"
-      RemoveProperties="RuntimeIdentifier;SelfContained;PublishAot;PublishTrimmed;OutputPath;TargetFramework;NoBuild;NoRestore;CurrentSolutionConfigurationContents;BuildingSolutionFile"
+      RemoveProperties="RuntimeIdentifier;SelfContained;PublishAot;PublishTrimmed;PublishSingleFile;PublishReadyToRun;OutputPath;TargetFramework;NoBuild;NoRestore;CurrentSolutionConfigurationContents;BuildingSolutionFile"
       Properties="Configuration=Release;PublishDir=$(ClientPublishDir);BuildProjectReferences=true" />
     <ItemGroup>
       <_ClientAsset Include="$(ClientPublishDir)wwwroot/**/*" Exclude="$(ClientPublishDir)wwwroot/**/*.pdb;$(ClientPublishDir)wwwroot/**/*.map" />

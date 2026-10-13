@@ -7,5 +7,13 @@
 *.json text eol=lf
 *.slnx text eol=lf
 
+# Files a Linux host reads directly. CRLF in a unit file or a compose command breaks it at run time rather
+# than at checkout, which is the worst place to find out.
+Containerfile text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.service text eol=lf
+.env.example text eol=lf
+
 # Vendored third-party assets keep upstream bytes so their recorded hash stays verifiable.
 src/Graft.Client/wwwroot/vendor/** -text
