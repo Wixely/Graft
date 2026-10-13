@@ -8,9 +8,16 @@
 <div class="shell">
     <header class="topbar">
         <a class="brand" href="/"><img src="graft-app-blue.png" alt="" width="24" height="24" />Graft</a>
-        <span class="label">Private forge</span>
+        @* Only claimed when it is true. A server with a public listing is not a private forge, and a label
+           saying otherwise is the kind of wrong that gets believed. *@
+        <span class="label">@(Api.Session?.PublicBrowsing == true ? "Forge" : "Private forge")</span>
         <div class="topbar-actions">
             <ThemeToggle />
+            @if (!Api.Authenticated)
+            {
+                <a class="button secondary" href="/-/explore"><Icon Name="search" />Explore</a>
+                <a class="button secondary" href="/-/login"><Icon Name="key" />Sign in</a>
+            }
             @if (Api.Authenticated)
             {
                 <a class="button secondary" href="/-/profile"><Avatar Url="@Api.Session?.AvatarUrl" Name="@Api.Username" Class="avatar-small" />@Api.Username</a>
@@ -26,6 +33,7 @@
                 <span class="sidebar-title">Graft</span>
                 <nav>
                     <a href="/" class="@Active("")"><Icon Name="repository" />Projects</a>
+                    <a href="/-/explore" class="@Active("-/explore")"><Icon Name="search" />Explore</a>
                     <a href="/-/profile" class="@Active("-/profile")"><Icon Name="key" />Profile and tokens</a>
                 </nav>
                 @if (Api.IsAdministrator)

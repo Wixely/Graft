@@ -1,0 +1,40 @@
+@* The badge that says who can read a project. One component rather than a literal in each place that shows
+   one, because the words and the stored value have to agree: a project list that said "Private" on every row
+   was true only while private was the only thing a project could be. *@
+
+<span class="label @(Visibility == "public" ? "accent" : "")">
+    @if (Icon is not null)
+    {
+        <Icon Name="@Icon" />
+    }
+    @Text
+</span>
+@if (PagePublished)
+{
+    @* Shown beside the repository's own visibility rather than instead of it, because a page and the
+       repository behind it are separate answers to separate questions. *@
+    <span class="label">Page published</span>
+}
+
+@code {
+    /// <summary>The stored visibility: private, unlisted or public. An unrecognised value reads as private,
+    /// which is the safe way to be wrong about this.</summary>
+    [Parameter] public string Visibility { get; set; } = "private";
+
+    /// <summary>Whether the curated project page is published. Omitted where it is not known.</summary>
+    [Parameter] public bool PagePublished { get; set; }
+
+    private string? Icon => Visibility switch
+    {
+        "public" => null,
+        "unlisted" => "shield",
+        _ => "lock"
+    };
+
+    private string Text => Visibility switch
+    {
+        "public" => "Public",
+        "unlisted" => "Unlisted",
+        _ => "Private"
+    };
+}
