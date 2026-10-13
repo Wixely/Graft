@@ -19,12 +19,12 @@
         <div class="panel-body">
             <form class="form" @onsubmit="SignIn" @onsubmit:preventDefault>
                 <label for="username">Username</label>
-                <input id="username" autocomplete="username" @bind="username" required maxlength="39" />
+                <input id="username" autocomplete="username" @bind="username" required maxlength="39" @ref="usernameField" />
                 <label for="password">Password</label>
                 @* No minlength here. This field submits an existing credential, so the creation policy is not
                    its business, and the server is the authority on whether it is accepted. The create, change
                    and reset forms still state the 16-character minimum, because there it is a real rule. *@
-                <input id="password" type="password" autocomplete="current-password" @bind="password" required maxlength="256" />
+                <input id="password" type="password" autocomplete="current-password" @bind="password" required maxlength="256" @ref="passwordField" />
                 <div class="form-actions">
                     <button type="submit" disabled="@busy">@(busy ? "Signing in…" : "Sign in")</button>
                 </div>
@@ -37,14 +37,54 @@
     /// <summary>Set when another page sent the browser here after ending the session.</summary>
     [SupplyParameterFromQuery(Name = "notice")] public string? Notice { get; set; }
 
+    private ElementReference usernameField;
+    private ElementReference passwordField;
     private string username = "";
     private string password = "";
     private string message = "";
     private bool busy;
 
+    /// <summary>
+    /// Set when a sign-in was refused. The submit button disables itself while the request is in flight, and
+    /// a browser moves focus to the document body when the focused element becomes disabled, so without this
+    /// a failed attempt leaves the caret nowhere at all and the reader has to go looking for the form again.
+    /// The refusal itself is announced by the banner's live region, which needs no focus of its own.
+    /// </summary>
+    private bool refocus;
+
     protected override async Task OnInitializedAsync()
     {
         if (await Api.EnsureSessionAsync()) Navigation.NavigateTo("/", replace: true);
+    }
+
+    /// <summary>
+    /// Puts the caret where the next keystroke should go: the username box when the page first appears, and
+    /// the password box after a refusal.
+    ///
+    /// <para>
+    /// The HTML <c>autofocus</c> attribute would not do the first of those. This is a single-page
+    /// application, so arriving here is usually a client-side route change rather than a document load, and
+    /// a browser applies autofocus only on the latter. Left alone, focus stays wherever the previous page
+    /// put it, which is whichever link was clicked to get here.
+    /// </para>
+    ///
+    /// <para>
+    /// It never moves focus on an ordinary re-render, only on those two events, so typing into one field is
+    /// never interrupted by the caret jumping to the other.
+    /// </para>
+    /// </summary>
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender && !refocus) return;
+        // A signed-in visitor is redirected away by OnInitializedAsync, and the element is gone by the time
+        // this runs. That is an ordinary race rather than a fault, so it is not worth reporting.
+        try
+        {
+            if (firstRender) await usernameField.FocusAsync();
+            else if (refocus) { refocus = false; await passwordField.FocusAsync(); }
+        }
+        catch (Microsoft.JSInterop.JSException) { }
+        catch (InvalidOperationException) { }
     }
 
     private async Task SignIn()
@@ -56,8 +96,9 @@
         {
             ApiResult result = await Api.LoginAsync(username, password);
             password = "";
-            if (result.Ok) Navigation.NavigateTo("/", replace: true);
-            else message = result.Message;
+            if (result.Ok) { Navigation.NavigateTo("/", replace: true); return; }
+            message = result.Message;
+            refocus = true;
         }
         finally { busy = false; }
     }

@@ -2,6 +2,23 @@
 
 Updated: 2026-10-13. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
 
+## Added on 2026-10-13, login focus
+
+**The sign-in page puts the caret in the username box.** Nothing focused anything before, so focus stayed
+wherever the previous page left it, usually the link that was clicked to get there. The HTML `autofocus`
+attribute would not have fixed it: arriving at a route in a single-page application is a client-side
+navigation rather than a document load, and a browser applies autofocus only on the latter.
+
+**A refused sign-in left focus nowhere at all,** which was the same defect one step later. The submit button
+disables itself while the request is in flight, and a browser moves focus to the document body when the
+focused element becomes disabled, so a failed attempt dropped the caret entirely and the reader had to go
+find the form again. Focus now moves to the password box, which is the field that was just cleared. The
+refusal is still announced by the banner's `role="status"` live region, which needs no focus of its own.
+
+Verified in Chromium against a running server: `#username` is the active element on arrival, `#password` is
+the active element after a refusal with the password cleared and the banner present, a successful sign-in
+still lands on the projects page, and the only console errors are the deliberately wrong passwords.
+
 ## Added on 2026-10-13, MCP deployment posture
 
 **Credentials are required and the override is explicit.** `--allow-anonymous`, off by default, serves
