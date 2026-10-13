@@ -220,6 +220,11 @@ public sealed record RepositoryPageResponse(
 public sealed record VisibilityRequest(string? Visibility);
 public sealed record PagePublishRequest(bool Published);
 
+/// <summary>Whether a project's curated page is published. Its own small shape rather than a field added to
+/// the GitLab-compatible project payload, because GitLab has no such concept and a payload somebody else
+/// owns should not grow a field only this server understands.</summary>
+public sealed record PageStateResponse(long ProjectId, bool Published);
+
 /// <summary>One card in the public browser. Deliberately not the GitLab project shape: it carries only what
 /// a stranger is shown, so there is no field here that could accidentally describe a private project.</summary>
 public sealed record BrowseEntryResponse(
@@ -276,5 +281,6 @@ public sealed record BrowseResponse(
 [JsonSerializable(typeof(UploadStatusResponse))]
 [JsonSerializable(typeof(VisibilityRequest))]
 [JsonSerializable(typeof(PagePublishRequest))]
+[JsonSerializable(typeof(PageStateResponse))]
 [JsonSerializable(typeof(BrowseResponse))]
 public partial class ApiJson : JsonSerializerContext;

@@ -73,6 +73,20 @@ namespace. The suite covers both states, and most of its assertions there are ab
 create. See [push-to-create evidence](validation/2026-10-13-push-to-create.md) and
 [ADR 0007](decisions/0007-push-to-create.md).
 
+Graft ships a Model Context Protocol server as a separate executable, `src/Graft.Mcp`. It speaks stdio and
+reaches Graft over the ordinary REST API with a personal access token, so it is deliberately not part of the
+forge process and the server's dependency closure is unchanged by it:
+
+```powershell
+dotnet build src\Graft.Mcp\Graft.Mcp.csproj -c Debug
+dotnet src\Graft.Mcp\bin\Debug\net10.0\Graft.Mcp.dll --server <https origin> --token-file <path> [--allow-writes true|false] [--ca-certificate <path>]
+dotnet src\Graft.Mcp\bin\Debug\net10.0\Graft.Mcp.dll --licences
+```
+
+Mutating tools are refused unless `--allow-writes true`. There is no option to skip certificate
+verification; `--ca-certificate` names the certificate to trust, which also covers a forge behind a private
+authority. See [MCP evidence](validation/2026-10-13-mcp-layer.md) and [ADR 0008](decisions/0008-mcp-layer.md).
+
 A browser session is an idle window, renewed by use, set by `--session-minutes` and defaulting to 12 hours
 with an absolute ceiling of 30 days from sign-in. It used to be a fifteen-minute countdown from sign-in that
 no amount of activity moved, which is what it looked like from a chair: being logged out mid-sentence. See
