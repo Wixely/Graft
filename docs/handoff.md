@@ -22,10 +22,12 @@ so that tool could never have worked, and nothing noticed because the suite call
 read tools. `graft_read_file` and `graft_list_tree` omitted the `ref` the file route requires. The MCP suite
 now calls every read tool against a seeded repository and is 36 assertions.
 
-**A container trap worth knowing.** Compose services here carry their own `build:` section, so compose
-builds and uses its own image and a separately tagged one is ignored, with its own cache. Several runs of
-the deployment check reported a server rejecting arguments it understood, because the container was older
-than the binary on disk. Build through `compose build`.
+**A container trap, now closed.** The compose services carried only a `build:` section, so compose invented
+an image name from the directory and the service and never referenced a separately built tag. Several runs
+of the deployment check reported a server rejecting arguments it understood, because the container was older
+than the binary on disk. Both services now name the image through `GRAFT_IMAGE`, so a tagged build and a
+compose build are the same object, and one image serves both services rather than the Containerfile being
+built twice. `up` still does not rebuild on its own, so `compose build` or `up --build` after republishing.
 
 Suites: 389 Git/API/browser, 129 accounts, 41 operations, 36 MCP.
 

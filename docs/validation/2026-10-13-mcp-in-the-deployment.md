@@ -113,11 +113,19 @@ file's own ownership and mode are what the container sees. A root-only `0600` ke
 `Access to the path '/run/secrets/graft-tls.pfx' is denied`, which reads like a certificate fault and is
 not one. The deployment runbook says so now.
 
-**Compose builds its own image and ignores a separately tagged one.** Both services carry a `build:`
-section, so `docker build --tag graft:x` produces an image compose never uses, with a separate layer cache.
-Several runs of this verification reported a server rejecting arguments it understood perfectly, because the
-container was an older build than the binary on disk. Build through `compose build`, and reach for
-`--no-cache` when a republished binary has not reached the running container. The runbook says so now.
+**Compose was building its own image and ignoring the tagged one, and now does not.** The services carried
+only a `build:` section, so compose invented a name from the project directory and the service, and a
+separately built `--tag` was never referenced. Several runs of this verification reported a server rejecting
+arguments it understood perfectly, because the container was an older build than the binary on disk, and the
+two ways I checked the binary both bypassed compose.
+
+Both services now name the image through `GRAFT_IMAGE`, default `graft:local`. Confirmed in Docker: compose
+tags what it builds with that name, both services resolve to it and start from it, and an image built
+separately under that name is then what compose runs. One image now serves both services instead of the same
+Containerfile being built twice under two invented names.
+
+`up` still does not rebuild by itself, which is the half that remains a matter of discipline: after
+republishing a binary, run `compose build` or `up --build`.
 
 The MCP server's own argument parser now reports *why* it refused rather than printing usage and leaving the
 reader to bisect their command line. That was found the hard way here: a container restarting every two
