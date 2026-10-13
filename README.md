@@ -8,6 +8,10 @@ Graft is a planned locally hosted GitLab alternative in C#/.NET 10. It targets G
 
 Status as of **2026-09-20**: [MVP-08 packaging and resource validation](docs/validation/2026-09-19-mvp08-packaging-resources.md) conditionally passes. Windows NativeAOT interactive and Windows Service, Linux static-musl interactive/systemd, and rootless Podman paths are implemented and tested; the recorded Linux static binaries retain all 76 Git/API/project-creation and 36 recovery assertions. That Windows Git/API/browser workflow passed **135 assertions** under the runtime and NativeAOT at the time, including [administrator user creation and project membership](docs/validation/2026-09-19-user-membership.md), [personal access-token lifecycle](docs/validation/2026-09-19-personal-access-tokens.md), and [account credential lifecycle](docs/validation/2026-09-20-account-credentials.md). The GitLab 18.0.0 source fixture passes against Graft and a [live reference](docs/validation/2026-09-19-gitlab-18-live-reference.md), while pinned `glab` 1.58.0 passes against both. The rendered Blazor workflow and one-use [operator bootstrap](docs/validation/2026-09-19-operator-bootstrap.md) pass. The Linux 3.10.108 run is deferred. DnaX distribution and a real CA/DNS trust environment remain gates. Remote hosting, visibility and project license are undecided. An `origin` remote exists but nothing has been pushed.
 
+Status as of **2026-10-13**: signing in now lasts. A session was expiring fifteen minutes after sign-in
+whatever you were doing, because the expiry was set once and never moved; it is now an idle window renewed
+by use, 12 hours by default via `--session-minutes`, with a 30 day ceiling from sign-in.
+
 Status as of **2026-10-13**: a fix worth calling out on its own. Every push larger than one mebibyte had
 been failing over HTTP, because Git settles authentication with an empty probe request before streaming a
 body it cannot replay, and Graft answered that probe with an error. Small pushes fit in the client's buffer
@@ -22,7 +26,7 @@ project is created private, owned by the pusher, in the pusher's own namespace o
 Status as of **2026-10-13**: a project can now be read by someone with no account. Visibility is stored for
 the first time, as `private`, `unlisted` or `public`, and a public or unlisted repository browses and clones
 with no credentials. A public one is listed and searchable on an `/-/explore` page that anonymous visitors
-reach. The three executable suites pass **365**, **113** and **41** assertions. See
+reach. The three executable suites pass **372**, **129** and **41** assertions. See
 [visibility evidence](docs/validation/2026-10-13-visibility-and-public-browsing.md) and
 [ADR 0006](docs/decisions/0006-project-pages-and-public-browsing.md).
 

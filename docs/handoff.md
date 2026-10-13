@@ -2,6 +2,27 @@
 
 Updated: 2026-10-13. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
 
+## Added on 2026-10-13, sessions
+
+**A session used to expire fifteen minutes after sign-in no matter what you were doing.** Not an idle
+timeout: the stored expiry was set once at login and nothing ever moved it, so continuous work was thrown
+out mid-sentence at the fifteen minute mark. The number was a bare magic value with no comment, unstated in
+any document and unpinned by any assertion. See [session evidence](validation/2026-10-13-session-renewal.md).
+
+A session is now an idle window, renewed by use once past the halfway point, defaulting to 12 hours and set
+by `--session-minutes`. An absolute ceiling of 30 days from sign-in bounds how long renewal can keep one
+alive. Renewal is halfway-gated because resolving happens on nearly every request and extending on each
+would be a database write per request against a single-writer store.
+
+**The first attempt at the fix did not work, and the reason is worth remembering.** It moved the stored
+expiry but never sent a refreshed cookie, because `app.UseAuthentication()` resolves the session on every
+request before any route runs, and it consumed the renewal; the route's own check then saw nothing due.
+`ResolveSessionAsync` is a pure read again, which is what the authentication handler needs, and renewal
+lives only in `ResolveSessionDetailedAsync`, used by the one caller that can also write the cookie. The
+general shape of that trap applies to anything else that becomes a side effect of resolving a session.
+
+Suites: 372 Git/API/browser, 129 accounts, 41 operations.
+
 ## Added on 2026-10-13, later
 
 **Every push larger than one mebibyte had been failing, and now does not.** Git cannot replay a chunked

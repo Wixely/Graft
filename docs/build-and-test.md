@@ -73,6 +73,11 @@ namespace. The suite covers both states, and most of its assertions there are ab
 create. See [push-to-create evidence](validation/2026-10-13-push-to-create.md) and
 [ADR 0007](decisions/0007-push-to-create.md).
 
+A browser session is an idle window, renewed by use, set by `--session-minutes` and defaulting to 12 hours
+with an absolute ceiling of 30 days from sign-in. It used to be a fifteen-minute countdown from sign-in that
+no amount of activity moved, which is what it looked like from a chair: being logged out mid-sentence. See
+[session evidence](validation/2026-10-13-session-renewal.md).
+
 The suite also pushes an incompressible two-mebibyte repository at the client's default settings. That is
 not a size test. A push above the client's `http.postBuffer` is streamed with chunked encoding, and Git
 probes authentication with an empty request first because it cannot replay a chunked body after a
