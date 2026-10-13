@@ -140,6 +140,32 @@ Nothing about the forge's own container changes. It gains a network alias so the
 it by the name on its certificate, since that container verifies the certificate rather than trusting a
 service name.
 
+## Decision: the two overrides default closed and say so
+
+Two things an operator may need are each a deliberate weakening, so each is a separate switch, each is off
+unless asked for, and each refusal names the switch that would lift it.
+
+**`--allow-anonymous`** serves callers who present no credential. They reach Graft as strangers and see only
+public projects, which is a real bound but the only one, so this is not the default even though the bound
+exists. Without it a credential-less request is refused `401` before the protocol is spoken, which also
+keeps the tool list from being a free description of the forge.
+
+**`--allow-plaintext`** permits an `http://` listener off loopback. The forge's own rule has no such
+override, because the forge serves browsers from the public internet. An MCP endpoint is commonly reached
+only from a container network that is already isolated, where terminating TLS twice buys little, and that is
+a judgement an operator can make and the server cannot. What it costs is that callers' tokens cross that
+network in the clear, which is why it has to be said out loud rather than inferred from a URL scheme.
+
+They are independent. The plaintext overlay still requires credentials, and allowing anonymous access does
+nothing to the transport.
+
+The server prints its posture on startup rather than only when unusual, so a deployment nobody has looked at
+for six months still says what it is doing:
+
+```text
+POSTURE: credentials=required; writes=refused; transport=TLS
+```
+
 ## What is not settled
 
 **NativeAOT for `Graft.Mcp` itself is unverified**, the same environmental gap as the rest of the

@@ -161,6 +161,9 @@
       "graft.core": {
         "type": "Project"
       },
+      "graft.git": {
+        "type": "Project"
+      },
       "graft.storage": {
         "type": "Project",
         "dependencies": {

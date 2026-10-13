@@ -1,0 +1,42 @@
+# Overlay for an MCP endpoint served over plain HTTP on a network you already trust.
+#
+#   docker compose -f compose.yaml -f compose.internal-http.yaml --profile mcp up --detach
+#
+# Everything the reference deployment hardens stays hardened. The only thing this changes is the MCP
+# endpoint's own transport, and it changes it loudly: `--allow-plaintext true` has to be present or the
+# server refuses to start, so a deployment cannot end up serving tokens in the clear by forgetting a flag.
+#
+# What this is for: an MCP endpoint reached only from inside a container network or a private segment, where
+# terminating TLS a second time buys nothing because the only hop is one the operator already controls. The
+# forge itself keeps its own TLS either way; this does not touch it.
+#
+# What it costs: callers' Graft tokens cross that network in the clear. If anything untrusted can reach the
+# port, or the traffic crosses a machine boundary you do not own, use the reference deployment instead.
+# Keeping the published port on host loopback, as below, is what makes this defensible.
+
+services:
+  graft-mcp:
+    command:
+      - --server
+      - https://${GRAFT_INTERNAL_HOST:-graft.internal}:8443
+      - --transport
+      - http
+      - --listen
+      - http://0.0.0.0:8444
+      # Required. Without it the server refuses a plaintext listener that is not on loopback.
+      - --allow-plaintext
+      - "true"
+      # The forge is still reached over TLS and its certificate is still verified. Only this endpoint's own
+      # transport is plain, and only inward.
+      - --ca-certificate
+      - /run/secrets/graft-ca.pem
+      - --allow-writes
+      - ${GRAFT_MCP_ALLOW_WRITES:-false}
+      - --allow-anonymous
+      - ${GRAFT_MCP_ALLOW_ANONYMOUS:-false}
+    # Still loopback on the host. Publishing this on 0.0.0.0 would put unencrypted tokens on the network,
+    # which is the one thing this overlay must not become.
+    ports:
+      - "127.0.0.1:8444:8444"
+    secrets:
+      - graft-ca.pem

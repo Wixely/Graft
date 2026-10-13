@@ -118,12 +118,24 @@ public sealed class GraftClient(GraftConnection connection, string token)
         catch (JsonException error) { return (default, "Graft returned something this client could not read: " + error.Message); }
     }
 
-    /// <summary>The token travels on the request rather than on the shared client, so one connection can
-    /// serve many callers without any of them inheriting another's credential.</summary>
+    /// <summary>Whether this caller presented a credential at all. False only where an operator has
+    /// explicitly allowed anonymous access, in which case Graft answers as it would any stranger.</summary>
+    public bool Anonymous => token.Length == 0;
+
+    /// <summary>
+    /// The token travels on the request rather than on the shared client, so one connection can serve many
+    /// callers without any of them inheriting another's credential.
+    ///
+    /// <para>
+    /// An empty token sends no header at all rather than an empty one. Graft treats a header it cannot
+    /// resolve as a bad credential and answers 401, while no header is an anonymous request that may still
+    /// read public projects, and those are different answers.
+    /// </para>
+    /// </summary>
     private HttpRequestMessage Build(HttpMethod method, string path)
     {
         HttpRequestMessage request = new(method, path);
-        request.Headers.Add("PRIVATE-TOKEN", token);
+        if (token.Length > 0) request.Headers.Add("PRIVATE-TOKEN", token);
         return request;
     }
 

@@ -11,8 +11,10 @@ Status as of **2026-09-20**: [MVP-08 packaging and resource validation](docs/val
 Status as of **2026-10-13**: the Model Context Protocol server ships in the standard container image and
 starts under a compose profile, so enabling agent access is a restart rather than a rebuild and an operator
 who wants none has nothing listening. It carries no credential of its own: every caller sends their own
-Graft token. Verified in a real container runtime; see
-[deployment evidence](docs/validation/2026-10-13-mcp-in-the-deployment.md).
+Graft token, and a caller presenting none is refused unless an operator explicitly allows that. A second
+overlay serves the endpoint over plain HTTP for an internal network, which also has to be asked for. The
+reference compose file is hardened by default and every posture was verified in a real container runtime;
+see [deployment evidence](docs/validation/2026-10-13-mcp-in-the-deployment.md).
 
 Graft has a Model Context Protocol server, `src/Graft.Mcp`, as a separate
 executable speaking both stdio and Streamable HTTP. It reaches Graft through the ordinary REST API with a personal access token, so an
@@ -40,7 +42,7 @@ project is created private, owned by the pusher, in the pusher's own namespace o
 Status as of **2026-10-13**: a project can now be read by someone with no account. Visibility is stored for
 the first time, as `private`, `unlisted` or `public`, and a public or unlisted repository browses and clones
 with no credentials. A public one is listed and searchable on an `/-/explore` page that anonymous visitors
-reach. The four executable suites pass **389**, **129**, **41** and **16** assertions. See
+reach. The four executable suites pass **389**, **129**, **41** and **36** assertions. See
 [visibility evidence](docs/validation/2026-10-13-visibility-and-public-browsing.md) and
 [ADR 0006](docs/decisions/0006-project-pages-and-public-browsing.md).
 

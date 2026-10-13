@@ -67,9 +67,11 @@ Copy `deploy/container/.env.example` to `deploy/container/.env` and fill it in f
 ```powershell
 dotnet publish src/Graft.Server/Graft.Server.csproj -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -o artifacts/mvp08/server-linux-x64
 dotnet publish src/Graft.Mcp/Graft.Mcp.csproj -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -o artifacts/mvp08/mcp-linux-x64
-podman build --file deploy/container/Containerfile --tag graft:mvp08 .
+podman compose --file deploy/container/compose.yaml build
 podman compose --file deploy/container/compose.yaml up --detach
 ```
+
+Build **through compose**, not with a separate `build --tag`. The compose services carry their own `build:` section, so compose builds and uses its own image and a separately tagged one is ignored, with its own layer cache. A tagged image that looks current while compose keeps running an older one is an afternoon nobody gets back; `compose build --no-cache` settles it when a published binary has changed and the running container has not.
 
 Compose mounts the certificate and password as read-only secrets. **Those files must be readable by UID 1654.** Compose secrets outside swarm are host bind mounts, so the file's own ownership and mode are what the container sees, and a root-only `0600` key produces a startup failure reading `Access to the path '/run/secrets/graft-tls.pfx' is denied`.
 
@@ -86,6 +88,22 @@ podman compose --file deploy/container/compose.yaml --profile mcp up --detach
 Without the profile nothing listens on 8444 and the image is unchanged, so turning it on is a restart rather than a rebuild. With it, the endpoint is at `https://<host>:8444/mcp`, bound to host loopback like the forge.
 
 It holds no credential. Every caller sends their own Graft personal access token as `PRIVATE-TOKEN` or `Authorization: Bearer`, so two callers get exactly the access their own tokens carry, and a request without one is refused `401` before the protocol is spoken. `GRAFT_MCP_ALLOW_WRITES` bounds what any caller can do through it and defaults to `false`.
+
+Two overrides exist and both default to closed. `GRAFT_MCP_ALLOW_ANONYMOUS=true` serves callers who present no credential at all; they then reach Graft as strangers and see only public projects, which is a real limit but the only one. The server prints its posture on startup, so what a deployment is actually doing is visible in its logs:
+
+```text
+POSTURE: credentials=required; writes=refused; transport=TLS
+```
+
+### Plain HTTP for an internal endpoint
+
+Where the MCP endpoint is reached only from inside a container network or a private segment, terminating TLS a second time buys little. An overlay file supplies that shape:
+
+```powershell
+podman compose --file deploy/container/compose.yaml --file deploy/container/compose.internal-http.yaml --profile mcp up --detach
+```
+
+It changes the endpoint's own transport and nothing else. The forge keeps its TLS, the MCP container still verifies the forge's certificate, credentials are still required, and the port stays bound to host loopback. The overlay must pass `--allow-plaintext true`, because the server refuses a plaintext listener off loopback without it; a deployment therefore cannot serve tokens in the clear by forgetting a flag. What it costs is that callers' tokens cross that network unencrypted, so use the reference deployment wherever anything untrusted can reach the port.
 
 Two variables exist only for this profile. `GRAFT_INTERNAL_HOST` is the name the MCP container uses to reach the forge, and compose gives the forge that name as a network alias; it must match a subject alternative name on the certificate, because the MCP server verifies it rather than trusting the service name. `GRAFT_CA_CERTIFICATE` is the forge's certificate in PEM or DER, which is the public half of the PKCS#12 and never the private key:
 
