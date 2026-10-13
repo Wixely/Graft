@@ -23,6 +23,20 @@ Each component remains under its own licence. Nothing here is modified unless st
 - **DnaX.Data.Migrations**, **DnaX.Data.Migrations.Sqlite** and **DnaX.Uploads** —
   MIT licence, © 2026 DNAX contributors. <https://github.com/Wixely/DnaX>.
 
+## Compiled into the Model Context Protocol server
+
+`Graft.Mcp` is a separate executable, so these are redistributed with it and not with the forge. It prints
+the same notice, for the same reason the server does.
+
+- **ModelContextProtocol** and **ModelContextProtocol.Core** 2.2.0 — Apache Licence 2.0,
+  © Model Context Protocol, a Series of LF Projects, LLC.
+  <https://csharp.sdk.modelcontextprotocol.io/>. A copy of the licence is at
+  <https://www.apache.org/licenses/LICENSE-2.0>. Neither is modified.
+- **Microsoft.Extensions.AI.Abstractions**, **Microsoft.Extensions.Hosting** and the
+  **Microsoft.Extensions.*** configuration, logging, options and dependency injection packages they bring
+  with them — MIT licence, © Microsoft Corporation. <https://github.com/dotnet/runtime> and
+  <https://github.com/dotnet/extensions>.
+
 ## Vendored browser assets
 
 - **mermaid** 11.15.0 — MIT licence, © 2014-2022 Knut Sveidqvist.

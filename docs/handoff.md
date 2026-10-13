@@ -2,6 +2,38 @@
 
 Updated: 2026-10-13. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
 
+## Added on 2026-10-13, the MCP layer
+
+**Graft has a Model Context Protocol server**, `src/Graft.Mcp`, as a separate executable over stdio. Ten
+tools, seven reads and three writes, all calling the ordinary REST API with a personal access token. See
+[MCP evidence](validation/2026-10-13-mcp-layer.md) and [ADR 0008](decisions/0008-mcp-layer.md).
+
+**It is not built on DnaX, and the request asked for DnaX.** Both DnaX MCP packages were read at the pinned
+commit first. `DnaX.MCPFab` is an application template, not a library: it creates its own WebApplication,
+Kestrel listener, Serilog logger, configuration chain and default authentication scheme, so adopting it
+would make Graft an MCPFab server rather than give Graft an MCP layer, at a cost of roughly twenty runtime
+assemblies. `DnaX.RemoteAccess.Mcp` is the right shape and twenty-four lines, but those lines are the
+official SDK's own API and it brings a second SQLite-backed credential store beside the one Graft has. The
+official SDK is therefore the smaller dependency; DnaX's own package depends on it and adds to it. DnaX's
+build policy was still worth reading, and its rules are followed.
+
+**It is a separate process because Graft.Server publishes NativeAOT and that is a release claim.** Nobody
+has AOT-published an MCP library; DnaX verifies trimmed and single-file and explicitly leaves
+`IsAotCompatible` off. The forge's dependency closure is unchanged by any of this. `Graft.Mcp` itself builds
+clean with the AOT, trim and single-file analyzers on and reflection JSON off, and those analyzers caught a
+real hazard during the work. ILC still never runs here.
+
+**Two API routes existed only in the browser and now have token equivalents.** `PUT /api/v4/projects/:id`
+takes `visibility`, which is a route and attribute GitLab has, so this makes Graft more compatible rather
+than less. Publishing the curated page has no upstream equivalent and stays at
+`PUT /api/graft/projects/:id/page`. Both check the token's scope before resolving the project, so an
+insufficient scope is reported as such while an inaccessible project still answers 404.
+
+Writes are off by default: the MCP server refuses every mutating tool unless started with
+`--allow-writes true`, and names the switch that would permit it.
+
+Suites: 389 Git/API/browser, 129 accounts, 41 operations.
+
 ## Added on 2026-10-13, sessions
 
 **A session used to expire fifteen minutes after sign-in no matter what you were doing.** Not an idle

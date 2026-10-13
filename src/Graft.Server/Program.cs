@@ -1101,6 +1101,101 @@ app.MapGet("/api/v4/projects/{**projectId}", async context =>
     await context.Response.WriteAsJsonAsync(await ProjectResponseFor(context, project.Details), ApiJson.Default.ProjectResponse, null, context.RequestAborted);
 });
 
+// Changing an existing project. GitLab's own edit route carries dozens of attributes; this accepts exactly
+// one, and refuses the rest by name rather than ignoring them, so a caller is never told it succeeded at
+// something that did not happen.
+//
+// It lives on the GitLab-shaped surface because GitLab has this route and this attribute. Publishing a
+// project page does not exist upstream, so it stays under Graft's own prefix below rather than inventing a
+// field in a payload somebody else owns.
+app.MapMethods("/api/v4/projects/{**projectId}", ["PUT"], async context =>
+{
+    // The scope is checked before the project is looked up, so a token that could never perform this is
+    // told its scope is wrong rather than being told the project does not exist. A credential's own scope
+    // is not a secret about somebody else's project, and the create route already answers this way.
+    (bool unresolved, AuthenticatedIdentity? caller) = await AuthenticateApiOptional(context);
+    if (unresolved) return;
+    if (caller is null) { await ApiError(context, 401, "401 Unauthorized"); return; }
+    if (!caller.TokenScopes.HasFlag(TokenScope.Api))
+    { await ApiError(context, 403, "403 Forbidden: insufficient_scope"); return; }
+
+    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.ManageProject);
+    if (project is null) return;
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+
+    ProjectVisibility visibility;
+    try
+    {
+        using JsonDocument document = await JsonDocument.ParseAsync(context.Request.Body, cancellationToken: context.RequestAborted);
+        if (document.RootElement.ValueKind != JsonValueKind.Object)
+        { await ApiError(context, 400, "project must be a JSON object"); return; }
+        string? unsupported = document.RootElement.EnumerateObject()
+            .Select(property => property.Name)
+            .FirstOrDefault(name => name != "visibility");
+        if (unsupported is not null)
+        { await ApiError(context, 400, "unsupported project property: " + unsupported); return; }
+        if (!document.RootElement.TryGetProperty("visibility", out JsonElement value) || value.ValueKind != JsonValueKind.String)
+        { await ApiError(context, 400, "visibility is required"); return; }
+        if (!TryReadVisibility(value.GetString(), out visibility))
+        { await ApiError(context, 400, "visibility must be private, unlisted or public"); return; }
+    }
+    catch (JsonException) { await ApiError(context, 400, "invalid JSON"); return; }
+
+    if (visibility != ProjectVisibility.Private && !settings.PublicBrowsing)
+    { await ApiError(context, 400, "this server does not allow projects to be published"); return; }
+
+    try
+    {
+        await store.SetProjectVisibilityAsync(caller, project.Details.Project.Id, visibility, context.RequestAborted);
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "404 Project Not Found"); return; }
+
+    ProjectDetails updated = (await store.GetReadyProjectAsync(project.Details.Project.Id, context.RequestAborted))!;
+    await context.Response.WriteAsJsonAsync(await ProjectResponseFor(context, updated), ApiJson.Default.ProjectResponse, null, context.RequestAborted);
+});
+
+// Publishing the curated project page. Under Graft's own prefix because GitLab has no equivalent, and
+// GL-012 in the compatibility record keeps the upstream upload path unclaimed for the same reason: a route
+// somebody else owns should not come to mean something only this server understands.
+app.MapMethods("/api/graft/projects/{projectId}/page", ["PUT"], async context =>
+{
+    (bool unresolved, AuthenticatedIdentity? caller) = await AuthenticateApiOptional(context);
+    if (unresolved) return;
+    if (caller is null) { await ApiError(context, 401, "401 Unauthorized"); return; }
+    if (!caller.TokenScopes.HasFlag(TokenScope.Api))
+    { await ApiError(context, 403, "403 Forbidden: insufficient_scope"); return; }
+
+    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.ManageProject);
+    if (project is null) return;
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+
+    PagePublishRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.PagePublishRequest, context.RequestAborted);
+    if (request is null) { await ApiError(context, 400, "published"); return; }
+    if (request.Published && !settings.PublicBrowsing)
+    { await ApiError(context, 400, "this server does not allow projects to be published"); return; }
+
+    try
+    {
+        await store.SetPagePublishedAsync(caller, project.Details.Project.Id, request.Published, context.RequestAborted);
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "404 Project Not Found"); return; }
+
+    ProjectDetails updated = (await store.GetReadyProjectAsync(project.Details.Project.Id, context.RequestAborted))!;
+    await context.Response.WriteAsJsonAsync(new PageStateResponse(updated.Project.Id, updated.Project.PagePublished),
+        ApiJson.Default.PageStateResponse, null, context.RequestAborted);
+});
+
+// Reading it back, so a client can see the state without a browser session.
+app.MapGet("/api/graft/projects/{projectId}/page", async context =>
+{
+    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.ReadRest);
+    if (project is null) return;
+    if (!await OnlyQuery(context)) return;
+    await context.Response.WriteAsJsonAsync(
+        new PageStateResponse(project.Details.Project.Id, project.Details.Project.PagePublished),
+        ApiJson.Default.PageStateResponse, null, context.RequestAborted);
+});
+
 app.Map("/api/v4/{**path}", context => ApiError(context, 404, "404 API endpoint not found"));
 
 app.MapGet("/{projectNamespace}/{project}.git/info/refs", async context =>

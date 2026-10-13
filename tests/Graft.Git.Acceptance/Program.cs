@@ -204,6 +204,7 @@ try
     address = await CheckPublicBrowsing(address, aliceIdentity);
     await CheckChunkedPush(address, aliceIdentity);
     address = await CheckPushToCreate(address, aliceIdentity, bob.Username, bobPassword);
+    await CheckTokenProjectSettings(address, aliceIdentity, bob.Username, bobPassword);
 
     Console.WriteLine($"RESULT: PASS; assertions: {assertions}");
     Console.WriteLine("BOUNDARY: loopback HTTPS with an ephemeral untrusted certificate; one writer process and bounded repositories.");
@@ -842,6 +843,97 @@ async Task CheckSessionRenewal(string address, string username, string password)
 
     using (HttpResponseMessage after = await client.GetAsync("/api/projects"))
         Check(after.IsSuccessStatusCode, "the session keeps working after renewal");
+}
+
+/// <summary>
+/// The two project settings, reached with a token and no browser. Until this existed an API client could
+/// create a project already public but could never change one, and could not publish a page at all, so an
+/// automated caller could set up a forge and then not administer it.
+/// </summary>
+async Task CheckTokenProjectSettings(string address, AuthenticatedIdentity alice, string bobUsername, string bobPassword)
+{
+    TokenGrant apiToken;
+    TokenGrant readOnlyToken;
+    TokenGrant bobToken;
+    await using (GraftStore fixture = await GraftStore.OpenAsync(databasePath))
+    {
+        await fixture.CreateProjectWithRepositoryAsync(alice, "settings", "Settings target",
+            (created, token) => { token.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, created.StorageId)); return Task.CompletedTask; },
+            "Driven entirely by token.");
+        apiToken = await fixture.CreateTokenAsync(alice, "settings-api", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1));
+        readOnlyToken = await fixture.CreateTokenAsync(alice, "settings-read", TokenScope.ReadApi, DateTimeOffset.UtcNow.AddHours(1));
+        SessionGrant bobSession = Required(await fixture.LoginAsync(bobUsername, bobPassword), "bob login for settings");
+        AuthenticatedIdentity bobIdentity = Required(await fixture.ResolveSessionAsync(bobSession.Secret), "bob identity for settings");
+        bobToken = await fixture.CreateTokenAsync(bobIdentity, "settings-bob", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1));
+    }
+
+    const string target = "/api/v4/projects/alice%2Fsettings";
+    const string pageRoute = "/api/graft/projects/alice%2Fsettings/page";
+
+    // The happy path, with nothing but a token.
+    using (HttpResponseMessage response = await ApiPutJson(address, target, apiToken.Secret, "{\"visibility\":\"public\"}"))
+    {
+        Check(response.IsSuccessStatusCode, "a token can change a project's visibility");
+        using JsonDocument body = JsonDocument.Parse(await response.Content.ReadAsStreamAsync());
+        Check(body.RootElement.GetProperty("visibility").GetString() == "public",
+            "the edit route reports the visibility it just set");
+    }
+    using (HttpResponseMessage response = await ApiGet(address, target, apiToken.Secret))
+    {
+        using JsonDocument body = JsonDocument.Parse(await response.Content.ReadAsStreamAsync());
+        Check(body.RootElement.GetProperty("visibility").GetString() == "public", "the change is persisted");
+    }
+    using (HttpResponseMessage response = await ApiPutJson(address, pageRoute, apiToken.Secret, "{\"published\":true}"))
+    {
+        Check(response.IsSuccessStatusCode, "a token can publish a project page");
+        using JsonDocument body = JsonDocument.Parse(await response.Content.ReadAsStreamAsync());
+        Check(body.RootElement.GetProperty("published").GetBoolean(), "the page route reports the state it set");
+    }
+    using (HttpResponseMessage response = await ApiGet(address, pageRoute, apiToken.Secret))
+    {
+        using JsonDocument body = JsonDocument.Parse(await response.Content.ReadAsStreamAsync());
+        Check(body.RootElement.GetProperty("published").GetBoolean(), "the page state reads back");
+    }
+
+    // Refusals. Each one matters: this route can publish somebody's private source to the world.
+    using (HttpResponseMessage response = await ApiPutJson(address, target, readOnlyToken.Secret, "{\"visibility\":\"private\"}"))
+        Check(response.StatusCode == HttpStatusCode.Forbidden, "a read_api token cannot change visibility");
+    using (HttpResponseMessage response = await ApiPutJson(address, pageRoute, readOnlyToken.Secret, "{\"published\":false}"))
+        Check(response.StatusCode == HttpStatusCode.Forbidden, "a read_api token cannot publish a page");
+    using (HttpResponseMessage response = await ApiPutJson(address, target, bobToken.Secret, "{\"visibility\":\"private\"}"))
+        Check(response.StatusCode == HttpStatusCode.NotFound,
+            "somebody else's token cannot change a project, and is told nothing about whether it exists");
+    using (HttpResponseMessage response = await ApiPutJson(address, target, null, "{\"visibility\":\"private\"}"))
+        Check(response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.NotFound,
+            "an anonymous caller cannot change a project");
+
+    // The same field vocabulary the create route enforces, and the same refusal to ignore what it was sent.
+    using (HttpResponseMessage response = await ApiPutJson(address, target, apiToken.Secret, "{\"visibility\":\"internal\"}"))
+        Check(response.StatusCode == HttpStatusCode.BadRequest, "the edit route refuses a visibility Graft does not implement");
+    using (HttpResponseMessage response = await ApiPutJson(address, target, apiToken.Secret, "{\"name\":\"renamed\"}"))
+        Check(response.StatusCode == HttpStatusCode.BadRequest,
+            "the edit route refuses a property it does not implement rather than ignoring it");
+    using (HttpResponseMessage response = await ApiPutJson(address, target, apiToken.Secret, "{}"))
+        Check(response.StatusCode == HttpStatusCode.BadRequest, "the edit route requires the one field it accepts");
+
+    // Put it back, so the state this leaves behind matches what the project started as.
+    using (HttpResponseMessage response = await ApiPutJson(address, pageRoute, apiToken.Secret, "{\"published\":false}"))
+        Check(response.IsSuccessStatusCode, "a token can withdraw a project page");
+    using (HttpResponseMessage response = await ApiPutJson(address, target, apiToken.Secret, "{\"visibility\":\"private\"}"))
+        Check(response.IsSuccessStatusCode, "a token can make a project private again");
+}
+
+async Task<HttpResponseMessage> ApiPutJson(string address, string path, string? token, string body)
+{
+    HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false };
+    HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
+    HttpRequestMessage request = new(HttpMethod.Put, path) { Content = new StringContent(body, Encoding.UTF8, "application/json") };
+    if (token is not null) request.Headers.Add("PRIVATE-TOKEN", token);
+    HttpResponseMessage response = await client.SendAsync(request);
+    request.Dispose();
+    client.Dispose();
+    handler.Dispose();
+    return response;
 }
 
 async Task<HttpResponseMessage> ApiGet(string address, string path, string? token)

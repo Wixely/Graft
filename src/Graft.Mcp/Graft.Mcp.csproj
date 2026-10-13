@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <DebugType Condition="'$(Configuration)' == 'Release'">none</DebugType>
+    <PublishAot Condition="'$(GraftMcpAot)' == 'true'">true</PublishAot>
+    <RestorePackagesWithLockFile Condition="'$(RuntimeIdentifier)' == ''">true</RestorePackagesWithLockFile>
+    <NuGetLockFilePath Condition="'$(RuntimeIdentifier)' != ''">$(BaseIntermediateOutputPath)packages.$(RuntimeIdentifier).lock.json</NuGetLockFilePath>
+
+    <!--
+      The analyzers run on every build rather than only when publishing native, so a change that would break
+      a NativeAOT publish is a warning here and now, on a machine that cannot run ILC. Reflection-based JSON
+      is off for the same reason: it is the thing that silently works under JIT and dies once trimmed.
+    -->
+    <IsAotCompatible>true</IsAotCompatible>
+    <EnableAotAnalyzer>true</EnableAotAnalyzer>
+    <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
+    <EnableSingleFileAnalyzer>true</EnableSingleFileAnalyzer>
+    <JsonSerializerIsReflectionEnabledByDefault>false</JsonSerializerIsReflectionEnabledByDefault>
+  </PropertyGroup>
+  <ItemGroup>
+    <!--
+      The official Model Context Protocol SDK. DnaX's own MCP package depends on this same library and adds
+      a host Graft cannot use, so this is the smaller dependency, not a substitution for one.
+    -->
+    <PackageReference Include="ModelContextProtocol" Version="2.2.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.5" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Same obligation as the server: the Apache and MIT terms here bind the binary, and this binary is
+         routinely copied somewhere the repository is not. -->
+    <EmbeddedResource Include="../../THIRD-PARTY-NOTICES.md" LogicalName="graft/THIRD-PARTY-NOTICES.md" />
+    <ProjectReference Include="../Graft.Contracts/Graft.Contracts.csproj" />
+  </ItemGroup>
+</Project>
