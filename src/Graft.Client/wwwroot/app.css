@@ -257,6 +257,10 @@ footer {
     padding: var(--space-3) var(--space-6); color: var(--text-muted); font-size: 11px;
     border-top: 1px solid var(--border-muted);
 }
+/* Inherits the footer's muted colour rather than taking the accent: it is a credit line that happens to be
+   clickable, not a call to action, and an accent-bright strip along the bottom of every page reads as one. */
+footer a { color: inherit; }
+footer a:hover { color: var(--text-secondary); text-decoration: underline; }
 
 /* Panels */
 
@@ -448,7 +452,9 @@ a.list-item:hover, button.list-item:hover { background: var(--sunken); text-deco
 .clone-note { margin: var(--space-2) 0 0; font-size: 12px; color: var(--text-secondary); }
 .danger-text { color: var(--danger); }
 
-.file-table { width: 100%; background: var(--raised); border: 1px solid var(--border); border-radius: var(--radius-large); overflow: hidden; }
+/* The same gap panels leave below themselves, so a README following the file list is separated on the
+   page's own rhythm rather than sitting flush against it. */
+.file-table { width: 100%; background: var(--raised); border: 1px solid var(--border); border-radius: var(--radius-large); overflow: hidden; margin-bottom: var(--space-4); }
 .file-table-header {
     display: flex; align-items: center; gap: var(--space-3);
     padding: var(--space-2) var(--space-4); background: var(--sunken); border-bottom: 1px solid var(--border);
