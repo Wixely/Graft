@@ -27,6 +27,11 @@ x-hardening: &hardening
 services:
   graft:
     <<: *hardening
+    # Named, so compose tags what it builds and uses what you tagged. Without this compose invents a name
+    # from the directory and the service, a separately built `--tag` is never referenced, and `up` quietly
+    # runs whatever it built first. Naming it also means both services share one image rather than compose
+    # building the same Containerfile twice under two invented names.
+    image: ${GRAFT_IMAGE:-graft:local}
     build:
       context: ../..
       dockerfile: deploy/container/Containerfile
@@ -79,6 +84,8 @@ services:
     <<: *hardening
     profiles:
       - mcp
+    # The same image as the forge. One build, two entrypoints.
+    image: ${GRAFT_IMAGE:-graft:local}
     build:
       context: ../..
       dockerfile: deploy/container/Containerfile

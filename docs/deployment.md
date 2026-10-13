@@ -71,7 +71,11 @@ podman compose --file deploy/container/compose.yaml build
 podman compose --file deploy/container/compose.yaml up --detach
 ```
 
-Build **through compose**, not with a separate `build --tag`. The compose services carry their own `build:` section, so compose builds and uses its own image and a separately tagged one is ignored, with its own layer cache. A tagged image that looks current while compose keeps running an older one is an afternoon nobody gets back; `compose build --no-cache` settles it when a published binary has changed and the running container has not.
+Both services name the image they run, through `GRAFT_IMAGE`, defaulting to `graft:local`. That matters more than it looks. A compose service with only a `build:` section and no `image:` makes compose invent a name from the project directory and the service, so an image you built and tagged yourself is never referenced, and `up` runs whatever compose built first regardless of what changed underneath. Naming it means `podman build --tag graft:local .` and `compose build` produce the same thing, and either is what runs. It also means one image serves both services rather than compose building the same Containerfile twice.
+
+`up` still does not rebuild on its own. After republishing a binary, run `compose build` again, or `up --build`. Where an image looks current and the container disagrees, `compose build --no-cache` settles it.
+
+Set `GRAFT_IMAGE` to a registry path to push a built image and pull it elsewhere.
 
 Compose mounts the certificate and password as read-only secrets. **Those files must be readable by UID 1654.** Compose secrets outside swarm are host bind mounts, so the file's own ownership and mode are what the container sees, and a root-only `0600` key produces a startup failure reading `Access to the path '/run/secrets/graft-tls.pfx' is denied`.
 
