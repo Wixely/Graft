@@ -25,6 +25,9 @@ string gitConfig = Path.Combine(root, "empty.gitconfig");
 Directory.CreateDirectory(root);
 File.WriteAllText(gitConfig, "");
 int assertions = 0;
+// Flipped between server restarts, because the operator switch is not something a running server can be
+// asked to change: the point of it is that it is decided before the process starts.
+bool publicBrowsing = false;
 Process? server = null;
 Task? outputReader = null;
 Task<string>? errorReader = null;
@@ -196,6 +199,8 @@ try
         Check(await pending.FindReadyProjectAsync("alice", "interrupted") is null, "pending project is not exposed");
     }
 
+    await CheckPublicBrowsing(address, aliceIdentity);
+
     Console.WriteLine($"RESULT: PASS; assertions: {assertions}");
     Console.WriteLine("BOUNDARY: loopback HTTPS with an ephemeral untrusted certificate; one writer process and bounded repositories.");
     return 0;
@@ -269,6 +274,8 @@ ProcessStartInfo ServerStart()
     start.ArgumentList.Add(databasePath);
     start.ArgumentList.Add("--repositories");
     start.ArgumentList.Add(repositoriesRoot);
+    start.ArgumentList.Add("--public-browsing");
+    start.ArgumentList.Add(publicBrowsing ? "true" : "false");
     return start;
 }
 
@@ -437,6 +444,184 @@ async Task CheckApi(string address, string apiToken, string readApiToken, string
         Check(unsupported.StatusCode == System.Net.HttpStatusCode.NotFound && unsupported.Content.Headers.ContentType?.MediaType == "application/json",
             "unknown API route returns JSON 404");
     }
+}
+
+/// <summary>
+/// Publishing, and the two ways a project can become readable without credentials. The repository's
+/// visibility opens the whole repository including clone; a published page opens a curated surface and
+/// nothing that walks the object graph. Both are asserted from the outside, with no session and no token,
+/// because that is the only vantage point from which "not available" can be believed.
+/// </summary>
+async Task CheckPublicBrowsing(string address, AuthenticatedIdentity alice)
+{
+    long cardId;
+    TokenGrant pushToken;
+
+    // Rows are written straight through the store while the server is still refusing to publish anything.
+    // That is deliberate: it reproduces a database that was published on one host and carried to another,
+    // and it is the only way to prove the operator switch withdraws a grant the data still claims.
+    await using (GraftStore fixture = await GraftStore.OpenAsync(databasePath))
+    {
+        ProjectInfo open = await fixture.CreateProjectWithRepositoryAsync(alice, "open", "Open source",
+            (created, token) => { token.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, created.StorageId)); return Task.CompletedTask; },
+            "Readable by anyone.");
+        ProjectInfo hidden = await fixture.CreateProjectWithRepositoryAsync(alice, "hidden", "Unlisted project",
+            (created, token) => { token.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, created.StorageId)); return Task.CompletedTask; },
+            "Reachable only by its path.");
+        ProjectInfo card = await fixture.CreateProjectWithRepositoryAsync(alice, "card", "Page only",
+            (created, token) => { token.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, created.StorageId)); return Task.CompletedTask; },
+            "A page over a private repository.");
+        cardId = card.Id;
+
+        await fixture.SetProjectVisibilityAsync(alice, open.Id, ProjectVisibility.Public);
+        await fixture.SetProjectVisibilityAsync(alice, hidden.Id, ProjectVisibility.Unlisted);
+        await fixture.SetPagePublishedAsync(alice, card.Id, true);
+        pushToken = await fixture.CreateTokenAsync(alice, "publish-push", TokenScope.WriteRepository, DateTimeOffset.UtcNow.AddHours(1));
+
+        // The store's own view of the precedence rule, before any of it is routed through HTTP.
+        PermissionDecision anonymousOpen = await fixture.GetPermissionAsync(null, open.Id, ProjectAction.FetchRepository);
+        Check(anonymousOpen.Allowed && anonymousOpen.Grant == AccessGrant.Repository,
+            "a public repository grants an anonymous fetch through visibility");
+        PermissionDecision anonymousPush = await fixture.GetPermissionAsync(null, open.Id, ProjectAction.PushRepository);
+        Check(!anonymousPush.Allowed, "a public repository still refuses an anonymous push");
+        PermissionDecision ownerOpen = await fixture.GetPermissionAsync(alice, open.Id, ProjectAction.PushRepository);
+        Check(ownerOpen.Allowed && ownerOpen.Grant == AccessGrant.Member,
+            "the owner of a public project is still a member, not a visitor");
+        PermissionDecision cardBrowse = await fixture.GetPermissionAsync(null, card.Id, ProjectAction.BrowseRepository);
+        Check(!cardBrowse.Allowed, "a published page does not open the repository behind it");
+        PermissionDecision cardPage = await fixture.GetPermissionAsync(null, card.Id, ProjectAction.ReadPage);
+        Check(cardPage.Allowed && cardPage.Grant == AccessGrant.Page,
+            "a published page grants only the page");
+        PermissionDecision hiddenPage = await fixture.GetPermissionAsync(null, hidden.Id, ProjectAction.ReadPage);
+        Check(hiddenPage.Allowed && hiddenPage.Grant == AccessGrant.Repository,
+            "an unlisted repository is read through visibility, not through a page");
+    }
+
+    string origin = address.TrimEnd('/');
+
+    // With publishing disabled, every one of those stored rows is inert.
+    using (HttpResponseMessage browse = await ApiGet(address, "/api/browse", null))
+        Check(browse.StatusCode == HttpStatusCode.NotFound, "the public listing is absent until an operator enables it");
+    using (HttpResponseMessage page = await ApiGet(address, "/api/browser/projects/alice/open", null))
+        Check(page.StatusCode == HttpStatusCode.NotFound, "a stored public project is not served while publishing is disabled");
+    await GitFails(root, ["ls-remote", origin + "/alice/open.git"],
+        "a stored public repository does not clone while publishing is disabled");
+
+    // Now the operator allows it, and the same rows start meaning what they say.
+    await StopServer();
+    publicBrowsing = true;
+    address = await StartServer();
+    origin = address.TrimEnd('/');
+
+    // Content, so the assertions below read a repository rather than an empty one.
+    string source = Path.Combine(root, "publish-source");
+    Directory.CreateDirectory(source);
+    await Git(source, ["init", "--initial-branch=main"]);
+    File.WriteAllText(Path.Combine(source, "README.md"), "# Open source\n\nAnyone may read this.\n");
+    await Git(source, ["add", "."]);
+    await Git(source, ["commit", "-m", "Public initial commit"]);
+    await Git(source, ["remote", "add", "origin", AuthenticatedUrl(address, "alice", pushToken.Secret, "alice/open.git")]);
+    await Git(source, ["push", "origin", "main"]);
+    // The unlisted project gets the same content, so the assertion below tests who may read it rather than
+    // whether an empty repository has a tree to show.
+    await Git(source, ["remote", "add", "unlisted", AuthenticatedUrl(address, "alice", pushToken.Secret, "alice/hidden.git")]);
+    await Git(source, ["push", "unlisted", "main"]);
+
+    // Anonymous clone, which is the whole point of public visibility and the one thing a page can never do.
+    await Git(root, ["clone", "--no-checkout", origin + "/alice/open.git", "anonymous-clone"]);
+    Check(Directory.Exists(Path.Combine(root, "anonymous-clone", ".git")), "a public repository clones with no credentials");
+    await Git(root, ["ls-remote", origin + "/alice/hidden.git"]);
+    Check(true, "an unlisted repository is reachable by its path with no credentials");
+    await GitFails(root, ["ls-remote", origin + "/alice/card.git"],
+        "a published page does not make its repository cloneable");
+    await GitFails(root, ["ls-remote", origin + "/carol/private.git"],
+        "a private repository is still refused with no credentials");
+
+    // The listing. Public and page-only appear; unlisted does not, which is the whole of what unlisted means.
+    using (HttpResponseMessage response = await ApiGet(address, "/api/browse", null))
+    {
+        Check(response.IsSuccessStatusCode, "the public listing is served with no credentials");
+        using JsonDocument body = JsonDocument.Parse(await response.Content.ReadAsStreamAsync());
+        string[] paths = [.. body.RootElement.GetProperty("projects").EnumerateArray()
+            .Select(item => item.GetProperty("path").GetString()!)];
+        Check(paths.Contains("alice/open"), "a public project is listed");
+        Check(paths.Contains("alice/card"), "a project that publishes only a page is listed");
+        Check(!paths.Contains("alice/hidden"), "an unlisted project is never listed");
+        Check(!paths.Contains("alice/durable") && !paths.Contains("carol/private"), "a private project is never listed");
+        JsonElement card = body.RootElement.GetProperty("projects").EnumerateArray()
+            .Single(item => item.GetProperty("path").GetString() == "alice/card");
+        Check(card.GetProperty("source_public").GetBoolean() is false,
+            "a page-only project does not claim its source is public");
+        Check(body.RootElement.GetProperty("projects").EnumerateArray()
+            .Single(item => item.GetProperty("path").GetString() == "alice/open")
+            .GetProperty("source_public").GetBoolean(), "a public project reports that its source is public");
+    }
+
+    // Search answers over the published set only, so it cannot become a way to confirm a private project.
+    using (HttpResponseMessage hit = await ApiGet(address, "/api/browse?search=Readable", null))
+    {
+        using JsonDocument body = JsonDocument.Parse(await hit.Content.ReadAsStreamAsync());
+        Check(body.RootElement.GetProperty("projects").GetArrayLength() == 1 &&
+            body.RootElement.GetProperty("projects")[0].GetProperty("path").GetString() == "alice/open",
+            "search matches a published description");
+    }
+    using (HttpResponseMessage miss = await ApiGet(address, "/api/browse?search=durable", null))
+    {
+        using JsonDocument body = JsonDocument.Parse(await miss.Content.ReadAsStreamAsync());
+        Check(body.RootElement.GetProperty("projects").GetArrayLength() == 0, "search does not reach a private project");
+    }
+    // A caller-supplied wildcard would otherwise match everything, which is what makes this worth asserting
+    // rather than assuming: the pattern is escaped, so the percent is searched for as a character.
+    using (HttpResponseMessage wildcard = await ApiGet(address, "/api/browse?search=%25", null))
+    {
+        using JsonDocument body = JsonDocument.Parse(await wildcard.Content.ReadAsStreamAsync());
+        Check(body.RootElement.GetProperty("projects").GetArrayLength() == 0, "a wildcard in a search is searched for, not interpreted");
+    }
+
+    // The repository view, anonymously. Public and unlisted open; page-only and private do not.
+    using (HttpResponseMessage open = await ApiGet(address, "/api/browser/projects/alice/open", null))
+    {
+        Check(open.IsSuccessStatusCode, "a public project opens with no credentials");
+        using JsonDocument body = JsonDocument.Parse(await open.Content.ReadAsStreamAsync());
+        Check(body.RootElement.GetProperty("project").GetProperty("visibility").GetString() == "public",
+            "the project reports the visibility it actually has");
+        Check(body.RootElement.GetProperty("can_push").GetBoolean() is false &&
+            body.RootElement.GetProperty("can_manage").GetBoolean() is false,
+            "a visitor is offered neither push nor management");
+        Check(body.RootElement.GetProperty("readme").ValueKind != JsonValueKind.Null,
+            "a public project renders its README for a visitor");
+    }
+    using (HttpResponseMessage hidden = await ApiGet(address, "/api/browser/projects/alice/hidden", null))
+        Check(hidden.IsSuccessStatusCode, "an unlisted project opens for anyone holding its path");
+    using (HttpResponseMessage card = await ApiGet(address, "/api/browser/projects/alice/card", null))
+        Check(card.StatusCode == HttpStatusCode.NotFound, "a page-only project refuses the repository view");
+    using (HttpResponseMessage secret = await ApiGet(address, "/api/browser/projects/carol/private", null))
+        Check(secret.StatusCode == HttpStatusCode.NotFound, "a private project refuses the repository view");
+    using (HttpResponseMessage absent = await ApiGet(address, "/api/browser/projects/alice/no-such-project", null))
+        Check(absent.StatusCode == HttpStatusCode.NotFound, "a project that does not exist is refused identically");
+
+    // A diff prints file contents, so it follows the repository and never a page.
+    using (HttpResponseMessage diff = await ApiGet(address, "/api/browser/projects/" + cardId + "/commit/" + new string('0', 40), null))
+        Check(diff.StatusCode == HttpStatusCode.NotFound, "a page-only project refuses a commit diff");
+
+    // The REST surface answers an anonymous caller for a public project, and no token is a different thing
+    // from a token that does not resolve.
+    using (HttpResponseMessage rest = await ApiGet(address, "/api/v4/projects/alice%2Fopen", null))
+        Check(rest.IsSuccessStatusCode, "the REST project route answers a public project without a token");
+    using (HttpResponseMessage restPrivate = await ApiGet(address, "/api/v4/projects/carol%2Fprivate", null))
+        Check(restPrivate.StatusCode == HttpStatusCode.NotFound, "the REST project route conceals a private project from a visitor");
+    using (HttpResponseMessage badToken = await ApiGet(address, "/api/v4/projects/alice%2Fopen", "graft_pat_" + new string('0', 64)))
+        Check(badToken.StatusCode == HttpStatusCode.Unauthorized,
+            "a token that does not resolve is an error rather than an anonymous request");
+    using (HttpResponseMessage tree = await ApiGet(address, "/api/v4/projects/alice%2Fopen/repository/tree?ref=main", null))
+        Check(tree.IsSuccessStatusCode, "a public project's tree is readable without a token");
+    using (HttpResponseMessage cardTree = await ApiGet(address, "/api/v4/projects/alice%2Fcard/repository/tree?ref=main", null))
+        Check(cardTree.StatusCode == HttpStatusCode.NotFound, "a page-only project's tree is refused without a token");
+
+    // An avatar route is a cheap way to ask which accounts exist, so one that has no avatar is a 404 whether
+    // or not the account is real.
+    using (HttpResponseMessage ownerAvatar = await ApiGet(address, "/api/graft/avatars/user/" + alice.UserId, null))
+        Check(ownerAvatar.StatusCode == HttpStatusCode.NotFound, "an owner with no avatar set is still a 404");
 }
 
 async Task<HttpResponseMessage> ApiGet(string address, string path, string? token)

@@ -4,7 +4,7 @@ namespace Graft.Storage;
 
 public static class GraftSchema
 {
-    public static DnaXMigrationManifest Manifest { get; } = new(3,
+    public static DnaXMigrationManifest Manifest { get; } = new(4,
     [
         DnaXMigration.Sql(1, "initial-identity-project-schema", "Create identity and private project schema", """
             CREATE TABLE Users (
@@ -95,6 +95,22 @@ public static class GraftSchema
         // A stored name is a preference, not a guarantee; the branch can be deleted after it is chosen.
         DnaXMigration.Sql(3, "project-default-branch", "Let a project choose its default branch", """
             ALTER TABLE Projects ADD COLUMN DefaultBranch TEXT NULL;
+            """),
+        // Both columns default to the closed value, so every project that existed before this migration stays
+        // exactly as private as it was. Publishing is never a side effect of an upgrade.
+        //
+        // Visibility and PagePublished are separate on purpose: a private repository may publish a curated
+        // page without publishing its source, which is the case the request describes. They are stored here
+        // rather than read from the repository's own .graft config because publishing is a Maintainer
+        // decision and pushing a commit is a Developer one; a config that could set these would let a
+        // Developer publish a private project by pushing to it.
+        DnaXMigration.Sql(4, "project-visibility", "Give a project a stored visibility and a publishable page", """
+            ALTER TABLE Projects ADD COLUMN Visibility TEXT NOT NULL DEFAULT 'private'
+                CHECK (Visibility IN ('private', 'unlisted', 'public'));
+            ALTER TABLE Projects ADD COLUMN PagePublished INTEGER NOT NULL DEFAULT 0
+                CHECK (PagePublished IN (0, 1));
+
+            CREATE INDEX IX_Projects_Published ON Projects(Visibility, PagePublished);
             """)
     ]);
 }

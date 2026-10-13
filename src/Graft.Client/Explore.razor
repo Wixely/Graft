@@ -1,0 +1,173 @@
+@* The public browser. Readable with no account, and it shows every reader the same thing: a project appears
+   here because its source is public or because it publishes a page, and an unlisted project never appears at
+   all. Searching is a server query rather than a client filter, because the client is never sent the set it
+   would have to filter. *@
+@page "/-/explore"
+@inject GraftApi Api
+@inject NavigationManager Navigation
+
+<PageTitle>Explore &middot; Graft</PageTitle>
+
+<div class="page-header">
+    <div>
+        <h1>Explore</h1>
+        <p class="subtitle">Projects published on this instance.</p>
+    </div>
+</div>
+
+@if (!Api.Reachable)
+{
+    <div class="panel"><p class="panel-empty">Graft could not be reached.</p></div>
+}
+else if (unavailable)
+{
+    <div class="panel">
+        <p class="panel-empty">
+            This server does not publish a public listing. Sign in to see the projects you have access to.
+        </p>
+    </div>
+}
+else
+{
+    <div class="panel">
+        <div class="panel-body">
+            <form class="form" @onsubmit="Search" @onsubmit:preventDefault role="search">
+                <label for="explore-search">Search published projects</label>
+                <div class="form-actions">
+                    <input id="explore-search" type="search" @bind="search" maxlength="200"
+                           placeholder="Name, path, owner or description" />
+                    <button type="submit" disabled="@busy">@(busy ? "Searching…" : "Search")</button>
+                    @if (submitted.Length > 0)
+                    {
+                        <button type="button" class="secondary" @onclick="Clear" disabled="@busy">Clear</button>
+                    }
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <div class="panel">
+        <div class="panel-header">
+            <h2>@(submitted.Length == 0 ? "Published projects" : "Results for " + submitted)</h2>
+            <span class="spacer"></span>
+            <span class="label">@total</span>
+        </div>
+        @if (loading)
+        {
+            <p class="panel-empty" role="status">Loading…</p>
+        }
+        else if (entries.Count == 0)
+        {
+            <p class="panel-empty">
+                @(submitted.Length == 0 ? "Nothing is published here yet." : "No published project matches that search.")
+            </p>
+        }
+        else
+        {
+            <div class="list">
+                @foreach (BrowseEntryResponse entry in entries)
+                {
+                    <a class="list-item" href="@("/" + entry.Path)">
+                        <Avatar Url="@entry.AvatarUrl" Name="@entry.Name" />
+                        <span class="list-item-main">
+                            <strong>@entry.Name</strong>
+                            <small class="mono">@entry.Path</small>
+                            @if (entry.Description.Length > 0) { <small>@entry.Description</small> }
+                        </span>
+                        <span class="list-item-actions">
+                            @* Said plainly, because "public" on a card next to a project whose code is not
+                               readable would be read as an offer of the code. *@
+                            <span class="label @(entry.SourcePublic ? "accent" : "")">
+                                @(entry.SourcePublic ? "source public" : "page only")
+                            </span>
+                        </span>
+                    </a>
+                }
+            </div>
+        }
+        @if (pages > 1)
+        {
+            <div class="panel-body">
+                <div class="form-actions">
+                    <button type="button" class="secondary" @onclick="() => Go(page - 1)" disabled="@(busy || page <= 1)">
+                        <Icon Name="chevron-left" />Previous
+                    </button>
+                    <span class="secondary-text">Page @(page) of @pages</span>
+                    <button type="button" class="secondary" @onclick="() => Go(page + 1)" disabled="@(busy || page >= pages)">
+                        Next<Icon Name="chevron-right" />
+                    </button>
+                </div>
+            </div>
+        }
+    </div>
+}
+
+@code {
+    private readonly List<BrowseEntryResponse> entries = [];
+    private string search = "";
+    private string submitted = "";
+    private long total;
+    private int page = 1;
+    private int perPage = 24;
+    private bool loading = true;
+    private bool busy;
+    private bool unavailable;
+
+    private int pages => perPage <= 0 ? 1 : (int)Math.Max(1, (total + perPage - 1) / perPage);
+
+    protected override async Task OnInitializedAsync()
+    {
+        await Api.EnsureSessionAsync();
+        await Fetch();
+    }
+
+    private Task Search()
+    {
+        submitted = search.Trim();
+        page = 1;
+        return Fetch();
+    }
+
+    private Task Clear()
+    {
+        search = "";
+        submitted = "";
+        page = 1;
+        return Fetch();
+    }
+
+    private Task Go(int target)
+    {
+        if (target < 1 || target > pages) return Task.CompletedTask;
+        page = target;
+        return Fetch();
+    }
+
+    private async Task Fetch()
+    {
+        busy = true;
+        try
+        {
+            string query = "api/browse?page=" + page +
+                (submitted.Length == 0 ? "" : "&search=" + Uri.EscapeDataString(submitted));
+            (bool reached, BrowseResponse? response) = await Api.GetOptionalAsync(query, ApiJson.Default.BrowseResponse);
+            // A refusal here means the operator has not enabled public browsing, which is a property of the
+            // server rather than a failure of this request, so it is said once instead of looking like an error.
+            if (reached && response is null) unavailable = true;
+            if (response is not null)
+            {
+                unavailable = false;
+                entries.Clear();
+                entries.AddRange(response.Projects);
+                total = response.Total;
+                perPage = response.PerPage;
+                page = response.Page;
+            }
+        }
+        finally
+        {
+            busy = false;
+            loading = false;
+        }
+    }
+}

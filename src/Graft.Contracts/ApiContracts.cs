@@ -88,7 +88,10 @@ public sealed record SessionResponse(
     bool IsAdministrator,
     string Csrf,
     long UserId,
-    [property: JsonPropertyName("avatar_url")] string? AvatarUrl);
+    [property: JsonPropertyName("avatar_url")] string? AvatarUrl,
+    /// <summary>Whether this server's operator permits publishing and serves a public listing. A property of
+    /// the server, not of the caller, so it is reported to an anonymous caller as well.</summary>
+    bool PublicBrowsing = false);
 public sealed record LoginRequest(string Username, string Password);
 public sealed record UserCreateRequest(string Username, string Password);
 public sealed record UserAccountResponse(long Id, string Username, bool IsAdministrator, bool Disabled);
@@ -205,7 +208,39 @@ public sealed record RepositoryPageResponse(
     IReadOnlyList<CommitResponse> Commits,
     IReadOnlyList<TreeEntryResponse> Tree,
     FileResponse? File,
-    ReadmeResponse? Readme);
+    ReadmeResponse? Readme,
+    /// <summary>Whether the curated project page is published. The repository's own visibility is reported
+    /// by <see cref="ProjectResponse.Visibility"/>; these are separate settings, because a page may stand
+    /// over a private repository.</summary>
+    bool PagePublished,
+    /// <summary>Whether this server's operator permits publishing at all. False hides the controls rather
+    /// than offering a choice the server would refuse.</summary>
+    bool PublishingAllowed);
+
+public sealed record VisibilityRequest(string? Visibility);
+public sealed record PagePublishRequest(bool Published);
+
+/// <summary>One card in the public browser. Deliberately not the GitLab project shape: it carries only what
+/// a stranger is shown, so there is no field here that could accidentally describe a private project.</summary>
+public sealed record BrowseEntryResponse(
+    long Id,
+    string Name,
+    string Path,
+    string Namespace,
+    string Description,
+    string? AvatarUrl,
+    string WebUrl,
+    DateTimeOffset CreatedAt,
+    string Visibility,
+    /// <summary>Whether the source itself is public. False means this project is listed because it publishes
+    /// a page, and its repository is not readable.</summary>
+    bool SourcePublic);
+
+public sealed record BrowseResponse(
+    IReadOnlyList<BrowseEntryResponse> Projects,
+    long Total,
+    int Page,
+    int PerPage);
 
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower)]
 [JsonSerializable(typeof(UserResponse))]
@@ -239,4 +274,7 @@ public sealed record RepositoryPageResponse(
 [JsonSerializable(typeof(RepositoryCommitRequest))]
 [JsonSerializable(typeof(RepositoryCommitResponse))]
 [JsonSerializable(typeof(UploadStatusResponse))]
+[JsonSerializable(typeof(VisibilityRequest))]
+[JsonSerializable(typeof(PagePublishRequest))]
+[JsonSerializable(typeof(BrowseResponse))]
 public partial class ApiJson : JsonSerializerContext;

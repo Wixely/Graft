@@ -57,6 +57,33 @@ try
             });
         token = await fixture.CreateTokenAsync(identity, "browser-fixture", TokenScope.WriteRepository,
             DateTimeOffset.UtcNow.AddHours(2));
+
+        // Three more projects, one for each way a project can be published, so the public browser has
+        // something to list and the difference between them is visible rather than described.
+        ProjectInfo open = await fixture.CreateProjectWithRepositoryAsync(identity, "open", "Open source",
+            (created, cancellationToken) =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, created.StorageId));
+                return Task.CompletedTask;
+            }, "Readable by anyone, and listed for everyone.");
+        ProjectInfo unlisted = await fixture.CreateProjectWithRepositoryAsync(identity, "unlisted", "Unlisted project",
+            (created, cancellationToken) =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, created.StorageId));
+                return Task.CompletedTask;
+            }, "Reachable only by its path.");
+        ProjectInfo card = await fixture.CreateProjectWithRepositoryAsync(identity, "page-only", "Page only",
+            (created, cancellationToken) =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, created.StorageId));
+                return Task.CompletedTask;
+            }, "A published page over a private repository.");
+        await fixture.SetProjectVisibilityAsync(identity, open.Id, ProjectVisibility.Public);
+        await fixture.SetProjectVisibilityAsync(identity, unlisted.Id, ProjectVisibility.Unlisted);
+        await fixture.SetPagePublishedAsync(identity, card.Id, true);
     }
 
     string address = await StartServer();
@@ -129,6 +156,10 @@ async Task<string> StartServer()
     start.ArgumentList.Add(databasePath);
     start.ArgumentList.Add("--repositories");
     start.ArgumentList.Add(repositoriesRoot);
+    // Publishing is on in the fixture so the public browser and the visibility controls can be looked at.
+    // It is off by default in the product, and a fixture is not a deployment.
+    start.ArgumentList.Add("--public-browsing");
+    start.ArgumentList.Add("true");
     server = Process.Start(start)!;
     Process active = server;
     errorReader = active.StandardError.ReadToEndAsync();

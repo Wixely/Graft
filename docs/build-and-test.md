@@ -50,6 +50,23 @@ The current extension adds administrator user creation and account lifecycle, ow
 
 The same harness now also covers README rendering, which is the one place repository content becomes markup. Its corpus is pushed as real repository content on a branch of its own and read back through the browser endpoint, so the assertions run against the whole path rather than against the renderer in isolation. Half the corpus is hostile and must not survive; the other half is ordinary markdown and must not be flattened, because a renderer that escaped everything would satisfy every attack case and still be useless. See [README rendering evidence](validation/2026-10-04-readme-rendering.md).
 
+The same harness also covers visibility and the public browser, in both operator states. It writes public,
+unlisted and page-published rows straight through the store while the server is still refusing to publish, so
+the assertions can show that the operator switch withdraws a grant the stored data still claims, then
+restarts the server with publishing enabled and asserts the same rows now mean what they say. Every one of
+those assertions runs with no session and no token, because that is the only vantage point from which "not
+available" can be believed. See [visibility evidence](validation/2026-10-13-visibility-and-public-browsing.md).
+
+Publishing is off unless an operator turns it on:
+
+```powershell
+dotnet src\Graft.Server\bin\Debug\net10.0\Graft.Server.dll --database <path> --repositories <dir> --public-browsing true
+```
+
+With it off, a project cannot be made public, the listing at `/api/browse` answers 404, and a stored public
+row is inert. The browser fixture passes `true` so the public listing and the visibility controls can be
+looked at; a fixture is not a deployment.
+
 The diff engine is measured against real Git rather than only against fixed fixtures. The fuzz harness
 generates file pairs from a deliberately repetitive alphabet, because repeated and blank lines are what make
 a change's placement ambiguous, and compares every resulting diff with `git diff`:

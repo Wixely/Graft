@@ -31,7 +31,7 @@ if (args.Length == 1 && args[0] == "--licences")
 
 if (!Arguments.TryParse(args, out Arguments? parsedSettings))
 {
-    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>].");
+    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false].");
     Console.Error.WriteLine("       Graft.Server --licences  prints the third-party notices this build redistributes.");
     return 2;
 }
@@ -43,7 +43,10 @@ await using GraftStore store = await GraftStore.OpenAsync(settings.Database);
 WebAssets assets = new();
 ConcurrentDictionary<string, Lazy<RepositoryEndpoint>> repositories = new(StringComparer.Ordinal);
 byte[] csrfKey = RandomNumberGenerator.GetBytes(32);
-LoginThrottle loginThrottle = new();
+RequestThrottle loginThrottle = new(20);
+// Looser than login because a single reader opening the front page and typing a search spends several of
+// these, and far tighter than unbounded because the route answers without credentials.
+RequestThrottle browseThrottle = new(240);
 string? serverOrigin = null;
 const string SessionCookie = "__Host-graft-session";
 
@@ -150,7 +153,7 @@ app.MapGet("/api/session", async context =>
     if (!await OnlyQuery(context)) return;
     (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: false);
     SessionResponse response;
-    if (browser is null) response = new(false, null, false, "", 0, null);
+    if (browser is null) response = new(false, null, false, "", 0, null, settings.PublicBrowsing);
     else
     {
         long userId = browser.Value.Identity.UserId;
@@ -158,7 +161,7 @@ app.MapGet("/api/session", async context =>
             ? AvatarUrl(context, AvatarOwner.User, userId)
             : null;
         response = new(true, browser.Value.Identity.Username, browser.Value.Identity.IsAdministrator,
-            Csrf(browser.Value.Secret), userId, avatarUrl);
+            Csrf(browser.Value.Secret), userId, avatarUrl, settings.PublicBrowsing);
     }
     await context.Response.WriteAsJsonAsync(response, ApiJson.Default.SessionResponse, null, context.RequestAborted);
 });
@@ -579,6 +582,92 @@ app.MapPost("/api/projects/{projectId:long}/default-branch", async context =>
     catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
 });
 
+// How widely a project may be read. Maintainer-equivalent, and refused outright on a server whose operator
+// has not enabled public browsing, so the closed answer cannot be stored where it would take effect later.
+app.MapPost("/api/projects/{projectId:long}/visibility", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    VisibilityRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.VisibilityRequest, context.RequestAborted);
+    if (request is null) { await ApiError(context, 400, "visibility"); return; }
+    if (!TryReadVisibility(request.Visibility, out ProjectVisibility visibility))
+    { await ApiError(context, 400, "visibility must be private, unlisted or public"); return; }
+    if (visibility != ProjectVisibility.Private && !settings.PublicBrowsing)
+    { await ApiError(context, 400, "this server does not allow projects to be published"); return; }
+
+    long projectId = Convert.ToInt64(context.Request.RouteValues["projectId"], System.Globalization.CultureInfo.InvariantCulture);
+    try
+    {
+        await store.SetProjectVisibilityAsync(browser.Value.Identity, projectId, visibility, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "project"); }
+});
+
+// Publishes or withdraws the project page: the curated surface that can stand over a private repository.
+app.MapPost("/api/projects/{projectId:long}/page", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    PagePublishRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.PagePublishRequest, context.RequestAborted);
+    if (request is null) { await ApiError(context, 400, "published"); return; }
+    if (request.Published && !settings.PublicBrowsing)
+    { await ApiError(context, 400, "this server does not allow projects to be published"); return; }
+
+    long projectId = Convert.ToInt64(context.Request.RouteValues["projectId"], System.Globalization.CultureInfo.InvariantCulture);
+    try
+    {
+        await store.SetPagePublishedAsync(browser.Value.Identity, projectId, request.Published, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "project"); }
+});
+
+// The public browser. Anonymous by design, and it answers identically for everyone: a signed-in caller sees
+// exactly what a stranger sees, so this listing can never become a way to discover a project that is not
+// published. Unlisted projects are absent, which is the whole of what makes them unlisted.
+app.MapGet("/api/browse", async context =>
+{
+    if (!await OnlyQuery(context, "search", "page")) return;
+    if (!settings.PublicBrowsing) { await ApiError(context, 404, "public browsing is not enabled on this server"); return; }
+    // Unauthenticated and therefore the cheapest oracle in the product, so it is throttled on the same
+    // mechanism as login rather than left open to be swept.
+    if (!browseThrottle.TryEnter(DateTimeOffset.UtcNow)) { await ApiError(context, 429, "browse-rate-limit"); return; }
+
+    string search = context.Request.Query["search"].ToString();
+    if (search.Length > 200) { await ApiError(context, 400, "search must be at most 200 characters"); return; }
+    string pageText = context.Request.Query["page"].ToString();
+    int page = 1;
+    if (pageText.Length > 0 && (!int.TryParse(pageText, System.Globalization.NumberStyles.None,
+        System.Globalization.CultureInfo.InvariantCulture, out page) || page is < 1 or > 1000))
+    { await ApiError(context, 400, "page"); return; }
+
+    const int perPage = 24;
+    ProjectPage projects = await store.ListPublishedProjectsAsync(search, (page - 1) * perPage, perPage, context.RequestAborted);
+    List<BrowseEntryResponse> entries = [];
+    foreach (ProjectDetails project in projects.Projects)
+    {
+        string path = project.Project.Namespace + "/" + project.Project.Slug;
+        string? avatarUrl = await store.HasAvatarAsync(AvatarOwner.Project, project.Project.Id, context.RequestAborted)
+            ? AvatarUrl(context, AvatarOwner.Project, project.Project.Id)
+            : null;
+        entries.Add(new(project.Project.Id, project.Project.Name, path, project.Project.Namespace,
+            project.Description, avatarUrl, Origin(context) + "/" + path, project.CreatedAtUtc,
+            VisibilityName(project.Project.Visibility),
+            project.Project.Visibility == ProjectVisibility.Public));
+    }
+    await context.Response.WriteAsJsonAsync(new BrowseResponse(entries.ToArray(), projects.Total, page, perPage),
+        ApiJson.Default.BrowseResponse, null, context.RequestAborted);
+});
+
 app.MapDelete("/api/projects/{projectId:long}/members/{userId:long}", async context =>
 {
     if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
@@ -645,12 +734,18 @@ app.MapPost("/api/graft/avatars/{ownerType}/{ownerId:long}", async context =>
 // supplied, and the global nosniff header keeps the browser from reinterpreting it.
 app.MapMethods("/api/graft/avatars/{ownerType}/{ownerId:long}", ["GET", "HEAD"], async context =>
 {
-    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
-    if (browser is null) return;
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: false);
     if (!await OnlyQuery(context)) return;
     if (!TryReadAvatarOwner(context, out AvatarOwner ownerType, out long ownerId)) { await ApiError(context, 404, "owner"); return; }
     if (ownerType == AvatarOwner.Project &&
-        !(await store.GetPermissionAsync(browser.Value.Identity, ownerId, ProjectAction.BrowseRepository, context.RequestAborted)).Allowed)
+        !(await DecideFor(context, browser?.Identity, ownerId, ProjectAction.ReadPage)).Allowed)
+    { await ApiError(context, 404, "owner"); return; }
+    // A user avatar is readable without credentials only for someone who owns a published project, because
+    // the public listing already names them. Opening every account's avatar to anonymous callers would turn
+    // this route into a way to enumerate which accounts exist, on a server whose accounts are otherwise
+    // administrator-only knowledge.
+    if (ownerType == AvatarOwner.User && browser is null &&
+        !(settings.PublicBrowsing && await store.HasPublishedProjectAsync(ownerId, context.RequestAborted)))
     { await ApiError(context, 404, "owner"); return; }
 
     StoredAvatar? avatar = await store.GetAvatarAsync(ownerType, ownerId, context.RequestAborted);
@@ -674,13 +769,12 @@ app.MapMethods("/api/graft/avatars/{ownerType}/{ownerId:long}", ["GET", "HEAD"],
 // refused with everything else, which is what stops a repository serving script from this origin.
 app.MapMethods("/api/graft/projects/{projectId:long}/image", ["GET", "HEAD"], async context =>
 {
-    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
-    if (browser is null) return;
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: false);
     if (!await OnlyQuery(context, "ref", "path")) return;
     long projectId = Convert.ToInt64(context.Request.RouteValues["projectId"], System.Globalization.CultureInfo.InvariantCulture);
     ProjectDetails? details = await store.GetReadyProjectAsync(projectId, context.RequestAborted);
     if (details is null ||
-        !(await store.GetPermissionAsync(browser.Value.Identity, projectId, ProjectAction.BrowseRepository, context.RequestAborted)).Allowed)
+        !(await DecideFor(context, browser?.Identity, projectId, ProjectAction.BrowseRepository)).Allowed)
     { await ApiError(context, 404, "project"); return; }
 
     string revision = context.Request.Query["ref"].ToString();
@@ -729,7 +823,7 @@ app.MapPost("/api/graft/projects/{projectId:long}/repository/files", async conte
     long projectId = Convert.ToInt64(context.Request.RouteValues["projectId"], System.Globalization.CultureInfo.InvariantCulture);
     ProjectDetails? details = await store.GetReadyProjectAsync(projectId, context.RequestAborted);
     if (details is null ||
-        !(await store.GetPermissionAsync(browser.Value.Identity, projectId, ProjectAction.PushRepository, context.RequestAborted)).Allowed)
+        !(await DecideFor(context, browser.Value.Identity, projectId, ProjectAction.PushRepository)).Allowed)
     { await ApiError(context, 404, "project"); return; }
 
     DiskUploadStore uploads = context.RequestServices.GetRequiredService<DiskUploadStore>();
@@ -773,14 +867,18 @@ app.MapPost("/api/graft/projects/{projectId:long}/repository/files", async conte
     });
 });
 
-app.MapGet("/api/browser/projects/{projectId:long}", async context =>
+// The repository view. Reachable by numeric id and by path, because a reader who arrives at /alice/thing
+// with no credentials has no way to learn the id: the listing that would have told them is precisely the
+// thing a stranger cannot read.
+Func<HttpContext, ProjectDetails?, Task> browseProject = async (context, details) =>
 {
-    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
-    if (browser is null) return;
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: false);
     if (!await OnlyQuery(context, "ref", "path", "file")) return;
-    long projectId = Convert.ToInt64(context.Request.RouteValues["projectId"], System.Globalization.CultureInfo.InvariantCulture);
-    ProjectDetails? details = await store.GetReadyProjectAsync(projectId, context.RequestAborted);
-    if (details is null || !(await store.GetPermissionAsync(browser.Value.Identity, projectId, ProjectAction.BrowseRepository, context.RequestAborted)).Allowed)
+    long projectId = details?.Project.Id ?? 0;
+    // BrowseRepository, not ReadPage: this route walks the tree, lists branches and reads history, so it is
+    // a repository surface. A caller whose only grant is a published page is refused here and reads the page
+    // route instead, because a path allowlist cannot be honoured by a listing that enumerates the tree.
+    if (details is null || !(await DecideFor(context, browser?.Identity, projectId, ProjectAction.BrowseRepository)).Allowed)
     { await ApiError(context, 404, "project"); return; }
     string revision = context.Request.Query["ref"].ToString();
     if (revision.Length == 0) revision = "HEAD";
@@ -794,8 +892,8 @@ app.MapGet("/api/browser/projects/{projectId:long}", async context =>
         GitFile? file = filePath.Length == 0 ? null : RepositoryView.File(repository, revision, filePath);
         if (filePath.Length > 0 && file is null) { await ApiError(context, 404, "file"); return; }
         ProjectResponse project = await ProjectResponseForLocked(context, details, repository);
-        PermissionDecision manage = await store.GetPermissionAsync(browser.Value.Identity, projectId, ProjectAction.ManageProject, context.RequestAborted);
-        PermissionDecision push = await store.GetPermissionAsync(browser.Value.Identity, projectId, ProjectAction.PushRepository, context.RequestAborted);
+        PermissionDecision manage = await DecideFor(context, browser?.Identity, projectId, ProjectAction.ManageProject);
+        PermissionDecision push = await DecideFor(context, browser?.Identity, projectId, ProjectAction.PushRepository);
         BranchResponse[] branches = RepositoryView.Branches(repository).Select(branch => new BranchResponse(
             branch.Name, false, false, branch.Name == repository.DefaultBranch, true, true, push.Allowed,
             ProjectWebUrl(context, details) + "/-/tree/" + Uri.EscapeDataString(branch.Name),
@@ -807,21 +905,34 @@ app.MapGet("/api/browser/projects/{projectId:long}", async context =>
         // The README is rendered for the root of the branch being viewed, so switching branch shows that
         // branch's README. Only the root is considered; a README deeper in the tree is an ordinary file.
         ReadmeResponse? readme = path.Length == 0 ? ReadmeFor(context, details, repository, revision) : null;
-        RepositoryPageResponse response = new(project, manage.Allowed, push.Allowed, branches, commits, entries, fileResponse, readme);
+        RepositoryPageResponse response = new(project, manage.Allowed, push.Allowed, branches, commits, entries,
+            fileResponse, readme, details.Project.PagePublished, settings.PublicBrowsing);
         await context.Response.WriteAsJsonAsync(response, ApiJson.Default.RepositoryPageResponse, null, context.RequestAborted);
     });
-});
+};
+
+app.MapGet("/api/browser/projects/{projectId:long}", async context => await browseProject(context,
+    await store.GetReadyProjectAsync(
+        Convert.ToInt64(context.Request.RouteValues["projectId"], System.Globalization.CultureInfo.InvariantCulture),
+        context.RequestAborted)));
+
+app.MapGet("/api/browser/projects/{projectNamespace}/{slug}", async context => await browseProject(context,
+    await store.FindReadyProjectDetailsAsync(
+        context.Request.RouteValues["projectNamespace"]?.ToString() ?? "",
+        context.Request.RouteValues["slug"]?.ToString() ?? "",
+        context.RequestAborted)));
 
 // What a commit changed. Every commit the API reports already carries a web URL pointing here, so this is
 // the page behind a link the product has been handing out all along.
 app.MapGet("/api/browser/projects/{projectId:long}/commit/{sha}", async context =>
 {
-    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
-    if (browser is null) return;
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: false);
     if (!await OnlyQuery(context, "parent")) return;
     long projectId = Convert.ToInt64(context.Request.RouteValues["projectId"], System.Globalization.CultureInfo.InvariantCulture);
     ProjectDetails? details = await store.GetReadyProjectAsync(projectId, context.RequestAborted);
-    if (details is null || !(await store.GetPermissionAsync(browser.Value.Identity, projectId, ProjectAction.BrowseRepository, context.RequestAborted)).Allowed)
+    // A diff prints the contents of the files a commit touched, so it is a repository surface and a page
+    // grant can never reach it. Only visibility or membership opens this.
+    if (details is null || !(await DecideFor(context, browser?.Identity, projectId, ProjectAction.BrowseRepository)).Allowed)
     { await ApiError(context, 404, "project"); return; }
 
     string sha = context.Request.RouteValues["sha"]?.ToString() ?? "";
@@ -909,7 +1020,7 @@ app.MapGet("/api/v4/projects/{projectId}/repository/branches", async context =>
     await WithRepository(project.Endpoint, context, async repository =>
     {
         (string Name, string Id)[] branches = RepositoryView.Branches(repository).ToArray();
-        PermissionDecision push = await store.GetPermissionAsync(project.Identity, project.Details.Project.Id, ProjectAction.PushRepository, context.RequestAborted);
+        PermissionDecision push = await DecideFor(context, project.Identity, project.Details.Project.Id, ProjectAction.PushRepository);
         BranchResponse[] result = branches.Skip((page - 1) * perPage).Take(perPage).Select(branch =>
             new BranchResponse(branch.Name, false, false, branch.Name == repository.DefaultBranch, true, true, push.Allowed,
                 ProjectWebUrl(context, project.Details) + "/-/tree/" + Uri.EscapeDataString(branch.Name),
@@ -1073,31 +1184,47 @@ Console.WriteLine("READY: " + address);
 await app.WaitForShutdownAsync();
 return 0;
 
+/// <summary>
+/// The one place a project permission is resolved. Every route goes through here rather than calling the
+/// store directly, so the operator switch can make a stored visibility inert: a member keeps their access,
+/// and a grant that came from visibility or a published page is withdrawn.
+///
+/// <para>
+/// This matters on restore. A database published on a host whose operator allowed public browsing must not
+/// begin serving strangers when it is restored onto a host whose operator never did.
+/// </para>
+/// </summary>
+async Task<PermissionDecision> DecideFor(HttpContext context, AuthenticatedIdentity? identity, long projectId, ProjectAction action)
+{
+    PermissionDecision decision = await store.GetPermissionAsync(identity, projectId, action, context.RequestAborted);
+    if (settings.PublicBrowsing || decision.Grant is AccessGrant.Member or AccessGrant.None) return decision;
+    return new(false, null, "Public browsing disabled", "This server does not serve projects to anonymous callers.");
+}
+
 async Task<AuthorizedRepository?> Authorize(HttpContext context, ProjectAction action)
 {
     string projectNamespace = context.Request.RouteValues["projectNamespace"]?.ToString() ?? "";
     string projectSlug = context.Request.RouteValues["project"]?.ToString() ?? "";
     ProjectInfo? project = await store.FindReadyProjectAsync(projectNamespace, projectSlug, context.RequestAborted);
     AuthenticatedIdentity? identity = await Authenticate(context);
+
+    // A public or unlisted repository clones without credentials, so the decision is taken before any
+    // challenge rather than after one. Push is never granted by visibility, so a write still reaches the
+    // challenge below and the client retries with a token.
+    PermissionDecision? decision = project is null ? null : await DecideFor(context, identity, project.Id, action);
+    if (decision is { Allowed: true }) return new(project!, identity, decision, EndpointFor(project!));
+
     if (identity is null)
     {
+        // Identical whether the project is absent, private, or simply not readable by whoever is asking, so
+        // an anonymous probe still cannot tell a repository that exists from one that does not. A real
+        // client treats this as a prompt for credentials and retries.
         context.Response.StatusCode = StatusCodes.Status401Unauthorized;
         context.Response.Headers.WWWAuthenticate = "Basic realm=\"Graft Git\", charset=\"UTF-8\"";
         return null;
     }
-    if (project is null)
-    {
-        context.Response.StatusCode = StatusCodes.Status404NotFound;
-        return null;
-    }
-    PermissionDecision decision = await store.GetPermissionAsync(identity, project.Id, action, context.RequestAborted);
-    if (!decision.Allowed)
-    {
-        context.Response.StatusCode = StatusCodes.Status404NotFound;
-        return null;
-    }
-    RepositoryEndpoint endpoint = EndpointFor(project);
-    return new(project, identity, decision, endpoint);
+    context.Response.StatusCode = StatusCodes.Status404NotFound;
+    return null;
 }
 
 async Task<AuthenticatedIdentity?> Authenticate(HttpContext context)
@@ -1174,8 +1301,14 @@ async Task CreateProject(HttpContext context, AuthenticatedIdentity identity, Pr
     if (name.Length == 0) name = requestedPath;
     if (name.Length > 200) { await ApiError(context, 400, "name must be at most 200 characters"); return; }
     if (description.Length > 2_000) { await ApiError(context, 400, "description must be at most 2000 characters"); return; }
-    if (!string.Equals(visibility, "private", StringComparison.Ordinal))
-    { await ApiError(context, 400, "visibility must be private"); return; }
+    // GitLab's "internal" has no meaning here, because Graft has no concept of an instance-wide signed-in
+    // audience distinct from the public: a project is private to its members, reachable by anyone holding
+    // the path, or listed for everyone. Matching the three names Graft actually implements is more honest
+    // than accepting a fourth and quietly treating it as one of these.
+    if (!TryReadVisibility(visibility, out ProjectVisibility requested))
+    { await ApiError(context, 400, "visibility must be private, unlisted or public"); return; }
+    if (requested != ProjectVisibility.Private && !settings.PublicBrowsing)
+    { await ApiError(context, 400, "this server does not allow projects to be published"); return; }
     string path = requestedPath.Length == 0 ? ProjectPathFromName(name) : requestedPath;
     if (!ValidProjectPath(path))
     {
@@ -1191,6 +1324,10 @@ async Task CreateProject(HttpContext context, AuthenticatedIdentity identity, Pr
                 _ = EndpointFor(created);
                 return Task.CompletedTask;
             }, description, context.RequestAborted);
+        // Applied after creation rather than inside it, so a project is never briefly readable by the world
+        // while its repository is still being initialised. Creation publishes nothing on its own.
+        if (requested != ProjectVisibility.Private)
+            await store.SetProjectVisibilityAsync(identity, project.Id, requested, context.RequestAborted);
         ProjectDetails details = (await store.GetReadyProjectAsync(project.Id, context.RequestAborted))!;
         context.Response.StatusCode = StatusCodes.Status201Created;
         await context.Response.WriteAsJsonAsync(await ProjectResponseFor(context, details), ApiJson.Default.ProjectResponse, null, context.RequestAborted);
@@ -1263,10 +1400,33 @@ static string[] TokenScopeNames(TokenScope scopes)
     return names.ToArray();
 }
 
+/// <summary>
+/// Resolves a token if one was presented, without requiring that one was. A request carrying no token at all
+/// is anonymous, which a public project may still satisfy. A request carrying a token that does not resolve
+/// is an error rather than an anonymous request, because a caller who presented a credential meant to use it
+/// and should be told it is bad instead of quietly seeing less.
+/// </summary>
+async Task<(bool Failed, AuthenticatedIdentity? Identity)> AuthenticateApiOptional(HttpContext context)
+{
+    string token = context.Request.Headers["PRIVATE-TOKEN"].ToString();
+    string authorization = context.Request.Headers.Authorization.ToString();
+    if (token.Length == 0 && authorization.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+        token = authorization[7..];
+    if (token.Length == 0) return (false, null);
+
+    AuthenticatedIdentity? identity = await store.ResolveTokenAsync(token, context.RequestAborted);
+    if (identity is null)
+    {
+        await ApiError(context, 401, "401 Unauthorized");
+        return (true, null);
+    }
+    return (false, identity);
+}
+
 async Task<ApiProject?> AuthorizeApiProject(HttpContext context, ProjectAction action)
 {
-    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: false);
-    if (identity is null) return null;
+    (bool failed, AuthenticatedIdentity? identity) = await AuthenticateApiOptional(context);
+    if (failed) return null;
     string identifier = context.Request.RouteValues["projectId"]?.ToString() ?? "";
     try { identifier = Uri.UnescapeDataString(identifier); }
     catch (UriFormatException) { await ApiError(context, 404, "404 Project Not Found"); return null; }
@@ -1284,7 +1444,7 @@ async Task<ApiProject?> AuthorizeApiProject(HttpContext context, ProjectAction a
         await ApiError(context, 404, "404 Project Not Found");
         return null;
     }
-    PermissionDecision permission = await store.GetPermissionAsync(identity, details.Project.Id, action, context.RequestAborted);
+    PermissionDecision permission = await DecideFor(context, identity, details.Project.Id, action);
     if (!permission.Allowed)
     {
         await ApiError(context, 404, "404 Project Not Found");
@@ -1338,7 +1498,7 @@ async Task<ProjectResponse> ProjectResponseForLocked(HttpContext context, Projec
         : null;
     return new(details.Project.Id, details.Description, details.Project.Name,
         details.Project.Namespace + " / " + details.Project.Name, details.Project.Slug, path, details.CreatedAtUtc,
-        defaultBranch, "private", null, webUrl + ".git", webUrl, avatarUrl,
+        defaultBranch, VisibilityName(details.Project.Visibility), null, webUrl + ".git", webUrl, avatarUrl,
         new(details.Project.OwnerUserId, details.Project.Namespace, details.Project.Namespace, "user", details.Project.Namespace,
             origin + "/" + Uri.EscapeDataString(details.Project.Namespace)));
 }
@@ -1379,6 +1539,26 @@ static string HunkHeader(DiffHunk hunk)
         : start.ToString(System.Globalization.CultureInfo.InvariantCulture) + "," +
             count.ToString(System.Globalization.CultureInfo.InvariantCulture);
     return "@@ -" + Range(hunk.OldStart, hunk.OldLines) + " +" + Range(hunk.NewStart, hunk.NewLines) + " @@";
+}
+
+/// <summary>The wire name for a visibility. These are the three values the API accepts and reports, and the
+/// same three the column stores; there is no fourth name that silently means one of these.</summary>
+static string VisibilityName(ProjectVisibility visibility) => visibility switch
+{
+    ProjectVisibility.Public => "public",
+    ProjectVisibility.Unlisted => "unlisted",
+    _ => "private"
+};
+
+static bool TryReadVisibility(string? value, out ProjectVisibility visibility)
+{
+    switch (value)
+    {
+        case "public": visibility = ProjectVisibility.Public; return true;
+        case "unlisted": visibility = ProjectVisibility.Unlisted; return true;
+        case "private" or null or "": visibility = ProjectVisibility.Private; return true;
+        default: visibility = ProjectVisibility.Private; return false;
+    }
 }
 
 string AvatarUrl(HttpContext context, AvatarOwner ownerType, long ownerId) =>
@@ -1555,11 +1735,13 @@ static string ReadPassword(string path)
 
 sealed record AuthorizedRepository(
     ProjectInfo Project,
-    AuthenticatedIdentity Identity,
+    /// <summary>Null when the caller presented no credentials and the repository's visibility let them in
+    /// anyway. Push never reaches this state, because visibility grants reads only.</summary>
+    AuthenticatedIdentity? Identity,
     PermissionDecision Permission,
     RepositoryEndpoint Endpoint);
 
-sealed record ApiProject(ProjectDetails Details, AuthenticatedIdentity Identity, RepositoryEndpoint Endpoint);
+sealed record ApiProject(ProjectDetails Details, AuthenticatedIdentity? Identity, RepositoryEndpoint Endpoint);
 
 sealed class RepositoryEndpoint(Repository repository)
 {
@@ -1567,7 +1749,12 @@ sealed class RepositoryEndpoint(Repository repository)
     public SemaphoreSlim Gate { get; } = new(1, 1);
 }
 
-sealed class LoginThrottle
+/// <summary>
+/// A fixed-window counter guarding an unauthenticated route. The limit is per server and per minute, not per
+/// caller: an attacker chooses their own source address, so counting per address would be counting something
+/// they control.
+/// </summary>
+sealed class RequestThrottle(int perMinute)
 {
     private readonly object gate = new();
     private DateTimeOffset window;
@@ -1578,24 +1765,25 @@ sealed class LoginThrottle
         lock (gate)
         {
             if (now >= window.AddMinutes(1)) { window = now; attempts = 0; }
-            return ++attempts <= 20;
+            return ++attempts <= perMinute;
         }
     }
 }
 
 sealed record Arguments(string Database, string Repositories, IPAddress ListenAddress, int ListenPort, string? Origin,
-    string? Certificate, string? CertificatePasswordFile)
+    string? Certificate, string? CertificatePasswordFile, bool PublicBrowsing)
 {
     public static bool TryParse(string[] values, out Arguments? result)
     {
         result = null;
-        if (values.Length is < 4 or > 12 || values.Length % 2 != 0) return false;
+        if (values.Length is < 4 or > 14 || values.Length % 2 != 0) return false;
         string? database = null;
         string? repositories = null;
         string? listen = null;
         string? origin = null;
         string? certificate = null;
         string? certificatePasswordFile = null;
+        string? publicBrowsing = null;
         HashSet<string> seen = new(StringComparer.Ordinal);
         for (int index = 0; index < values.Length; index += 2)
         {
@@ -1606,9 +1794,13 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             else if (values[index] == "--origin") origin = values[index + 1];
             else if (values[index] == "--certificate") certificate = values[index + 1];
             else if (values[index] == "--certificate-password-file") certificatePasswordFile = values[index + 1];
+            else if (values[index] == "--public-browsing") publicBrowsing = values[index + 1];
             else return false;
         }
         if (string.IsNullOrWhiteSpace(database) || string.IsNullOrWhiteSpace(repositories)) return false;
+        // Takes a value rather than being a bare switch, so the grammar stays one option per pair, and so an
+        // operator can state the closed answer explicitly in a unit file or container command.
+        if (publicBrowsing is not null and not "true" and not "false") return false;
         IPAddress address = IPAddress.Loopback;
         int port = 0;
         if (listen is not null)
@@ -1633,7 +1825,8 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             !File.Exists(certificatePasswordFile))) return false;
         result = new(Path.GetFullPath(database), Path.GetFullPath(repositories), address, port,
             origin is null ? null : origin.TrimEnd('/'), certificate is null ? null : Path.GetFullPath(certificate),
-            certificatePasswordFile is null ? null : Path.GetFullPath(certificatePasswordFile));
+            certificatePasswordFile is null ? null : Path.GetFullPath(certificatePasswordFile),
+            publicBrowsing == "true");
         return true;
     }
 }

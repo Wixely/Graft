@@ -66,7 +66,7 @@ else
                             <strong>@project.NameWithNamespace</strong>
                             <small>@(project.Description.Length > 0 ? project.Description : "No description")</small>
                         </span>
-                        <span class="label"><Icon Name="lock" />Private</span>
+                        <VisibilityLabel Visibility="@project.Visibility" />
                     </a>
                 }
             </div>
@@ -91,7 +91,11 @@ else
         {
             if (!await Api.EnsureSessionAsync())
             {
-                if (Api.Reachable) Navigation.NavigateTo("/-/login", replace: true);
+                // An anonymous visitor goes to the public listing rather than to a sign-in form. If nothing
+                // is published, or the operator has not enabled publishing, that page says so and offers
+                // sign-in; sending a reader straight to a password prompt would hide a forge that is
+                // deliberately open.
+                if (Api.Reachable) Navigation.NavigateTo("/-/explore", replace: true);
                 return;
             }
             await LoadProjects();

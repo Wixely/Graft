@@ -1,10 +1,55 @@
 # Next-agent handoff
 
-Updated: 2026-10-09. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
+Updated: 2026-10-13. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
+
+## Added on 2026-10-13
+
+Merged to `main`. The Git/API/browser suite is now 340 assertions, accounts 113, operations 41.
+
+**A project can be read by someone who has no account.** Visibility is stored for the first time: `private`,
+`unlisted` or `public`. Before this there was no visibility column at all, only a request field validated
+against the literal `"private"` and thrown away. A public or unlisted repository now browses and clones with
+no credentials, and a public one is listed and searchable at `/-/explore`. See
+[visibility evidence](validation/2026-10-13-visibility-and-public-browsing.md) and
+[ADR 0006](decisions/0006-project-pages-and-public-browsing.md).
+
+**Access resolves to one grant, and the grant carries its own reach.** `Member`, then `Repository` from
+visibility, then `Page` from a published project page, then nothing. They resolve in that order and the first
+that applies wins, so "repository settings take precedence over project page settings" is a property of the
+order rather than of a set of interacting flags, and it can be checked by reading `ProjectAuthorization.Decide`.
+
+Two consequences are load-bearing and neither is a limitation to be fixed later. **A page can never offer
+clone, history or a diff**, because all three walk the object graph: a pack is reachability-shaped rather
+than path-shaped, so no filter makes `git fetch` honour a path allowlist, and a commit diff would print files
+the page never named. Every graph-walking surface therefore refuses a `Page` grant outright rather than
+filtering it. And **a restrictive page over a public repository protects nothing**, which the settings panel
+says where the choice is made, because the opposite is the natural assumption.
+
+**Publishing is an operator switch**, `--public-browsing true|false`, default false. With it off a stored
+`public` is inert, not merely unlisted: the server withdraws any decision whose grant is not `Member`. This
+is about restore. A database published on one host must not start serving strangers when it is restored onto
+a host whose operator never allowed it. Migration 4 defaults every existing project to private.
+
+**Publishing is stored in the database, not in the repository.** Authoring `.graft` needs Developer access
+and publishing needs Maintainer, so a config able to set visibility would let a Developer publish a private
+project by pushing a commit.
+
+### Open from this slice
+
+The `.graft` config, the file allowlist and the custom static site are **designed in ADR 0006 and not
+implemented**. A published page currently carries the project's name, description and avatar and no
+repository content. That is what makes the "or publishes a page" branch of the listing real, and it is not
+yet the curated file surface the request asked for.
+
+| Item | Owner | Why it is open |
+| --- | --- | --- |
+| `.graft/project.json` and the file allowlist | Implementation agent | The curated surface itself. Deny by default, one bounded matcher, unknown fields and feature names are errors, an invalid config unpublishes |
+| Custom static site | Operator + implementation agent | Needs a separate pages origin configured before a line of it is written. ADR 0006 explains why the main origin is not an option |
+| Issues, releases and other page features | User | The page config can name features; none exist, so every name is currently an error |
 
 ## Added on 2026-10-04
 
-Work on branch `feat/ui-overhaul-and-uploads`, not merged to `main`.
+Merged to `main`. This section previously said the branch was unmerged; it is not, and the branch is gone.
 
 **The browser UI was rebuilt** into a GitLab-shaped interface with light and dark themes and a routed page set under the reserved `/-/` prefix. See [UI evidence](validation/2026-10-04-ui-overhaul.md).
 
@@ -62,7 +107,7 @@ so anything pushed into it is destroyed when it stops.
 
 ## Added on 2026-10-08
 
-Work on branch `readme-rendering`, not merged to `main`.
+Merged to `main`. This section previously said the branch was unmerged; it is not, and the branch is gone.
 
 **A repository README now renders on the project page.** This is the first place Graft turns repository content into markup rather than text, so it is the first place a stored cross-site scripting bug could live. Three layers hold it closed and each was proved by removing it and watching the suite fail: raw HTML is escaped rather than parsed, link and image destinations are judged on the parsed tree while still structured, and the output is checked against an allowlist of elements and attributes before it is sent. See [README rendering evidence](validation/2026-10-04-readme-rendering.md).
 
@@ -90,13 +135,17 @@ Backups use a consistent SQLite backup plus the complete repository tree. Every 
 
 The main release gates are the durable DnaX package source, a real CA/DNS/client-trust environment and integrated static-musl execution on the required Linux 3.10.108 host. The user deferred the legacy-host run for now. Windows Service, local operator-managed certificate loading, restart/replacement, systemd and container secret plumbing pass. A GitLab 18.0.0 source-backed project-creation fixture now passes against both Graft and a live GitLab CE 18.0.0 reference. Pinned `glab` 1.58.0 API workflows pass against both services. The production Blazor workflow now passes [rendered Chromium validation](validation/2026-09-19-browser-ui.md); that run found and fixed an invalid project-path HTML pattern.
 
-Private project creation now passes through both the Blazor session API and the bounded GitLab-style REST route. The write route requires `api`, creates an empty durable repository through pending/ready publication, and rejects duplicates, invalid paths, unsupported visibility, and unsupported fields. A pinned GitLab 18.0.0 source fixture added path-only creation and raises the combined Windows JIT and NativeAOT harness to 87 assertions; see [source-fixture evidence](validation/2026-09-19-gitlab-18-source-fixture.md) and [live-reference evidence](validation/2026-09-19-gitlab-18-live-reference.md).
+Project creation passes through both the Blazor session API and the bounded GitLab-style REST route. The write route requires `api`, creates an empty durable repository through pending/ready publication, and rejects duplicates, invalid paths, unsupported visibility, and unsupported fields. Since 2026-10-13 a project is created private and may then be made `unlisted` or `public` by a Maintainer, or created non-private directly, but only on a server whose operator enabled publishing. A pinned GitLab 18.0.0 source fixture added path-only creation and raises the combined Windows JIT and NativeAOT harness to 87 assertions; see [source-fixture evidence](validation/2026-09-19-gitlab-18-source-fixture.md) and [live-reference evidence](validation/2026-09-19-gitlab-18-live-reference.md).
 
-An `origin` remote exists (github.com/Wixely/Graft) but nothing has been pushed. Do not deploy, publish, import production data, expose a network listener or select repository visibility without explicit authorization.
+An `origin` remote exists (github.com/Wixely/Graft) but nothing has been pushed. Do not deploy, publish, import production data, expose a network listener or select repository visibility without explicit authorization. Graft can now serve anonymous readers, so that caution covers starting a server with `--public-browsing true` on anything but loopback.
 
 ## Next work
 
-Keep the recorded static-musl server/admin pair available for the deferred Linux 3.10.108 run. Add project ownership transfer and prevent disabling a sole active project owner so account administration cannot orphan project management. Validate the intended CA-issued certificate, DNS, client trust and renewal path before non-loopback deployment.
+Build the `.graft` config and the file allowlist, which is the half of the project-page request that is
+designed and not yet written. Keep the recorded static-musl server/admin pair available for the deferred
+Linux 3.10.108 run. Validate the intended CA-issued certificate, DNS, client trust and renewal path before
+non-loopback deployment, which now matters more than it did: a public listing is only reachable by strangers
+on a non-loopback address.
 
 Continue to use the ignored reproducible DnaX feed until the user or DnaX maintainer selects an approved durable package source. Do not substitute a server-side Git executable or native Git library.
 
@@ -106,9 +155,11 @@ Continue to use the ignored reproducible DnaX feed until the user or DnaX mainta
 | --- | --- | --- |
 | ~~Project ownership continuity~~ | Done 2026-10-04 | [Evidence](validation/2026-10-04-project-ownership.md): transfer is owner-or-administrator only, and an account owning projects cannot be disabled |
 | Git's indent heuristic in the diff | Implementation agent | `tests/Graft.Diff.Fuzz` agrees with `git diff` at its default settings as closely as it already does with the heuristic turned off |
+| `.graft` config and file allowlist | Implementation agent | A page serves exactly the paths its config names and 404s every other path, proved by a corpus where most files must not be reachable |
+| Custom static site on a pages origin | Operator + implementation agent | A site serves only from the configured second hostname, only from under `site.root`, and the main origin serves no repository-authored HTML |
 | Markdig under NativeAOT | User + implementation agent | `tests/Graft.Git.Acceptance` passes against a published NativeAOT server built where the C++ workload exists |
 | Deployment TLS trust | Operator + implementation agent | Intended CA certificate, DNS/SAN, client trust and renewal rehearsal |
 | Required legacy host | Implementation agent + user | Integrated static-musl artifact inspected and run on Linux 3.10.108 with sanitized evidence |
 | DnaX distribution | User/DnaX maintainer | Clean checkout restores without a sibling source tree or locally prepared feed |
 
-Recommended next action: Owner: User + implementation agent — run the Android picker case on a device and publish NativeAOT on a machine with the C++ build tools, since both gate claims this work cannot make. Remaining release gates: deployment CA/DNS trust, DnaX distribution and the deferred Linux 3.10.108 MVP-08 run.
+Recommended next action: Owner: Implementation agent — build `.graft/project.json` and the file allowlist, which is the remaining half of the project-page request and the only queued item that is fully buildable here. The user-gated items are unchanged: the Android picker needs a device and NativeAOT needs the C++ build tools. Remaining release gates: deployment CA/DNS trust, DnaX distribution and the deferred Linux 3.10.108 MVP-08 run.

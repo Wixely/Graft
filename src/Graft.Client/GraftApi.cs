@@ -62,6 +62,26 @@ public sealed class GraftApi(HttpClient http)
         catch (HttpRequestException) { Reachable = false; return default; }
     }
 
+    /// <summary>
+    /// A GET where "not there" is an ordinary answer rather than a fault. <see cref="GetAsync"/> cannot tell
+    /// the two apart, because it reports a refusal and an unreachable server as the same exception, and a
+    /// project a reader may not see is not an outage. Reached is false only when the transport failed.
+    /// </summary>
+    public async Task<(bool Reached, T? Value)> GetOptionalAsync<T>(string uri, JsonTypeInfo<T> type,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            using HttpResponseMessage response = await http.GetAsync(uri, cancellationToken);
+            Reachable = true;
+            return response.IsSuccessStatusCode
+                ? (true, await response.Content.ReadFromJsonAsync(type, cancellationToken))
+                : (true, default);
+        }
+        catch (HttpRequestException) { Reachable = false; return (false, default); }
+        catch (System.Text.Json.JsonException) { return (true, default); }
+    }
+
     public Task<ApiResult> PostAsync(string uri, string accepted, CancellationToken cancellationToken = default) =>
         SendAsync(HttpMethod.Post, uri, null, accepted, cancellationToken);
 

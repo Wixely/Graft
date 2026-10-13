@@ -22,7 +22,7 @@ else
             <h1><span class="namespace">@repo.Project.Namespace.Name /</span> @repo.Project.Name</h1>
             <p class="subtitle">@(repo.Project.Description.Length > 0 ? repo.Project.Description : "No description")</p>
         </div>
-        <span class="label"><Icon Name="lock" />Private</span>
+        <VisibilityLabel Visibility="@repo.Project.Visibility" PagePublished="repo.PagePublished" />
     </div>
 
     <Banner Message="@message" Kind="@messageKind" />
@@ -36,7 +36,7 @@ else
         }
         @if (repo.CanManage)
         {
-            <button type="button" class="@(tab == "settings" ? "active" : "")" @onclick='() => tab = "settings"'>Members</button>
+            <button type="button" class="@(tab == "settings" ? "active" : "")" @onclick='() => tab = "settings"'>Settings</button>
         }
     </div>
 
@@ -207,6 +207,64 @@ else
     else
     {
         <div class="panel">
+            <div class="panel-header"><Icon Name="lock" /><h2>Who can see this</h2></div>
+            <div class="panel-body">
+                @if (!repo.PublishingAllowed)
+                {
+                    <p class="secondary-text">
+                        This server does not allow projects to be published, so every project stays private to
+                        its members. An operator enables publishing when the server starts.
+                    </p>
+                }
+                else
+                {
+                    <form class="form" @onsubmit="SetVisibility" @onsubmit:preventDefault>
+                        <label for="visibility">Repository</label>
+                        <select id="visibility" @bind="visibilityChoice">
+                            <option value="private">Private &mdash; owner, members and administrators</option>
+                            <option value="unlisted">Unlisted &mdash; anyone holding the link</option>
+                            <option value="public">Public &mdash; anyone, and listed for everyone</option>
+                        </select>
+                        <p class="field-hint">
+                            This covers the whole repository: every file, the history, and cloning. Unlisted is
+                            not a secret and does not expire, because the link is the whole of the protection.
+                        </p>
+                        <div class="form-actions">
+                            <button type="submit" disabled="@busy">Save visibility</button>
+                        </div>
+                    </form>
+
+                    <hr />
+
+                    <h3>Project page</h3>
+                    <p class="secondary-text">
+                        A page is a curated surface that can stand over a private repository, so you can share a
+                        readme without sharing the code. It offers no clone, no history and no diff, because
+                        those read the whole repository rather than the files you chose.
+                    </p>
+                    @if (repo.Project.Visibility == "public")
+                    {
+                        <div class="banner warning">
+                            <Icon Name="alert" />
+                            <span>
+                                This repository is public, so its files are already readable by anyone. A page
+                                changes how the project is presented here, and protects nothing while the
+                                repository stays public.
+                            </span>
+                        </div>
+                    }
+                    <div class="form-actions">
+                        <button type="button" class="@(repo.PagePublished ? "secondary" : "")"
+                                @onclick="() => SetPagePublished(!repo.PagePublished)" disabled="@busy">
+                            @(repo.PagePublished ? "Withdraw the project page" : "Publish a project page")
+                        </button>
+                        @if (repo.PagePublished) { <span class="label accent">published</span> }
+                    </div>
+                }
+            </div>
+        </div>
+
+        <div class="panel">
             <div class="panel-header"><Icon Name="branch" /><h2>Default branch</h2></div>
             <div class="panel-body">
                 <p class="secondary-text">
@@ -318,6 +376,7 @@ else
     private string tab = "code";
     private string branch = "";
     private string defaultBranchChoice = "";
+    private string visibilityChoice = "private";
     private string path = "";
     private string filePath = "";
     private string? fileText;
@@ -377,7 +436,7 @@ else
             path = "";
             filePath = "";
             tab = "code";
-            await Load(repo.Project.Id);
+            await Load();
         }
         finally { committing = false; }
     }
@@ -399,16 +458,19 @@ else
         loading = true;
         try
         {
-            if (!await Api.EnsureSessionAsync())
-            {
-                if (Api.Reachable) Navigation.NavigateTo("/-/login", replace: true);
-                else message = "Graft could not be reached.";
-                return;
-            }
-            ProjectResponse[] projects = await Api.GetAsync("api/projects", ApiJson.Default.ProjectResponseArray) ?? [];
-            ProjectResponse? project = projects.SingleOrDefault(item => item.PathWithNamespace == Namespace + "/" + Slug);
-            if (project is null) { message = "You do not have access to this project."; return; }
-            await Load(project.Id);
+            // Not gated on a session. A public or unlisted project is readable without one, and a reader who
+            // arrives at a link has no id to look the project up by: the listing that would have told them is
+            // exactly what a stranger cannot read, so the path is the lookup key.
+            await Api.EnsureSessionAsync();
+            if (!Api.Reachable) { message = "Graft could not be reached."; return; }
+            await Load();
+            if (repo is null)
+                // Absent, private, and shared-with-someone-else all answer identically, so this cannot say
+                // which. Naming sign-in is the useful next step for a reader who has an account and is not
+                // currently using it.
+                message = Api.Authenticated
+                    ? "You do not have access to this project."
+                    : "This project is not public. Sign in if you have access to it.";
         }
         finally { loading = false; }
     }
@@ -419,17 +481,21 @@ else
     /// </summary>
     private string Branch => branch.Length > 0 ? branch : repo?.Project.DefaultBranch ?? "";
 
-    private async Task Load(long id)
+    private async Task Load()
     {
         string reference = branch.Length > 0 ? branch : "HEAD";
-        string query = $"api/browser/projects/{id}?ref={Uri.EscapeDataString(reference)}&path={Uri.EscapeDataString(path)}" +
+        string query = $"api/browser/projects/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}" +
+            $"?ref={Uri.EscapeDataString(reference)}&path={Uri.EscapeDataString(path)}" +
             (filePath.Length == 0 ? "" : "&file=" + Uri.EscapeDataString(filePath));
-        repo = await Api.GetAsync(query, ApiJson.Default.RepositoryPageResponse);
+        (bool reached, RepositoryPageResponse? loaded) = await Api.GetOptionalAsync(query, ApiJson.Default.RepositoryPageResponse);
+        if (!reached) { message = "Graft could not be reached."; return; }
+        repo = loaded;
         fileText = repo?.File is null ? null : DecodeText(repo.File.Content);
         // The payload reports the branch actually in effect, whether that came from the stored preference
         // or from convention, so the settings selector starts on what the project is really opening at.
         defaultBranchChoice = repo?.Project.DefaultBranch ?? "";
-        if (repo?.CanManage == true) await LoadMembers(id);
+        visibilityChoice = repo?.Project.Visibility ?? "private";
+        if (repo?.CanManage == true) await LoadMembers(repo.Project.Id);
     }
 
     /// <summary>Switches branch, dropping the current path because it may not exist on the new one.</summary>
@@ -439,13 +505,50 @@ else
         branch = args.Value?.ToString() ?? "";
         path = "";
         filePath = "";
-        await Load(repo.Project.Id);
+        await Load();
     }
 
     /// <summary>
     /// Stores which branch the project opens at. An empty choice clears the preference, which returns the
     /// project to the convention the repository applies on its own.
     /// </summary>
+    private async Task SetVisibility()
+    {
+        if (busy || repo is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/projects/{repo.Project.Id}/visibility",
+                new VisibilityRequest(visibilityChoice), ApiJson.Default.VisibilityRequest,
+                visibilityChoice switch
+                {
+                    "public" => "Anyone can now read this repository, and it is listed for everyone.",
+                    "unlisted" => "Anyone holding the link can now read this repository. It is not listed.",
+                    _ => "This repository is private to its members again."
+                });
+            Report(result);
+            if (result.Ok) await Load();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task SetPagePublished(bool published)
+    {
+        if (busy || repo is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/projects/{repo.Project.Id}/page",
+                new PagePublishRequest(published), ApiJson.Default.PagePublishRequest,
+                published ? "The project page is published." : "The project page is withdrawn.");
+            Report(result);
+            if (result.Ok) await Load();
+        }
+        finally { busy = false; }
+    }
+
     private async Task SetDefaultBranch()
     {
         if (busy || repo is null) return;
@@ -458,7 +561,7 @@ else
                 new DefaultBranchRequest(choice), ApiJson.Default.DefaultBranchRequest,
                 choice is null ? "Default branch now follows convention." : $"{choice} is now the default branch.");
             Report(result);
-            if (result.Ok) await Load(repo.Project.Id);
+            if (result.Ok) await Load();
         }
         finally { busy = false; }
     }
@@ -467,14 +570,14 @@ else
     {
         if (entry.Type == "tree") { path = entry.Path; filePath = ""; }
         else { filePath = entry.Path; }
-        if (repo is not null) await Load(repo.Project.Id);
+        if (repo is not null) await Load();
     }
 
     private async Task Navigate(string target)
     {
         path = target;
         filePath = "";
-        if (repo is not null) await Load(repo.Project.Id);
+        if (repo is not null) await Load();
     }
 
     private async Task Up()
@@ -529,7 +632,7 @@ else
             ApiResult result = await Api.PostAsync($"api/graft/avatars/project/{repo.Project.Id}",
                 new UploadIngestRequest(uploadId), ApiJson.Default.UploadIngestRequest, "Project avatar updated.");
             Report(result);
-            if (result.Ok) await Load(repo.Project.Id);
+            if (result.Ok) await Load();
         }
         finally { busy = false; }
     }

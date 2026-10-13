@@ -393,21 +393,23 @@ public sealed class GraftStore : IAsyncDisposable
 
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
         ProjectPathRow? row = await db.QuerySingleOrDefaultAsync<ProjectPathRow>("""
-            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.StorageId, p.DefaultBranch
+            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.StorageId, p.DefaultBranch,
+                   p.Visibility, p.PagePublished
             FROM Projects p
             JOIN Users u ON u.Id = p.OwnerUserId
             WHERE u.NormalizedUsername = @NormalizedNamespace
               AND p.NormalizedSlug = @NormalizedSlug
               AND p.State = 'ready';
             """, new ProjectPathParameters(normalizedNamespace, normalizedSlug));
-        return row is null ? null : new(row.Id, row.OwnerUserId, row.Namespace, row.Slug, row.Name, row.StorageId, row.DefaultBranch);
+        return row is null ? null : ToInfo(row);
     }
 
     public async Task<ProjectDetails?> GetReadyProjectAsync(long projectId, CancellationToken cancellationToken = default)
     {
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
         ProjectDetailsRow? row = await db.QuerySingleOrDefaultAsync<ProjectDetailsRow>("""
-            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.Description, p.StorageId, p.CreatedAtUtc, p.DefaultBranch
+            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.Description, p.StorageId, p.CreatedAtUtc,
+                   p.DefaultBranch, p.Visibility, p.PagePublished
             FROM Projects p
             JOIN Users u ON u.Id = p.OwnerUserId
             WHERE p.Id = @Id AND p.State = 'ready';
@@ -435,7 +437,8 @@ public sealed class GraftStore : IAsyncDisposable
         AuthenticatedIdentity live = await RequireLiveIdentityAsync(db, null, identity, cancellationToken);
         ProjectListParameters parameters = new(live.UserId, live.IsAdministrator ? 1 : 0, take, skip);
         IEnumerable<ProjectDetailsRow> rows = await db.QueryAsync<ProjectDetailsRow>("""
-            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.Description, p.StorageId, p.CreatedAtUtc, p.DefaultBranch
+            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.Description, p.StorageId, p.CreatedAtUtc,
+                   p.DefaultBranch, p.Visibility, p.PagePublished
             FROM Projects p
             JOIN Users u ON u.Id = p.OwnerUserId
             WHERE p.State = 'ready' AND (
@@ -651,6 +654,132 @@ public sealed class GraftStore : IAsyncDisposable
         await transaction.CommitAsync(cancellationToken);
     }
 
+    /// <summary>
+    /// Sets how widely a project may be read. Maintainer-equivalent, so the owner or an administrator; a
+    /// Maintainer membership grants it too, in common with every other project setting.
+    ///
+    /// <para>
+    /// This is the switch the request calls final. It is stored here rather than read from the repository's
+    /// own config because a push must never be able to publish a project: authoring <c>.graft</c> needs only
+    /// Developer access, and this needs Maintainer.
+    /// </para>
+    /// </summary>
+    public async Task SetProjectVisibilityAsync(
+        AuthenticatedIdentity actor,
+        long projectId,
+        ProjectVisibility visibility,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(actor);
+        if (!Enum.IsDefined(visibility)) throw new ArgumentOutOfRangeException(nameof(visibility));
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
+        PermissionDecision permission = await DecideAsync(db, transaction, actor, projectId, ProjectAction.ManageProject, cancellationToken);
+        if (!permission.Allowed) throw new UnauthorizedAccessException(permission.Explanation);
+
+        string now = Now();
+        await db.ExecuteAsync("UPDATE Projects SET Visibility = @Value WHERE Id = @Id;",
+            new ProjectTextParameters(projectId, StoreVisibility(visibility)), transaction);
+        await AuditAsync(db, transaction, actor.UserId, "set-visibility", "project",
+            projectId.ToString(CultureInfo.InvariantCulture),
+            "Repository visibility set to " + StoreVisibility(visibility) + ".", now);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Publishes or withdraws the project page: the curated surface that can exist over a private
+    /// repository. Maintainer-equivalent, for the same reason as visibility.
+    /// </summary>
+    public async Task SetPagePublishedAsync(
+        AuthenticatedIdentity actor,
+        long projectId,
+        bool published,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(actor);
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
+        PermissionDecision permission = await DecideAsync(db, transaction, actor, projectId, ProjectAction.ManageProject, cancellationToken);
+        if (!permission.Allowed) throw new UnauthorizedAccessException(permission.Explanation);
+
+        string now = Now();
+        await db.ExecuteAsync("UPDATE Projects SET PagePublished = @Value WHERE Id = @Id;",
+            new ProjectFlagParameters(projectId, published ? 1 : 0), transaction);
+        await AuditAsync(db, transaction, actor.UserId, "set-page-published", "project",
+            projectId.ToString(CultureInfo.InvariantCulture),
+            published ? "Project page published." : "Project page withdrawn.", now);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// The public browser's listing: projects whose source is public, plus projects that publish a page
+    /// without publishing their source. Unlisted projects are deliberately absent, because being absent from
+    /// this listing is the only thing that distinguishes unlisted from public.
+    ///
+    /// <para>
+    /// Takes no identity. It answers for the anonymous public, so a signed-in caller sees exactly what a
+    /// stranger sees, and the result can never depend on who is asking.
+    /// </para>
+    /// </summary>
+    public async Task<ProjectPage> ListPublishedProjectsAsync(
+        string? search,
+        int skip,
+        int take,
+        CancellationToken cancellationToken = default)
+    {
+        if (skip < 0 || take is < 1 or > 100) throw new ArgumentOutOfRangeException(nameof(take));
+        if (search is { Length: > 200 }) throw new ArgumentException("Search text is too long.", nameof(search));
+
+        // A caller-supplied LIKE pattern would otherwise be a wildcard they control, so % and _ are escaped
+        // and the escape character itself is escaped first. An empty or whitespace search matches everything
+        // rather than matching nothing, because a blank search box means "show me what is here".
+        string? pattern = string.IsNullOrWhiteSpace(search)
+            ? null
+            : "%" + search.Trim().Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_") + "%";
+
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        PublishedListParameters parameters = new(pattern, pattern is null ? 1 : 0, take, skip);
+        const string where = """
+            WHERE p.State = 'ready'
+              AND (p.Visibility = 'public' OR p.PagePublished = 1)
+              AND (@MatchAll = 1
+                   OR p.Name LIKE @Pattern ESCAPE '\'
+                   OR p.Slug LIKE @Pattern ESCAPE '\'
+                   OR p.Description LIKE @Pattern ESCAPE '\'
+                   OR u.Username LIKE @Pattern ESCAPE '\')
+            """;
+        IEnumerable<ProjectDetailsRow> rows = await db.QueryAsync<ProjectDetailsRow>($"""
+            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.Description, p.StorageId, p.CreatedAtUtc,
+                   p.DefaultBranch, p.Visibility, p.PagePublished
+            FROM Projects p
+            JOIN Users u ON u.Id = p.OwnerUserId
+            {where}
+            ORDER BY p.CreatedAtUtc DESC, p.Id DESC
+            LIMIT @Take OFFSET @Skip;
+            """, parameters);
+        long total = await db.QuerySingleAsync<long>($"""
+            SELECT COUNT(*) FROM Projects p
+            JOIN Users u ON u.Id = p.OwnerUserId
+            {where};
+            """, parameters);
+        return new(rows.Select(ToDetails).ToArray(), total);
+    }
+
+    /// <summary>
+    /// Whether this account owns anything that appears in the public listing. Used to decide whether an
+    /// anonymous caller may read their avatar: the listing already names the owner of every published
+    /// project, so this reveals nothing the listing does not, while accounts that publish nothing stay
+    /// unmentioned rather than becoming enumerable one id at a time.
+    /// </summary>
+    public async Task<bool> HasPublishedProjectAsync(long userId, CancellationToken cancellationToken = default)
+    {
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        return await db.QuerySingleAsync<long>("""
+            SELECT COUNT(*) FROM Projects
+            WHERE OwnerUserId = @Id AND State = 'ready' AND (Visibility = 'public' OR PagePublished = 1);
+            """, new IdParameters(userId)) != 0;
+    }
+
     public async Task RevokeMembershipAsync(
         AuthenticatedIdentity actor,
         long projectId,
@@ -684,7 +813,8 @@ public sealed class GraftStore : IAsyncDisposable
         // way to appoint a replacement. Transfer first. For an urgent response to a compromised account,
         // resetting its password already revokes every session and token immediately.
         IEnumerable<ProjectPathRow> owned = await db.QueryAsync<ProjectPathRow>("""
-            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.StorageId, p.DefaultBranch
+            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.StorageId, p.DefaultBranch,
+                   p.Visibility, p.PagePublished
             FROM Projects p
             JOIN Users u ON u.Id = p.OwnerUserId
             WHERE p.OwnerUserId = @Id
@@ -833,7 +963,7 @@ public sealed class GraftStore : IAsyncDisposable
         CancellationToken cancellationToken)
     {
         ProjectAccessRow? project = await db.QuerySingleOrDefaultAsync<ProjectAccessRow>("""
-            SELECT p.OwnerUserId, m.Role
+            SELECT p.OwnerUserId, p.Visibility, p.PagePublished, m.Role
             FROM Projects p
             LEFT JOIN ProjectMemberships m ON m.ProjectId = p.Id AND m.UserId = @UserId
             WHERE p.Id = @ProjectId AND p.State = 'ready';
@@ -843,8 +973,12 @@ public sealed class GraftStore : IAsyncDisposable
         AuthenticatedIdentity? liveIdentity = identity is null
             ? null
             : await FindLiveIdentityAsync(db, transaction, identity, cancellationToken);
-        ProjectRole? membership = project.Role is null ? null : (ProjectRole)project.Role.Value;
-        return ProjectAuthorization.Decide(liveIdentity, project.OwnerUserId, membership, action);
+        ProjectAccess access = new(
+            project.OwnerUserId,
+            ParseVisibility(project.Visibility),
+            project.PagePublished != 0,
+            project.Role is null ? null : (ProjectRole)project.Role.Value);
+        return ProjectAuthorization.Decide(liveIdentity, access, action);
     }
 
     private static async Task<AuthenticatedIdentity?> FindLiveIdentityAsync(
@@ -923,10 +1057,33 @@ public sealed class GraftStore : IAsyncDisposable
     private static string Now() => DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture);
 
     private static ProjectDetails ToDetails(ProjectDetailsRow row) => new(
-        new(row.Id, row.OwnerUserId, row.Namespace, row.Slug, row.Name, row.StorageId, row.DefaultBranch),
+        ToInfo(row),
         row.Description,
         DateTimeOffset.Parse(row.CreatedAtUtc, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
         row.DefaultBranch);
+
+    private static ProjectInfo ToInfo(ProjectPathRow row) => new(
+        row.Id, row.OwnerUserId, row.Namespace, row.Slug, row.Name, row.StorageId, row.DefaultBranch,
+        ParseVisibility(row.Visibility), row.PagePublished != 0);
+
+    /// <summary>
+    /// Turns the stored text into the enum. An unrecognised value is treated as private rather than thrown
+    /// on: the column has a CHECK constraint so it cannot happen through this code, and if a future schema
+    /// change ever introduced a wider value, failing closed is the only safe way to misread it.
+    /// </summary>
+    internal static ProjectVisibility ParseVisibility(string? stored) => stored switch
+    {
+        "public" => ProjectVisibility.Public,
+        "unlisted" => ProjectVisibility.Unlisted,
+        _ => ProjectVisibility.Private
+    };
+
+    internal static string StoreVisibility(ProjectVisibility visibility) => visibility switch
+    {
+        ProjectVisibility.Public => "public",
+        ProjectVisibility.Unlisted => "unlisted",
+        _ => "private"
+    };
 
     public async ValueTask DisposeAsync()
     {
@@ -975,7 +1132,13 @@ internal sealed class TokenRow
     public string CreatedAtUtc { get; set; } = "";
 }
 internal sealed class ProjectOwnerRow { public long OwnerUserId { get; set; } }
-internal sealed class ProjectAccessRow { public long OwnerUserId { get; set; } public long? Role { get; set; } }
+internal sealed class ProjectAccessRow
+{
+    public long OwnerUserId { get; set; }
+    public string Visibility { get; set; } = "private";
+    public long PagePublished { get; set; }
+    public long? Role { get; set; }
+}
 internal sealed class ProjectMemberRow { public long UserId { get; set; } public string Username { get; set; } = ""; public long Role { get; set; } }
 internal class ProjectPathRow
 {
@@ -986,6 +1149,8 @@ internal class ProjectPathRow
     public string Name { get; set; } = "";
     public string StorageId { get; set; } = "";
     public string? DefaultBranch { get; set; }
+    public string Visibility { get; set; } = "private";
+    public long PagePublished { get; set; }
 }
 internal sealed class ProjectDetailsRow : ProjectPathRow
 {
@@ -1021,3 +1186,6 @@ internal sealed class AvatarRow
     public string Sha256 { get; set; } = "";
 }
 internal sealed record DefaultBranchParameters(long Id, string? Value);
+internal sealed record ProjectTextParameters(long Id, string Value);
+internal sealed record ProjectFlagParameters(long Id, int Value);
+internal sealed record PublishedListParameters(string? Pattern, int MatchAll, int Take, int Skip);
