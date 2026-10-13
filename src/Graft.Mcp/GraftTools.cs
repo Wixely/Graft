@@ -25,8 +25,10 @@ public sealed class GraftTools
     [Description("Lists the projects this token can see: the ones its owner owns or is a member of. Does not list other people's public projects; use graft_browse for those.")]
     public static async Task<string> ListProjects(GraftClient graft, CancellationToken cancellationToken)
     {
+        // The GitLab-shaped listing, not Graft's own /api/projects. That one authenticates a browser session
+        // cookie and refuses a token outright, so this tool could never have worked against it.
         (ProjectResponse[]? projects, string? error) =
-            await graft.GetAsync("api/projects", ApiJson.Default.ProjectResponseArray, cancellationToken);
+            await graft.GetAsync("api/v4/projects", ApiJson.Default.ProjectResponseArray, cancellationToken);
         if (error is not null) return Failure(error);
 
         return new JsonObject
@@ -144,8 +146,7 @@ public sealed class GraftTools
         CancellationToken cancellationToken)
     {
         string query = "api/v4/projects/" + Encode(project) + "/repository/tree?path=" +
-            Uri.EscapeDataString(path?.Trim() ?? "") +
-            (string.IsNullOrWhiteSpace(reference) ? "" : "&ref=" + Uri.EscapeDataString(reference.Trim()));
+            Uri.EscapeDataString(path?.Trim() ?? "") + "&ref=" + Uri.EscapeDataString(Revision(reference));
         (TreeEntryResponse[]? entries, string? error) =
             await graft.GetAsync(query, ApiJson.Default.TreeEntryResponseArray, cancellationToken);
         if (error is not null) return Failure(error);
@@ -171,8 +172,11 @@ public sealed class GraftTools
         [Description("Branch or revision. Empty uses the default branch.")] string reference,
         CancellationToken cancellationToken)
     {
+        // The file route requires a ref and refuses an empty one, so "the default branch" has to be spelled
+        // as HEAD rather than left out. The tree and commit routes are more forgiving, which is exactly why
+        // this was the tool that broke while the others looked fine.
         string query = "api/v4/projects/" + Encode(project) + "/repository/files/" + Uri.EscapeDataString(file ?? "") +
-            (string.IsNullOrWhiteSpace(reference) ? "" : "?ref=" + Uri.EscapeDataString(reference.Trim()));
+            "?ref=" + Uri.EscapeDataString(Revision(reference));
         (FileResponse? found, string? error) = await graft.GetAsync(query, ApiJson.Default.FileResponse, cancellationToken);
         if (error is not null) return Failure(error);
 
@@ -300,6 +304,11 @@ public sealed class GraftTools
 
     private static string Encode(string project) =>
         Uri.EscapeDataString((project ?? "").Trim());
+
+    /// <summary>The revision to ask for. Empty means the branch the project opens at, which the engine
+    /// resolves from HEAD, so the caller never has to know its name.</summary>
+    private static string Revision(string? reference) =>
+        string.IsNullOrWhiteSpace(reference) ? "HEAD" : reference.Trim();
 
     /// <summary>Decodes strict UTF-8, or returns null. Strict so that a binary file is detected rather than
     /// turned into replacement characters that read like text.</summary>

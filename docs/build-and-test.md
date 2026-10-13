@@ -84,6 +84,10 @@ dotnet src\Graft.Mcp\bin\Debug\net10.0\Graft.Mcp.dll --server <https origin> --t
 dotnet src\Graft.Mcp\bin\Debug\net10.0\Graft.Mcp.dll --licences
 ```
 
+Credentials are required by default and both ways of loosening that are explicit switches, each off unless
+asked for: `--allow-anonymous true` serves callers who present nothing, and `--allow-plaintext true` permits
+an http listener off loopback. The server prints its posture on startup.
+
 Over stdio the credential belongs to the process, so `--token-file` is required. Over Streamable HTTP it
 belongs to the caller: each request carries its own Graft token as `PRIVATE-TOKEN` or
 `Authorization: Bearer`, this server stores none, `--token-file` is refused, and a request without a token

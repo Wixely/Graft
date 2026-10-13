@@ -29,10 +29,39 @@ The MCP container verifies the forge's certificate rather than trusting whatever
 compose gives the forge a network alias matching the name on its certificate. A service name would not match
 a subject alternative name, and there is no option anywhere that skips the check.
 
+## Credentials are required, and the override is explicit
+
+A caller presenting nothing is refused `401` before the protocol is spoken. That was already true; what is
+new is that lifting it is a named switch rather than something nobody can do, and that the refusal says so:
+
+```text
+Send a Graft personal access token as PRIVATE-TOKEN or Authorization: Bearer. This server does not serve
+anonymous callers; an operator can allow that with --allow-anonymous true.
+```
+
+With `--allow-anonymous true` an uncredentialed caller reaches Graft as a stranger and sees only public
+projects. That is a real bound, and it is the only one, which is why it is not the default.
+
+The server prints its posture on startup so a deployment nobody has looked at in months still says what it
+is doing: `POSTURE: credentials=required; writes=refused; transport=TLS`.
+
+## Plain HTTP for an internal endpoint
+
+`deploy/container/compose.internal-http.yaml` is an overlay that serves the MCP endpoint over plain HTTP:
+
+```
+docker compose -f compose.yaml -f compose.internal-http.yaml --profile mcp up --detach
+```
+
+It changes the endpoint's own transport and nothing else. The forge keeps its TLS, the MCP container still
+verifies the forge's certificate, credentials are still required, and the port stays on host loopback. The
+overlay must pass `--allow-plaintext true` because the server refuses a plaintext listener off loopback
+without it, so a deployment cannot serve tokens in the clear by forgetting a flag.
+
 ## Verified, in a real container runtime
 
-Docker 29.8.0 inside WSL Ubuntu 24.04, building the real `Containerfile` and running the real `compose.yaml`
-against a self-signed certificate whose subject alternative name matches the configured hostname.
+Docker 29.8.0 inside WSL Ubuntu 24.04, building through compose and running the real files against a
+self-signed certificate whose subject alternative name matches the configured hostname.
 
 | Check | Result |
 | --- | --- |
@@ -40,11 +69,18 @@ against a self-signed certificate whose subject alternative name matches the con
 | Services selected with `--profile mcp` | `graft` and `graft-mcp` |
 | Forge health with no profile | `200` |
 | Port 8444 with no profile | nothing listening |
-| MCP endpoint, no credential | `401`, with the header and message saying how to authenticate |
-| MCP endpoint, with a token | `200`, `text/event-stream`, `"serverInfo":{"name":"graft","version":"1.0.0"}` |
+| Reference deployment posture | `credentials=required; writes=refused; transport=TLS` |
+| MCP endpoint, no credential | `401`, naming `--allow-anonymous` in the body |
+| MCP endpoint, with a token | `200`, `text/event-stream`, correct server identity |
 | Tool call reaching the forge | refused by Graft: `The token was not accepted` |
 | Write tool, read-only deployment | refused, naming `--allow-writes` |
+| With `GRAFT_MCP_ALLOW_ANONYMOUS=true` | posture `credentials=optional`, and no credential gives `200` |
+| Internal HTTP overlay | posture `transport=plaintext`, still `401` with no credential, `200` with one |
+| Hardening on the MCP container | `read_only=true cap_drop=[ALL] no-new-privileges pids=128 memory=256M` |
 | Compose without `GRAFT_CA_CERTIFICATE` | valid, and the forge starts |
+
+The last two rows of the override block matter together: the two switches are independent, so the plaintext
+overlay still demands a credential and allowing anonymous access does nothing to the transport.
 
 The tool-call row is the one that proves the wiring rather than the configuration. A bogus but well-formed
 token gets past this server's own check, so the call travels to the forge over TLS. Getting back "the token
@@ -54,7 +90,17 @@ would have said "Graft could not be reached" instead.
 The last row matters for operators who never enable MCP: the two variables that exist only for this profile
 are not required to run the forge.
 
-## Two things this found
+## Hardened defaults
+
+`compose.yaml` is the reference deployment and its defaults are the ones to copy. Both services drop every
+capability, refuse privilege escalation, run read-only with a small tmpfs, carry bounded logs and bounded
+memory and process counts, and publish only to host loopback. A YAML anchor carries the shared block so the
+two services cannot drift apart.
+
+There is no healthcheck, deliberately: the chiseled base has no shell and no HTTP client, so there is
+nothing in the image to probe with. Whatever sits in front should watch `/healthz` instead.
+
+## Three things this found, none of them MCP's fault
 
 **The documented container publish command did not work.** `-p:PublishSingleFile=true` applies to every
 project in the graph, and it reached the nested Blazor client publish, which cannot use an application host:
@@ -67,6 +113,17 @@ file's own ownership and mode are what the container sees. A root-only `0600` ke
 `Access to the path '/run/secrets/graft-tls.pfx' is denied`, which reads like a certificate fault and is
 not one. The deployment runbook says so now.
 
+**Compose builds its own image and ignores a separately tagged one.** Both services carry a `build:`
+section, so `docker build --tag graft:x` produces an image compose never uses, with a separate layer cache.
+Several runs of this verification reported a server rejecting arguments it understood perfectly, because the
+container was an older build than the binary on disk. Build through `compose build`, and reach for
+`--no-cache` when a republished binary has not reached the running container. The runbook says so now.
+
+The MCP server's own argument parser now reports *why* it refused rather than printing usage and leaving the
+reader to bisect their command line. That was found the hard way here: a container restarting every two
+seconds with nothing but a usage message is close to undiagnosable, and in a container there is no command
+line to inspect.
+
 ## What this does not cover
 
 The MCP binary is published self-contained and **not** NativeAOT, unlike the forge, because no Model Context
@@ -77,3 +134,4 @@ is unaffected either way.
 about the MCP profile. The run above was Docker and was driven by hand rather than by that suite.
 
 The base image is still not pinned by digest, which remains release work and is unchanged by this.
+

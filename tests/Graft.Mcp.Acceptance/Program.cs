@@ -4,6 +4,7 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using Graft.Core;
+using Graft.Git;
 using Graft.Storage;
 
 // Drives Graft's MCP server over both transports, as a client would, against a real Graft.
@@ -46,11 +47,29 @@ try
             (created, cancellation) =>
             {
                 cancellation.ThrowIfCancellationRequested();
-                Directory.CreateDirectory(Path.Combine(repositoriesRoot, created.StorageId));
+                // Seeded with real content, so the tools that read a tree, a history and a file are
+                // answering about something. Against an empty repository they all legitimately return
+                // nothing, and an assertion that accepts nothing would not have caught a tool pointed at
+                // the wrong route.
+                Repository repository = new(new DurableRepositoryStorage(Path.Combine(repositoriesRoot, created.StorageId)));
+                repository.CommitFiles("main",
+                    [new FileChange("README.md", System.Text.Encoding.UTF8.GetBytes(
+                        "# Shared\n\nSeeded for the MCP suite.\n"))],
+                    new GitIdentity("Fixture", "fixture@graft.invalid", DateTimeOffset.UtcNow),
+                    "Seed the MCP acceptance fixture", cancellation);
                 return Task.CompletedTask;
             }, "Visible to anyone.");
         ProjectInfo project = Required(await fixture.FindReadyProjectAsync("admin", "shared"), "project");
         await fixture.SetProjectVisibilityAsync(identity, project.Id, ProjectVisibility.Public);
+
+        // Stays private, so an anonymous caller can be shown to reach the public one and not this.
+        await fixture.CreateProjectWithRepositoryAsync(identity, "private", "Private project",
+            (created, cancellation) =>
+            {
+                cancellation.ThrowIfCancellationRequested();
+                Directory.CreateDirectory(Path.Combine(repositoriesRoot, created.StorageId));
+                return Task.CompletedTask;
+            }, "Not for strangers.");
         TokenGrant grant = await fixture.CreateTokenAsync(identity, "mcp", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1));
         token = grant.Secret;
     }
@@ -65,6 +84,7 @@ try
 
     // Streamable HTTP. The transport where the credential belongs to the caller.
     await CheckHttp(address, token);
+    await CheckOverrides(address);
 
     Console.WriteLine($"RESULT: PASS; assertions: {assertions}");
     Console.WriteLine("BOUNDARY: loopback only; the MCP endpoint is plain HTTP on loopback and the forge uses an ephemeral certificate pinned by file.");
@@ -143,6 +163,8 @@ async Task CheckHttp(string address, string token)
     {
         Check(anonymous.StatusCode == HttpStatusCode.Unauthorized, "the HTTP endpoint refuses a caller with no token");
         Check(anonymous.Headers.WwwAuthenticate.Count > 0, "the refusal says how to authenticate");
+        Check((await anonymous.Content.ReadAsStringAsync()).Contains("--allow-anonymous", StringComparison.Ordinal),
+            "the refusal names the switch that would permit it rather than leaving it to be guessed");
     }
 
     using (HttpResponseMessage handshake = await Post(client, token, Request(2, "initialize", """
@@ -173,6 +195,31 @@ async Task CheckHttp(string address, string token)
             "a tool call over HTTP reaches the forge");
     }
 
+    // Every read tool, not a representative one. The listing tool was pointed at a browser-session route
+    // that refuses a token outright, and no assertion noticed because nothing called it.
+    (string Tool, string Arguments, string Expected)[] reads =
+    [
+        ("graft_list_projects", "{}", "admin/shared"),
+        ("graft_browse", """{"search":""}""", "admin/shared"),
+        ("graft_get_project", """{"project":"admin/shared"}""", "admin/shared"),
+        ("graft_list_branches", """{"project":"admin/shared"}""", "main"),
+        ("graft_list_commits", """{"project":"admin/shared","reference":""}""", "Seed the MCP acceptance fixture"),
+        ("graft_list_tree", """{"project":"admin/shared","path":"","reference":""}""", "README.md"),
+        ("graft_read_file", """{"project":"admin/shared","file":"README.md","reference":""}""", "Seeded for the MCP suite")
+    ];
+    foreach ((string tool, string arguments, string expected) in reads)
+    {
+        using HttpResponseMessage response = await Post(client, token, Call(20, tool, arguments));
+        using JsonDocument body = Parse(await response.Content.ReadAsStringAsync());
+        string result = Text(body);
+        Check(result.Contains(expected, StringComparison.Ordinal), tool + " answers through the deployed endpoint");
+        // An empty repository has no branches and no README, so some of these legitimately report nothing.
+        // What must never happen is the tool failing because it asked the forge the wrong question.
+        Check(!result.Contains("token was not accepted", StringComparison.Ordinal) &&
+              !result.Contains("could not be reached", StringComparison.Ordinal),
+            tool + " reaches a route a token can actually use");
+    }
+
     // The decisive one for this transport. The server holds no credential, so a caller presenting a token
     // that does not resolve must be refused by Graft rather than quietly served under somebody else's.
     using (HttpResponseMessage impostor = await Post(client, "graft_pat_" + new string('0', 64),
@@ -182,6 +229,68 @@ async Task CheckHttp(string address, string token)
         Check(Text(body).Contains("token was not accepted", StringComparison.Ordinal),
             "a caller's own token is what is used, so an unusable one is refused");
     }
+}
+
+/// <summary>
+/// The two overrides that loosen the default posture. Both are off unless asked for, and the point of
+/// asserting them is that the closed answer is the default rather than something an operator has to
+/// remember to choose.
+/// </summary>
+async Task CheckOverrides(string address)
+{
+    // Anonymous access, explicitly allowed. The caller reaches Graft as a stranger, so a public project is
+    // readable and nothing else is.
+    int anonymousPort = FreePort();
+    string anonymousEndpoint = "http://127.0.0.1:" + anonymousPort.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    Process open = Process.Start(Launch(mcpPath,
+        ["--server", address, "--transport", "http", "--listen", anonymousEndpoint,
+         "--ca-certificate", caFile, "--allow-anonymous", "true"]))!;
+    try
+    {
+        await WaitForListener(anonymousPort);
+        using HttpClient client = new() { BaseAddress = new(anonymousEndpoint), Timeout = TimeSpan.FromSeconds(30) };
+
+        using (HttpResponseMessage handshake = await Post(client, null, Request(1, "initialize", """
+            {"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"acceptance","version":"1"}}
+            """)))
+            Check(handshake.IsSuccessStatusCode, "an operator can allow callers with no credential");
+
+        using (HttpResponseMessage read = await Post(client, null, Call(2, "graft_browse", """{"search":""}""")))
+        {
+            using JsonDocument body = Parse(await read.Content.ReadAsStringAsync());
+            Check(Text(body).Contains("admin/shared", StringComparison.Ordinal),
+                "an anonymous caller reads what is public");
+        }
+
+        // The forge decides this, not the MCP server: an anonymous caller is simply a stranger to Graft.
+        using (HttpResponseMessage denied = await Post(client, null, Call(3, "graft_get_project", """{"project":"admin/private"}""")))
+        {
+            using JsonDocument body = Parse(await denied.Content.ReadAsStringAsync());
+            Check(!Text(body).Contains("admin/private", StringComparison.Ordinal),
+                "an anonymous caller sees nothing that is not public");
+        }
+    }
+    finally { Stop(open); }
+
+    // Plaintext off loopback. Refused unless asked for, which is the assertion that matters: a deployment
+    // that forgets the override fails to start rather than quietly serving tokens in the clear.
+    int plaintextPort = FreePort();
+    string offLoopback = "http://0.0.0.0:" + plaintextPort.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    Process refused = Process.Start(Launch(mcpPath,
+        ["--server", address, "--transport", "http", "--listen", offLoopback, "--ca-certificate", caFile]))!;
+    await refused.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(30));
+    Check(refused.ExitCode == 2, "a plaintext listener off loopback is refused without the override");
+    refused.Dispose();
+
+    Process permitted = Process.Start(Launch(mcpPath,
+        ["--server", address, "--transport", "http", "--listen", offLoopback,
+         "--ca-certificate", caFile, "--allow-plaintext", "true"]))!;
+    try
+    {
+        await WaitForListener(plaintextPort);
+        Check(true, "the same listener starts once an operator allows plaintext");
+    }
+    finally { Stop(permitted); }
 }
 
 async Task<HttpResponseMessage> Post(HttpClient client, string? token, string payload)

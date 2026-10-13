@@ -2,6 +2,33 @@
 
 Updated: 2026-10-13. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
 
+## Added on 2026-10-13, MCP deployment posture
+
+**Credentials are required and the override is explicit.** `--allow-anonymous`, off by default, serves
+callers who present nothing; they reach Graft as strangers and see only public projects. The refusal names
+the switch. **`--allow-plaintext`**, also off by default, permits an `http://` listener off loopback for an
+internal endpoint, and `deploy/container/compose.internal-http.yaml` is an overlay that uses it. The two are
+independent: the plaintext overlay still demands a credential. The server prints
+`POSTURE: credentials=...; writes=...; transport=...` on startup.
+
+`compose.yaml` is now the hardened reference: every capability dropped, no privilege escalation, read-only
+root, bounded logs, memory and process counts, both ports on host loopback, shared through a YAML anchor so
+the two services cannot drift. All of it verified in Docker.
+
+**Three things this found.** The MCP server's argument parser printed usage and no reason, which makes a
+container that restarts every two seconds nearly undiagnosable; it now says what it refused and why.
+`graft_list_projects` was pointed at `/api/projects`, a browser-session route that refuses a token outright,
+so that tool could never have worked, and nothing noticed because the suite called only two of the seven
+read tools. `graft_read_file` and `graft_list_tree` omitted the `ref` the file route requires. The MCP suite
+now calls every read tool against a seeded repository and is 36 assertions.
+
+**A container trap worth knowing.** Compose services here carry their own `build:` section, so compose
+builds and uses its own image and a separately tagged one is ignored, with its own cache. Several runs of
+the deployment check reported a server rejecting arguments it understood, because the container was older
+than the binary on disk. Build through `compose build`.
+
+Suites: 389 Git/API/browser, 129 accounts, 41 operations, 36 MCP.
+
 ## Added on 2026-10-13, MCP in the deployment
 
 **The MCP server ships in the standard container image and starts under a compose profile.** `docker compose
