@@ -8,7 +8,13 @@ Graft is a planned locally hosted GitLab alternative in C#/.NET 10. It targets G
 
 Status as of **2026-09-20**: [MVP-08 packaging and resource validation](docs/validation/2026-09-19-mvp08-packaging-resources.md) conditionally passes. Windows NativeAOT interactive and Windows Service, Linux static-musl interactive/systemd, and rootless Podman paths are implemented and tested; the recorded Linux static binaries retain all 76 Git/API/project-creation and 36 recovery assertions. That Windows Git/API/browser workflow passed **135 assertions** under the runtime and NativeAOT at the time, including [administrator user creation and project membership](docs/validation/2026-09-19-user-membership.md), [personal access-token lifecycle](docs/validation/2026-09-19-personal-access-tokens.md), and [account credential lifecycle](docs/validation/2026-09-20-account-credentials.md). The GitLab 18.0.0 source fixture passes against Graft and a [live reference](docs/validation/2026-09-19-gitlab-18-live-reference.md), while pinned `glab` 1.58.0 passes against both. The rendered Blazor workflow and one-use [operator bootstrap](docs/validation/2026-09-19-operator-bootstrap.md) pass. The Linux 3.10.108 run is deferred. DnaX distribution and a real CA/DNS trust environment remain gates. Remote hosting, visibility and project license are undecided. An `origin` remote exists but nothing has been pushed.
 
-Status as of **2026-10-13**: Graft has a Model Context Protocol server, `src/Graft.Mcp`, as a separate
+Status as of **2026-10-13**: the Model Context Protocol server ships in the standard container image and
+starts under a compose profile, so enabling agent access is a restart rather than a rebuild and an operator
+who wants none has nothing listening. It carries no credential of its own: every caller sends their own
+Graft token. Verified in a real container runtime; see
+[deployment evidence](docs/validation/2026-10-13-mcp-in-the-deployment.md).
+
+Graft has a Model Context Protocol server, `src/Graft.Mcp`, as a separate
 executable speaking both stdio and Streamable HTTP. It reaches Graft through the ordinary REST API with a personal access token, so an
 agent can do exactly what that token's owner can do and nothing more, and mutating tools are refused unless
 it is started with writes allowed. It is deliberately not part of the forge: the server publishes NativeAOT

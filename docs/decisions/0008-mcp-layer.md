@@ -3,7 +3,7 @@
 - Date: 2026-10-13
 - Status: Accepted user request, implemented, with one substitution the request did not specify
 - Source: "can you build this using DNAX? so it remains backwards compatible with the gitlab API layer but we have our own MCP layer?"
-- Review trigger: A DnaX release that makes MCPFab embeddable, a NativeAOT publish of `Graft.Mcp` actually running, any proposal to move MCP into the forge process, or an OAuth story for the HTTP transport
+- Review trigger: A DnaX release that makes MCPFab embeddable, a NativeAOT publish of `Graft.Mcp` actually running, any proposal to move MCP into the forge process, an OAuth story for the HTTP transport, or a change to the container base or secret model
 
 ## What was asked, and what was built
 
@@ -124,6 +124,21 @@ this server forwards; the refusal is in front, not instead.
 Off loopback the endpoint must be HTTPS and must have a certificate to be it, the same rule the forge
 applies to itself. On loopback plain HTTP is allowed, which is what a local supervisor launching a managed
 server expects.
+
+## Decision: in the standard image, off unless a profile asks for it
+
+The MCP server ships inside the one container image beside the forge, and compose starts it only under the
+`mcp` profile. Enabling it is therefore a restart rather than a rebuild, and the image an operator ships is
+the same whether or not they use it.
+
+A profile rather than a second image, because two images would mean two things to build, tag and keep in
+step for a feature most deployments will leave off. A profile rather than a flag inside the forge, because
+the server is a separate process for the reasons above: an operator who wants no agent access then has
+nothing listening, rather than a route switched off.
+
+Nothing about the forge's own container changes. It gains a network alias so the MCP container can address
+it by the name on its certificate, since that container verifies the certificate rather than trusting a
+service name.
 
 ## What is not settled
 

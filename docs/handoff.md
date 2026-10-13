@@ -2,6 +2,28 @@
 
 Updated: 2026-10-13. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
 
+## Added on 2026-10-13, MCP in the deployment
+
+**The MCP server ships in the standard container image and starts under a compose profile.** `docker compose
+--profile mcp up`. Without the profile nothing listens on 8444 and the image is identical, so enabling it is
+a restart rather than a rebuild. See [deployment evidence](validation/2026-10-13-mcp-in-the-deployment.md).
+
+Verified in a real container runtime, Docker inside WSL, building the real Containerfile and running the
+real compose file: profiles select the right services, the forge is healthy with the profile off and nothing
+answers on 8444, and with it on the endpoint refuses an uncredentialed caller, completes the handshake for a
+credentialed one, reaches the forge over verified TLS, and still refuses writes in a read-only deployment.
+
+**Two pre-existing problems surfaced while doing it.** The documented container publish command did not
+work: `PublishSingleFile` propagated into the nested Blazor client publish, which cannot use an application
+host, failing with `NETSDK1098`. The nested publish already stripped `RuntimeIdentifier`, `SelfContained`,
+`PublishAot` and `PublishTrimmed`, and `PublishSingleFile` was missing from that list; it and
+`PublishReadyToRun` are stripped now. Separately, compose secrets outside swarm are host bind mounts, so the
+operator's certificate and password files must be readable by UID 1654 or the forge fails at startup with
+what looks like a certificate fault. The runbook says so now.
+
+`deploy/container/.env.example` is new and documents every variable, including the two that only matter
+under the MCP profile.
+
 ## Added on 2026-10-13, the MCP layer
 
 **Graft has a Model Context Protocol server**, `src/Graft.Mcp`, as a separate executable speaking both

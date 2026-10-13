@@ -60,18 +60,42 @@ The unit uses `Type=notify`, restarts on failure, restricts filesystem writes to
 
 ## Optional container
 
-The container path uses the self-contained `linux-x64` publication at `artifacts/mvp08/server-linux-x64`. It runs as UID/GID 1654 with a read-only root filesystem and a writable named data volume.
+The container path uses the self-contained `linux-x64` publications at `artifacts/mvp08/server-linux-x64` and `artifacts/mvp08/mcp-linux-x64`. Both go into one image, which runs as UID/GID 1654 with a read-only root filesystem and a writable named data volume.
+
+Copy `deploy/container/.env.example` to `deploy/container/.env` and fill it in first. It documents every variable, including the two that only matter when the MCP profile is enabled.
 
 ```powershell
 dotnet publish src/Graft.Server/Graft.Server.csproj -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -o artifacts/mvp08/server-linux-x64
-$env:GRAFT_TLS_CERTIFICATE = '/operator/path/tls.pfx'
-$env:GRAFT_TLS_PASSWORD_FILE = '/operator/path/tls-password'
-$env:GRAFT_ORIGIN = 'https://graft.example.internal:8443'
+dotnet publish src/Graft.Mcp/Graft.Mcp.csproj -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -o artifacts/mvp08/mcp-linux-x64
 podman build --file deploy/container/Containerfile --tag graft:mvp08 .
 podman compose --file deploy/container/compose.yaml up --detach
 ```
 
-Compose mounts the certificate and password as read-only secrets. The port is bound to host loopback. The image currently uses the .NET 10 Ubuntu runtime-deps base and is separate from the static-musl legacy-host artifact. Pinning the base by digest remains release work.
+Compose mounts the certificate and password as read-only secrets. **Those files must be readable by UID 1654.** Compose secrets outside swarm are host bind mounts, so the file's own ownership and mode are what the container sees, and a root-only `0600` key produces a startup failure reading `Access to the path '/run/secrets/graft-tls.pfx' is denied`.
+
+The port is bound to host loopback. The image uses the .NET 10 Ubuntu runtime-deps base and is separate from the static-musl legacy-host artifact. Pinning the base by digest remains release work.
+
+### Optional MCP endpoint
+
+The Model Context Protocol server ships in the same image and starts only when asked for, as a compose profile:
+
+```powershell
+podman compose --file deploy/container/compose.yaml --profile mcp up --detach
+```
+
+Without the profile nothing listens on 8444 and the image is unchanged, so turning it on is a restart rather than a rebuild. With it, the endpoint is at `https://<host>:8444/mcp`, bound to host loopback like the forge.
+
+It holds no credential. Every caller sends their own Graft personal access token as `PRIVATE-TOKEN` or `Authorization: Bearer`, so two callers get exactly the access their own tokens carry, and a request without one is refused `401` before the protocol is spoken. `GRAFT_MCP_ALLOW_WRITES` bounds what any caller can do through it and defaults to `false`.
+
+Two variables exist only for this profile. `GRAFT_INTERNAL_HOST` is the name the MCP container uses to reach the forge, and compose gives the forge that name as a network alias; it must match a subject alternative name on the certificate, because the MCP server verifies it rather than trusting the service name. `GRAFT_CA_CERTIFICATE` is the forge's certificate in PEM or DER, which is the public half of the PKCS#12 and never the private key:
+
+```sh
+openssl pkcs12 -in tls.pfx -clcerts -nokeys -out graft-ca.pem -passin file:tls-password
+```
+
+There is no option anywhere that skips certificate verification. The MCP server reaches the forge over TLS and checks it, and off loopback its own endpoint must be HTTPS with a certificate too, which the compose file supplies from the same secret.
+
+The MCP binary is published self-contained but **not** NativeAOT, unlike the forge, because no Model Context Protocol library has been verified under AOT by anyone. See [ADR 0008](decisions/0008-mcp-layer.md). Both binaries run on the same runtime-deps base either way.
 
 ## Certificate renewal
 
