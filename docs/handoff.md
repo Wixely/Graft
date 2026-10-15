@@ -221,7 +221,7 @@ Merged to `main`. This section previously said the branch was unmerged; it is no
 
 Assertions now: 110 accounts/permissions, 165 Git/API/browser, 41 operations.
 
-Two corrections to the earlier record. The solution did **not** build on the current toolchain before this work; two independent causes needed fixing together. And a remote **is** configured (`origin`, github.com/Wixely/Graft), contrary to the statement that stood here previously; nothing has been pushed.
+Two corrections to the earlier record. The solution did **not** build on the current toolchain before this work; two independent causes needed fixing together. And a remote **is** configured (`origin`, github.com/Wixely/Graft), contrary to the statement that stood here previously.
 
 ### Open from this slice
 
@@ -260,8 +260,8 @@ view, and handoff to Visual Studio Code and Visual Studio through the handler UR
 `<details>` disclosure so it needs no scripting to open, close or take focus; only copying does, and that
 reports a refusal rather than claiming a copy that never happened.
 
-**Still open and unchanged:** nothing has been pushed to `origin`. The demo fixture is disposable by design,
-so anything pushed into it is destroyed when it stops.
+**Still open and unchanged:** the demo fixture is disposable by design, so anything pushed into it is
+destroyed when it stops.
 
 ## Added on 2026-10-08
 
@@ -295,7 +295,7 @@ The main release gates are the durable DnaX package source, a real CA/DNS/client
 
 Project creation passes through both the Blazor session API and the bounded GitLab-style REST route. The write route requires `api`, creates an empty durable repository through pending/ready publication, and rejects duplicates, invalid paths, unsupported visibility, and unsupported fields. Since 2026-10-13 a project is created private and may then be made `unlisted` or `public` by a Maintainer, or created non-private directly, but only on a server whose operator enabled publishing. A pinned GitLab 18.0.0 source fixture added path-only creation and raises the combined Windows JIT and NativeAOT harness to 87 assertions; see [source-fixture evidence](validation/2026-09-19-gitlab-18-source-fixture.md) and [live-reference evidence](validation/2026-09-19-gitlab-18-live-reference.md).
 
-An `origin` remote exists (github.com/Wixely/Graft) but nothing has been pushed. Do not deploy, publish, import production data, expose a network listener or select repository visibility without explicit authorization. Graft can now serve anonymous readers, so that caution covers starting a server with `--public-browsing true` on anything but loopback.
+This repository is published at github.com/Wixely/Graft and the GitHub repository is **public**, so every commit here is world-readable the moment it is pushed. Treat anything added to it accordingly. Do not deploy, import production data, expose a network listener or select repository visibility without explicit authorization. Graft can now serve anonymous readers, so that caution covers starting a server with `--public-browsing true` on anything but loopback.
 
 ## Next work
 
