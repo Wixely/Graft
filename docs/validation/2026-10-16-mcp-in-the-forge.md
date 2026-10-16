@@ -53,15 +53,14 @@ inside `vcvars64.bat` with `IlcUseEnvironmentalTools=true` and `Platform` cleare
 third-party notices, and refuses a bad command line with exit code 2 and the reason. Done twice, before and
 after the tools moved to the shared library.
 
-**`Graft.Server` with `ModelContextProtocol.AspNetCore` inside it reaches the end of ILC with no warning
-from the MCP SDK or from `Graft.McpTools`.** All sixteen ILC warnings in the publish are from one assembly,
-`DnaX.Uploads`: eight `IL2026` and eight `IL3050`, every one on `UploadEndpoints.MapDnaXUploads` calling
-`MapPost` and `MapDelete` with handlers the runtime must build a request delegate for. Under this
-repository's warnings-as-errors policy they are the `IL2104` and `IL3053` errors that stop the publish, so
-the native server binary here was produced with that policy relaxed for the one diagnostic run.
+**`Graft.Server` with `ModelContextProtocol.AspNetCore` inside it produces no ILC warning from the MCP SDK
+or from `Graft.McpTools`.** The question ADR 0008 left open is answered: the SDK is AOT-clean in the forge.
 
-**That binary does not start, and the reason is not MCP.** With `--mcp true` and with `--mcp false` alike it
-dies while building its endpoint table:
+### The one thing that was not clean, and the fix
+
+The first native publish stopped on `DnaX.Uploads`: eight `IL2026` and eight `IL3050`, every one on
+`UploadEndpoints.MapDnaXUploads`. Relaxing warnings-as-errors for one diagnostic run produced a binary that
+would not start at all, with `--mcp true` and `--mcp false` alike:
 
 ```text
 System.NotSupportedException: JsonTypeInfo metadata for type 'System.Threading.Tasks.Task`1[Microsoft.AspNetCore.Http.IResult]'
@@ -70,16 +69,42 @@ was not provided by TypeInfoResolver of type '[Graft.Contracts.ApiJson]'.
    at Microsoft.AspNetCore.Routing.RouteGroupBuilder.GroupEndpointDataSource.get_Endpoints()
 ```
 
-That is the upload route group: `RequestDelegateFactory` is the runtime, reflection-based path the Request
-Delegate Generator replaces at compile time, and the generator only rewrites routes in the assembly being
-compiled, never in a referenced library. The warnings said exactly this. The upload transport landed with
-[ADR 0005](../decisions/0005-browser-upload-transport.md) after the last time the Windows NativeAOT server
-was exercised, and until today no machine here could run ILC to find out.
+The cause is the shape of the upload routes, not their serialization: they are minimal-API lambdas taking
+injected services and returning `Task<IResult>`, so the runtime `RequestDelegateFactory` builds their
+delegates and asks for metadata no trimmed binary has. The package's own payloads are already
+source-generated through `UploadJsonContext`.
 
-So the NativeAOT release claim for the forge is currently **not met**, independently of this work, and the
-MCP suite could not be run against a native forge. The MCP SDK has been shown AOT-clean inside the forge,
-which was the question ADR 0008 left open; whether the forge as a whole publishes native is now a question
-about `DnaX.Uploads`. The next action is in [the handoff](../handoff.md).
+The Request Delegate Generator replaces that factory at compile time, and it rewrites the `Map` calls in the
+compilation it runs in. The consuming application cannot enable it on a referenced library; the library
+enables it for itself. `DnaX.Uploads` does not, while the DnaX repository's own MCPFab projects do, along
+with `IsTrimmable` and the trim, AOT and single-file analyzers. The upload package is the experimental one
+and carries none of that.
+
+Measured against the DnaX source at the commit this repository pins:
+
+| Build of `DnaX.Uploads` | IL2026 | IL3050 |
+| --- | --- | --- |
+| As shipped | 16 | 16 |
+| With `EnableRequestDelegateGenerator=true` | 0 | 0 |
+
+It also builds clean with `IsTrimmable` and both analyzers on, so nothing else in the package objects.
+
+### The forge, published and run native
+
+The package was rebuilt locally with that one property, packed as `10.0.0-alpha.7-rdgtest`, and Graft was
+published NativeAOT against it with warnings-as-errors left on:
+
+- The publish succeeds with **zero ILC warnings** and produces a 55 MB `Graft.Server.exe`.
+- It starts, reporting `MODE: NativeAOT`, the `MCP:` posture line and `READY:`.
+- `/healthz` answers `healthy`; `/mcp` answers `401` without a token; and the upload capabilities route,
+  the one that could not previously be built at all, answers `401` rather than crashing the process.
+- **`Graft.Mcp.Acceptance` passes all 82 assertions against the native forge**, and
+  **`Graft.Git.Acceptance` passes all 389**.
+
+So the forge's NativeAOT claim is reachable today and the MCP endpoint does not stand in its way. What
+stands in the way is one MSBuild property in a package Graft does not own. Graft still pins the published
+`10.0.0-alpha.7`; the local package and the reference to it were reverted after the run, and the DnaX
+checkout was not modified.
 
 ## The page, in a browser
 

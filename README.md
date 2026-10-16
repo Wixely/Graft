@@ -18,7 +18,9 @@ ones and still reach Graft over the REST API with each caller's own token, so an
 that token could do with curl. What made this possible is that the MCP SDK turned out to publish NativeAOT
 cleanly, on its own and with no warning inside the forge, which [ADR 0008](docs/decisions/0008-mcp-layer.md)
 had named as the thing to wait for. The same first native publish of the forge in weeks found that the
-upload transport, not MCP, stops the native forge from starting; that gap is recorded and is the next action. See [ADR 0009](docs/decisions/0009-mcp-in-the-forge.md) and
+upload transport, not MCP, stops the native forge from starting, and that one MSBuild property in that
+package fixes it: rebuilt that way, the forge publishes native with no warnings and passes all 82 MCP and
+389 Git assertions as a native binary. Releasing that package is the next action. See [ADR 0009](docs/decisions/0009-mcp-in-the-forge.md) and
 [the evidence](docs/validation/2026-10-16-mcp-in-the-forge.md).
 
 Status as of **2026-10-13**: the Model Context Protocol server ships in the standard container image and

@@ -23,22 +23,29 @@ to the public origin, so result links are the ones a person could open, over a s
 bound port and accepting only the certificate this process serves. Every authorization decision stays in the
 API route, made once for agents and people alike.
 
-**What unblocked it: NativeAOT runs here now.** The MSVC toolchain is installed. `Graft.Mcp` publishes native
-with zero ILC warnings, and the forge with `ModelContextProtocol.AspNetCore` inside it produces no ILC warning
-from the SDK or the tools library. ADR 0008 had
+**What unblocked it: NativeAOT runs here now.** The MSVC toolchain is installed, so ILC runs to completion
+for the first time in this repository. ADR 0008 had
 named exactly that as its review trigger. The SDK finds the linker through `vswhere.exe`, which this Visual
 Studio installer lacks, so the publish runs inside `vcvars64.bat` with `IlcUseEnvironmentalTools=true` and
-`Platform` cleared; the command is in [build-and-test](build-and-test.md).
+`Platform` cleared; the command is in [build-and-test](build-and-test.md). `Graft.Mcp` publishes native with
+zero ILC warnings, and the MCP SDK produces none inside the forge either.
 
-**And it found a pre-existing break in the forge's NativeAOT claim.** All sixteen ILC warnings are in
-`DnaX.Uploads`, whose `MapDnaXUploads` maps `MapPost`/`MapDelete` handlers the runtime must build request
-delegates for, and the native forge dies at startup building its endpoint table, with `--mcp true` and
-`--mcp false` alike. The Request Delegate Generator only rewrites routes in the assembly being compiled, so
-the fix is in `DnaX.Uploads` itself, or in Graft mapping those routes with explicit `RequestDelegate`s. Until
-then the native forge does not run and the MCP suite could not be run against one; see
-[the evidence](validation/2026-10-16-mcp-in-the-forge.md). **Next action, owner: implementation agent with the
-user's say on DnaX:** make `DnaX.Uploads` AOT-safe or wrap its routes, then publish the forge native inside
-`vcvars64` and run the Git, operations and MCP suites against the `.exe`.
+**And it found, then solved, a break in the forge's NativeAOT claim.** All sixteen ILC warnings were in
+`DnaX.Uploads`, whose `MapDnaXUploads` registers minimal-API lambdas returning `Task<IResult>`, and the
+native forge died at startup building its endpoint table, with `--mcp true` and `--mcp false` alike. The
+Request Delegate Generator replaces that runtime factory at compile time, but only in the compilation it
+runs in, so a referenced library has to enable it for itself. `DnaX.Uploads` does not; the DnaX repository's
+own MCPFab projects do. Rebuilding the package with `EnableRequestDelegateGenerator=true` takes it from
+32 compile-level trim/AOT warnings to zero, and Graft then publishes NativeAOT with no ILC warnings at all,
+starts, serves, and **passes all 82 MCP and all 389 Git assertions as a native binary**. See
+[the evidence](validation/2026-10-16-mcp-in-the-forge.md).
+
+**Next action, owner: implementation agent, with the user's say on DnaX.** Add
+`<EnableRequestDelegateGenerator>true</EnableRequestDelegateGenerator>` to `src/DnaX.Uploads/DnaX.Uploads.csproj`
+in the DnaX repository, ideally with `IsTrimmable` and the trim/AOT analyzers its siblings carry, release it,
+and move Graft's pin to that version. Nothing in Graft needs to change. Until then Graft pins
+`10.0.0-alpha.7` and the native forge cannot start, which is a published-dependency problem rather than a
+Graft one.
 
 **The client gained an admin page**, `/-/admin/agents`, shown only when the session reports
 `mcp_available`, and the session response carries that flag beside `public_browsing`.

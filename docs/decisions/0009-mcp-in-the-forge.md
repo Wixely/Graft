@@ -20,11 +20,14 @@ inside it runs ILC to the end with no warning from the SDK or the tools library.
 as its review trigger, and this is the review.
 
 The same publish found something else, recorded in full in the
-[validation record](../validation/2026-10-16-mcp-in-the-forge.md): the native forge does not start, with or
-without `--mcp`, because `DnaX.Uploads` maps its routes through the runtime request-delegate factory, which
-has no source-generated metadata in a trimmed binary. That defect predates this work and was invisible while
-no machine here could run ILC. It is not a reason to keep MCP out of the forge, since the MCP SDK is not the
-thing that fails, but it means the forge's NativeAOT claim is currently unmet for a different reason.
+[validation record](../validation/2026-10-16-mcp-in-the-forge.md): `DnaX.Uploads` maps its routes through
+the runtime request-delegate factory, which has no source-generated metadata in a trimmed binary, so the
+native forge would not start at all, with or without `--mcp`. That defect predates this work and was
+invisible while no machine here could run ILC. Rebuilding that package with
+`EnableRequestDelegateGenerator=true`, the property its sibling MCPFab projects already set, removes every
+warning; the forge then publishes native with none at all, starts, and passes both the 82-assertion MCP
+suite and the 389-assertion Git suite as a native binary. Graft still pins the published package, so the
+release claim waits on a DnaX change rather than on anything here.
 
 The two consequences were real and are weighed below rather than waved away.
 
@@ -118,5 +121,6 @@ endpoint paused and resumed without a restart, result links on the public origin
 audit rows, and a server started without the flag answering a 404 that names it. The launcher's stdio and
 HTTP checks are unchanged and still pass against the same forge.
 
-The main Git/API/browser suite still passes its 389 assertions. The NativeAOT findings, including the one
-that is not about MCP, are in the [validation record](../validation/2026-10-16-mcp-in-the-forge.md).
+The main Git/API/browser suite still passes its 389 assertions. Both suites were also run against a
+NativeAOT-published forge, which passes them in full once the upload package is rebuilt as described in the
+[validation record](../validation/2026-10-16-mcp-in-the-forge.md).
