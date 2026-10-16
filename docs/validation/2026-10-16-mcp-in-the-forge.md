@@ -102,7 +102,10 @@ published NativeAOT against it with warnings-as-errors left on:
   **`Graft.Git.Acceptance` passes all 389**.
 
 So the forge's NativeAOT claim is reachable today and the MCP endpoint does not stand in its way. What
-stands in the way is one MSBuild property in a package Graft does not own. Graft still pins the published
+stands in the way is one MSBuild property in a package Graft does not own, filed upstream as
+[Wixely/DnaX#17](https://github.com/Wixely/DnaX/issues/17). That investigation also found the same defect in
+`DnaX.Diagnostics`, which Graft does not use, and a sibling one in `DnaX.RemoteAccess`' configuration
+binding; the issue carries measurements for all three. Graft still pins the published
 `10.0.0-alpha.7`; the local package and the reference to it were reverted after the run, and the DnaX
 checkout was not modified.
 

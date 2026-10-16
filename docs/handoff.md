@@ -40,12 +40,12 @@ own MCPFab projects do. Rebuilding the package with `EnableRequestDelegateGenera
 starts, serves, and **passes all 82 MCP and all 389 Git assertions as a native binary**. See
 [the evidence](validation/2026-10-16-mcp-in-the-forge.md).
 
-**Next action, owner: implementation agent, with the user's say on DnaX.** Add
-`<EnableRequestDelegateGenerator>true</EnableRequestDelegateGenerator>` to `src/DnaX.Uploads/DnaX.Uploads.csproj`
-in the DnaX repository, ideally with `IsTrimmable` and the trim/AOT analyzers its siblings carry, release it,
-and move Graft's pin to that version. Nothing in Graft needs to change. Until then Graft pins
-`10.0.0-alpha.7` and the native forge cannot start, which is a published-dependency problem rather than a
-Graft one.
+**Filed upstream as [Wixely/DnaX#17](https://github.com/Wixely/DnaX/issues/17)**, which also found that
+`DnaX.Diagnostics` has the same defect (12 warnings, same fix) and `DnaX.RemoteAccess` a sibling one in
+`OptionsBuilder.Bind`, cleared by `EnableConfigurationBindingGenerator`. **Next action, owner: implementation
+agent once that issue is resolved:** move Graft's pin to the released version and publish the forge native.
+Nothing in Graft needs to change. Until then Graft pins `10.0.0-alpha.7` and the native forge cannot start,
+which is a published-dependency problem rather than a Graft one.
 
 **The client gained an admin page**, `/-/admin/agents`, shown only when the session reports
 `mcp_available`, and the session response carries that flag beside `public_browsing`.
