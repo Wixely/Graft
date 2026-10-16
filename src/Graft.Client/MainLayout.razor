@@ -39,6 +39,10 @@
                     <nav>
                         <a href="/-/admin/users" class="@Active("-/admin/users")"><Icon Name="user" />Users</a>
                         <a href="/-/admin/import" class="@Active("-/admin/import")"><Icon Name="upload" />Import</a>
+                        @if (Api.Session?.McpAvailable == true)
+                        {
+                            <a href="/-/admin/agents" class="@Active("-/admin/agents")"><Icon Name="settings" />Agent access</a>
+                        }
                     </nav>
                 }
             </aside>

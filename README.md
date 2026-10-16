@@ -8,6 +8,19 @@ Graft is a planned locally hosted GitLab alternative in C#/.NET 10. It targets G
 
 Status as of **2026-09-20**: [MVP-08 packaging and resource validation](docs/validation/2026-09-19-mvp08-packaging-resources.md) conditionally passes. Windows NativeAOT interactive and Windows Service, Linux static-musl interactive/systemd, and rootless Podman paths are implemented and tested; the recorded Linux static binaries retain all 76 Git/API/project-creation and 36 recovery assertions. That Windows Git/API/browser workflow passed **135 assertions** under the runtime and NativeAOT at the time, including [administrator user creation and project membership](docs/validation/2026-09-19-user-membership.md), [personal access-token lifecycle](docs/validation/2026-09-19-personal-access-tokens.md), and [account credential lifecycle](docs/validation/2026-09-20-account-credentials.md). The GitLab 18.0.0 source fixture passes against Graft and a [live reference](docs/validation/2026-09-19-gitlab-18-live-reference.md), while pinned `glab` 1.58.0 passes against both. The rendered Blazor workflow and one-use [operator bootstrap](docs/validation/2026-09-19-operator-bootstrap.md) pass. The Linux 3.10.108 run is deferred. DnaX distribution and a real CA/DNS trust environment remain gates. Remote hosting and the project licence are undecided. The repository itself is public at github.com/Wixely/Graft.
 
+Status as of **2026-10-16**: the Model Context Protocol endpoint is part of the forge. `--mcp true`, or
+`GRAFT_MCP=true` in the container deployment, serves it at `/mcp` on the same port and certificate as
+everything else; nothing else about a deployment changes, and the compose profile, second port and
+plain-HTTP overlay are gone. Once on, an administrator decides in the browser, under Administration, Agent
+access, whether agents are served, whether they may change anything, and whether callers with no token are
+served at all, and each change applies to the next request with nothing restarted. The tools are the same
+ones and still reach Graft over the REST API with each caller's own token, so an agent can do exactly what
+that token could do with curl. What made this possible is that the MCP SDK turned out to publish NativeAOT
+cleanly, on its own and with no warning inside the forge, which [ADR 0008](docs/decisions/0008-mcp-layer.md)
+had named as the thing to wait for. The same first native publish of the forge in weeks found that the
+upload transport, not MCP, stops the native forge from starting; that gap is recorded and is the next action. See [ADR 0009](docs/decisions/0009-mcp-in-the-forge.md) and
+[the evidence](docs/validation/2026-10-16-mcp-in-the-forge.md).
+
 Status as of **2026-10-13**: the Model Context Protocol server ships in the standard container image and
 starts under a compose profile, so enabling agent access is a restart rather than a rebuild and an operator
 who wants none has nothing listening. It carries no credential of its own: every caller sends their own
@@ -16,13 +29,12 @@ overlay serves the endpoint over plain HTTP for an internal network, which also 
 reference compose file is hardened by default and every posture was verified in a real container runtime;
 see [deployment evidence](docs/validation/2026-10-13-mcp-in-the-deployment.md).
 
-Graft has a Model Context Protocol server, `src/Graft.Mcp`, as a separate
-executable speaking both stdio and Streamable HTTP. It reaches Graft through the ordinary REST API with a personal access token, so an
-agent can do exactly what that token's owner can do and nothing more, and mutating tools are refused unless
-it is started with writes allowed. It is deliberately not part of the forge: the server publishes NativeAOT
-and no MCP library has been AOT-published by anyone, so the forge's dependency closure is unchanged. Two
-settings that were previously browser-only gained token equivalents to support it, one of which is a route
-GitLab already has. See [ADR 0008](docs/decisions/0008-mcp-layer.md).
+Graft also ships the same tools as a separate launcher, `src/Graft.Mcp`, speaking stdio for clients that
+start their MCP server locally, and Streamable HTTP on its own. It reaches Graft through the ordinary REST
+API with a personal access token, so an agent can do exactly what that token's owner can do and nothing
+more, and mutating tools are refused unless it is started with writes allowed. Two settings that were
+previously browser-only gained token equivalents to support it, one of which is a route GitLab already has.
+See [ADR 0008](docs/decisions/0008-mcp-layer.md), partly superseded by ADR 0009 above.
 
 Status as of **2026-10-13**: signing in now lasts. A session was expiring fifteen minutes after sign-in
 whatever you were doing, because the expiry was set once and never moved; it is now an idle window renewed

@@ -60,18 +60,17 @@ The unit uses `Type=notify`, restarts on failure, restricts filesystem writes to
 
 ## Optional container
 
-The container path uses the self-contained `linux-x64` publications at `artifacts/mvp08/server-linux-x64` and `artifacts/mvp08/mcp-linux-x64`. Both go into one image, which runs as UID/GID 1654 with a read-only root filesystem and a writable named data volume.
+The container path uses the self-contained `linux-x64` publication at `artifacts/mvp08/server-linux-x64`. It goes into one image, which runs as UID/GID 1654 with a read-only root filesystem and a writable named data volume.
 
-Copy `deploy/container/.env.example` to `deploy/container/.env` and fill it in first. It documents every variable, including the two that only matter when the MCP profile is enabled.
+Copy `deploy/container/.env.example` to `deploy/container/.env` and fill it in first. It documents every variable.
 
 ```powershell
 dotnet publish src/Graft.Server/Graft.Server.csproj -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -o artifacts/mvp08/server-linux-x64
-dotnet publish src/Graft.Mcp/Graft.Mcp.csproj -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -o artifacts/mvp08/mcp-linux-x64
 podman compose --file deploy/container/compose.yaml build
 podman compose --file deploy/container/compose.yaml up --detach
 ```
 
-Both services name the image they run, through `GRAFT_IMAGE`, defaulting to `graft:local`. That matters more than it looks. A compose service with only a `build:` section and no `image:` makes compose invent a name from the project directory and the service, so an image you built and tagged yourself is never referenced, and `up` runs whatever compose built first regardless of what changed underneath. Naming it means `podman build --tag graft:local .` and `compose build` produce the same thing, and either is what runs. It also means one image serves both services rather than compose building the same Containerfile twice.
+The service names the image it runs, through `GRAFT_IMAGE`, defaulting to `graft:local`. That matters more than it looks. A compose service with only a `build:` section and no `image:` makes compose invent a name from the project directory and the service, so an image you built and tagged yourself is never referenced, and `up` runs whatever compose built first regardless of what changed underneath. Naming it means `podman build --tag graft:local .` and `compose build` produce the same thing, and either is what runs.
 
 `up` still does not rebuild on its own. After republishing a binary, run `compose build` again, or `up --build`. Where an image looks current and the container disagrees, `compose build --no-cache` settles it.
 
@@ -83,41 +82,31 @@ The port is bound to host loopback. The image uses the .NET 10 Ubuntu runtime-de
 
 ### Optional MCP endpoint
 
-The Model Context Protocol server ships in the same image and starts only when asked for, as a compose profile:
-
-```powershell
-podman compose --file deploy/container/compose.yaml --profile mcp up --detach
-```
-
-Without the profile nothing listens on 8444 and the image is unchanged, so turning it on is a restart rather than a rebuild. With it, the endpoint is at `https://<host>:8444/mcp`, bound to host loopback like the forge.
-
-It holds no credential. Every caller sends their own Graft personal access token as `PRIVATE-TOKEN` or `Authorization: Bearer`, so two callers get exactly the access their own tokens carry, and a request without one is refused `401` before the protocol is spoken. `GRAFT_MCP_ALLOW_WRITES` bounds what any caller can do through it and defaults to `false`.
-
-Two overrides exist and both default to closed. `GRAFT_MCP_ALLOW_ANONYMOUS=true` serves callers who present no credential at all; they then reach Graft as strangers and see only public projects, which is a real limit but the only one. The server prints its posture on startup, so what a deployment is actually doing is visible in its logs:
-
-```text
-POSTURE: credentials=required; writes=refused; transport=TLS
-```
-
-### Plain HTTP for an internal endpoint
-
-Where the MCP endpoint is reached only from inside a container network or a private segment, terminating TLS a second time buys little. An overlay file supplies that shape:
-
-```powershell
-podman compose --file deploy/container/compose.yaml --file deploy/container/compose.internal-http.yaml --profile mcp up --detach
-```
-
-It changes the endpoint's own transport and nothing else. The forge keeps its TLS, the MCP container still verifies the forge's certificate, credentials are still required, and the port stays bound to host loopback. The overlay must pass `--allow-plaintext true`, because the server refuses a plaintext listener off loopback without it; a deployment therefore cannot serve tokens in the clear by forgetting a flag. What it costs is that callers' tokens cross that network unencrypted, so use the reference deployment wherever anything untrusted can reach the port.
-
-Two variables exist only for this profile. `GRAFT_INTERNAL_HOST` is the name the MCP container uses to reach the forge, and compose gives the forge that name as a network alias; it must match a subject alternative name on the certificate, because the MCP server verifies it rather than trusting the service name. `GRAFT_CA_CERTIFICATE` is the forge's certificate in PEM or DER, which is the public half of the PKCS#12 and never the private key:
+The forge hosts its own Model Context Protocol endpoint, at `/mcp` on the same port and certificate as everything else. It is off unless the operator asks for it: `--mcp true` on the command line, or in the container deployment
 
 ```sh
-openssl pkcs12 -in tls.pfx -clcerts -nokeys -out graft-ca.pem -passin file:tls-password
+GRAFT_MCP=true
 ```
 
-There is no option anywhere that skips certificate verification. The MCP server reaches the forge over TLS and checks it, and off loopback its own endpoint must be HTTPS with a certificate too, which the compose file supplies from the same secret.
+in `.env`, then `up --detach` again. Turning it on is a restart rather than a rebuild, and nothing else about the deployment changes: no second port, no second service, no second certificate. With it off, a request for `/mcp` is answered with a 404 that names the flag.
 
-The MCP binary is published self-contained but **not** NativeAOT, unlike the forge, because no Model Context Protocol library has been verified under AOT by anyone. See [ADR 0008](decisions/0008-mcp-layer.md). Both binaries run on the same runtime-deps base either way.
+Once on, what agents may do is decided in the browser, by an administrator, under **Administration, Agent access**. Three switches live there and each change applies to the next request with nothing restarted:
+
+| Switch | Default | What it does |
+| --- | --- | --- |
+| Serve agents | on | Pauses or resumes the endpoint. Off, callers get a 404 until it is turned back on. |
+| Allow writes | off | Lets agents create projects, change visibility, and publish or withdraw pages, within what each caller's token permits. Off, those tools are refused and the refusal names this page. |
+| Serve callers with no token | off | Serves requests that carry no credential, as strangers who see only public projects and published pages. Anyone who can reach the port can then talk to it. |
+
+The endpoint holds no credential. Every caller sends their own Graft personal access token as `PRIVATE-TOKEN` or `Authorization: Bearer`, so two callers get exactly the access their own tokens carry, and a request without one is refused `401` before the protocol is spoken unless the third switch is on. Tokens are created under Profile and tokens; reading needs `read_api`, the mutating tools need `api`.
+
+The forge prints its agent posture on startup beside its other lines, so what a deployment is actually doing is visible in its logs; the switches can change afterwards, which is their point:
+
+```text
+MCP: https://graft.example.internal:8443/mcp; enabled=true; credentials=required; writes=refused
+```
+
+For a client that launches its MCP server locally over stdio, `Graft.Mcp` remains a separate executable; see [build-and-test](build-and-test.md). It is not in the container image. See [ADR 0009](decisions/0009-mcp-in-the-forge.md) for why the endpoint moved into the forge and what it keeps from [ADR 0008](decisions/0008-mcp-layer.md).
 
 ## Certificate renewal
 

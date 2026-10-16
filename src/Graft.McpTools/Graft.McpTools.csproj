@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <RestorePackagesWithLockFile Condition="'$(RuntimeIdentifier)' == ''">true</RestorePackagesWithLockFile>
+    <NuGetLockFilePath Condition="'$(RuntimeIdentifier)' != ''">$(BaseIntermediateOutputPath)packages.$(RuntimeIdentifier).lock.json</NuGetLockFilePath>
+
+    <!--
+      The tools are compiled into the forge, which publishes NativeAOT, so every analyzer that would catch a
+      trim or reflection hazard runs here on every build. Reflection-based JSON is off for the same reason:
+      it is the thing that works under JIT and dies once trimmed.
+    -->
+    <IsAotCompatible>true</IsAotCompatible>
+    <EnableAotAnalyzer>true</EnableAotAnalyzer>
+    <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
+    <EnableSingleFileAnalyzer>true</EnableSingleFileAnalyzer>
+    <JsonSerializerIsReflectionEnabledByDefault>false</JsonSerializerIsReflectionEnabledByDefault>
+  </PropertyGroup>
+  <ItemGroup>
+    <!--
+      The tool attributes and the server abstractions, without the hosting half. Graft.Server and Graft.Mcp
+      each bring the transport they need; this library only says what the tools are.
+    -->
+    <PackageReference Include="ModelContextProtocol.Core" Version="2.2.0" />
+    <ProjectReference Include="../Graft.Contracts/Graft.Contracts.csproj" />
+  </ItemGroup>
+</Project>

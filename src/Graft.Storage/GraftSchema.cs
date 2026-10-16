@@ -4,7 +4,7 @@ namespace Graft.Storage;
 
 public static class GraftSchema
 {
-    public static DnaXMigrationManifest Manifest { get; } = new(4,
+    public static DnaXMigrationManifest Manifest { get; } = new(5,
     [
         DnaXMigration.Sql(1, "initial-identity-project-schema", "Create identity and private project schema", """
             CREATE TABLE Users (
@@ -111,6 +111,18 @@ public static class GraftSchema
                 CHECK (PagePublished IN (0, 1));
 
             CREATE INDEX IX_Projects_Published ON Projects(Visibility, PagePublished);
+            """),
+        // One row per setting rather than one column per setting, so adding a switch is a write and not a
+        // migration. Only the Model Context Protocol switches live here so far; an absent row means the
+        // default, which keeps a restored database from a build that never had a switch meaning what the
+        // newer build would have stored for it.
+        DnaXMigration.Sql(5, "server-settings", "Store administrator-managed server settings", """
+            CREATE TABLE ServerSettings (
+                Name TEXT NOT NULL PRIMARY KEY,
+                Value TEXT NOT NULL,
+                UpdatedByUserId INTEGER NULL REFERENCES Users(Id),
+                UpdatedAtUtc TEXT NOT NULL
+            );
             """)
     ]);
 }

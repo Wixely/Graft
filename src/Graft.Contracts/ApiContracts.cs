@@ -91,7 +91,10 @@ public sealed record SessionResponse(
     [property: JsonPropertyName("avatar_url")] string? AvatarUrl,
     /// <summary>Whether this server's operator permits publishing and serves a public listing. A property of
     /// the server, not of the caller, so it is reported to an anonymous caller as well.</summary>
-    bool PublicBrowsing = false);
+    bool PublicBrowsing = false,
+    /// <summary>Whether this server's operator started it with the Model Context Protocol endpoint available.
+    /// Also a property of the server; the administrator settings behind it are read separately.</summary>
+    bool McpAvailable = false);
 public sealed record LoginRequest(string Username, string Password);
 public sealed record UserCreateRequest(string Username, string Password);
 public sealed record UserAccountResponse(long Id, string Username, bool IsAdministrator, bool Disabled);
@@ -247,6 +250,23 @@ public sealed record BrowseResponse(
     int Page,
     int PerPage);
 
+/// <summary>The administrator-facing state of the forge's own Model Context Protocol endpoint. Reported only
+/// when the operator started the server with the endpoint available; otherwise the route is absent.</summary>
+public sealed record McpSettingsResponse(
+    /// <summary>Whether agents are currently served at all. An administrator switch, under the operator's.</summary>
+    bool Enabled,
+    /// <summary>Whether tools that change something are permitted for any caller.</summary>
+    bool AllowWrites,
+    /// <summary>Whether callers who present no credential are served, as strangers.</summary>
+    bool AllowAnonymous,
+    /// <summary>Where a client connects, as an absolute URL on the public origin.</summary>
+    string Endpoint);
+
+public sealed record McpSettingsRequest(
+    bool Enabled,
+    bool AllowWrites,
+    bool AllowAnonymous);
+
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower)]
 [JsonSerializable(typeof(UserResponse))]
 [JsonSerializable(typeof(ProjectResponse))]
@@ -283,4 +303,6 @@ public sealed record BrowseResponse(
 [JsonSerializable(typeof(PagePublishRequest))]
 [JsonSerializable(typeof(PageStateResponse))]
 [JsonSerializable(typeof(BrowseResponse))]
+[JsonSerializable(typeof(McpSettingsResponse))]
+[JsonSerializable(typeof(McpSettingsRequest))]
 public partial class ApiJson : JsonSerializerContext;

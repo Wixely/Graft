@@ -9,6 +9,7 @@ using System.Text.Json;
 using Graft.Contracts;
 using Graft.Core;
 using Graft.Git;
+using Graft.Mcp;
 using Graft.Operations;
 using Graft.Server;
 using Graft.Storage;
@@ -17,6 +18,7 @@ using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.AspNetCore.Http.Features;
+using ModelContextProtocol.Server;
 
 // Several bundled components require their attribution to accompany the binary, so the binary can print it
 // without the repository being present. The same text is served at /-/licences by a running server.
@@ -31,7 +33,7 @@ if (args.Length == 1 && args[0] == "--licences")
 
 if (!Arguments.TryParse(args, out Arguments? parsedSettings))
 {
-    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>].");
+    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>] [--mcp true|false].");
     Console.Error.WriteLine("       Graft.Server --licences  prints the third-party notices this build redistributes.");
     return 2;
 }
@@ -50,6 +52,12 @@ RequestThrottle loginThrottle = new(20);
 RequestThrottle browseThrottle = new(240);
 string? serverOrigin = null;
 const string SessionCookie = "__Host-graft-session";
+// The forge's own Model Context Protocol endpoint. Mounted only when the operator asked for it, and then
+// governed by the administrator's stored switches, which the middleware in front of it reads per request.
+const string McpPath = "/mcp";
+const string McpSettingsItem = "graft.mcp.settings";
+const string McpWriteRemedy = "An administrator can allow writes under Administration, Agent access.";
+McpEndpoint mcpEndpoint = new();
 
 // Browser uploads are mounted under Graft's own API namespace, never GitLab's. GitLab owns "/uploads/..."
 // and "/api/v4/projects/:id/uploads", so squatting either would block later compatibility work. Unmatched
@@ -82,6 +90,30 @@ builder.Services.AddAuthentication(GraftSessionAuthenticationHandler.SchemeName)
     .AddScheme<GraftSessionAuthenticationOptions, GraftSessionAuthenticationHandler>(
         GraftSessionAuthenticationHandler.SchemeName, options => options.CookieName = SessionCookie);
 builder.Services.AddAuthorization();
+if (settings.Mcp)
+{
+    // The same tools the launched Graft.Mcp offers, served from inside the forge. They still reach Graft
+    // through the HTTP API with the caller's own token, so what an agent can do here is exactly what that
+    // token could do with curl; hosting them in-process changes where the socket goes, not who decides.
+    //
+    // WithTools<T> and never the assembly-scanning overload. Scanning is trim-unsafe and its failure mode is
+    // a server that starts cleanly and advertises no tools at all.
+    builder.Services.AddSingleton(mcpEndpoint);
+    builder.Services.AddHttpContextAccessor();
+    builder.Services.AddScoped(provider =>
+    {
+        // Per request, not per process. Each caller presents their own token and the administrator's live
+        // setting decides whether writes are permitted, both of which the middleware in front of the endpoint
+        // has already placed on the request by the time a tool is constructed.
+        HttpContext context = provider.GetRequiredService<IHttpContextAccessor>().HttpContext
+            ?? throw new InvalidOperationException("Graft tools are only constructed for a request.");
+        McpSettings live = context.Items[McpSettingsItem] as McpSettings ?? McpSettings.Default with { AllowWrites = false };
+        return new GraftClient(mcpEndpoint.Connection, McpToken(context.Request), live.AllowWrites);
+    });
+    builder.Services.AddMcpServer(options => options.ServerInfo = new() { Name = "graft", Version = "1.0.0" })
+        .WithTools<GraftTools>()
+        .WithHttpTransport(http => http.Stateless = true);
+}
 builder.Services.AddDnaXUploads(options =>
 {
     options.Root = uploadRoot;
@@ -154,7 +186,7 @@ app.MapGet("/api/session", async context =>
     if (!await OnlyQuery(context)) return;
     (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: false);
     SessionResponse response;
-    if (browser is null) response = new(false, null, false, "", 0, null, settings.PublicBrowsing);
+    if (browser is null) response = new(false, null, false, "", 0, null, settings.PublicBrowsing, settings.Mcp);
     else
     {
         long userId = browser.Value.Identity.UserId;
@@ -162,7 +194,7 @@ app.MapGet("/api/session", async context =>
             ? AvatarUrl(context, AvatarOwner.User, userId)
             : null;
         response = new(true, browser.Value.Identity.Username, browser.Value.Identity.IsAdministrator,
-            Csrf(browser.Value.Secret), userId, avatarUrl, settings.PublicBrowsing);
+            Csrf(browser.Value.Secret), userId, avatarUrl, settings.PublicBrowsing, settings.Mcp);
     }
     await context.Response.WriteAsJsonAsync(response, ApiJson.Default.SessionResponse, null, context.RequestAborted);
 });
@@ -401,6 +433,38 @@ app.MapPost("/api/graft/admin/import/inspect", async context =>
     catch (UploadException error) { await ApiError(context, error.StatusCode, error.Message); }
     catch (InvalidDataException error) { await ApiError(context, 400, error.Message); }
     finally { try { if (File.Exists(staged)) File.Delete(staged); } catch (IOException) { } }
+});
+
+// The administrator's switches for the forge's own Model Context Protocol endpoint. Absent, not refused, on a
+// server the operator started without the endpoint: there is nothing for the switches to govern, and the
+// client hides the page on the same signal, so a 404 here is the honest answer rather than an error.
+app.MapGet("/api/graft/admin/mcp", async context =>
+{
+    if (!settings.Mcp) { await ApiError(context, 404, "the MCP endpoint is not enabled on this server"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!browser.Value.Identity.IsAdministrator) { await ApiError(context, 403, "administrator"); return; }
+    if (!await OnlyQuery(context)) return;
+    McpSettings current = await store.GetMcpSettingsAsync(context.RequestAborted);
+    await context.Response.WriteAsJsonAsync(McpResponse(current), ApiJson.Default.McpSettingsResponse, null, context.RequestAborted);
+});
+
+app.MapPost("/api/graft/admin/mcp", async context =>
+{
+    if (!settings.Mcp) { await ApiError(context, 404, "the MCP endpoint is not enabled on this server"); return; }
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!browser.Value.Identity.IsAdministrator) { await ApiError(context, 403, "administrator"); return; }
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    McpSettingsRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.McpSettingsRequest, context.RequestAborted);
+    if (request is null) { await ApiError(context, 400, "settings"); return; }
+    McpSettings updated = new(request.Enabled, request.AllowWrites, request.AllowAnonymous);
+    try { await store.SetMcpSettingsAsync(browser.Value.Identity, updated, context.RequestAborted); }
+    catch (UnauthorizedAccessException) { await ApiError(context, 403, "administrator"); return; }
+    await context.Response.WriteAsJsonAsync(McpResponse(updated), ApiJson.Default.McpSettingsResponse, null, context.RequestAborted);
 });
 
 app.MapGet("/api/tokens", async context =>
@@ -1277,11 +1341,59 @@ app.MapPost("/{projectNamespace}/{project}.git/{service}", async context =>
     finally { authorized.Endpoint.Gate.Release(); }
 });
 
+// The agent endpoint. Mounted ahead of the fallback so a request for it never receives the browser shell,
+// and answered here rather than left absent when the operator did not enable it, because the fallback would
+// otherwise serve HTML with a 200 to a client that asked for a protocol.
+if (settings.Mcp)
+{
+    app.Use(async (context, next) =>
+    {
+        if (!context.Request.Path.StartsWithSegments(McpPath)) { await next(context); return; }
+
+        McpSettings live = await store.GetMcpSettingsAsync(context.RequestAborted);
+        if (!live.Enabled) { await ApiError(context, 404, "the MCP endpoint is turned off by an administrator"); return; }
+
+        // A caller with no credential is refused before the protocol is spoken, so the tool list is not a
+        // free description of the forge for somebody who has shown nothing. Graft re-checks the token on
+        // every call the tools make; the refusal is in front, not instead. An administrator can lift it, and
+        // then an uncredentialed caller reaches Graft as a stranger and sees only what is public.
+        if (!live.AllowAnonymous && McpToken(context.Request).Length == 0)
+        {
+            context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            context.Response.Headers.WWWAuthenticate = "Bearer realm=\"Graft MCP\"";
+            context.Response.ContentType = "text/plain; charset=utf-8";
+            await context.Response.WriteAsync(
+                "Send a Graft personal access token as PRIVATE-TOKEN or Authorization: Bearer. " +
+                "This server does not serve anonymous callers; an administrator can allow that under Administration, Agent access.",
+                context.RequestAborted);
+            return;
+        }
+        context.Items[McpSettingsItem] = live;
+        await next(context);
+    });
+    app.MapMcp(McpPath);
+}
+else
+{
+    app.Map(McpPath, context => ApiError(context, 404, "the MCP endpoint is not enabled on this server; start Graft with --mcp true"));
+}
+
 app.MapFallback("/{**path}", context => assets.Serve(context));
 
 await app.StartAsync();
 string address = app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.Single();
 serverOrigin = settings.Origin ?? address;
+if (settings.Mcp)
+{
+    // Addressed to the public origin, connected to the listener this process actually bound, trusting only
+    // the certificate it is itself serving. The port is read back from the server rather than from the
+    // settings because a loopback test server listens on whatever port it was given.
+    int listenPort = new Uri(address).Port;
+    IPAddress target = settings.ListenAddress.Equals(IPAddress.Any) ? IPAddress.Loopback
+        : settings.ListenAddress.Equals(IPAddress.IPv6Any) ? IPAddress.IPv6Loopback
+        : settings.ListenAddress;
+    mcpEndpoint.Open(GraftConnection.ToOwnListener(new Uri(serverOrigin + "/"), new IPEndPoint(target, listenPort), certificate, McpWriteRemedy));
+}
 NotifySystemd("READY=1\nSTATUS=Graft is ready");
 app.Lifetime.ApplicationStopping.Register(() =>
 {
@@ -1293,6 +1405,18 @@ if (PasswordPolicy.RelaxedForLocalDebug)
     Console.WriteLine($"WARNING: debug build; passwords of {PasswordPolicy.MinimumLength} characters are accepted. " +
         "Do not expose this build. Release builds require 16.");
 Console.WriteLine($"ASSETS: {assets.Count}; bytes={assets.Bytes}");
+// Printed every time rather than only when unusual, so the posture a server is actually running in is
+// visible in the logs of a deployment nobody has looked at for six months. The administrator's switches are
+// read at this moment; they can change afterwards without a restart, which is the point of them.
+if (settings.Mcp)
+{
+    McpSettings posture = await store.GetMcpSettingsAsync();
+    Console.WriteLine("MCP: " + serverOrigin + McpPath +
+        "; enabled=" + (posture.Enabled ? "true" : "false") +
+        "; credentials=" + (posture.AllowAnonymous ? "optional" : "required") +
+        "; writes=" + (posture.AllowWrites ? "allowed" : "refused"));
+}
+else Console.WriteLine("MCP: off");
 Console.WriteLine("READY: " + address);
 await app.WaitForShutdownAsync();
 return 0;
@@ -1817,6 +1941,22 @@ static async Task ApiError(HttpContext context, int status, string message)
 
 static string Origin(HttpContext context) => context.Request.Scheme + "://" + context.Request.Host.Value;
 
+McpSettingsResponse McpResponse(McpSettings current) =>
+    new(current.Enabled, current.AllowWrites, current.AllowAnonymous, serverOrigin + McpPath);
+
+/// <summary>
+/// The caller's Graft token for the agent endpoint. Both spellings are accepted because the API accepts
+/// both, and an MCP client that can only set one of them should not be the thing that decides whether this
+/// works. Empty means no credential was presented, which is a different thing from a bad one.
+/// </summary>
+static string McpToken(HttpRequest request)
+{
+    string token = request.Headers["PRIVATE-TOKEN"].ToString();
+    if (token.Length > 0) return token;
+    string authorization = request.Headers.Authorization.ToString();
+    return authorization.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase) ? authorization[7..] : "";
+}
+
 /// <summary>
 /// Creates a directory holding state that only the service account should read. Staged upload bytes and the
 /// data-protection key ring both qualify: the key ring signs antiforgery tokens, and staged bytes are another
@@ -1948,13 +2088,30 @@ sealed class RequestThrottle(int perMinute)
     }
 }
 
+/// <summary>
+/// The forge's connection to its own listener, for the agent endpoint. A holder rather than the connection
+/// itself because the tools are registered before the server starts and the port is only known after it.
+/// Disposed with the service container, which outlives every request that could use it.
+/// </summary>
+sealed class McpEndpoint : IDisposable
+{
+    private GraftConnection? connection;
+
+    public GraftConnection Connection => connection
+        ?? throw new InvalidOperationException("The agent endpoint is not open until the server has started.");
+
+    public void Open(GraftConnection opened) => connection = opened;
+
+    public void Dispose() => connection?.Dispose();
+}
+
 sealed record Arguments(string Database, string Repositories, IPAddress ListenAddress, int ListenPort, string? Origin,
-    string? Certificate, string? CertificatePasswordFile, bool PublicBrowsing, bool PushToCreate, int SessionMinutes)
+    string? Certificate, string? CertificatePasswordFile, bool PublicBrowsing, bool PushToCreate, int SessionMinutes, bool Mcp)
 {
     public static bool TryParse(string[] values, out Arguments? result)
     {
         result = null;
-        if (values.Length is < 4 or > 18 || values.Length % 2 != 0) return false;
+        if (values.Length is < 4 or > 20 || values.Length % 2 != 0) return false;
         string? database = null;
         string? repositories = null;
         string? listen = null;
@@ -1964,6 +2121,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         string? publicBrowsing = null;
         string? pushToCreate = null;
         string? sessionMinutes = null;
+        string? mcp = null;
         HashSet<string> seen = new(StringComparer.Ordinal);
         for (int index = 0; index < values.Length; index += 2)
         {
@@ -1977,6 +2135,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             else if (values[index] == "--public-browsing") publicBrowsing = values[index + 1];
             else if (values[index] == "--push-to-create") pushToCreate = values[index + 1];
             else if (values[index] == "--session-minutes") sessionMinutes = values[index + 1];
+            else if (values[index] == "--mcp") mcp = values[index + 1];
             else return false;
         }
         if (string.IsNullOrWhiteSpace(database) || string.IsNullOrWhiteSpace(repositories)) return false;
@@ -1984,6 +2143,9 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         // operator can state the closed answer explicitly in a unit file or container command.
         if (publicBrowsing is not null and not "true" and not "false") return false;
         if (pushToCreate is not null and not "true" and not "false") return false;
+        // Whether the forge hosts its Model Context Protocol endpoint at all. The operator's gate; the
+        // administrator's switches beneath it live in the database and are edited in the browser.
+        if (mcp is not null and not "true" and not "false") return false;
         // How long a signed-in browser stays signed in without being used. Bounded at both ends: below five
         // minutes nobody could get anything done, and the ceiling is the absolute lifetime a session can
         // reach however much it is used, so a larger number here would be a setting that did nothing.
@@ -2016,7 +2178,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         result = new(Path.GetFullPath(database), Path.GetFullPath(repositories), address, port,
             origin is null ? null : origin.TrimEnd('/'), certificate is null ? null : Path.GetFullPath(certificate),
             certificatePasswordFile is null ? null : Path.GetFullPath(certificatePasswordFile),
-            publicBrowsing == "true", pushToCreate == "true", window);
+            publicBrowsing == "true", pushToCreate == "true", window, mcp == "true");
         return true;
     }
 }

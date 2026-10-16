@@ -2,6 +2,10 @@
 
 Recorded: 2026-10-13. Owner: Implementation agent. Decision: [ADR 0008](../decisions/0008-mcp-layer.md).
 
+> Superseded on 2026-10-16. The compose profile, the second port and the plain-HTTP overlay described here no
+> longer exist; the forge hosts the endpoint itself behind `GRAFT_MCP=true`. See
+> [the later record](2026-10-16-mcp-in-the-forge.md) and [ADR 0009](../decisions/0009-mcp-in-the-forge.md).
+
 ## What changed
 
 The MCP server ships in the standard container image beside the forge and starts only when an operator asks

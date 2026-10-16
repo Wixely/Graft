@@ -1,18 +1,20 @@
 using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
 using Graft.Core;
 using Graft.Git;
 using Graft.Storage;
 
-// Drives Graft's MCP server over both transports, as a client would, against a real Graft.
+// Drives Graft's Model Context Protocol surface as a client would, against a real Graft: the endpoint the
+// forge hosts itself, and the separate Graft.Mcp launcher over both of its transports.
 //
-// Launching it as a child process rather than calling its types is deliberate. What matters here is the
-// protocol on the wire and the credential handling around it, and neither is exercised by an in-process
-// call. The stdio half in particular can only be wrong in ways a reference would hide: a stray line on
-// standard output corrupts the stream, and nothing but a real client reading it would notice.
+// Launching the processes rather than calling their types is deliberate. What matters here is the protocol
+// on the wire and the credential handling around it, and neither is exercised by an in-process call. The
+// stdio half in particular can only be wrong in ways a reference would hide: a stray line on standard
+// output corrupts the stream, and nothing but a real client reading it would notice.
 
 if (args.Length != 2 || !File.Exists(args[0]) || !File.Exists(args[1]))
 {
@@ -33,6 +35,7 @@ Directory.CreateDirectory(repositoriesRoot);
 int assertions = 0;
 Process? server = null;
 Process? mcp = null;
+List<string> serverLines = [];
 
 try
 {
@@ -75,19 +78,28 @@ try
     }
     await File.WriteAllTextAsync(tokenFile, token);
 
-    string address = await StartServer();
+    // The forge with its own endpoint enabled by the operator. This is the deployment shape.
+    string address = await StartServer(mcp: true);
     await ExportCertificateAsync(address, caFile);
+    await CheckForge(address, token, password);
 
-    // Stdio. The transport a client launches directly, where the credential belongs to the process.
+    // The separate launcher, pointed at the same forge. Stdio is the transport a client launches directly,
+    // where the credential belongs to the process.
     await CheckStdio(address, readOnly: true);
     await CheckStdio(address, readOnly: false);
 
-    // Streamable HTTP. The transport where the credential belongs to the caller.
+    // The launcher's own Streamable HTTP listener, where the credential belongs to the caller.
     await CheckHttp(address, token);
     await CheckOverrides(address);
 
+    // And the forge started without the endpoint, which is the default. There has to be nothing to find.
+    Stop(server);
+    server = null;
+    string closed = await StartServer(mcp: false);
+    await CheckForgeWithoutEndpoint(closed, token);
+
     Console.WriteLine($"RESULT: PASS; assertions: {assertions}");
-    Console.WriteLine("BOUNDARY: loopback only; the MCP endpoint is plain HTTP on loopback and the forge uses an ephemeral certificate pinned by file.");
+    Console.WriteLine("BOUNDARY: loopback only; the forge uses an ephemeral certificate, pinned by file for the launcher and accepted by the harness's own client.");
     return 0;
 }
 catch (Exception error)
@@ -103,6 +115,235 @@ finally
     try { Directory.Delete(root, recursive: true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
 }
 
+/// <summary>
+/// The endpoint the forge hosts itself, governed by the administrator's switches. Driven as a client would
+/// drive it and as an administrator would change it: over the real admin route with a browser session,
+/// not by writing rows, so the whole path from the page to the next agent request is what is asserted.
+/// </summary>
+async Task CheckForge(string address, string token, string password)
+{
+    using HttpClient client = Forge(address);
+    string posture = serverLines.FirstOrDefault(line => line.StartsWith("MCP: ", StringComparison.Ordinal)) ?? "";
+    Check(posture.Contains("/mcp", StringComparison.Ordinal) && posture.Contains("enabled=true", StringComparison.Ordinal) &&
+          posture.Contains("credentials=required", StringComparison.Ordinal) && posture.Contains("writes=refused", StringComparison.Ordinal),
+        "the forge prints its agent posture on startup, and the defaults are serving, credentials required, no writes");
+
+    // No credential at all. Refused before the protocol is spoken, so the tool list is not a free
+    // description of the forge for somebody who has shown nothing.
+    using (HttpResponseMessage anonymous = await Post(client, null, Initialize(1)))
+    {
+        Check(anonymous.StatusCode == HttpStatusCode.Unauthorized, "the forge's endpoint refuses a caller with no token");
+        Check(anonymous.Headers.WwwAuthenticate.Count > 0, "the refusal says how to authenticate");
+        Check((await anonymous.Content.ReadAsStringAsync()).Contains("Agent access", StringComparison.Ordinal),
+            "the refusal names the administrator page that would permit anonymous callers");
+    }
+
+    using (HttpResponseMessage handshake = await Post(client, token, Initialize(2)))
+    {
+        Check(handshake.IsSuccessStatusCode, "the forge's endpoint completes the handshake for a caller with a token");
+        Check(handshake.Content.Headers.ContentType?.MediaType == "text/event-stream", "the forge's endpoint streams its reply");
+        using JsonDocument body = Parse(await handshake.Content.ReadAsStringAsync());
+        Check(body.RootElement.GetProperty("result").GetProperty("serverInfo").GetProperty("name").GetString() == "graft",
+            "the streamed reply carries the server identity");
+    }
+
+    using (HttpResponseMessage listing = await Post(client, token, Request(3, "tools/list", "{}")))
+    {
+        using JsonDocument body = Parse(await listing.Content.ReadAsStringAsync());
+        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 10,
+            "the forge's endpoint advertises every tool");
+    }
+
+    foreach ((string tool, string arguments, string expected) in ReadTools())
+    {
+        using HttpResponseMessage response = await Post(client, token, Call(20, tool, arguments));
+        using JsonDocument body = Parse(await response.Content.ReadAsStringAsync());
+        string result = Text(body);
+        Check(result.Contains(expected, StringComparison.Ordinal), tool + " answers through the forge's own endpoint");
+        Check(!result.Contains("token was not accepted", StringComparison.Ordinal) &&
+              !result.Contains("could not be reached", StringComparison.Ordinal),
+            tool + " reaches the API through the forge's own listener");
+    }
+
+    // The URLs in a result are built from the request the API saw. The forge calls itself addressed to its
+    // public origin, so an agent is handed links a person could open, not the loopback the socket used.
+    using (HttpResponseMessage project = await Post(client, token, Call(4, "graft_get_project", """{"project":"admin/shared"}""")))
+    {
+        using JsonDocument body = Parse(await project.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("\"web_url\":\"" + address.TrimEnd('/') + "/admin/shared\"", StringComparison.Ordinal),
+            "a result's links are on the public origin");
+    }
+
+    // The forge holds no credential for this, so a caller presenting a token that does not resolve must be
+    // refused by Graft rather than quietly served under somebody else's.
+    using (HttpResponseMessage impostor = await Post(client, "graft_pat_" + new string('0', 64), Call(5, "graft_list_projects", "{}")))
+    {
+        using JsonDocument body = Parse(await impostor.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("token was not accepted", StringComparison.Ordinal),
+            "a caller's own token is what is used, so an unusable one is refused");
+    }
+
+    using (HttpResponseMessage write = await Post(client, token, Call(6, "graft_set_page_published", """{"project":"admin/shared","published":true}""")))
+    {
+        using JsonDocument body = Parse(await write.Content.ReadAsStringAsync());
+        string result = Text(body);
+        Check(result.Contains("read-only", StringComparison.Ordinal) && result.Contains("Agent access", StringComparison.Ordinal),
+            "writes are refused by default, and the refusal names the administrator page rather than a flag");
+    }
+
+    // The administrator's switches, through the browser route. A token is the wrong credential for it.
+    using (HttpRequestMessage byToken = new(HttpMethod.Get, "/api/graft/admin/mcp"))
+    {
+        byToken.Headers.Add("PRIVATE-TOKEN", token);
+        using HttpResponseMessage refused = await client.SendAsync(byToken);
+        Check(refused.StatusCode == HttpStatusCode.Unauthorized, "the settings route wants a browser session, not a token");
+    }
+
+    using HttpClient browser = await SignIn(address, "admin", password);
+    using (HttpResponseMessage session = await browser.GetAsync("/api/session"))
+    {
+        using JsonDocument body = JsonDocument.Parse(await session.Content.ReadAsStringAsync());
+        Check(body.RootElement.GetProperty("mcp_available").GetBoolean(), "the session tells the client the endpoint is available");
+    }
+
+    using (HttpResponseMessage current = await browser.GetAsync("/api/graft/admin/mcp"))
+    {
+        Check(current.IsSuccessStatusCode, "an administrator reads the agent settings");
+        using JsonDocument body = JsonDocument.Parse(await current.Content.ReadAsStringAsync());
+        Check(body.RootElement.GetProperty("enabled").GetBoolean() &&
+              !body.RootElement.GetProperty("allow_writes").GetBoolean() &&
+              !body.RootElement.GetProperty("allow_anonymous").GetBoolean(),
+            "the stored defaults are serving, no writes, no anonymous callers");
+        Check(body.RootElement.GetProperty("endpoint").GetString() == address.TrimEnd('/') + "/mcp",
+            "the settings name the endpoint a client should connect to");
+    }
+
+    // Allow writes, then the same write succeeds on the next request with nothing restarted.
+    await SetSettings(browser, address, enabled: true, allowWrites: true, allowAnonymous: false);
+    using (HttpResponseMessage write = await Post(client, token, Call(7, "graft_set_page_published", """{"project":"admin/shared","published":true}""")))
+    {
+        using JsonDocument body = Parse(await write.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("\"page_published\":true", StringComparison.Ordinal),
+            "once an administrator allows writes, a write performs without a restart");
+    }
+
+    // Allow anonymous callers. A stranger reads what is public and nothing else; the forge decides that,
+    // not the endpoint, because an anonymous caller is simply a stranger to Graft.
+    await SetSettings(browser, address, enabled: true, allowWrites: true, allowAnonymous: true);
+    using (HttpResponseMessage handshake = await Post(client, null, Initialize(8)))
+        Check(handshake.IsSuccessStatusCode, "an administrator can allow callers with no credential");
+    using (HttpResponseMessage read = await Post(client, null, Call(9, "graft_browse", """{"search":""}""")))
+    {
+        using JsonDocument body = Parse(await read.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("admin/shared", StringComparison.Ordinal), "an anonymous caller reads what is public");
+    }
+    using (HttpResponseMessage denied = await Post(client, null, Call(10, "graft_get_project", """{"project":"admin/private"}""")))
+    {
+        using JsonDocument body = Parse(await denied.Content.ReadAsStringAsync());
+        Check(!Text(body).Contains("admin/private", StringComparison.Ordinal), "an anonymous caller sees nothing that is not public");
+    }
+
+    // Turned off by an administrator: the endpoint answers nothing, while the settings route stays
+    // reachable so it can be turned on again.
+    await SetSettings(browser, address, enabled: false, allowWrites: false, allowAnonymous: false);
+    using (HttpResponseMessage off = await Post(client, token, Initialize(11)))
+        Check(off.StatusCode == HttpStatusCode.NotFound, "an administrator can pause the endpoint without a restart");
+    using (HttpResponseMessage still = await browser.GetAsync("/api/graft/admin/mcp"))
+        Check(still.IsSuccessStatusCode, "the settings stay reachable while the endpoint is paused");
+    await SetSettings(browser, address, enabled: true, allowWrites: false, allowAnonymous: false);
+    using (HttpResponseMessage back = await Post(client, token, Initialize(12)))
+        Check(back.IsSuccessStatusCode, "and turn it back on");
+
+    // The settings are audited with the resulting posture, not as a bare "changed".
+    await using (Microsoft.Data.Sqlite.SqliteConnection db = new($"Data Source={databasePath};Pooling=False"))
+    {
+        await db.OpenAsync();
+        await using Microsoft.Data.Sqlite.SqliteCommand command = db.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM AuditEvents WHERE Action = 'mcp-settings' AND Detail LIKE 'enabled=%allow-writes=%allow-anonymous=%';";
+        Check(Convert.ToInt64(await command.ExecuteScalarAsync()) == 4, "every change to the switches is audited with the posture it produced");
+    }
+}
+
+/// <summary>The default: the operator did not enable the endpoint, and nothing about it is reachable.</summary>
+async Task CheckForgeWithoutEndpoint(string address, string token)
+{
+    using HttpClient client = Forge(address);
+    Check(serverLines.Any(line => line == "MCP: off"), "a forge started without the endpoint says so");
+    using (HttpResponseMessage absent = await Post(client, token, Initialize(1)))
+    {
+        Check(absent.StatusCode == HttpStatusCode.NotFound, "without --mcp true the endpoint is a 404, not the browser shell");
+        Check((await absent.Content.ReadAsStringAsync()).Contains("--mcp true", StringComparison.Ordinal),
+            "and the refusal names the flag that would enable it");
+    }
+    using (HttpResponseMessage session = await client.GetAsync("/api/session"))
+    {
+        using JsonDocument body = JsonDocument.Parse(await session.Content.ReadAsStringAsync());
+        Check(!body.RootElement.GetProperty("mcp_available").GetBoolean(), "the session tells the client there is nothing to configure");
+    }
+}
+
+async Task SetSettings(HttpClient browser, string address, bool enabled, bool allowWrites, bool allowAnonymous)
+{
+    using HttpRequestMessage request = new(HttpMethod.Post, "/api/graft/admin/mcp");
+    request.Headers.Add("Origin", address.TrimEnd('/'));
+    request.Headers.Add("X-Graft-CSRF", browser.DefaultRequestHeaders.GetValues("X-Graft-CSRF").Single());
+    request.Content = JsonContent.Create(new { enabled, allow_writes = allowWrites, allow_anonymous = allowAnonymous });
+    using HttpResponseMessage response = await browser.SendAsync(request);
+    Check(response.IsSuccessStatusCode, "an administrator saves the agent settings");
+}
+
+/// <summary>A signed-in browser, as the client would be: the session cookie and the CSRF secret the session
+/// route hands back, which every mutation has to echo.</summary>
+async Task<HttpClient> SignIn(string address, string username, string password)
+{
+    HttpClientHandler handler = new()
+    {
+        CookieContainer = new CookieContainer(),
+        ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
+        UseProxy = false
+    };
+    HttpClient browser = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(30) };
+    using (HttpRequestMessage login = new(HttpMethod.Post, "/api/login"))
+    {
+        login.Headers.Add("Origin", address.TrimEnd('/'));
+        login.Content = JsonContent.Create(new { username, password });
+        using HttpResponseMessage response = await browser.SendAsync(login);
+        Check(response.IsSuccessStatusCode, "the administrator signs in");
+    }
+    using (HttpResponseMessage session = await browser.GetAsync("/api/session"))
+    {
+        using JsonDocument body = JsonDocument.Parse(await session.Content.ReadAsStringAsync());
+        browser.DefaultRequestHeaders.Add("X-Graft-CSRF", body.RootElement.GetProperty("csrf").GetString());
+    }
+    return browser;
+}
+
+static HttpClient Forge(string address)
+{
+    HttpClientHandler handler = new()
+    {
+        ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
+        UseProxy = false
+    };
+    return new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(30) };
+}
+
+static string Initialize(int id) => Request(id, "initialize",
+    """{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"acceptance","version":"1"}}""");
+
+/// <summary>Every read tool, not a representative one. The listing tool was once pointed at a browser-session
+/// route that refuses a token outright, and no assertion noticed because nothing called it.</summary>
+static (string Tool, string Arguments, string Expected)[] ReadTools() =>
+[
+    ("graft_list_projects", "{}", "admin/shared"),
+    ("graft_browse", """{"search":""}""", "admin/shared"),
+    ("graft_get_project", """{"project":"admin/shared"}""", "admin/shared"),
+    ("graft_list_branches", """{"project":"admin/shared"}""", "main"),
+    ("graft_list_commits", """{"project":"admin/shared","reference":""}""", "Seed the MCP acceptance fixture"),
+    ("graft_list_tree", """{"project":"admin/shared","path":"","reference":""}""", "README.md"),
+    ("graft_read_file", """{"project":"admin/shared","file":"README.md","reference":""}""", "Seeded for the MCP suite")
+];
+
 async Task CheckStdio(string address, bool readOnly)
 {
     string label = readOnly ? "stdio read-only" : "stdio with writes";
@@ -113,9 +354,7 @@ async Task CheckStdio(string address, bool readOnly)
     using Process client = Process.Start(start)!;
     try
     {
-        JsonDocument initialize = await Exchange(client, Request(1, "initialize", """
-            {"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"acceptance","version":"1"}}
-            """));
+        JsonDocument initialize = await Exchange(client, Initialize(1));
         Check(initialize.RootElement.GetProperty("result").GetProperty("serverInfo").GetProperty("name").GetString() == "graft",
             label + " completes the handshake");
         initialize.Dispose();
@@ -136,10 +375,10 @@ async Task CheckStdio(string address, bool readOnly)
         if (readOnly)
             Check(result.Contains("read-only", StringComparison.Ordinal) &&
                 result.Contains("--allow-writes", StringComparison.Ordinal),
-                "a read-only server refuses a write and names the switch that would permit it");
+                "a read-only launcher refuses a write and names the switch that would permit it");
         else
             Check(result.Contains("\"page_published\":true", StringComparison.Ordinal),
-                "a server started with writes performs one");
+                "a launcher started with writes performs one");
     }
     finally { Stop(client); }
 }
@@ -155,27 +394,21 @@ async Task CheckHttp(string address, string token)
 
     using HttpClient client = new() { BaseAddress = new(endpoint), Timeout = TimeSpan.FromSeconds(30) };
 
-    // No credential at all. Refused before the protocol is spoken, so the tool list is not a free
-    // description of the forge for somebody who has shown nothing.
-    using (HttpResponseMessage anonymous = await Post(client, null, Request(1, "initialize", """
-        {"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"acceptance","version":"1"}}
-        """)))
+    using (HttpResponseMessage anonymous = await Post(client, null, Initialize(1)))
     {
-        Check(anonymous.StatusCode == HttpStatusCode.Unauthorized, "the HTTP endpoint refuses a caller with no token");
+        Check(anonymous.StatusCode == HttpStatusCode.Unauthorized, "the launcher's HTTP endpoint refuses a caller with no token");
         Check(anonymous.Headers.WwwAuthenticate.Count > 0, "the refusal says how to authenticate");
         Check((await anonymous.Content.ReadAsStringAsync()).Contains("--allow-anonymous", StringComparison.Ordinal),
             "the refusal names the switch that would permit it rather than leaving it to be guessed");
     }
 
-    using (HttpResponseMessage handshake = await Post(client, token, Request(2, "initialize", """
-        {"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"acceptance","version":"1"}}
-        """)))
+    using (HttpResponseMessage handshake = await Post(client, token, Initialize(2)))
     {
-        Check(handshake.IsSuccessStatusCode, "the HTTP endpoint completes the handshake for a caller with a token");
+        Check(handshake.IsSuccessStatusCode, "the launcher's HTTP endpoint completes the handshake for a caller with a token");
         // Streamable HTTP answers as an event stream rather than a plain body, which is the whole point of
         // this transport and the thing a plain JSON response would quietly fail to be.
         Check(handshake.Content.Headers.ContentType?.MediaType == "text/event-stream",
-            "the HTTP endpoint streams its reply");
+            "the launcher's HTTP endpoint streams its reply");
         using JsonDocument body = Parse(await handshake.Content.ReadAsStringAsync());
         Check(body.RootElement.GetProperty("result").GetProperty("serverInfo").GetProperty("name").GetString() == "graft",
             "the streamed reply carries the server identity");
@@ -185,36 +418,15 @@ async Task CheckHttp(string address, string token)
     {
         using JsonDocument body = Parse(await listing.Content.ReadAsStringAsync());
         Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 10,
-            "the HTTP endpoint advertises every tool");
+            "the launcher's HTTP endpoint advertises every tool");
     }
 
-    using (HttpResponseMessage read = await Post(client, token, Call(4, "graft_get_project", """{"project":"admin/shared"}""")))
-    {
-        using JsonDocument body = Parse(await read.Content.ReadAsStringAsync());
-        Check(Text(body).Contains("\"visibility\":\"public\"", StringComparison.Ordinal),
-            "a tool call over HTTP reaches the forge");
-    }
-
-    // Every read tool, not a representative one. The listing tool was pointed at a browser-session route
-    // that refuses a token outright, and no assertion noticed because nothing called it.
-    (string Tool, string Arguments, string Expected)[] reads =
-    [
-        ("graft_list_projects", "{}", "admin/shared"),
-        ("graft_browse", """{"search":""}""", "admin/shared"),
-        ("graft_get_project", """{"project":"admin/shared"}""", "admin/shared"),
-        ("graft_list_branches", """{"project":"admin/shared"}""", "main"),
-        ("graft_list_commits", """{"project":"admin/shared","reference":""}""", "Seed the MCP acceptance fixture"),
-        ("graft_list_tree", """{"project":"admin/shared","path":"","reference":""}""", "README.md"),
-        ("graft_read_file", """{"project":"admin/shared","file":"README.md","reference":""}""", "Seeded for the MCP suite")
-    ];
-    foreach ((string tool, string arguments, string expected) in reads)
+    foreach ((string tool, string arguments, string expected) in ReadTools())
     {
         using HttpResponseMessage response = await Post(client, token, Call(20, tool, arguments));
         using JsonDocument body = Parse(await response.Content.ReadAsStringAsync());
         string result = Text(body);
-        Check(result.Contains(expected, StringComparison.Ordinal), tool + " answers through the deployed endpoint");
-        // An empty repository has no branches and no README, so some of these legitimately report nothing.
-        // What must never happen is the tool failing because it asked the forge the wrong question.
+        Check(result.Contains(expected, StringComparison.Ordinal), tool + " answers through the launcher's endpoint");
         Check(!result.Contains("token was not accepted", StringComparison.Ordinal) &&
               !result.Contains("could not be reached", StringComparison.Ordinal),
             tool + " reaches a route a token can actually use");
@@ -232,14 +444,12 @@ async Task CheckHttp(string address, string token)
 }
 
 /// <summary>
-/// The two overrides that loosen the default posture. Both are off unless asked for, and the point of
-/// asserting them is that the closed answer is the default rather than something an operator has to
-/// remember to choose.
+/// The launcher's two overrides that loosen the default posture. Both are off unless asked for, and the
+/// point of asserting them is that the closed answer is the default rather than something an operator has
+/// to remember to choose.
 /// </summary>
 async Task CheckOverrides(string address)
 {
-    // Anonymous access, explicitly allowed. The caller reaches Graft as a stranger, so a public project is
-    // readable and nothing else is.
     int anonymousPort = FreePort();
     string anonymousEndpoint = "http://127.0.0.1:" + anonymousPort.ToString(System.Globalization.CultureInfo.InvariantCulture);
     Process open = Process.Start(Launch(mcpPath,
@@ -250,9 +460,7 @@ async Task CheckOverrides(string address)
         await WaitForListener(anonymousPort);
         using HttpClient client = new() { BaseAddress = new(anonymousEndpoint), Timeout = TimeSpan.FromSeconds(30) };
 
-        using (HttpResponseMessage handshake = await Post(client, null, Request(1, "initialize", """
-            {"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"acceptance","version":"1"}}
-            """)))
+        using (HttpResponseMessage handshake = await Post(client, null, Initialize(1)))
             Check(handshake.IsSuccessStatusCode, "an operator can allow callers with no credential");
 
         using (HttpResponseMessage read = await Post(client, null, Call(2, "graft_browse", """{"search":""}""")))
@@ -262,7 +470,6 @@ async Task CheckOverrides(string address)
                 "an anonymous caller reads what is public");
         }
 
-        // The forge decides this, not the MCP server: an anonymous caller is simply a stranger to Graft.
         using (HttpResponseMessage denied = await Post(client, null, Call(3, "graft_get_project", """{"project":"admin/private"}""")))
         {
             using JsonDocument body = Parse(await denied.Content.ReadAsStringAsync());
@@ -335,23 +542,28 @@ static string Call(int id, string tool, string arguments) =>
 static string Text(JsonDocument document) =>
     document.RootElement.GetProperty("result").GetProperty("content")[0].GetProperty("text").GetString() ?? "";
 
-async Task<string> StartServer()
+async Task<string> StartServer(bool mcp)
 {
     TaskCompletionSource<string> ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    serverLines = [];
+    List<string> lines = serverLines;
     server = Process.Start(Launch(serverPath,
-        ["--database", databasePath, "--repositories", repositoriesRoot, "--public-browsing", "true"]))!;
+        ["--database", databasePath, "--repositories", repositoriesRoot, "--public-browsing", "true", "--mcp", mcp ? "true" : "false"]))!;
     Process active = server;
     _ = Task.Run(async () =>
     {
         while (await active.StandardOutput.ReadLineAsync() is string line)
+        {
+            lock (lines) lines.Add(line);
             if (line.StartsWith("READY: ", StringComparison.Ordinal)) ready.TrySetResult(line[7..]);
+        }
     });
     return await ready.Task.WaitAsync(TimeSpan.FromSeconds(30));
 }
 
 /// <summary>
-/// Writes the forge's own certificate out so the MCP server can be pointed at it. The forge generates an
-/// ephemeral one on loopback, and the MCP server has no option to skip verification, so pinning it is how
+/// Writes the forge's own certificate out so the launcher can be pointed at it. The forge generates an
+/// ephemeral one on loopback, and the launcher has no option to skip verification, so pinning it is how
 /// this test runs with checking switched on rather than off.
 /// </summary>
 static async Task ExportCertificateAsync(string address, string path)
