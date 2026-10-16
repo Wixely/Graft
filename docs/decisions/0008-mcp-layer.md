@@ -1,7 +1,7 @@
 # 0008: The Model Context Protocol layer
 
 - Date: 2026-10-13
-- Status: Accepted user request, implemented, with one substitution the request did not specify
+- Status: Accepted user request, implemented, with one substitution the request did not specify. **Partly superseded on 2026-10-16 by [ADR 0009](0009-mcp-in-the-forge.md):** the forge now hosts the endpoint itself behind `--mcp true`, and the compose profile and plain-HTTP overlay are gone. The tools, the credential model, writes off by default, no option to skip certificate verification, and the stdio launcher all carry forward
 - Source: "can you build this using DNAX? so it remains backwards compatible with the gitlab API layer but we have our own MCP layer?"
 - Review trigger: A DnaX release that makes MCPFab embeddable, a NativeAOT publish of `Graft.Mcp` actually running, any proposal to move MCP into the forge process, an OAuth story for the HTTP transport, or a change to the container base or secret model
 
@@ -168,9 +168,9 @@ POSTURE: credentials=required; writes=refused; transport=TLS
 
 ## What is not settled
 
-**NativeAOT for `Graft.Mcp` itself is unverified**, the same environmental gap as the rest of the
-repository: this machine has no C++ build tools, so ILC never runs. What is now known is better than
-nothing. The project builds clean with `IsAotCompatible`, the AOT, trim and single-file analyzers all on,
+**NativeAOT for `Graft.Mcp` itself was unverified when this was written**, because this machine had no C++
+build tools and ILC never ran. Settled on 2026-10-16: it publishes clean, and so does the forge with the
+transport inside it; see [ADR 0009](0009-mcp-in-the-forge.md). What was known at the time is kept below. The project builds clean with `IsAotCompatible`, the AOT, trim and single-file analyzers all on,
 and reflection-based JSON off. Those analyzers caught a real hazard while this was written, a generic
 `JsonArray.Add<T>` that reflects over its argument, and failed the build until it was fixed. An AOT publish
 reaches the native linker and stops there on the missing toolchain, not on anything in the code.

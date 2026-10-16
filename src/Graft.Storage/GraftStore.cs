@@ -1004,6 +1004,70 @@ public sealed class GraftStore : IAsyncDisposable
 
     private static string Owner(AvatarOwner ownerType) => ownerType == AvatarOwner.Project ? "project" : "user";
 
+    /// <summary>
+    /// The administrator's Model Context Protocol switches. Read per request by the endpoint rather than
+    /// cached, so a change in the browser takes effect on the next call without anything being restarted;
+    /// three indexed rows are cheaper than the request that follows them.
+    /// </summary>
+    public async Task<McpSettings> GetMcpSettingsAsync(CancellationToken cancellationToken = default)
+    {
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        IEnumerable<SettingRow> rows = await db.QueryAsync<SettingRow>(
+            "SELECT Name, Value FROM ServerSettings WHERE Name IN ('mcp.enabled', 'mcp.allow-writes', 'mcp.allow-anonymous');");
+        McpSettings settings = McpSettings.Default;
+        foreach (SettingRow row in rows)
+        {
+            // Anything other than the literal "true" reads as false. The only writer stores one of two
+            // literals, so this is about a hand-edited database failing closed rather than open.
+            bool value = row.Value == "true";
+            settings = row.Name switch
+            {
+                "mcp.enabled" => settings with { Enabled = value },
+                "mcp.allow-writes" => settings with { AllowWrites = value },
+                "mcp.allow-anonymous" => settings with { AllowAnonymous = value },
+                _ => settings
+            };
+        }
+        return settings;
+    }
+
+    public async Task SetMcpSettingsAsync(
+        AuthenticatedIdentity actor,
+        McpSettings settings,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
+        AuthenticatedIdentity liveActor = await RequireLiveIdentityAsync(db, transaction, actor, cancellationToken);
+        if (!liveActor.IsAdministrator) throw new UnauthorizedAccessException("Administrator access is required.");
+
+        string now = Now();
+        foreach ((string name, bool value) in new[]
+        {
+            ("mcp.enabled", settings.Enabled),
+            ("mcp.allow-writes", settings.AllowWrites),
+            ("mcp.allow-anonymous", settings.AllowAnonymous)
+        })
+        {
+            await db.ExecuteAsync("""
+                INSERT INTO ServerSettings (Name, Value, UpdatedByUserId, UpdatedAtUtc)
+                VALUES (@Name, @Value, @UpdatedByUserId, @UpdatedAtUtc)
+                ON CONFLICT (Name) DO UPDATE SET
+                    Value = excluded.Value,
+                    UpdatedByUserId = excluded.UpdatedByUserId,
+                    UpdatedAtUtc = excluded.UpdatedAtUtc;
+                """, new SettingWriteParameters(name, value ? "true" : "false", liveActor.UserId, now), transaction);
+        }
+        // Audited with the whole resulting posture, so a reader of the log sees what the server was doing
+        // after the change rather than reconstructing it from a sequence of single-switch events.
+        await AuditAsync(db, transaction, liveActor.UserId, "mcp-settings", "server", null,
+            "enabled=" + (settings.Enabled ? "true" : "false") +
+            "; allow-writes=" + (settings.AllowWrites ? "true" : "false") +
+            "; allow-anonymous=" + (settings.AllowAnonymous ? "true" : "false"), now);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
     public async Task<PermissionDecision> GetPermissionAsync(
         AuthenticatedIdentity? identity,
         long projectId,
@@ -1273,3 +1337,9 @@ internal sealed record DefaultBranchParameters(long Id, string? Value);
 internal sealed record ProjectTextParameters(long Id, string Value);
 internal sealed record ProjectFlagParameters(long Id, int Value);
 internal sealed record PublishedListParameters(string? Pattern, int MatchAll, int Take, int Skip);
+internal sealed record SettingWriteParameters(string Name, string Value, long UpdatedByUserId, string UpdatedAtUtc);
+internal sealed class SettingRow
+{
+    public string Name { get; set; } = "";
+    public string Value { get; set; } = "";
+}

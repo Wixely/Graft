@@ -1,11 +1,11 @@
 # The reference deployment. Defaults here are the ones to copy: every switch that widens access is off, the
-# filesystem is read-only, the containers drop every capability, and both published ports are bound to host
+# filesystem is read-only, the container drops every capability, and the published port is bound to host
 # loopback so nothing is exposed until a reverse proxy in front chooses to expose it.
 #
 # Copy .env.example to .env and fill it in before using this.
 
 x-hardening: &hardening
-  # Nothing in either image needs a capability, and neither ever escalates privileges.
+  # Nothing in the image needs a capability, and it never escalates privileges.
   security_opt:
     - no-new-privileges:true
   cap_drop:
@@ -29,8 +29,7 @@ services:
     <<: *hardening
     # Named, so compose tags what it builds and uses what you tagged. Without this compose invents a name
     # from the directory and the service, a separately built `--tag` is never referenced, and `up` quietly
-    # runs whatever it built first. Naming it also means both services share one image rather than compose
-    # building the same Containerfile twice under two invented names.
+    # runs whatever it built first.
     image: ${GRAFT_IMAGE:-graft:local}
     build:
       context: ../..
@@ -54,14 +53,13 @@ services:
       - ${GRAFT_PUSH_TO_CREATE:-false}
       - --session-minutes
       - ${GRAFT_SESSION_MINUTES:-720}
+      # The Model Context Protocol endpoint, served by the forge itself at /mcp on the same port and
+      # certificate. Off unless asked for. Once on, what agents may do is set by an administrator in the
+      # browser under Administration, Agent access, and changes there need no restart.
+      - --mcp
+      - ${GRAFT_MCP:-false}
     ports:
       - "127.0.0.1:8443:8443"
-    networks:
-      default:
-        # The MCP service reaches the forge by the name on its certificate, not by the service name, because
-        # the certificate is checked and a service name would not match a subject alternative name.
-        aliases:
-          - ${GRAFT_INTERNAL_HOST:-graft.internal}
     volumes:
       - graft-data:/data
     secrets:
@@ -77,57 +75,6 @@ services:
     # No healthcheck: the chiseled base carries no shell and no HTTP client, so there is nothing in the
     # image to probe with. Watch /healthz from whatever sits in front instead.
 
-  # Off unless asked for: `docker compose --profile mcp up`. A profile rather than a flag inside the forge,
-  # because the MCP server is a separate process and an operator who does not want agent access should have
-  # nothing listening rather than a route switched off.
-  graft-mcp:
-    <<: *hardening
-    profiles:
-      - mcp
-    # The same image as the forge. One build, two entrypoints.
-    image: ${GRAFT_IMAGE:-graft:local}
-    build:
-      context: ../..
-      dockerfile: deploy/container/Containerfile
-    entrypoint:
-      - /app/mcp/Graft.Mcp
-    command:
-      - --server
-      - https://${GRAFT_INTERNAL_HOST:-graft.internal}:8443
-      - --transport
-      - http
-      - --listen
-      - https://0.0.0.0:8444
-      - --certificate
-      - /run/secrets/graft-tls.pfx
-      - --certificate-password-file
-      - /run/secrets/graft-tls-password
-      # The forge's own certificate, so this verifies it rather than trusting whatever answers. There is no
-      # option anywhere that skips the check.
-      - --ca-certificate
-      - /run/secrets/graft-ca.pem
-      # Reads only unless an operator says otherwise. This holds no credential of its own: every caller
-      # sends their own Graft token, so this bounds what any of them can do through it.
-      - --allow-writes
-      - ${GRAFT_MCP_ALLOW_WRITES:-false}
-      # Callers must present a Graft token. Turning this on serves people who present nothing, who then
-      # reach Graft as strangers and see only what is public. Deliberate, narrow, and off by default.
-      - --allow-anonymous
-      - ${GRAFT_MCP_ALLOW_ANONYMOUS:-false}
-    ports:
-      - "127.0.0.1:8444:8444"
-    depends_on:
-      - graft
-    secrets:
-      - graft-tls.pfx
-      - graft-tls-password
-      - graft-ca.pem
-    deploy:
-      resources:
-        limits:
-          memory: ${GRAFT_MCP_MEMORY_LIMIT:-256M}
-          pids: 128
-
 volumes:
   graft-data:
 
@@ -136,7 +83,3 @@ secrets:
     file: ${GRAFT_TLS_CERTIFICATE}
   graft-tls-password:
     file: ${GRAFT_TLS_PASSWORD_FILE}
-  # Only read by the MCP service. Compose resolves every secret's source whichever profile is active, so
-  # this falls back to the certificate file and an operator who never enables MCP never needs a second one.
-  graft-ca.pem:
-    file: ${GRAFT_CA_CERTIFICATE:-${GRAFT_TLS_CERTIFICATE}}

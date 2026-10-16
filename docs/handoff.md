@@ -1,6 +1,49 @@
 # Next-agent handoff
 
-Updated: 2026-10-13. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
+Updated: 2026-10-16. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
+
+## Added on 2026-10-16, MCP in the forge
+
+**The Model Context Protocol endpoint is hosted by the forge itself**, at `/mcp` on the same port and
+certificate, behind `--mcp true` or `GRAFT_MCP=true`. Off by default. The compose `mcp` profile, the second
+service and port, the extracted CA and the plain-HTTP overlay are gone; the Containerfile no longer carries
+the launcher. See [ADR 0009](decisions/0009-mcp-in-the-forge.md) and
+[the evidence](validation/2026-10-16-mcp-in-the-forge.md).
+
+**Beneath the operator's gate, three administrator switches live in the database** and are edited in the
+browser at Administration, Agent access: serve agents (default on), allow writes (off), serve callers with no
+token (off). The endpoint reads them on every request, so a change applies to the next call with nothing
+restarted. Every change is audited with the resulting posture, and the forge prints
+`MCP: <endpoint>; enabled=...; credentials=...; writes=...` on startup. A new `ServerSettings` table,
+migration 5, holds them one row per setting.
+
+**The tools still call the HTTP API from inside the process.** `GraftTools` and `GraftClient` moved to
+`src/Graft.McpTools`, shared by the forge and the launcher. The forge connects to its own listener addressed
+to the public origin, so result links are the ones a person could open, over a socket opened straight to the
+bound port and accepting only the certificate this process serves. Every authorization decision stays in the
+API route, made once for agents and people alike.
+
+**What unblocked it: NativeAOT runs here now.** The MSVC toolchain is installed. `Graft.Mcp` publishes native
+with zero ILC warnings, and the forge with `ModelContextProtocol.AspNetCore` inside it produces no ILC warning
+from the SDK or the tools library. ADR 0008 had
+named exactly that as its review trigger. The SDK finds the linker through `vswhere.exe`, which this Visual
+Studio installer lacks, so the publish runs inside `vcvars64.bat` with `IlcUseEnvironmentalTools=true` and
+`Platform` cleared; the command is in [build-and-test](build-and-test.md).
+
+**And it found a pre-existing break in the forge's NativeAOT claim.** All sixteen ILC warnings are in
+`DnaX.Uploads`, whose `MapDnaXUploads` maps `MapPost`/`MapDelete` handlers the runtime must build request
+delegates for, and the native forge dies at startup building its endpoint table, with `--mcp true` and
+`--mcp false` alike. The Request Delegate Generator only rewrites routes in the assembly being compiled, so
+the fix is in `DnaX.Uploads` itself, or in Graft mapping those routes with explicit `RequestDelegate`s. Until
+then the native forge does not run and the MCP suite could not be run against one; see
+[the evidence](validation/2026-10-16-mcp-in-the-forge.md). **Next action, owner: implementation agent with the
+user's say on DnaX:** make `DnaX.Uploads` AOT-safe or wrap its routes, then publish the forge native inside
+`vcvars64` and run the Git, operations and MCP suites against the `.exe`.
+
+**The client gained an admin page**, `/-/admin/agents`, shown only when the session reports
+`mcp_available`, and the session response carries that flag beside `public_browsing`.
+
+Suites: 389 Git/API/browser, 129 accounts, 41 operations, 82 MCP.
 
 ## Added on 2026-10-13, login focus
 

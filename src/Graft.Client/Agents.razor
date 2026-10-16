@@ -1,0 +1,159 @@
+@page "/-/admin/agents"
+@inject GraftApi Api
+@inject NavigationManager Navigation
+
+<PageTitle>Agent access &middot; Graft</PageTitle>
+
+@if (loading)
+{
+    <p role="status" class="secondary-text">Loading…</p>
+}
+else if (!Api.IsAdministrator)
+{
+    <div class="page-header"><div><h1>Agent access</h1><p class="subtitle">This page requires an administrator account.</p></div></div>
+}
+else if (current is null)
+{
+    @* The operator did not start the server with the endpoint, so there is nothing here to switch. Said
+       plainly, with the flag, rather than shown as a form whose switches would do nothing. *@
+    <div class="page-header"><div><h1>Agent access</h1><p class="subtitle">The Model Context Protocol endpoint is not enabled on this server.</p></div></div>
+    <Banner Message="@message" Kind="@messageKind" />
+    <div class="panel">
+        <div class="panel-body">
+            <p class="secondary-text">
+                An operator enables it by starting Graft with <span class="mono">--mcp true</span>, or
+                <span class="mono">GRAFT_MCP=true</span> in the container deployment. The switches below then
+                become available here without a further restart.
+            </p>
+        </div>
+    </div>
+}
+else
+{
+    <div class="page-header">
+        <div><h1>Agent access</h1><p class="subtitle">What AI agents may do on this instance through the Model Context Protocol.</p></div>
+    </div>
+
+    <Banner Message="@message" Kind="@messageKind" />
+
+    <div class="panel">
+        <div class="panel-header"><Icon Name="settings" /><h2>Endpoint</h2><span class="spacer"></span>
+            <span class="label @(current.Enabled ? "success" : "")">@(current.Enabled ? "Serving" : "Off")</span></div>
+        <div class="panel-body">
+            <p class="mono">@current.Endpoint</p>
+            <p class="secondary-text">
+                Streamable HTTP. Every caller sends their own personal access token as
+                <span class="mono">Authorization: Bearer</span> or <span class="mono">PRIVATE-TOKEN</span>, and reaches
+                exactly what that token's owner can reach. The server stores no credential of its own, and a
+                request without one is refused before the protocol is spoken.
+            </p>
+            <p class="secondary-text">
+                Tokens are created under <a href="/-/profile">Profile and tokens</a>. Reading needs
+                <span class="mono">read_api</span>; the tools that change something need <span class="mono">api</span>
+                and the switch below.
+            </p>
+        </div>
+    </div>
+
+    <div class="panel">
+        <div class="panel-header"><h2>Switches</h2></div>
+        <div class="panel-body">
+            <form class="form" @onsubmit="Save" @onsubmit:preventDefault>
+                <label class="checkbox"><input type="checkbox" @bind="enabled" /> Serve agents</label>
+                <p class="field-hint">Off pauses the endpoint without a restart. Callers receive a 404 until it is turned back on.</p>
+
+                <label class="checkbox"><input type="checkbox" @bind="allowWrites" /> Allow writes</label>
+                <p class="field-hint">
+                    Lets agents create projects, change who can see a project, and publish or withdraw project
+                    pages, within what each caller's token already permits. Off, every tool that changes
+                    something is refused and names this switch.
+                </p>
+
+                <label class="checkbox"><input type="checkbox" @bind="allowAnonymous" /> Serve callers with no token</label>
+                <p class="field-hint">
+                    They reach Graft as strangers and see only public projects and published pages. That is a
+                    real limit, but the only one: anyone who can reach the endpoint can then talk to it.
+                </p>
+
+                @if (allowAnonymous && !current.AllowAnonymous)
+                {
+                    <div class="banner warning">
+                        <Icon Name="alert" />
+                        <span>Anonymous access widens who can use this server. Make sure the endpoint is only reachable from where you intend.</span>
+                    </div>
+                }
+
+                <div class="form-actions">
+                    <button type="submit" disabled="@(busy || !Changed)">@(busy ? "Saving…" : "Save")</button>
+                    <button type="button" class="secondary" @onclick="Reset" disabled="@(busy || !Changed)">Discard</button>
+                </div>
+            </form>
+        </div>
+    </div>
+}
+
+@code {
+    private McpSettingsResponse? current;
+    private bool enabled;
+    private bool allowWrites;
+    private bool allowAnonymous;
+    private string message = "";
+    private string messageKind = "info";
+    private bool loading = true;
+    private bool busy;
+
+    private bool Changed => current is not null &&
+        (enabled != current.Enabled || allowWrites != current.AllowWrites || allowAnonymous != current.AllowAnonymous);
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            if (!await Api.EnsureSessionAsync())
+            {
+                if (Api.Reachable) Navigation.NavigateTo("/-/login", replace: true);
+                return;
+            }
+            if (Api.IsAdministrator && Api.Session?.McpAvailable == true) await Load();
+        }
+        finally { loading = false; }
+    }
+
+    private async Task Load()
+    {
+        (bool reached, McpSettingsResponse? settings) = await Api.GetOptionalAsync("api/graft/admin/mcp", ApiJson.Default.McpSettingsResponse);
+        if (!reached) { Report(ApiResult.Refused("Graft could not be reached.")); return; }
+        current = settings;
+        Reset();
+    }
+
+    private void Reset()
+    {
+        if (current is null) return;
+        enabled = current.Enabled;
+        allowWrites = current.AllowWrites;
+        allowAnonymous = current.AllowAnonymous;
+    }
+
+    private async Task Save()
+    {
+        if (busy || current is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult<McpSettingsResponse> result = await Api.SendAsync(HttpMethod.Post, "api/graft/admin/mcp",
+                new McpSettingsRequest(enabled, allowWrites, allowAnonymous),
+                ApiJson.Default.McpSettingsRequest, ApiJson.Default.McpSettingsResponse, "Agent access updated. The change applies to the next request.");
+            Report(new ApiResult(result.Ok, result.Message));
+            if (result.Ok && result.Value is not null) { current = result.Value; Reset(); }
+        }
+        finally { busy = false; }
+    }
+
+    private void Report(ApiResult result)
+    {
+        message = result.Message;
+        messageKind = result.Ok ? "success" : "error";
+    }
+}

@@ -2,6 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/Graft.Admin/Graft.Admin.csproj" />
     <Project Path="src/Graft.Mcp/Graft.Mcp.csproj" />
+    <Project Path="src/Graft.McpTools/Graft.McpTools.csproj" />
     <Project Path="src/Graft.Client/Graft.Client.csproj" />
     <Project Path="src/Graft.Contracts/Graft.Contracts.csproj" />
     <Project Path="src/Graft.Core/Graft.Core.csproj" />

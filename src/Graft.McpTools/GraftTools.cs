@@ -207,7 +207,7 @@ public sealed class GraftTools
     }
 
     [McpServerTool(Name = "graft_create_project")]
-    [Description("Creates a project owned by the token's account. Refused unless this server was started with writes allowed.")]
+    [Description("Creates a project owned by the token's account. Refused unless writes are allowed on this server.")]
     public static async Task<string> CreateProject(
         GraftClient graft,
         [Description("Path for the new project, 2 to 39 letters or numbers separated by single dots, underscores or hyphens.")] string path,
@@ -215,7 +215,7 @@ public sealed class GraftTools
         [Description("Description. May be empty.")] string description,
         CancellationToken cancellationToken)
     {
-        if (!graft.AllowWrites) return Refused("creating a project");
+        if (!graft.AllowWrites) return Refused(graft, "creating a project");
 
         JsonObject body = new() { ["path"] = path };
         if (!string.IsNullOrWhiteSpace(name)) body["name"] = name;
@@ -228,14 +228,14 @@ public sealed class GraftTools
     }
 
     [McpServerTool(Name = "graft_set_visibility")]
-    [Description("Sets who can read a whole project: private, unlisted, or public. Public and unlisted expose every file and the history, and allow cloning without an account. Refused unless this server was started with writes allowed.")]
+    [Description("Sets who can read a whole project: private, unlisted, or public. Public and unlisted expose every file and the history, and allow cloning without an account. Refused unless writes are allowed on this server.")]
     public static async Task<string> SetVisibility(
         GraftClient graft,
         [Description("The project path like alice/widgets, or its numeric id.")] string project,
         [Description("One of private, unlisted or public.")] string visibility,
         CancellationToken cancellationToken)
     {
-        if (!graft.AllowWrites) return Refused("changing who can see a project");
+        if (!graft.AllowWrites) return Refused(graft, "changing who can see a project");
         if (visibility is not ("private" or "unlisted" or "public"))
             return Failure("visibility must be private, unlisted or public.");
 
@@ -247,14 +247,14 @@ public sealed class GraftTools
     }
 
     [McpServerTool(Name = "graft_set_page_published")]
-    [Description("Publishes or withdraws a project's curated page. A published page lists the project for everyone even when its repository stays private, and it exposes no source. Refused unless this server was started with writes allowed.")]
+    [Description("Publishes or withdraws a project's curated page. A published page lists the project for everyone even when its repository stays private, and it exposes no source. Refused unless writes are allowed on this server.")]
     public static async Task<string> SetPagePublished(
         GraftClient graft,
         [Description("The project path like alice/widgets, or its numeric id.")] string project,
         [Description("True to publish the page, false to withdraw it.")] bool published,
         CancellationToken cancellationToken)
     {
-        if (!graft.AllowWrites) return Refused("publishing or withdrawing a project page");
+        if (!graft.AllowWrites) return Refused(graft, "publishing or withdrawing a project page");
 
         (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Put,
             "api/graft/projects/" + Encode(project) + "/page",
@@ -265,14 +265,14 @@ public sealed class GraftTools
     }
 
     /// <summary>
-    /// A refusal that names the switch which would permit the action. An agent told only "not allowed"
+    /// A refusal that names what would permit the action. An agent told only "not allowed"
     /// tends to try again a different way; one told what the operator would have to change stops.
     /// </summary>
-    private static string Refused(string action) => new JsonObject
+    private static string Refused(GraftClient graft, string action) => new JsonObject
     {
         ["error"] = true,
         ["refused"] = "This Graft MCP server is read-only, so " + action + " is not available.",
-        ["remedy"] = "An operator can restart it with --allow-writes true."
+        ["remedy"] = graft.WriteRemedy
     }.ToJsonString();
 
     private static string Failure(string message) =>

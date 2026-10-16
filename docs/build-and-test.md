@@ -73,9 +73,18 @@ namespace. The suite covers both states, and most of its assertions there are ab
 create. See [push-to-create evidence](validation/2026-10-13-push-to-create.md) and
 [ADR 0007](decisions/0007-push-to-create.md).
 
-Graft ships a Model Context Protocol server as a separate executable, `src/Graft.Mcp`. It speaks stdio and
-Streamable HTTP, and reaches Graft over the ordinary REST API with a personal access token, so it is
-deliberately not part of the forge process and the server's dependency closure is unchanged by it:
+Graft hosts a Model Context Protocol endpoint inside the forge, at `/mcp` on the same port and certificate,
+when started with `--mcp true`. Off by default. Once on, an administrator decides in the browser, under
+Administration, Agent access, whether agents are served, whether they may change anything, and whether
+callers with no token are served at all; those default to serving, no writes, and no anonymous callers, and
+a change applies to the next request. Every caller sends their own personal access token as
+`PRIVATE-TOKEN` or `Authorization: Bearer`. The tools still reach Graft over the ordinary REST API, so an
+agent can do exactly what that token could do with curl. The forge prints `MCP: ...` on startup with the
+posture it is running in.
+
+The same tools also ship as a separate launcher, `src/Graft.Mcp`, for a client that starts its MCP server
+locally over stdio, and it still has its own Streamable HTTP listener for a forge that was started without
+the endpoint:
 
 ```powershell
 dotnet build src\Graft.Mcp\Graft.Mcp.csproj -c Debug
@@ -84,28 +93,26 @@ dotnet src\Graft.Mcp\bin\Debug\net10.0\Graft.Mcp.dll --server <https origin> --t
 dotnet src\Graft.Mcp\bin\Debug\net10.0\Graft.Mcp.dll --licences
 ```
 
-Credentials are required by default and both ways of loosening that are explicit switches, each off unless
-asked for: `--allow-anonymous true` serves callers who present nothing, and `--allow-plaintext true` permits
-an http listener off loopback. The server prints its posture on startup.
-
-Over stdio the credential belongs to the process, so `--token-file` is required. Over Streamable HTTP it
-belongs to the caller: each request carries its own Graft token as `PRIVATE-TOKEN` or
-`Authorization: Bearer`, this server stores none, `--token-file` is refused, and a request without a token
-is answered `401` before the protocol is spoken. Off loopback the endpoint must be HTTPS with a certificate.
-
+Over stdio the credential belongs to the process, so `--token-file` is required. Over the launcher's own
+HTTP listener it belongs to the caller, `--token-file` is refused, and a request without a token is answered
+`401`; `--allow-anonymous true` and `--allow-plaintext true` loosen that and are each off unless asked for.
 Mutating tools are refused unless `--allow-writes true`. There is no option to skip certificate
-verification; `--ca-certificate` names the certificate to trust, which also covers a forge behind a private
-authority.
+verification; `--ca-certificate` names the certificate to trust.
 
-A fourth suite drives both transports against a real Graft, launching the MCP server as a child process the
-way a client would:
+The shared tool code lives in `src/Graft.McpTools`, referenced by both, so the forge and the launcher cannot
+offer different tools.
+
+A fourth suite drives the forge's own endpoint, changing the administrator's switches over the real admin
+route, and then the launcher over both of its transports, launching it as a child process the way a client
+would:
 
 ```powershell
 dotnet build tests\Graft.Mcp.Acceptance\Graft.Mcp.Acceptance.csproj -c Debug
 dotnet tests\Graft.Mcp.Acceptance\bin\Debug\net10.0\Graft.Mcp.Acceptance.dll src\Graft.Server\bin\Debug\net10.0\Graft.Server.dll src\Graft.Mcp\bin\Debug\net10.0\Graft.Mcp.dll
 ```
 
-See [MCP evidence](validation/2026-10-13-mcp-layer.md) and [ADR 0008](decisions/0008-mcp-layer.md).
+See [MCP evidence](validation/2026-10-16-mcp-in-the-forge.md), [ADR 0009](decisions/0009-mcp-in-the-forge.md)
+and [ADR 0008](decisions/0008-mcp-layer.md).
 
 A browser session is an idle window, renewed by use, set by `--session-minutes` and defaulting to 12 hours
 with an absolute ceiling of 30 days from sign-in. It used to be a fifteen-minute countdown from sign-in that
@@ -211,6 +218,20 @@ dotnet run --project tests\Graft.Packaging.Acceptance\Graft.Packaging.Acceptance
 ```
 
 The elevated Windows NativeAOT run passed all five lifecycle assertions on 2026-09-19, including certificate-backed readiness, clean stop and maintenance-lock release.
+
+The Windows publish needs the MSVC linker, which the .NET SDK locates through `vswhere.exe` from the Visual
+Studio installer directory. On a machine where that directory has no `vswhere.exe`, the publish stops with
+"Platform linker not found" even though `link.exe` is installed. The way through is to run inside the
+Visual Studio developer environment and tell ILC to use the tools on `PATH`, clearing the `Platform` variable
+that environment exports because MSBuild would otherwise force the embedded Blazor client's `browser-wasm`
+build onto x64:
+
+```bat
+"C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat" && set Platform= && dotnet publish src\Graft.Server\Graft.Server.csproj -c Release -r win-x64 --self-contained true -p:GraftServerAot=true -p:IlcUseEnvironmentalTools=true -o artifacts\mvp08\server-win-x64
+```
+
+Recorded 2026-10-16, when this is how the forge with its MCP transport and the `Graft.Mcp` launcher were both
+published native for the first time; see [MCP evidence](validation/2026-10-16-mcp-in-the-forge.md).
 
 Build the integrated static Linux server and admin tool with the existing isolated WSL toolchain:
 

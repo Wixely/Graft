@@ -41,6 +41,13 @@
       },
       "graft.contracts": {
         "type": "Project"
+      },
+      "graft.mcptools": {
+        "type": "Project",
+        "dependencies": {
+          "Graft.Contracts": "[1.0.0, )",
+          "ModelContextProtocol.Core": "[2.2.0, )"
+        }
       }
     }
   }

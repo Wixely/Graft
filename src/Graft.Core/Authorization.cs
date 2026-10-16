@@ -220,3 +220,19 @@ public sealed record SessionGrant(string Secret, DateTimeOffset ExpiresAtUtc);
 public sealed record ResolvedSession(AuthenticatedIdentity Identity, DateTimeOffset ExpiresAtUtc, bool Renewed);
 public sealed record TokenGrant(long Id, string Secret, TokenScope Scopes, DateTimeOffset ExpiresAtUtc);
 public sealed record PersonalAccessToken(long Id, string Name, TokenScope Scopes, DateTimeOffset ExpiresAtUtc, DateTimeOffset CreatedAtUtc);
+
+/// <summary>
+/// The administrator's switches for the forge's own Model Context Protocol endpoint. These exist only
+/// beneath the operator's: a server started without the endpoint has nothing for them to govern.
+///
+/// <para>
+/// Enabled defaults open because the operator starting the endpoint is already the deliberate act; this
+/// switch lets an administrator pause agent access without a redeploy. The other two default closed, the
+/// same as the launched server's flags did: writes and anonymous callers are each a widening that has to be
+/// asked for.
+/// </para>
+/// </summary>
+public sealed record McpSettings(bool Enabled, bool AllowWrites, bool AllowAnonymous)
+{
+    public static McpSettings Default { get; } = new(true, false, false);
+}

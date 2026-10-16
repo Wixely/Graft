@@ -1,5 +1,9 @@
+using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
+using System.Net.Security;
+using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
@@ -10,23 +14,86 @@ namespace Graft.Mcp;
 
 /// <summary>
 /// The shared connection to one Graft instance: where it is, how its certificate is trusted, and whether
-/// this server is permitted to change anything. It holds no credential.
+/// tools reached through it may change anything by default. It holds no credential.
 /// </summary>
 public sealed class GraftConnection : IDisposable
 {
     public GraftConnection(Uri server, bool allowWrites, X509Certificate2? trustedRoot = null)
+        : this(server, allowWrites, Handler(trustedRoot), "An operator can restart it with --allow-writes true.")
+    {
+    }
+
+    private GraftConnection(Uri server, bool allowWrites, SocketsHttpHandler handler, string writeRemedy)
     {
         ArgumentNullException.ThrowIfNull(server);
         AllowWrites = allowWrites;
+        WriteRemedy = writeRemedy;
+        Http = new HttpClient(handler) { BaseAddress = server, Timeout = TimeSpan.FromSeconds(30) };
+        Http.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("Graft.Mcp", "1.0"));
+    }
 
-        // A self-hosted forge often presents a certificate from a private authority, or its own self-signed
-        // one. The answer to that is to name the certificate to trust, not to stop checking: there is no
-        // option here that accepts any certificate, because a tool that carries a credential to a host it
-        // did not verify is handing the credential to whoever answered.
-        //
-        // Naming a root replaces the system store rather than adding to it, which pins this client to that
-        // one authority. For a tool pointed at a single known forge that is the stronger position, and the
-        // hostname is still checked against the certificate either way.
+    /// <summary>
+    /// A connection from the forge to its own listener, for the endpoint the forge hosts in-process.
+    ///
+    /// <para>
+    /// The tools still go through the HTTP API rather than reaching into the store, so an agent inside the
+    /// forge can do exactly what the same token could do with curl, and every authorization decision is the
+    /// one the API route already makes. What this changes is only the wire: requests are addressed to the
+    /// public origin, so SNI, the Host header and every URL the API builds are the ones a browser would see,
+    /// but the socket is opened straight to the listener instead of resolving that name, and the certificate
+    /// that answers must be byte-for-byte the one this process is serving. Nothing between here and there
+    /// can be impersonated, because there is nothing between here and there.
+    /// </para>
+    /// </summary>
+    /// <param name="origin">The public origin, with a trailing slash.</param>
+    /// <param name="listener">Where this process is actually listening.</param>
+    /// <param name="own">The certificate this process serves, which is the only one accepted.</param>
+    /// <param name="writeRemedy">What a refused write tells the agent an administrator could change.</param>
+    public static GraftConnection ToOwnListener(Uri origin, IPEndPoint listener, X509Certificate2 own, string writeRemedy)
+    {
+        ArgumentNullException.ThrowIfNull(listener);
+        ArgumentNullException.ThrowIfNull(own);
+        byte[] expected = own.GetCertHash(HashAlgorithmName.SHA256);
+        SocketsHttpHandler handler = new()
+        {
+            UseProxy = false,
+            ConnectCallback = async (_, cancellationToken) =>
+            {
+                Socket socket = new(listener.AddressFamily, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+                try
+                {
+                    await socket.ConnectAsync(listener, cancellationToken);
+                    return new NetworkStream(socket, ownsSocket: true);
+                }
+                catch
+                {
+                    socket.Dispose();
+                    throw;
+                }
+            }
+        };
+        handler.SslOptions.RemoteCertificateValidationCallback = (_, presented, _, _) =>
+            presented is not null &&
+            CryptographicOperations.FixedTimeEquals(expected, presented.GetCertHash(HashAlgorithmName.SHA256));
+        // Writes are decided per caller by the administrator's setting, so the connection's own default is
+        // the closed one and the per-request client carries the live answer.
+        return new(origin, allowWrites: false, handler, writeRemedy);
+    }
+
+    /// <summary>
+    /// A self-hosted forge often presents a certificate from a private authority, or its own self-signed
+    /// one. The answer to that is to name the certificate to trust, not to stop checking: there is no
+    /// option here that accepts any certificate, because a tool that carries a credential to a host it
+    /// did not verify is handing the credential to whoever answered.
+    ///
+    /// <para>
+    /// Naming a root replaces the system store rather than adding to it, which pins this client to that
+    /// one authority. For a tool pointed at a single known forge that is the stronger position, and the
+    /// hostname is still checked against the certificate either way.
+    /// </para>
+    /// </summary>
+    private static SocketsHttpHandler Handler(X509Certificate2? trustedRoot)
+    {
         SocketsHttpHandler handler = new();
         if (trustedRoot is not null)
         {
@@ -38,18 +105,21 @@ public sealed class GraftConnection : IDisposable
             policy.CustomTrustStore.Add(trustedRoot);
             handler.SslOptions.CertificateChainPolicy = policy;
         }
-
-        Http = new HttpClient(handler) { BaseAddress = server, Timeout = TimeSpan.FromSeconds(30) };
-        Http.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("Graft.Mcp", "1.0"));
+        return handler;
     }
 
     internal HttpClient Http { get; }
 
     /// <summary>
-    /// Whether the tools that change something are permitted. Off unless an operator turned it on, so an
-    /// agent handed this server by default can read a forge and cannot alter one.
+    /// Whether the tools that change something are permitted for a caller that carries no answer of its
+    /// own. Off unless an operator turned it on, so an agent handed this server by default can read a forge
+    /// and cannot alter one.
     /// </summary>
     public bool AllowWrites { get; }
+
+    /// <summary>What a refused write says would permit it. Names the switch an operator or administrator
+    /// would actually change, which differs between a launched process and the forge's own endpoint.</summary>
+    public string WriteRemedy { get; }
 
     public void Dispose() => Http.Dispose();
 }
@@ -69,9 +139,31 @@ public sealed class GraftConnection : IDisposable
 /// caller brings their own, and one connection serves them all.
 /// </para>
 /// </summary>
-public sealed class GraftClient(GraftConnection connection, string token)
+public sealed class GraftClient
 {
-    public bool AllowWrites => connection.AllowWrites;
+    private readonly GraftConnection connection;
+    private readonly string token;
+    private readonly bool allowWrites;
+
+    public GraftClient(GraftConnection connection, string token)
+        : this(connection, token, connection.AllowWrites)
+    {
+    }
+
+    /// <summary>A client whose write permission was decided for this caller, as the forge's own endpoint
+    /// decides it from the administrator's live setting rather than from how the process was started.</summary>
+    public GraftClient(GraftConnection connection, string token, bool allowWrites)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        ArgumentNullException.ThrowIfNull(token);
+        this.connection = connection;
+        this.token = token;
+        this.allowWrites = allowWrites;
+    }
+
+    public bool AllowWrites => allowWrites;
+
+    public string WriteRemedy => connection.WriteRemedy;
 
     public async Task<(bool Ok, string Body, int Status)> SendAsync(
         HttpMethod method,

@@ -33,6 +33,6 @@
     <!-- Same obligation as the server: the Apache and MIT terms here bind the binary, and this binary is
          routinely copied somewhere the repository is not. -->
     <EmbeddedResource Include="../../THIRD-PARTY-NOTICES.md" LogicalName="graft/THIRD-PARTY-NOTICES.md" />
-    <ProjectReference Include="../Graft.Contracts/Graft.Contracts.csproj" />
+    <ProjectReference Include="../Graft.McpTools/Graft.McpTools.csproj" />
   </ItemGroup>
 </Project>
