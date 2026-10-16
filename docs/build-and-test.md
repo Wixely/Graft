@@ -224,11 +224,18 @@ Studio installer directory. On a machine where that directory has no `vswhere.ex
 "Platform linker not found" even though `link.exe` is installed. The way through is to run inside the
 Visual Studio developer environment and tell ILC to use the tools on `PATH`, clearing the `Platform` variable
 that environment exports because MSBuild would otherwise force the embedded Blazor client's `browser-wasm`
-build onto x64:
+build onto x64.
+
+Open the **x64 Native Tools Command Prompt for VS** from the Start menu, which is the edition-independent way
+to get that environment, then:
 
 ```bat
-"C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat" && set Platform= && dotnet publish src\Graft.Server\Graft.Server.csproj -c Release -r win-x64 --self-contained true -p:GraftServerAot=true -p:IlcUseEnvironmentalTools=true -o artifacts\mvp08\server-win-x64
+set Platform= && dotnet publish src\Graft.Server\Graft.Server.csproj -c Release -r win-x64 --self-contained true -p:GraftServerAot=true -p:IlcUseEnvironmentalTools=true -o artifacts\mvp08\server-win-x64
 ```
+
+To stay in one shell instead, call `vcvars64.bat` first. It lives under the Visual Studio installation at
+`VC\Auxiliary\Build\vcvars64.bat`, so the full path carries the edition and year of the install, as in
+`...\Microsoft Visual Studio\<year>\<edition>\VC\Auxiliary\Build\vcvars64.bat`.
 
 Recorded 2026-10-16, when this is how the forge with its MCP transport and the `Graft.Mcp` launcher were both
 published native for the first time; see [MCP evidence](validation/2026-10-16-mcp-in-the-forge.md).
