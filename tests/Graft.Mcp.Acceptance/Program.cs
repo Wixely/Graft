@@ -150,7 +150,7 @@ async Task CheckForge(string address, string token, string password)
     using (HttpResponseMessage listing = await Post(client, token, Request(3, "tools/list", "{}")))
     {
         using JsonDocument body = Parse(await listing.Content.ReadAsStringAsync());
-        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 13,
+        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 14,
             "the forge's endpoint advertises every tool");
     }
 
@@ -278,6 +278,38 @@ async Task CheckForge(string address, string token, string password)
         using JsonDocument body = Parse(await readBack.Content.ReadAsStringAsync());
         Check(Text(body).Contains("Written by an agent", StringComparison.Ordinal),
             "and reads back exactly what it wrote, through the tool that was already there");
+    }
+
+    // What a commit changed. An agent could already see that a commit exists; this is the first time it can
+    // see what it did, which is the only question worth asking about one.
+    string seeded;
+    using (HttpResponseMessage commits = await Post(client, token, Call(19, "graft_list_commits",
+        """{"project":"admin/shared","reference":"main"}""")))
+    {
+        using JsonDocument body = Parse(await commits.Content.ReadAsStringAsync());
+        using JsonDocument listed = JsonDocument.Parse(Text(body));
+        seeded = listed.RootElement.GetProperty("commits")[0].GetProperty("id").GetString()!;
+    }
+    using (HttpResponseMessage diff = await Post(client, token, Call(20, "graft_read_commit",
+        $$"""{"project":"admin/shared","commit":"{{seeded}}","parent":0}""")))
+    {
+        using JsonDocument body = Parse(await diff.Content.ReadAsStringAsync());
+        // Parsed rather than string-matched: the tool's payload is JSON, and a serializer escapes '+' as
+        // +, so searching the raw text for a diff marker finds nothing however correct the diff is.
+        using JsonDocument reported = JsonDocument.Parse(Text(body));
+        JsonElement file = reported.RootElement.GetProperty("files")[0];
+        Check(file.GetProperty("path").GetString() == "README.md", "an agent reads which files a commit touched");
+        Check(file.GetProperty("status").GetString() == "added" && reported.RootElement.GetProperty("added").GetInt32() == 3,
+            "with what happened to each and how many lines moved");
+        // Unified diff text, because that is the form every tool prints and an agent reads best.
+        Check(file.GetProperty("diff").GetString()!.Contains("+# Shared", StringComparison.Ordinal),
+            "and the added lines as ordinary unified diff text");
+    }
+    using (HttpResponseMessage missing = await Post(client, token, Call(21, "graft_read_commit",
+        """{"project":"admin/shared","commit":"0000000000000000000000000000000000000000","parent":0}""")))
+    {
+        using JsonDocument body = Parse(await missing.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("error", StringComparison.Ordinal), "a commit that is not there is reported rather than invented");
     }
 
     // Allow anonymous callers. A stranger reads what is public and nothing else; the forge decides that,
@@ -417,7 +449,7 @@ async Task CheckStdio(string address, bool readOnly)
 
         using JsonDocument tools = await Exchange(client, Request(2, "tools/list", "{}"));
         int count = tools.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength();
-        Check(count == 13, label + " advertises every tool");
+        Check(count == 14, label + " advertises every tool");
 
         using JsonDocument read = await Exchange(client, Call(3, "graft_browse", """{"search":""}"""));
         Check(Text(read).Contains("admin/shared", StringComparison.Ordinal), label + " reads the public listing");
@@ -470,7 +502,7 @@ async Task CheckHttp(string address, string token)
     using (HttpResponseMessage listing = await Post(client, token, Request(3, "tools/list", "{}")))
     {
         using JsonDocument body = Parse(await listing.Content.ReadAsStringAsync());
-        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 13,
+        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 14,
             "the launcher's HTTP endpoint advertises every tool");
     }
 
