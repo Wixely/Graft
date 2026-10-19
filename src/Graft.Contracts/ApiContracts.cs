@@ -149,6 +149,19 @@ public sealed record RepositoryFileUpload(
 
 public sealed record RepositoryCommitRequest(string Branch, string Message, RepositoryFileUpload[] Files);
 
+/// <summary>
+/// One file written through the API, in GitLab's shape: the content travels in the request rather than as
+/// an upload receipt, because [ADR 0005](../../docs/decisions/0005-browser-upload-transport.md) puts the
+/// resumable transport in the browser and plain HTTP in front of API clients.
+/// </summary>
+public sealed record RepositoryFileWriteRequest(
+    string? Branch,
+    string? Content,
+    /// <summary><c>text</c> or <c>base64</c>. Absent means text.</summary>
+    string? Encoding,
+    string? CommitMessage,
+    bool ExecuteFilemode = false);
+
 public sealed record RepositoryCommitResponse(
     [property: JsonPropertyName("commit_id")] string CommitId,
     [property: JsonPropertyName("tree_id")] string TreeId,
@@ -308,6 +321,7 @@ public sealed record McpSettingsRequest(
 [JsonSerializable(typeof(UploadIngestRequest))]
 [JsonSerializable(typeof(BundleInventoryResponse))]
 [JsonSerializable(typeof(RepositoryCommitRequest))]
+[JsonSerializable(typeof(RepositoryFileWriteRequest))]
 [JsonSerializable(typeof(RepositoryCommitResponse))]
 [JsonSerializable(typeof(UploadStatusResponse))]
 [JsonSerializable(typeof(VisibilityRequest))]

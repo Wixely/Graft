@@ -1172,6 +1172,62 @@ app.MapGet("/api/v4/projects/{projectId}/repository/tree", async context =>
     });
 });
 
+// Writing one file, in GitLab's shape, with the content in the request rather than as an upload receipt.
+// ADR 0005 put the resumable transport in the browser and plain HTTP in front of API clients; this is that
+// second half for repository content, and it is what lets an agent propose a change at all.
+//
+// POST and PUT behave identically. GitLab distinguishes creating a file from updating one and refuses the
+// wrong verb; Graft commits what it was given either way, which is recorded as a deviation rather than
+// pretended away.
+app.MapMethods("/api/v4/projects/{projectId}/repository/files/{**filePath}", ["POST", "PUT"], async context =>
+{
+    // PushRepository, so the token's scopes decide exactly as they do for a git push: api or
+    // write_repository, and Developer-equivalent access to the project.
+    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.PushRepository);
+    if (project is null) return;
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+
+    string filePath = context.Request.RouteValues["filePath"]?.ToString() ?? "";
+    try { filePath = Uri.UnescapeDataString(filePath); }
+    catch (UriFormatException) { await ApiError(context, 400, "file path is not valid"); return; }
+    if (filePath.Length == 0) { await ApiError(context, 400, "file path is missing"); return; }
+
+    RepositoryFileWriteRequest? request;
+    try { request = await context.Request.ReadFromJsonAsync(ApiJson.Default.RepositoryFileWriteRequest, context.RequestAborted); }
+    catch (JsonException) { await ApiError(context, 400, "invalid JSON"); return; }
+    if (request is null) { await ApiError(context, 400, "file is missing"); return; }
+    if (string.IsNullOrWhiteSpace(request.Branch)) { await ApiError(context, 400, "branch is required"); return; }
+    if (string.IsNullOrWhiteSpace(request.CommitMessage)) { await ApiError(context, 400, "commit_message is required"); return; }
+    if (request.Encoding is not (null or "text" or "base64")) { await ApiError(context, 400, "encoding must be text or base64"); return; }
+
+    byte[] content;
+    try
+    {
+        content = request.Encoding == "base64"
+            ? Convert.FromBase64String(request.Content ?? "")
+            : Encoding.UTF8.GetBytes(request.Content ?? "");
+    }
+    catch (FormatException) { await ApiError(context, 400, "content is not valid base64"); return; }
+    if (content.Length > Limits.ObjectBytes) { await ApiError(context, 413, "file exceeds the repository object limit"); return; }
+
+    // Graft accounts carry no email address, so attribution uses the reserved .invalid domain rather than
+    // inventing a deliverable one, exactly as the browser route does.
+    GitIdentity author = new(project.Identity!.Username, project.Identity.Username + "@graft.invalid", DateTimeOffset.UtcNow);
+    try
+    {
+        await WithRepository(project.Endpoint, context, async repository =>
+        {
+            AuthoredCommit authored = repository.CommitFiles(request.Branch!,
+                [new FileChange(filePath, content, request.ExecuteFilemode)], author, request.CommitMessage!, context.RequestAborted);
+            context.Response.StatusCode = StatusCodes.Status201Created;
+            await context.Response.WriteAsJsonAsync(
+                new RepositoryCommitResponse(authored.CommitId, authored.TreeId, authored.Branch, authored.CreatedBranch),
+                ApiJson.Default.RepositoryCommitResponse, null, context.RequestAborted);
+        });
+    }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+});
+
 app.MapGet("/api/v4/projects/{projectId}/repository/files/{**filePath}", async context =>
 {
     ApiProject? project = await AuthorizeApiProject(context, ProjectAction.BrowseRepository);
@@ -1179,7 +1235,12 @@ app.MapGet("/api/v4/projects/{projectId}/repository/files/{**filePath}", async c
     if (!await OnlyQuery(context, "ref")) return;
     string revision = context.Request.Query["ref"].ToString();
     if (revision.Length == 0) { await ApiError(context, 400, "ref is missing"); return; }
+    // GitLab documents this path as URL-encoded, so `docs%2Fthing.md` and `docs/thing.md` have to name the
+    // same file. Unescaping here matches what the write route does, so a file can be read back by the same
+    // spelling it was written with.
     string filePath = context.Request.RouteValues["filePath"]?.ToString() ?? "";
+    try { filePath = Uri.UnescapeDataString(filePath); }
+    catch (UriFormatException) { await ApiError(context, 400, "file path is not valid"); return; }
     await WithRepository(project.Endpoint, context, async repository =>
     {
         GitFile? file = RepositoryView.File(repository, revision, filePath);

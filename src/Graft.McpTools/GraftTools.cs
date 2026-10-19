@@ -276,6 +276,54 @@ public sealed class GraftTools
         return result.ToJsonString();
     }
 
+    [McpServerTool(Name = "graft_write_file")]
+    [Description("Writes one text file into a project and commits it, creating the file or replacing it. The branch must already exist unless the repository is empty. Refused unless writes are allowed on this server.")]
+    public static async Task<string> WriteFile(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("File path inside the repository, such as docs/README.md.")] string file,
+        [Description("The complete new contents of the file. This replaces the file rather than patching it.")] string content,
+        [Description("Branch to commit on, such as main.")] string branch,
+        [Description("Commit message.")] string message,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowWrites) return Refused(graft, "writing a file");
+        if (string.IsNullOrWhiteSpace(file)) return Failure("A file path is required.");
+        if (string.IsNullOrWhiteSpace(branch)) return Failure("A branch is required.");
+        if (string.IsNullOrWhiteSpace(message)) return Failure("A commit message is required.");
+
+        // Sent as base64 so the bytes survive exactly. A file full of quotes, newlines or anything the
+        // transport might normalise is the ordinary case for source code, not the exception.
+        JsonObject body = new()
+        {
+            ["branch"] = branch,
+            ["commit_message"] = message,
+            ["encoding"] = "base64",
+            ["content"] = Convert.ToBase64String(Encoding.UTF8.GetBytes(content ?? ""))
+        };
+
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Post,
+            "api/v4/projects/" + Encode(project) + "/repository/files/" + Uri.EscapeDataString(file.Trim()),
+            body, cancellationToken);
+        if (!ok) return Failure(GraftClient.Describe(status, response));
+
+        // The server answers with the commit it made, which is the thing an agent needs in order to report
+        // what it did or to read the result back.
+        try
+        {
+            JsonNode? commit = JsonNode.Parse(response);
+            return new JsonObject
+            {
+                ["project"] = project,
+                ["path"] = file,
+                ["branch"] = commit?["branch"]?.GetValue<string>() ?? branch,
+                ["commit_id"] = commit?["commit_id"]?.GetValue<string>(),
+                ["created_branch"] = commit?["created_branch"]?.GetValue<bool>() ?? false
+            }.ToJsonString();
+        }
+        catch (System.Text.Json.JsonException) { return new JsonObject { ["project"] = project, ["path"] = file, ["committed"] = true }.ToJsonString(); }
+    }
+
     [McpServerTool(Name = "graft_whoami")]
     [Description("Reports the account this server's credential belongs to, and whether it is an administrator. Use it to check what the agent is allowed to do before trying something.")]
     public static async Task<string> WhoAmI(GraftClient graft, CancellationToken cancellationToken)
