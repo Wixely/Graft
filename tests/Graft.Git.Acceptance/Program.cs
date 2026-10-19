@@ -118,6 +118,8 @@ try
     Check(true, "restart clone passes fsck");
 
     await CheckApi(address, aliceApiToken.Secret, aliceReadApiToken.Secret, aliceToken.Secret, bobApiToken.Secret, project.Id, firstHead);
+    // After the API checks, which assert on project counts this one would otherwise change.
+    await CheckGlobalSlug(address, aliceApiToken.Secret, bobToken.Secret, project.Id, source);
     await CheckBrowser(address, "alice", alicePassword, project.Id);
     await CheckSessionRenewal(address, "alice", alicePassword);
     await CheckPersonalAccessTokens(address, "alice", alicePassword, project.Id);
@@ -337,6 +339,101 @@ async Task<(int ExitCode, string Output, string Errors)> RunGit(string directory
     {
         if (!process.HasExited) { process.Kill(entireProcessTree: true); await process.WaitForExitAsync(); }
     }
+}
+
+/// <summary>
+/// The instance-wide slug: a second name for a project that carries no account name, so a link can be
+/// shared without naming its owner. What matters here is that it is only a name. It must reach the same
+/// project, clone and push exactly as the owned path does, and change nothing about who may do either.
+/// </summary>
+async Task CheckGlobalSlug(string address, string apiToken, string pushToken, long projectId, string worktree)
+{
+    string slug;
+    using (HttpResponseMessage response = await ApiGet(address, "/api/v4/projects/" + projectId, apiToken))
+    {
+        Check(response.IsSuccessStatusCode, "the project reads back by id");
+        using JsonDocument json = JsonDocument.Parse(await response.Content.ReadAsStreamAsync());
+        slug = json.RootElement.GetProperty("global_slug").GetString() ?? "";
+        Check(slug == "durable", "a project is given its own path as its instance-wide slug when that name is free");
+        Check(json.RootElement.GetProperty("global_web_url").GetString() == address.TrimEnd('/') + "/projects/durable",
+            "and a shareable page URL built from it");
+        // The point of the feature: the shared address contains no account name.
+        Check(!json.RootElement.GetProperty("global_web_url").GetString()!.Contains("alice", StringComparison.Ordinal),
+            "the shared URL does not name the owner");
+    }
+
+    // The REST surface accepts the slug wherever it accepts a path, so a caller can use the one name it was
+    // given. Two segments stay GitLab's owner/slug; one segment that is not a number is this.
+    using (HttpResponseMessage bySlug = await ApiGet(address, "/api/v4/projects/" + slug, apiToken))
+    {
+        Check(bySlug.IsSuccessStatusCode, "the REST API resolves a project by its instance-wide slug");
+        using JsonDocument json = JsonDocument.Parse(await bySlug.Content.ReadAsStreamAsync());
+        Check(json.RootElement.GetProperty("id").GetInt64() == projectId, "and resolves it to the same project");
+    }
+
+    // The browser page behind the shared link, which must answer without the owner's name anywhere in it.
+    using (HttpResponseMessage page = await ApiGet(address, "/api/graft/slugs/" + slug, apiToken))
+        Check(page.StatusCode == System.Net.HttpStatusCode.NotFound,
+            "the shared page is a browser-session route and refuses a token");
+
+    // Clone by the slug, with a credential that has no more rights than before.
+    string clonePath = "projects/" + slug + ".git";
+    string cloneUrl = AuthenticatedUrl(address, "bob", pushToken, clonePath);
+    await Git(root, ["clone", "--no-checkout", cloneUrl, "slug-clone"]);
+    Check(Directory.Exists(Path.Combine(root, "slug-clone", ".git")), "a repository clones by its instance-wide slug");
+
+    // And push by the slug. This is the assertion that makes the slug a real address rather than a link:
+    // the pushed commit has to arrive in the same repository the owned path serves.
+    //
+    // On a branch of its own, so the main-branch assertions elsewhere in this suite keep testing what they
+    // were written to test rather than whatever this pushed last.
+    await Git(worktree, ["checkout", "-b", "shared-slug-push"]);
+    File.AppendAllText(Path.Combine(worktree, "readme.txt"), "pushed through the shared slug\n");
+    await Git(worktree, ["add", "."]);
+    await Git(worktree, ["commit", "-m", "Push through the instance-wide slug"]);
+    await Git(worktree, ["push", cloneUrl, "shared-slug-push"]);
+    await Git(worktree, ["checkout", "main"]);
+
+    string throughOwnedPath = await Git(root, ["ls-remote", AuthenticatedUrl(address, "bob", pushToken, "alice/durable.git"), "refs/heads/shared-slug-push"]);
+    string throughSlug = await Git(root, ["ls-remote", cloneUrl, "refs/heads/shared-slug-push"]);
+    Check(throughOwnedPath.Length > 0 && throughOwnedPath.Split('\t')[0] == throughSlug.Split('\t')[0],
+        "a push through the slug lands in the repository the owned path serves");
+
+    // An unauthenticated caller is refused exactly as it is on the owned path. Asserted as "the same
+    // answer" rather than a fixed status, because the invariant that matters is that the slug is a name
+    // and not a second, looser way in; whatever the owned path says to a stranger, this must say too.
+    using (HttpResponseMessage bySlug = await ApiGet(address, "/api/v4/projects/" + slug, null))
+    using (HttpResponseMessage byPath = await ApiGet(address, "/api/v4/projects/" + Uri.EscapeDataString("alice/durable"), null))
+        Check(bySlug.StatusCode == byPath.StatusCode && bySlug.StatusCode != System.Net.HttpStatusCode.OK,
+            "an anonymous caller gets the same refusal through the slug as through the owned path");
+
+    // A slug nobody has is a miss, and it is the same miss as a project somebody may not see, so the flat
+    // namespace cannot be probed to learn what exists.
+    using (HttpResponseMessage missing = await ApiGet(address, "/api/v4/projects/no-such-slug-here", apiToken))
+        Check(missing.StatusCode == System.Net.HttpStatusCode.NotFound, "an unused slug is not found");
+    using (HttpResponseMessage hidden = await ApiGet(address, "/api/v4/projects/private", apiToken))
+        Check(hidden.StatusCode == System.Net.HttpStatusCode.NotFound,
+            "another account's private project answers the same way through its slug as it does by path");
+
+    // The collision rule. Carol already owns a project whose path is "private", so she holds that name
+    // instance-wide; alice may still create a project at the same path in her own namespace, and it has to
+    // be given a different shared name rather than taking Carol's or failing.
+    using (HttpResponseMessage colliding = await ApiPost(address, "/api/v4/projects", apiToken,
+        new { name = "Same path as somebody else", path = "private", visibility = "private" }))
+    {
+        Check(colliding.StatusCode == System.Net.HttpStatusCode.Created, "a path another account already uses is still creatable");
+        using JsonDocument json = JsonDocument.Parse(await colliding.Content.ReadAsStreamAsync());
+        string taken = json.RootElement.GetProperty("global_slug").GetString() ?? "";
+        Check(taken != "private" && taken.StartsWith("private-", StringComparison.Ordinal) && taken.Length > "private-".Length,
+            "the second project to want a name keeps its path and gains a suffix");
+        Check(json.RootElement.GetProperty("path_with_namespace").GetString() == "alice/private",
+            "while its owned path is untouched");
+    }
+
+    // Pushing to an unused slug never creates anything, even where push-to-create is enabled, because a
+    // slug names no owner to create it under.
+    await GitFails(root, ["clone", AuthenticatedUrl(address, "bob", pushToken, "projects/invented-by-a-push.git"), "invented"],
+        "a push or fetch at an unused slug does not create a project");
 }
 
 async Task CheckApi(string address, string apiToken, string readApiToken, string repositoryOnlyToken, string memberApiToken, long projectId, string expectedHead)

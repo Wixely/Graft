@@ -55,6 +55,10 @@ const string SessionCookie = "__Host-graft-session";
 // The forge's own Model Context Protocol endpoint. Mounted only when the operator asked for it, and then
 // governed by the administrator's stored switches, which the middleware in front of it reads per request.
 const string McpPath = "/mcp";
+// Where a project answers to its instance-wide slug, with no owner in the path. One segment, so the Git
+// route template already matches `/projects/<slug>.git/...` and only the lookup inside it differs.
+const string GlobalPrefix = "/projects";
+const string GlobalNamespace = "projects";
 const string McpSettingsItem = "graft.mcp.settings";
 const string McpWriteRemedy = "An administrator can allow writes under Administration, Agent access.";
 McpEndpoint mcpEndpoint = new();
@@ -987,6 +991,14 @@ app.MapGet("/api/browser/projects/{projectNamespace}/{slug}", async context => a
         context.Request.RouteValues["slug"]?.ToString() ?? "",
         context.RequestAborted)));
 
+// The same page, reached by the project's instance-wide slug. It lives under Graft's own prefix rather than
+// beside the namespaced route because a literal segment there would shadow any account of that name, and
+// account names are not a list this server gets to shorten.
+app.MapGet("/api/graft/slugs/{globalSlug}", async context => await browseProject(context,
+    await store.FindReadyProjectDetailsByGlobalSlugAsync(
+        context.Request.RouteValues["globalSlug"]?.ToString() ?? "",
+        context.RequestAborted)));
+
 // What a commit changed. Every commit the API reports already carries a web URL pointing here, so this is
 // the page behind a link the product has been handing out all along.
 app.MapGet("/api/browser/projects/{projectId:long}/commit/{sha}", async context =>
@@ -1442,7 +1454,15 @@ async Task<AuthorizedRepository?> Authorize(HttpContext context, ProjectAction a
 {
     string projectNamespace = context.Request.RouteValues["projectNamespace"]?.ToString() ?? "";
     string projectSlug = context.Request.RouteValues["project"]?.ToString() ?? "";
-    ProjectInfo? project = await store.FindReadyProjectAsync(projectNamespace, projectSlug, context.RequestAborted);
+
+    // `/projects/<slug>.git` is the same two segments as `/<owner>/<slug>.git`, so this route already
+    // matches it and only the lookup changes. Everything after this point is identical: the same
+    // credential, the same permission decision, the same refusals. A slug is a second name for a project,
+    // never a second set of rules.
+    bool byGlobalSlug = string.Equals(projectNamespace, GlobalNamespace, StringComparison.OrdinalIgnoreCase);
+    ProjectInfo? project = byGlobalSlug
+        ? await store.FindReadyProjectByGlobalSlugAsync(projectSlug, context.RequestAborted)
+        : await store.FindReadyProjectAsync(projectNamespace, projectSlug, context.RequestAborted);
     AuthenticatedIdentity? identity = await Authenticate(context);
 
     // Push to a path that does not exist yet, and the project is created to receive it. Only on a push:
@@ -1450,7 +1470,10 @@ async Task<AuthorizedRepository?> Authorize(HttpContext context, ProjectAction a
     // is empty would be absurd. Creation happens on the ref advertisement rather than on the pack upload,
     // because the advertisement is the first request Git makes and it would otherwise fail before the push
     // began.
-    if (project is null && identity is not null && action == ProjectAction.PushRepository && settings.PushToCreate)
+    //
+    // Never through a slug: that path names no owner, and a project has to be created in somebody's
+    // namespace. A push to an unused slug is simply a push to something that is not there.
+    if (project is null && !byGlobalSlug && identity is not null && action == ProjectAction.PushRepository && settings.PushToCreate)
         project = await CreateOnPush(context, identity, projectNamespace, projectSlug);
 
     // A public or unlisted repository clones without credentials, so the decision is taken before any
@@ -1729,9 +1752,15 @@ async Task<ApiProject?> AuthorizeApiProject(HttpContext context, ProjectAction a
     else
     {
         string[] path = identifier.Split('/');
-        details = path.Length == 2
-            ? await store.FindReadyProjectDetailsAsync(path[0], path[1], context.RequestAborted)
-            : null;
+        // Two segments is GitLab's `owner/slug`. One segment that is not a number is Graft's instance-wide
+        // slug, which GitLab has no meaning for at all, so reading it here takes nothing away from a
+        // GitLab client and lets an API caller use the same name it was given to share.
+        details = path.Length switch
+        {
+            2 => await store.FindReadyProjectDetailsAsync(path[0], path[1], context.RequestAborted),
+            1 => await store.FindReadyProjectDetailsByGlobalSlugAsync(path[0], context.RequestAborted),
+            _ => null
+        };
     }
     if (details is null)
     {
@@ -1794,7 +1823,9 @@ async Task<ProjectResponse> ProjectResponseForLocked(HttpContext context, Projec
         details.Project.Namespace + " / " + details.Project.Name, details.Project.Slug, path, details.CreatedAtUtc,
         defaultBranch, VisibilityName(details.Project.Visibility), null, webUrl + ".git", webUrl, avatarUrl,
         new(details.Project.OwnerUserId, details.Project.Namespace, details.Project.Namespace, "user", details.Project.Namespace,
-            origin + "/" + Uri.EscapeDataString(details.Project.Namespace)));
+            origin + "/" + Uri.EscapeDataString(details.Project.Namespace)),
+        details.Project.GlobalSlug,
+        details.Project.GlobalSlug.Length == 0 ? "" : origin + GlobalPrefix + "/" + Uri.EscapeDataString(details.Project.GlobalSlug));
 }
 
 /// <summary>

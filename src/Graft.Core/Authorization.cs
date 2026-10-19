@@ -207,7 +207,10 @@ public sealed record ProjectMember(long UserId, string Username, ProjectRole Rol
 public sealed record ProjectInfo(long Id, long OwnerUserId, string Namespace, string Slug, string Name, string StorageId,
     string? DefaultBranch = null,
     ProjectVisibility Visibility = ProjectVisibility.Private,
-    bool PagePublished = false);
+    bool PagePublished = false,
+    /// <summary>The instance-wide name this project can also be reached by, without its owner in the path.
+    /// Every stored project has one; it is empty only on a value built before the row was written.</summary>
+    string GlobalSlug = "");
 /// <summary>A project and its stored settings. DefaultBranch is a preference and may be null, or may name
 /// a branch that no longer exists; the Git engine resolves the effective branch.</summary>
 public sealed record ProjectDetails(ProjectInfo Project, string Description, DateTimeOffset CreatedAtUtc, string? DefaultBranch);

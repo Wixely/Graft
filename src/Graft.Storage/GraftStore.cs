@@ -93,7 +93,7 @@ public sealed class GraftStore : IAsyncDisposable
         string password,
         CancellationToken cancellationToken = default)
     {
-        string normalized = NormalizeName(username, nameof(username));
+        string normalized = NormalizeNewUsername(username);
         string passwordHash = PasswordHash.Create(password);
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
         await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
@@ -117,7 +117,7 @@ public sealed class GraftStore : IAsyncDisposable
         string password,
         CancellationToken cancellationToken = default)
     {
-        string normalized = NormalizeName(username, nameof(username));
+        string normalized = NormalizeNewUsername(username);
         string passwordHash = PasswordHash.Create(password);
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
         await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
@@ -471,7 +471,7 @@ public sealed class GraftStore : IAsyncDisposable
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
         ProjectPathRow? row = await db.QuerySingleOrDefaultAsync<ProjectPathRow>("""
             SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.StorageId, p.DefaultBranch,
-                   p.Visibility, p.PagePublished
+                   p.Visibility, p.PagePublished, p.GlobalSlug
             FROM Projects p
             JOIN Users u ON u.Id = p.OwnerUserId
             WHERE u.NormalizedUsername = @NormalizedNamespace
@@ -486,7 +486,7 @@ public sealed class GraftStore : IAsyncDisposable
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
         ProjectDetailsRow? row = await db.QuerySingleOrDefaultAsync<ProjectDetailsRow>("""
             SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.Description, p.StorageId, p.CreatedAtUtc,
-                   p.DefaultBranch, p.Visibility, p.PagePublished
+                   p.DefaultBranch, p.Visibility, p.PagePublished, p.GlobalSlug
             FROM Projects p
             JOIN Users u ON u.Id = p.OwnerUserId
             WHERE p.Id = @Id AND p.State = 'ready';
@@ -515,7 +515,7 @@ public sealed class GraftStore : IAsyncDisposable
         ProjectListParameters parameters = new(live.UserId, live.IsAdministrator ? 1 : 0, take, skip);
         IEnumerable<ProjectDetailsRow> rows = await db.QueryAsync<ProjectDetailsRow>("""
             SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.Description, p.StorageId, p.CreatedAtUtc,
-                   p.DefaultBranch, p.Visibility, p.PagePublished
+                   p.DefaultBranch, p.Visibility, p.PagePublished, p.GlobalSlug
             FROM Projects p
             JOIN Users u ON u.Id = p.OwnerUserId
             WHERE p.State = 'ready' AND (
@@ -553,14 +553,15 @@ public sealed class GraftStore : IAsyncDisposable
         AuthenticatedIdentity liveActor = await RequireLiveIdentityAsync(db, transaction, actor, cancellationToken);
         string storageId = Guid.NewGuid().ToString("N");
         string now = Now();
+        string globalSlug = await ReserveGlobalSlugAsync(db, transaction, normalizedSlug);
         long id;
         try
         {
             id = await db.QuerySingleAsync<long>("""
-                INSERT INTO Projects (OwnerUserId, Slug, NormalizedSlug, Name, Description, StorageId, State, CreatedAtUtc)
-                VALUES (@OwnerUserId, @Slug, @NormalizedSlug, @Name, @Description, @StorageId, 'pending', @CreatedAtUtc)
+                INSERT INTO Projects (OwnerUserId, Slug, NormalizedSlug, Name, Description, StorageId, State, CreatedAtUtc, GlobalSlug)
+                VALUES (@OwnerUserId, @Slug, @NormalizedSlug, @Name, @Description, @StorageId, 'pending', @CreatedAtUtc, @GlobalSlug)
                 RETURNING Id;
-                """, new CreateProjectParameters(liveActor.UserId, slug, normalizedSlug, name, description, storageId, now), transaction);
+                """, new CreateProjectParameters(liveActor.UserId, slug, normalizedSlug, name, description, storageId, now, globalSlug), transaction);
         }
         catch (SqliteException error) when (error.SqliteErrorCode == 19)
         {
@@ -828,7 +829,7 @@ public sealed class GraftStore : IAsyncDisposable
             """;
         IEnumerable<ProjectDetailsRow> rows = await db.QueryAsync<ProjectDetailsRow>($"""
             SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.Description, p.StorageId, p.CreatedAtUtc,
-                   p.DefaultBranch, p.Visibility, p.PagePublished
+                   p.DefaultBranch, p.Visibility, p.PagePublished, p.GlobalSlug
             FROM Projects p
             JOIN Users u ON u.Id = p.OwnerUserId
             {where}
@@ -892,7 +893,7 @@ public sealed class GraftStore : IAsyncDisposable
         // resetting its password already revokes every session and token immediately.
         IEnumerable<ProjectPathRow> owned = await db.QueryAsync<ProjectPathRow>("""
             SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.StorageId, p.DefaultBranch,
-                   p.Visibility, p.PagePublished
+                   p.Visibility, p.PagePublished, p.GlobalSlug
             FROM Projects p
             JOIN Users u ON u.Id = p.OwnerUserId
             WHERE p.OwnerUserId = @Id
@@ -1181,6 +1182,28 @@ public sealed class GraftStore : IAsyncDisposable
         return connection;
     }
 
+    /// <summary>
+    /// Path segments the application answers to itself, which therefore cannot be account names. A
+    /// namespace is a username and sits at the root, so a user called "projects" would own every link the
+    /// instance-wide slugs live under, and one called "api" would shadow the REST surface.
+    ///
+    /// <para>Checked when an account is created, not when one is read, so an instance that already has such
+    /// an account keeps working and simply loses that one path to the application.</para>
+    /// </summary>
+    private static readonly HashSet<string> ReservedNames = new(StringComparer.Ordinal)
+    {
+        "projects", "api", "healthz", "mcp", "index.html"
+    };
+
+    /// <summary>Normalizes a name that will become an account, refusing the ones the application owns.</summary>
+    private static string NormalizeNewUsername(string value)
+    {
+        string normalized = NormalizeName(value, "username");
+        if (ReservedNames.Contains(normalized))
+            throw new ArgumentException("That name is reserved by the application.", "username");
+        return normalized;
+    }
+
     private static string NormalizeName(string value, string parameterName)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(value, parameterName);
@@ -1188,6 +1211,70 @@ public sealed class GraftStore : IAsyncDisposable
             value.Any(character => character is not (>= 'A' and <= 'Z' or >= 'a' and <= 'z' or >= '0' and <= '9' or '_' or '-' or '.')))
             throw new ArgumentException("Names must be 2-39 ASCII letters, numbers, dots, underscores or hyphens and start with a letter or number.", parameterName);
         return value.ToLowerInvariant();
+    }
+
+    /// <summary>
+    /// Picks the instance-wide slug a new project will answer to, inside the caller's transaction.
+    ///
+    /// <para>
+    /// A project asks for its own path first, because that is the name somebody would guess. Instance-wide
+    /// that name is first-come, so when it is taken the project gets its path with a short random suffix
+    /// rather than waiting for a human to choose. Random rather than a counter: a counter would publish how
+    /// many projects of that name exist, and the second one would always be predictable from the first.
+    /// </para>
+    ///
+    /// <para>
+    /// Safe against a concurrent creation because the transaction is immediate, so no other writer can slip
+    /// a row in between this check and the insert that follows it. The unique index is still the authority;
+    /// this only avoids making a caller retry.
+    /// </para>
+    /// </summary>
+    private static async Task<string> ReserveGlobalSlugAsync(
+        SqliteConnection db,
+        SqliteTransaction transaction,
+        string preferred)
+    {
+        if (!await TakenAsync(preferred)) return preferred;
+        // Widening, not endless: four hex characters give 65,536 names per path, and the loop grows the
+        // suffix rather than spinning on the same width if a path is somehow that popular.
+        for (int width = 2; width <= 8; width *= 2)
+        {
+            for (int attempt = 0; attempt < 8; attempt++)
+            {
+                string candidate = preferred + "-" + Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(width));
+                if (!await TakenAsync(candidate)) return candidate;
+            }
+        }
+        throw new InvalidOperationException("No instance-wide slug was available for this project path.");
+
+        async Task<bool> TakenAsync(string candidate) => await db.QuerySingleAsync<long>(
+            "SELECT COUNT(*) FROM Projects WHERE GlobalSlug = @Value;",
+            new RawValueParameters(candidate), transaction) != 0;
+    }
+
+    /// <summary>
+    /// Finds a ready project by its instance-wide slug. Authorization is the caller's, exactly as it is for
+    /// the namespaced lookup: this answers what exists, never who may see it.
+    /// </summary>
+    public async Task<ProjectInfo?> FindReadyProjectByGlobalSlugAsync(string globalSlug, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(globalSlug)) return null;
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        ProjectPathRow? row = await db.QuerySingleOrDefaultAsync<ProjectPathRow>("""
+            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.StorageId, p.DefaultBranch,
+                   p.Visibility, p.PagePublished, p.GlobalSlug
+            FROM Projects p
+            JOIN Users u ON u.Id = p.OwnerUserId
+            WHERE p.GlobalSlug = @Value AND p.State = 'ready';
+            """, new RawValueParameters(globalSlug.Trim().ToLowerInvariant()));
+        return row is null ? null : ToInfo(row);
+    }
+
+    /// <summary>Finds a ready project and its details by instance-wide slug.</summary>
+    public async Task<ProjectDetails?> FindReadyProjectDetailsByGlobalSlugAsync(string globalSlug, CancellationToken cancellationToken = default)
+    {
+        ProjectInfo? project = await FindReadyProjectByGlobalSlugAsync(globalSlug, cancellationToken);
+        return project is null ? null : await GetReadyProjectAsync(project.Id, cancellationToken);
     }
 
     private static string NewSecret(string prefix) => prefix + Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(32));
@@ -1206,7 +1293,7 @@ public sealed class GraftStore : IAsyncDisposable
 
     private static ProjectInfo ToInfo(ProjectPathRow row) => new(
         row.Id, row.OwnerUserId, row.Namespace, row.Slug, row.Name, row.StorageId, row.DefaultBranch,
-        ParseVisibility(row.Visibility), row.PagePublished != 0);
+        ParseVisibility(row.Visibility), row.PagePublished != 0, row.GlobalSlug);
 
     /// <summary>
     /// Turns the stored text into the enum. An unrecognised value is treated as private rather than thrown
@@ -1298,6 +1385,7 @@ internal class ProjectPathRow
     public string? DefaultBranch { get; set; }
     public string Visibility { get; set; } = "private";
     public long PagePublished { get; set; }
+    public string GlobalSlug { get; set; } = "";
 }
 internal sealed class ProjectDetailsRow : ProjectPathRow
 {
@@ -1318,7 +1406,7 @@ internal sealed record RevokeOwnTokenParameters(long Id, long UserId, string Rev
 internal sealed record ActiveTokensParameters(long UserId, string NowUtc);
 internal sealed record RevokeUserParameters(long UserId, string RevokedAtUtc);
 internal sealed record PasswordUpdateParameters(long Id, string PasswordHash);
-internal sealed record CreateProjectParameters(long OwnerUserId, string Slug, string NormalizedSlug, string Name, string Description, string StorageId, string CreatedAtUtc);
+internal sealed record CreateProjectParameters(long OwnerUserId, string Slug, string NormalizedSlug, string Name, string Description, string StorageId, string CreatedAtUtc, string GlobalSlug);
 internal sealed record MembershipParameters(long ProjectId, long UserId, int Role, long GrantedByUserId, string CreatedAtUtc);
 internal sealed record ProjectUserParameters(long ProjectId, long UserId);
 internal sealed record PermissionQueryParameters(long ProjectId, long UserId);

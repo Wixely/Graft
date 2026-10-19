@@ -33,7 +33,13 @@ public sealed record ProjectResponse(
     [property: JsonPropertyName("http_url_to_repo")] string HttpUrlToRepo,
     [property: JsonPropertyName("web_url")] string WebUrl,
     [property: JsonPropertyName("avatar_url")] string? AvatarUrl,
-    NamespaceResponse Namespace);
+    NamespaceResponse Namespace,
+    /// <summary>The instance-wide name this project also answers to, with no owner in the path. Graft's
+    /// own field: GitLab has no equivalent, and it is additive, so a client that ignores it loses
+    /// nothing.</summary>
+    [property: JsonPropertyName("global_slug")] string GlobalSlug = "",
+    /// <summary>The shareable page for that slug, and <c>.git</c> after it is the clone URL.</summary>
+    [property: JsonPropertyName("global_web_url")] string GlobalWebUrl = "");
 
 public sealed record CommitResponse(
     string Id,

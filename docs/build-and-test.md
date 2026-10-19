@@ -114,6 +114,11 @@ dotnet tests\Graft.Mcp.Acceptance\bin\Debug\net10.0\Graft.Mcp.Acceptance.dll src
 See [MCP evidence](validation/2026-10-16-mcp-in-the-forge.md), [ADR 0009](decisions/0009-mcp-in-the-forge.md)
 and [ADR 0008](decisions/0008-mcp-layer.md).
 
+Every project also answers at `/projects/<slug>`, an instance-wide name with no account in it, for browsing,
+cloning and pushing. It is assigned automatically and the suite covers clone, push, concealment and the
+collision rule; see [slug evidence](validation/2026-10-19-project-slugs.md) and
+[ADR 0010](decisions/0010-project-slugs.md).
+
 A browser session is an idle window, renewed by use, set by `--session-minutes` and defaulting to 12 hours
 with an absolute ceiling of 30 days from sign-in. It used to be a fifteen-minute countdown from sign-in that
 no amount of activity moved, which is what it looked like from a chair: being logged out mid-sentence. See

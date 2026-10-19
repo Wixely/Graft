@@ -1,4 +1,9 @@
 @page "/{Namespace}/{Slug}"
+@* The same page by the project's instance-wide slug, with no owner in the address. It renders here rather
+   than redirecting to the owned path, because a redirect would put the username straight back in the
+   address bar and undo the only thing this link is for. Every link the page builds therefore stays on
+   whichever of the two routes the reader arrived by. *@
+@page "/projects/{Slug}"
 @inject GraftApi Api
 @inject NavigationManager Navigation
 @inject IJSRuntime JS
@@ -58,7 +63,10 @@ else
                     <span class="label accent">default</span>
                 }
                 <span class="spacer"></span>
-                <CloneMenu Url="@repo.Project.HttpUrlToRepo" Branch="@Branch" />
+                @* Arrive by the slug and the clone URL offered first is the slug's, so a reader who was
+                   given an ownerless link is never handed back one with an account name in it. *@
+                <CloneMenu Url="@(ViaSlug && repo.Project.GlobalWebUrl.Length > 0 ? repo.Project.GlobalWebUrl + ".git" : repo.Project.HttpUrlToRepo)"
+                           Branch="@Branch" ShareUrl="@repo.Project.GlobalWebUrl" />
             </div>
         </div>
 
@@ -178,7 +186,7 @@ else
             <div class="list">
                 @foreach (CommitResponse commit in repo.Commits)
                 {
-                    <a class="commit-row" href="@($"/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}/-/commit/{commit.Id}")">
+                    <a class="commit-row" href="@($"{ProjectBase}/-/commit/{commit.Id}")">
                         <code class="sha">@commit.ShortId</code>
                         <span class="list-item-main">
                             <strong>@commit.Title</strong>
@@ -371,6 +379,16 @@ else
     [Parameter] public string Namespace { get; set; } = "";
     [Parameter] public string Slug { get; set; } = "";
 
+    /// <summary>Whether the reader arrived by the instance-wide slug. The owned route always supplies a
+    /// namespace, so its absence is what distinguishes the two.</summary>
+    private bool ViaSlug => Namespace.Length == 0;
+
+    /// <summary>The prefix every link on this page is built from, so navigating within a project never
+    /// moves the reader onto the other route and never reveals an owner the link deliberately omitted.</summary>
+    private string ProjectBase => ViaSlug
+        ? $"/projects/{Uri.EscapeDataString(Slug)}"
+        : $"/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
+
     private RepositoryPageResponse? repo;
     private ProjectMemberResponse[] members = [];
     private string tab = "code";
@@ -484,7 +502,9 @@ else
     private async Task Load()
     {
         string reference = branch.Length > 0 ? branch : "HEAD";
-        string query = $"api/browser/projects/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}" +
+        string query = (ViaSlug
+                ? $"api/graft/slugs/{Uri.EscapeDataString(Slug)}"
+                : $"api/browser/projects/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}") +
             $"?ref={Uri.EscapeDataString(reference)}&path={Uri.EscapeDataString(path)}" +
             (filePath.Length == 0 ? "" : "&file=" + Uri.EscapeDataString(filePath));
         (bool reached, RepositoryPageResponse? loaded) = await Api.GetOptionalAsync(query, ApiJson.Default.RepositoryPageResponse);
