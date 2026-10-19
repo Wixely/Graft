@@ -612,6 +612,29 @@ app.MapPost("/api/projects/{projectId:long}/owner", async context =>
 
 // Choose which branch a project opens at. Null clears the preference, which returns the project to the
 // convention the repository applies on its own.
+// A project's name and description, after it was created. Until this existed a description could only be
+// set at creation and never corrected, which made it the one piece of project text nobody could maintain.
+app.MapPost("/api/projects/{projectId:long}/details", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    ProjectDetailsRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.ProjectDetailsRequest, context.RequestAborted);
+    if (request is null) { await ApiError(context, 400, "details"); return; }
+
+    long projectId = Convert.ToInt64(context.Request.RouteValues["projectId"], System.Globalization.CultureInfo.InvariantCulture);
+    try
+    {
+        await store.SetProjectDetailsAsync(browser.Value.Identity, projectId, request.Name, request.Description, context.RequestAborted);
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "project"); return; }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); return; }
+    context.Response.StatusCode = StatusCodes.Status204NoContent;
+});
+
 app.MapPost("/api/projects/{projectId:long}/default-branch", async context =>
 {
     if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
@@ -1199,7 +1222,15 @@ app.MapMethods("/api/v4/projects/{**projectId}", ["PUT"], async context =>
     if (project is null) return;
     if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
 
-    ProjectVisibility visibility;
+    // The attributes this route understands, each a GitLab attribute with GitLab's meaning. Everything
+    // else is still refused by name, so a caller is never told it succeeded at something that did not
+    // happen. `name` and `description` are text and move nothing; `default_branch` is a preference the
+    // engine resolves; `visibility` is the only one that can widen who sees the project.
+    ProjectVisibility? visibility = null;
+    string? newName = null;
+    string? newDescription = null;
+    string? newDefaultBranch = null;
+    bool defaultBranchGiven = false;
     try
     {
         using JsonDocument document = await JsonDocument.ParseAsync(context.Request.Body, cancellationToken: context.RequestAborted);
@@ -1207,24 +1238,56 @@ app.MapMethods("/api/v4/projects/{**projectId}", ["PUT"], async context =>
         { await ApiError(context, 400, "project must be a JSON object"); return; }
         string? unsupported = document.RootElement.EnumerateObject()
             .Select(property => property.Name)
-            .FirstOrDefault(name => name != "visibility");
+            .FirstOrDefault(name => name is not ("visibility" or "name" or "description" or "default_branch"));
         if (unsupported is not null)
         { await ApiError(context, 400, "unsupported project property: " + unsupported); return; }
-        if (!document.RootElement.TryGetProperty("visibility", out JsonElement value) || value.ValueKind != JsonValueKind.String)
-        { await ApiError(context, 400, "visibility is required"); return; }
-        if (!TryReadVisibility(value.GetString(), out visibility))
-        { await ApiError(context, 400, "visibility must be private, unlisted or public"); return; }
+
+        if (document.RootElement.TryGetProperty("visibility", out JsonElement visibilityValue))
+        {
+            if (visibilityValue.ValueKind != JsonValueKind.String || !TryReadVisibility(visibilityValue.GetString(), out ProjectVisibility parsed))
+            { await ApiError(context, 400, "visibility must be private, unlisted or public"); return; }
+            visibility = parsed;
+        }
+        if (document.RootElement.TryGetProperty("name", out JsonElement nameValue))
+        {
+            newName = nameValue.ValueKind == JsonValueKind.String ? nameValue.GetString() : null;
+            if (string.IsNullOrWhiteSpace(newName) || newName.Length > 200)
+            { await ApiError(context, 400, "name is 1 to 200 characters"); return; }
+        }
+        if (document.RootElement.TryGetProperty("description", out JsonElement descriptionValue))
+        {
+            newDescription = descriptionValue.ValueKind == JsonValueKind.String ? descriptionValue.GetString() : null;
+            if (newDescription is null || newDescription.Length > 2_000)
+            { await ApiError(context, 400, "description is text of at most 2000 characters"); return; }
+        }
+        if (document.RootElement.TryGetProperty("default_branch", out JsonElement branchValue))
+        {
+            // Null clears the preference and lets the repository fall back to convention, which is what the
+            // browser's own control does; the store takes null to mean exactly that.
+            if (branchValue.ValueKind is not (JsonValueKind.String or JsonValueKind.Null))
+            { await ApiError(context, 400, "default_branch must be a branch name or null"); return; }
+            newDefaultBranch = branchValue.ValueKind == JsonValueKind.Null ? null : branchValue.GetString();
+            defaultBranchGiven = true;
+        }
+        if (visibility is null && newName is null && newDescription is null && !defaultBranchGiven)
+        { await ApiError(context, 400, "no supported project property was given"); return; }
     }
     catch (JsonException) { await ApiError(context, 400, "invalid JSON"); return; }
 
-    if (visibility != ProjectVisibility.Private && !settings.PublicBrowsing)
+    if (visibility is not null and not ProjectVisibility.Private && !settings.PublicBrowsing)
     { await ApiError(context, 400, "this server does not allow projects to be published"); return; }
 
     try
     {
-        await store.SetProjectVisibilityAsync(caller, project.Details.Project.Id, visibility, context.RequestAborted);
+        if (visibility is not null)
+            await store.SetProjectVisibilityAsync(caller, project.Details.Project.Id, visibility.Value, context.RequestAborted);
+        if (newName is not null || newDescription is not null)
+            await store.SetProjectDetailsAsync(caller, project.Details.Project.Id, newName, newDescription, context.RequestAborted);
+        if (defaultBranchGiven)
+            await store.SetDefaultBranchAsync(caller, project.Details.Project.Id, newDefaultBranch, context.RequestAborted);
     }
     catch (UnauthorizedAccessException) { await ApiError(context, 404, "404 Project Not Found"); return; }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); return; }
 
     ProjectDetails updated = (await store.GetReadyProjectAsync(project.Details.Project.Id, context.RequestAborted))!;
     await context.Response.WriteAsJsonAsync(await ProjectResponseFor(context, updated), ApiJson.Default.ProjectResponse, null, context.RequestAborted);

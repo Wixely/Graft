@@ -415,6 +415,39 @@ async Task CheckGlobalSlug(string address, string apiToken, string pushToken, lo
         Check(hidden.StatusCode == System.Net.HttpStatusCode.NotFound,
             "another account's private project answers the same way through its slug as it does by path");
 
+    // A project's text, after it was created. Until this route accepted them, a description could be set
+    // once and never corrected, and the name could not be changed at all.
+    using (HttpResponseMessage updated = await ApiPut(address, "/api/v4/projects/" + projectId, apiToken,
+        new { name = "Durable, renamed", description = "Edited after creation" }))
+    {
+        Check(updated.IsSuccessStatusCode, "a project's name and description can be changed after creation");
+        using JsonDocument json = JsonDocument.Parse(await updated.Content.ReadAsStreamAsync());
+        Check(json.RootElement.GetProperty("name").GetString() == "Durable, renamed" &&
+              json.RootElement.GetProperty("description").GetString() == "Edited after creation",
+            "and the response reports what it now holds");
+        // Neither is an address, so neither may move the project.
+        Check(json.RootElement.GetProperty("path_with_namespace").GetString() == "alice/durable" &&
+              json.RootElement.GetProperty("global_slug").GetString() == "durable",
+            "changing text moves neither the owned path nor the instance-wide slug");
+    }
+
+    // One field at a time, because a caller that has to resend both races anybody else editing the other.
+    using (HttpResponseMessage one = await ApiPut(address, "/api/v4/projects/" + projectId, apiToken,
+        new { description = "Only the description this time" }))
+    {
+        Check(one.IsSuccessStatusCode, "one attribute can be sent on its own");
+        using JsonDocument json = JsonDocument.Parse(await one.Content.ReadAsStreamAsync());
+        Check(json.RootElement.GetProperty("name").GetString() == "Durable, renamed", "and the others are left alone");
+    }
+
+    // Still refused by name, so a caller is never told it succeeded at something that did not happen.
+    using (HttpResponseMessage unsupported = await ApiPut(address, "/api/v4/projects/" + projectId, apiToken,
+        new { path = "renamed-path" }))
+        Check(unsupported.StatusCode == System.Net.HttpStatusCode.BadRequest,
+            "an attribute this route does not implement is still refused by name");
+    using (HttpResponseMessage empty = await ApiPut(address, "/api/v4/projects/" + projectId, apiToken, new { }))
+        Check(empty.StatusCode == System.Net.HttpStatusCode.BadRequest, "and a body asking for nothing is refused");
+
     // The collision rule. Carol already owns a project whose path is "private", so she holds that name
     // instance-wide; alice may still create a project at the same path in her own namespace, and it has to
     // be given a different shared name rather than taking Carol's or failing.
@@ -1007,7 +1040,9 @@ async Task CheckTokenProjectSettings(string address, AuthenticatedIdentity alice
     // The same field vocabulary the create route enforces, and the same refusal to ignore what it was sent.
     using (HttpResponseMessage response = await ApiPutJson(address, target, apiToken.Secret, "{\"visibility\":\"internal\"}"))
         Check(response.StatusCode == HttpStatusCode.BadRequest, "the edit route refuses a visibility Graft does not implement");
-    using (HttpResponseMessage response = await ApiPutJson(address, target, apiToken.Secret, "{\"name\":\"renamed\"}"))
+    // `name` is implemented now, so the refusal is asserted with something that still is not: `path` is an
+    // address, and this route does not move projects.
+    using (HttpResponseMessage response = await ApiPutJson(address, target, apiToken.Secret, "{\"path\":\"renamed\"}"))
         Check(response.StatusCode == HttpStatusCode.BadRequest,
             "the edit route refuses a property it does not implement rather than ignoring it");
     using (HttpResponseMessage response = await ApiPutJson(address, target, apiToken.Secret, "{}"))
@@ -1038,6 +1073,19 @@ async Task<HttpResponseMessage> ApiGet(string address, string path, string? toke
     HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false };
     HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
     HttpRequestMessage request = new(HttpMethod.Get, path);
+    if (token is not null) request.Headers.Add("PRIVATE-TOKEN", token);
+    HttpResponseMessage response = await client.SendAsync(request);
+    request.Dispose();
+    client.Dispose();
+    handler.Dispose();
+    return response;
+}
+
+async Task<HttpResponseMessage> ApiPut(string address, string path, string? token, object body)
+{
+    HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false };
+    HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
+    HttpRequestMessage request = new(HttpMethod.Put, path) { Content = JsonContent.Create(body) };
     if (token is not null) request.Headers.Add("PRIVATE-TOKEN", token);
     HttpResponseMessage response = await client.SendAsync(request);
     request.Dispose();
