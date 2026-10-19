@@ -314,6 +314,7 @@ public sealed record McpSettingsRequest(
 [JsonSerializable(typeof(ProjectDetailsRequest))]
 [JsonSerializable(typeof(OwnershipTransferRequest))]
 [JsonSerializable(typeof(DefaultBranchRequest))]
+[JsonSerializable(typeof(ProjectMemberResponse))]
 [JsonSerializable(typeof(ProjectMemberResponse[]))]
 [JsonSerializable(typeof(RepositoryPageResponse))]
 [JsonSerializable(typeof(ReadmeResponse))]

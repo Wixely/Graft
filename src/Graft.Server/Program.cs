@@ -1172,6 +1172,82 @@ app.MapGet("/api/v4/projects/{projectId}/repository/tree", async context =>
     });
 });
 
+// Who may work on a project, for a token. GitLab shapes these as /members with an access_level; Graft has
+// three named roles and reports both, so a GitLab client reads a number it understands and a person reads
+// a word. Membership is a Maintainer decision, which the store enforces, not this route.
+app.MapGet("/api/v4/projects/{projectId}/members", async context =>
+{
+    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.ManageProject);
+    if (project is null) return;
+    if (!await OnlyQuery(context)) return;
+    try
+    {
+        IReadOnlyList<ProjectMember> members = await store.ListProjectMembersAsync(
+            project.Identity!, project.Details.Project.Id, context.RequestAborted);
+        await context.Response.WriteAsJsonAsync(
+            members.Select(member => new ProjectMemberResponse(member.UserId, member.Username, member.Role.ToString().ToLowerInvariant())).ToArray(),
+            ApiJson.Default.ProjectMemberResponseArray, null, context.RequestAborted);
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "404 Project Not Found"); }
+});
+
+app.MapMethods("/api/v4/projects/{projectId}/members", ["POST", "PUT"], async context =>
+{
+    (bool unresolved, AuthenticatedIdentity? caller) = await AuthenticateApiOptional(context);
+    if (unresolved) return;
+    if (caller is null) { await ApiError(context, 401, "401 Unauthorized"); return; }
+    if (!caller.TokenScopes.HasFlag(TokenScope.Api))
+    { await ApiError(context, 403, "403 Forbidden: insufficient_scope"); return; }
+
+    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.ManageProject);
+    if (project is null) return;
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+
+    MembershipSetRequest? request;
+    try { request = await context.Request.ReadFromJsonAsync(ApiJson.Default.MembershipSetRequest, context.RequestAborted); }
+    catch (JsonException) { await ApiError(context, 400, "invalid JSON"); return; }
+    if (request is null || !Enum.TryParse(request.Role, ignoreCase: true, out ProjectRole role) || !Enum.IsDefined(role))
+    { await ApiError(context, 400, "role must be reporter, developer or maintainer"); return; }
+
+    try
+    {
+        UserAccount? user = await store.FindActiveUserAsync(request.Username, context.RequestAborted);
+        // A username that is not there is a bad request, not a 404: the project was found, and refusing
+        // with the project's own "not found" would say something untrue about the project.
+        if (user is null) { await ApiError(context, 400, "no such account"); return; }
+        await store.SetMembershipAsync(caller, project.Details.Project.Id, user.Id, role, context.RequestAborted);
+        await context.Response.WriteAsJsonAsync(new ProjectMemberResponse(user.Id, user.Username, role.ToString().ToLowerInvariant()),
+            ApiJson.Default.ProjectMemberResponse, null, context.RequestAborted);
+    }
+    catch (ArgumentException) { await ApiError(context, 400, "username"); }
+    catch (InvalidOperationException error) { await ApiError(context, 400, error.Message); }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "404 Project Not Found"); }
+});
+
+app.MapDelete("/api/v4/projects/{projectId}/members/{username}", async context =>
+{
+    (bool unresolved, AuthenticatedIdentity? caller) = await AuthenticateApiOptional(context);
+    if (unresolved) return;
+    if (caller is null) { await ApiError(context, 401, "401 Unauthorized"); return; }
+    if (!caller.TokenScopes.HasFlag(TokenScope.Api))
+    { await ApiError(context, 403, "403 Forbidden: insufficient_scope"); return; }
+
+    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.ManageProject);
+    if (project is null) return;
+
+    string username = context.Request.RouteValues["username"]?.ToString() ?? "";
+    try
+    {
+        UserAccount? user = await store.FindActiveUserAsync(username, context.RequestAborted);
+        if (user is null) { await ApiError(context, 400, "no such account"); return; }
+        await store.RevokeMembershipAsync(caller, project.Details.Project.Id, user.Id, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (ArgumentException) { await ApiError(context, 400, "username"); }
+    catch (InvalidOperationException error) { await ApiError(context, 400, error.Message); }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "404 Project Not Found"); }
+});
+
 // What one commit changed, for a token. The browser has had this since commits became linkable; without it
 // an agent can see that a commit exists and never what it did, which is the one question worth asking
 // about a commit.

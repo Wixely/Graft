@@ -276,6 +276,67 @@ public sealed class GraftTools
         return result.ToJsonString();
     }
 
+    [McpServerTool(Name = "graft_list_members")]
+    [Description("Lists who may work on a project and in what role. Only somebody who could change the membership can read it.")]
+    public static async Task<string> ListMembers(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        CancellationToken cancellationToken)
+    {
+        (ProjectMemberResponse[]? members, string? error) = await graft.GetAsync(
+            "api/v4/projects/" + Encode(project) + "/members", ApiJson.Default.ProjectMemberResponseArray, cancellationToken);
+        if (error is not null) return Failure(error);
+
+        return new JsonObject
+        {
+            ["count"] = members!.Length,
+            ["members"] = Array(members, member => new JsonObject
+            {
+                ["username"] = member.Username,
+                ["role"] = member.Role
+            })
+        }.ToJsonString();
+    }
+
+    [McpServerTool(Name = "graft_set_member")]
+    [Description("Grants an account a role on a project, or changes the role it already has. Reporter can read, developer can push, maintainer can change the project's settings. Refused unless writes are allowed on this server.")]
+    public static async Task<string> SetMember(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("The account's username.")] string username,
+        [Description("One of reporter, developer or maintainer.")] string role,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowWrites) return Refused(graft, "changing who may work on a project");
+        if (role is not ("reporter" or "developer" or "maintainer"))
+            return Failure("role must be reporter, developer or maintainer.");
+
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Post,
+            "api/v4/projects/" + Encode(project) + "/members",
+            new JsonObject { ["username"] = username, ["role"] = role }, cancellationToken);
+        return ok
+            ? new JsonObject { ["project"] = project, ["username"] = username, ["role"] = role }.ToJsonString()
+            : Failure(GraftClient.Describe(status, response));
+    }
+
+    [McpServerTool(Name = "graft_remove_member")]
+    [Description("Takes away an account's role on a project. The owner cannot be removed this way. Refused unless writes are allowed on this server.")]
+    public static async Task<string> RemoveMember(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("The account's username.")] string username,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowWrites) return Refused(graft, "removing somebody from a project");
+
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Delete,
+            "api/v4/projects/" + Encode(project) + "/members/" + Uri.EscapeDataString((username ?? "").Trim()),
+            null, cancellationToken);
+        return ok
+            ? new JsonObject { ["project"] = project, ["username"] = username, ["removed"] = true }.ToJsonString()
+            : Failure(GraftClient.Describe(status, response));
+    }
+
     [McpServerTool(Name = "graft_read_commit")]
     [Description("Reads what one commit changed: the files it touched and the lines it added and removed. Large or binary files are reported rather than printed.")]
     public static async Task<string> ReadCommit(
