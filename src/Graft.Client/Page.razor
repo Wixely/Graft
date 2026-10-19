@@ -1,0 +1,131 @@
+@page "/-/p/{Slug}"
+@inject GraftApi Api
+@inject NavigationManager Navigation
+@inject IJSRuntime JS
+
+@* A published project page: the curated surface an owner chose to show, which is not the repository and
+   never becomes it. Everything on this page came from the project's own .graft/project.json; nothing is
+   offered by default, so an empty page means the config named nothing rather than that something failed. *@
+
+<PageTitle>@(view?.Title ?? "Project page") &middot; Graft</PageTitle>
+
+@if (loading)
+{
+    <p role="status" class="secondary-text">Loading…</p>
+}
+else if (view is null)
+{
+    <div class="page-header"><div><h1>Not found</h1><p class="subtitle">There is no published page at this address.</p></div></div>
+    <Banner Message="@message" Kind="error" />
+}
+else
+{
+    <div class="page-header">
+        <div>
+            <h1>@view.Title</h1>
+            @if (view.Description.Length > 0) { <p class="subtitle">@view.Description</p> }
+        </div>
+        @if (view.SiteUrl is { Length: > 0 })
+        {
+            <div class="page-header-actions">
+                @* Leaves this origin by design: a project's site is served from a hostname of its own. *@
+                <a class="button primary" href="@view.SiteUrl" target="_blank" rel="noopener noreferrer">
+                    <Icon Name="repository" />Open the site
+                </a>
+            </div>
+        }
+    </div>
+
+    <Banner Message="@message" Kind="@messageKind" />
+
+    @if (view.Readme is not null)
+    {
+        <div class="panel">
+            <div class="panel-header"><Icon Name="file" /><h2>@view.Readme.Path</h2></div>
+            <div class="panel-body">
+                <article class="markdown">@((MarkupString)view.Readme.Html)</article>
+            </div>
+        </div>
+    }
+
+    <div class="panel">
+        <div class="panel-header"><Icon Name="folder" /><h2>Files</h2><span class="spacer"></span>
+            <span class="label">@view.Files.Count</span></div>
+        @if (view.Files.Count == 0)
+        {
+            <div class="panel-empty">This page offers no files.</div>
+        }
+        else
+        {
+            <div class="list">
+                @foreach (string file in view.Files)
+                {
+                    <button type="button" class="list-item file-row" @onclick="() => Open(file)">
+                        <Icon Name="file" />
+                        <span class="list-item-main"><strong>@file</strong></span>
+                    </button>
+                }
+            </div>
+        }
+    </div>
+
+    @if (openPath is not null)
+    {
+        <div class="panel">
+            <div class="panel-header"><Icon Name="file" /><h2>@openPath</h2><span class="spacer"></span>
+                <button type="button" class="secondary" @onclick="() => openPath = null">Close</button></div>
+            <div class="panel-body">
+                <pre class="file-view"><code>@openText</code></pre>
+            </div>
+        </div>
+    }
+
+    <p class="secondary-text">
+        This is a published page. The project's repository is not readable from here.
+    </p>
+}
+
+@code {
+    [Parameter] public string Slug { get; set; } = "";
+
+    private ProjectPageResponse? view;
+    private string? openPath;
+    private string openText = "";
+    private string message = "";
+    private string messageKind = "info";
+    private bool loading = true;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        loading = true;
+        openPath = null;
+        try
+        {
+            // Deliberately not requiring a session. A published page is for readers who have no account,
+            // which is the entire reason the surface exists.
+            (bool reached, ProjectPageResponse? loaded) =
+                await Api.GetOptionalAsync($"api/graft/pages/{Uri.EscapeDataString(Slug)}", ApiJson.Default.ProjectPageResponse);
+            if (!reached) { message = "Graft could not be reached."; messageKind = "error"; return; }
+            view = loaded;
+            if (view is null) message = "No page is published at this address, or it was withdrawn.";
+        }
+        finally { loading = false; }
+    }
+
+    private async Task Open(string file)
+    {
+        if (openPath == file) { openPath = null; return; }
+        message = "";
+        (bool reached, string? text) = await Api.GetTextAsync(
+            $"api/graft/pages/{Uri.EscapeDataString(Slug)}/files/{Uri.EscapeDataString(file)}");
+        if (!reached) { message = "Graft could not be reached."; messageKind = "error"; return; }
+        if (text is null)
+        {
+            message = $"{file} could not be shown. It may not be text.";
+            messageKind = "error";
+            return;
+        }
+        openPath = file;
+        openText = text;
+    }
+}

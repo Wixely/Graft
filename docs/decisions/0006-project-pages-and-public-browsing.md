@@ -1,7 +1,7 @@
 # 0006: Project pages and public browsing
 
 - Date: 2026-10-13
-- Status: Accepted, design agreed, implementation in slices
+- Status: Accepted, design agreed, implementation in slices. **Implemented on 2026-10-20:** the `.graft/project.json` config, the file allowlist, the page surface and the static site behind `--pages-origin`. See [the evidence](../validation/2026-10-20-project-pages.md). `features` remains unimplemented, and naming one is an error
 - Source: Request for project pages that share only chosen files (a README, other Markdown, compose files) or only issues, or serve a custom static site like GitHub Pages, configured in a `.graft` folder, with nothing outside the configured files or the designated pages folder available; and for an optional public repository browser that lists only public repositories or those with a public project page, where the repository's public/private/unlisted setting is final and takes precedence over the page's own settings
 - Review trigger: Any new route that reads repository bytes, any new project surface such as issues or releases, and any proposal to serve repository-authored HTML from the main origin
 

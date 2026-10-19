@@ -82,6 +82,24 @@ public sealed class GraftApi(HttpClient http)
         catch (System.Text.Json.JsonException) { return (true, default); }
     }
 
+    /// <summary>
+    /// Reads a plain-text body. Used for the files a project page offers, which are served as text rather
+    /// than as JSON because they are somebody's repository content and not a shape this client defines.
+    /// Reached is false only when the transport failed; a refusal returns null text.
+    /// </summary>
+    public async Task<(bool Reached, string? Text)> GetTextAsync(string uri, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            using HttpResponseMessage response = await http.GetAsync(uri, cancellationToken);
+            Reachable = true;
+            return response.IsSuccessStatusCode
+                ? (true, await response.Content.ReadAsStringAsync(cancellationToken))
+                : (true, null);
+        }
+        catch (HttpRequestException) { Reachable = false; return (false, null); }
+    }
+
     public Task<ApiResult> PostAsync(string uri, string accepted, CancellationToken cancellationToken = default) =>
         SendAsync(HttpMethod.Post, uri, null, accepted, cancellationToken);
 

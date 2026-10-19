@@ -108,6 +108,31 @@ MCP: https://graft.example.internal:8443/mcp; enabled=true; credentials=required
 
 For a client that launches its MCP server locally over stdio, `Graft.Mcp` remains a separate executable; see [build-and-test](build-and-test.md). It is not in the container image. See [ADR 0009](decisions/0009-mcp-in-the-forge.md) for why the endpoint moved into the forge and what it keeps from [ADR 0008](decisions/0008-mcp-layer.md).
 
+### Optional project sites
+
+A project page can serve a static site from a folder in its repository. That is repository-authored HTML,
+which cannot share an origin with the session cookie and the API, so it is served only from a second
+hostname and the feature is off until an operator names one:
+
+```sh
+GRAFT_PAGES_ORIGIN=https://pages.example.com
+```
+
+or `--pages-origin https://pages.example.com` on the command line. Point that hostname at the same server;
+Graft selects the pages behaviour by the request's `Host`, so no second listener and no second certificate
+are needed when one certificate covers both names.
+
+On that hostname there is no API, no session, no upload route and no browser shell. A site is reachable at
+`https://pages.example.com/<project-slug>/`, and nothing outside the configured folder is reachable at all.
+The forge prints which it is using at startup:
+
+```text
+PAGES: https://pages.example.com/<project-slug>/
+```
+
+See [project pages](project-pages.md) for the repository-side config, and
+[ADR 0006](decisions/0006-project-pages-and-public-browsing.md) for why the second hostname is not optional.
+
 ## Certificate renewal
 
 Graft loads the certificate during process startup. To renew it, write and validate the new PKCS#12 and password files at separate temporary paths, stop Graft, atomically replace both configured files, then start Graft and verify `/healthz` plus the certificate presented to a normal validating client. Keep the previous files until verification completes. Roll back both files together if startup or trust validation fails. The acceptance harness verifies that an unchanged file keeps the same certificate across restart and that a replaced file is loaded after restart; live reload is not implemented.

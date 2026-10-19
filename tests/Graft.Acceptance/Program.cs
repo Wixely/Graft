@@ -1,3 +1,4 @@
+using System.Text;
 using System.Security.Cryptography;
 using Graft.Core;
 using Graft.Storage;
@@ -289,6 +290,68 @@ try
         await AgeTo(DateTimeOffset.UtcNow.AddMinutes(-1));
         Check(await sessions.ResolveSessionDetailedAsync(grant.Secret) is null, "an expired session is gone");
         Check(await sessions.ResolveSessionAsync(grant.Secret) is null, "an expired session cannot be renewed back to life");
+    }
+
+    // The project page matcher and config. A page is a deny-by-default surface, so these assertions are
+    // mostly about what must NOT match: this is the one place a leak would be a single wrong character.
+    {
+        // Deny by default, in all three spellings of "nobody said yes".
+        Check(!PathMatcher.IsAllowed(null, "README.md"), "no allowlist admits nothing");
+        Check(!PathMatcher.IsAllowed([], "README.md"), "an empty allowlist admits nothing");
+        Check(!PageConfiguration.AllowsFile(PageSettings.Empty, "README.md"), "a page with no config serves no files");
+
+        // A single star stays inside one segment; a double star crosses them.
+        Check(PathMatcher.IsAllowed(["*.md"], "README.md"), "a star matches within a segment");
+        Check(!PathMatcher.IsAllowed(["*.md"], "docs/README.md"), "a star does not reach into a directory");
+        Check(PathMatcher.IsAllowed(["docs/**/*.md"], "docs/deep/inside/thing.md"), "a double star crosses segments");
+        Check(PathMatcher.IsAllowed(["docs/**/*.md"], "docs/thing.md"), "and also matches no directories at all");
+
+        // Whole-path comparison. A prefix test would open every one of these.
+        Check(!PathMatcher.IsAllowed(["docs"], "docs-private/secret.md"), "a pattern is not a prefix test");
+        Check(!PathMatcher.IsAllowed(["docs/*.md"], "docs/secret.md.key"), "nor does it match a longer name");
+        Check(!PathMatcher.IsInside("pages", "pages-draft/index.html"), "a site root is not a prefix test either");
+        Check(PathMatcher.IsInside("pages", "pages/index.html"), "while a file inside the root is inside it");
+
+        // Traversal normalises to nothing rather than being resolved, so it can never escape the allowlist.
+        foreach (string hostile in new[] { "../secret", "docs/../../secret", "./secret", "docs//secret", "..", "docs/.." })
+            Check(!PathMatcher.IsAllowed(["**"], hostile), "a path with a traversal or empty segment matches nothing: " + hostile);
+
+        // A leading slash is stripped rather than refused, because a request path always carries one. What
+        // matters is that stripping it yields an ordinary repository path and never reaches outside one.
+        Check(PathMatcher.Normalize("/docs/guide.md") == "docs/guide.md", "a leading slash is stripped, not resolved");
+        Check(!PageConfiguration.AllowsFile(PageSettings.Empty, "/anything"), "and stripping it still admits nothing by default");
+
+        // The config's own directory is never servable, however the config asks.
+        PageConfigurationResult reserved = PageConfiguration.Read(Encoding.UTF8.GetBytes("""{"page":{"files":[".graft/project.json"]}}"""));
+        Check(!reserved.Ok, "a config may not publish the .graft directory");
+
+        // Unknown fields and unknown features are errors, not warnings.
+        Check(!PageConfiguration.Read(Encoding.UTF8.GetBytes("""{"page":{"flies":["*.md"]}}""")).Ok, "an unknown field is an error");
+        Check(!PageConfiguration.Read(Encoding.UTF8.GetBytes("""{"page":{"features":["issues"]}}""")).Ok,
+            "naming a feature Graft does not have is an error");
+        Check(!PageConfiguration.Read(Encoding.UTF8.GetBytes("not json at all")).Ok, "an unparseable config is an error");
+        Check(!PageConfiguration.Read(Encoding.UTF8.GetBytes("""{"version":2,"page":{}}""")).Ok, "an unknown version is an error");
+
+        // A path named in one field but absent from the allowlist is a config error, not an implicit grant.
+        Check(!PageConfiguration.Read(Encoding.UTF8.GetBytes("""{"page":{"files":["README.md"],"image":"logo.png"}}""")).Ok,
+            "an image outside the allowlist is an error rather than an implicit grant");
+
+        // A config that is absent is not an error: it is the empty page.
+        PageConfigurationResult absent = PageConfiguration.Read(null);
+        Check(absent.Ok && !absent.Settings!.OffersContent, "a repository with no config has a page that offers nothing");
+
+        // And the shape the decision record documents parses into what it says.
+        PageConfigurationResult full = PageConfiguration.Read(Encoding.UTF8.GetBytes("""
+            {"version":1,"page":{"title":"Graft","description":"A forge.","readme":"README.md",
+             "files":["README.md","docs/**/*.md"],"site":{"root":"pages","index":"index.html"}}}
+            """));
+        Check(full.Ok, "the documented config shape parses");
+        Check(PageConfiguration.AllowsFile(full.Settings!, "docs/guide.md"), "and admits a file its patterns name");
+        Check(!PageConfiguration.AllowsFile(full.Settings!, "src/secret.cs"), "and refuses one they do not");
+        Check(PageConfiguration.AllowsSiteFile(full.Settings!, "pages/index.html"), "a site file inside the root is servable");
+        Check(!PageConfiguration.AllowsSiteFile(full.Settings!, "README.md"), "and a file outside it is not, even though it is allowlisted");
+        Check(SiteContentTypes.For("index.html") == "text/html; charset=utf-8", "a site file's type comes from its extension");
+        Check(SiteContentTypes.For("payload.exe") is null, "and an extension that is not on the list has no type at all");
     }
 
     Console.WriteLine($"RESULT: PASS; assertions: {assertions}");

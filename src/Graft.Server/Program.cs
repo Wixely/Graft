@@ -33,7 +33,7 @@ if (args.Length == 1 && args[0] == "--licences")
 
 if (!Arguments.TryParse(args, out Arguments? parsedSettings))
 {
-    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>] [--mcp true|false].");
+    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>] [--mcp true|false] [--pages-origin <https origin>].");
     Console.Error.WriteLine("       Graft.Server --licences  prints the third-party notices this build redistributes.");
     return 2;
 }
@@ -754,7 +754,8 @@ app.MapGet("/api/browse", async context =>
         entries.Add(new(project.Project.Id, project.Project.Name, path, project.Project.Namespace,
             project.Description, avatarUrl, Origin(context) + "/" + path, project.CreatedAtUtc,
             VisibilityName(project.Project.Visibility),
-            project.Project.Visibility == ProjectVisibility.Public));
+            project.Project.Visibility == ProjectVisibility.Public,
+            project.Project.GlobalSlug));
     }
     await context.Response.WriteAsJsonAsync(new BrowseResponse(entries.ToArray(), projects.Total, page, perPage),
         ApiJson.Default.BrowseResponse, null, context.RequestAborted);
@@ -1013,6 +1014,107 @@ app.MapGet("/api/browser/projects/{projectNamespace}/{slug}", async context => a
         context.Request.RouteValues["projectNamespace"]?.ToString() ?? "",
         context.Request.RouteValues["slug"]?.ToString() ?? "",
         context.RequestAborted)));
+
+// The published project page: the curated surface, for anybody the page is published to. A separate read
+// path from the repository view, never a filter over it, because a filter is where a leak hides: a pack is
+// reachability-shaped rather than path-shaped, and a diff prints files the page never named. So this route
+// reads named files and nothing that walks the graph.
+app.MapGet("/api/graft/pages/{globalSlug}", async context =>
+{
+    if (!await OnlyQuery(context)) return;
+    ProjectInfo? found = await store.FindReadyProjectByGlobalSlugAsync(
+        context.Request.RouteValues["globalSlug"]?.ToString() ?? "", context.RequestAborted);
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: false);
+    if (found is null || !(await DecideFor(context, browser?.Identity, found.Id, ProjectAction.ReadPage)).Allowed)
+    { await ApiError(context, 404, "page"); return; }
+
+    ProjectDetails details = (await store.GetReadyProjectAsync(found.Id, context.RequestAborted))!;
+    await WithRepository(EndpointFor(found), context, async repository =>
+    {
+        PageConfigurationResult config = PageConfiguration.Read(ReadRepositoryFile(repository, PageConfiguration.Path));
+        // An invalid config means nobody has said what may be served, so the page is not served at all
+        // rather than served with defaults. The owner finds out from the project's own settings tab.
+        if (!config.Ok) { await ApiError(context, 404, "page"); return; }
+        PageSettings page = config.Settings!;
+
+        // Only the readme the config named, and only if the allowlist admits it. A project's actual
+        // README.md is not offered by default: on a page, nothing is offered by default.
+        ReadmeResponse? readme = null;
+        if (page.Readme is not null)
+        {
+            GitFile? file;
+            try { file = RepositoryView.File(repository, "HEAD", page.Readme); }
+            catch (GitInputException) { file = null; }
+            if (file is not null && file.Content.Length > 0 && file.Content.Length <= MarkdownContent.MaximumBytes)
+            {
+                string? source = null;
+                try { source = new UTF8Encoding(false, true).GetString(file.Content); }
+                catch (DecoderFallbackException) { }
+                if (source is not null)
+                {
+                    string baseUrl = Origin(context) + "/api/graft/projects/" +
+                        details.Project.Id.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/image";
+                    RenderedMarkdown rendered = MarkdownContent.Render(source, path =>
+                        baseUrl + "?ref=HEAD&path=" + Uri.EscapeDataString(path));
+                    readme = new(file.Path, rendered.Html, rendered.HasDiagrams);
+                }
+            }
+        }
+
+        // The listing is produced by asking the allowlist about each path the repository actually holds,
+        // rather than by expanding patterns, so a pattern can never name something that is not there and a
+        // file can never appear that the matcher would refuse.
+        List<string> files = [];
+        CollectPagePaths(repository, page, "", files);
+        files.Sort(StringComparer.Ordinal);
+
+        ProjectPageResponse response = new(
+            page.Title is { Length: > 0 } ? page.Title : details.Project.Name,
+            page.Description is { Length: > 0 } ? page.Description : details.Description,
+            details.Project.GlobalSlug,
+            readme,
+            files,
+            page.Site is null || settings.PagesOrigin is null
+                ? null
+                : settings.PagesOrigin.TrimEnd('/') + "/" + Uri.EscapeDataString(details.Project.GlobalSlug) + "/");
+        await context.Response.WriteAsJsonAsync(response, ApiJson.Default.ProjectPageResponse, null, context.RequestAborted);
+    });
+});
+
+// One file a published page offers. Named paths only: the allowlist is asked before the object store is,
+// so a path the config did not admit is indistinguishable from one that does not exist.
+app.MapGet("/api/graft/pages/{globalSlug}/files/{**filePath}", async context =>
+{
+    if (!await OnlyQuery(context)) return;
+    ProjectInfo? found = await store.FindReadyProjectByGlobalSlugAsync(
+        context.Request.RouteValues["globalSlug"]?.ToString() ?? "", context.RequestAborted);
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: false);
+    if (found is null || !(await DecideFor(context, browser?.Identity, found.Id, ProjectAction.ReadPage)).Allowed)
+    { await ApiError(context, 404, "page"); return; }
+
+    string filePath = context.Request.RouteValues["filePath"]?.ToString() ?? "";
+    try { filePath = Uri.UnescapeDataString(filePath); }
+    catch (UriFormatException) { await ApiError(context, 404, "file"); return; }
+
+    await WithRepository(EndpointFor(found), context, async repository =>
+    {
+        PageConfigurationResult config = PageConfiguration.Read(ReadRepositoryFile(repository, PageConfiguration.Path));
+        if (!config.Ok || !PageConfiguration.AllowsFile(config.Settings!, filePath))
+        { await ApiError(context, 404, "file"); return; }
+
+        byte[]? content = ReadRepositoryFile(repository, filePath);
+        if (content is null) { await ApiError(context, 404, "file"); return; }
+        // Served as text or refused. A page's file list is for reading, and handing a browser an arbitrary
+        // content type from somebody else's repository is the thing the whole surface is built to avoid.
+        string? text = null;
+        try { text = new UTF8Encoding(false, true).GetString(content); }
+        catch (DecoderFallbackException) { }
+        if (text is null) { await ApiError(context, 415, "that file is not text"); return; }
+
+        context.Response.ContentType = "text/plain; charset=utf-8";
+        await context.Response.WriteAsync(text, context.RequestAborted);
+    });
+});
 
 // The same page, reached by the project's instance-wide slug. It lives under Graft's own prefix rather than
 // beside the namespaced route because a literal segment there would shadow any account of that name, and
@@ -1635,6 +1737,82 @@ app.MapPost("/{projectNamespace}/{project}.git/{service}", async context =>
     finally { authorized.Endpoint.Gate.Release(); }
 });
 
+// The pages origin: a project's static site, served from a different hostname and nothing else.
+//
+// Why a second hostname rather than a path on this one. A site is repository-authored HTML, which the
+// README pipeline refuses to serve precisely because same-origin script reaches the session cookie's
+// privileges, the CSRF token and every authenticated route. A separate origin is what contains it: the
+// session cookie is `__Host-` prefixed and cannot travel there, and this branch short-circuits before
+// authentication, the API, the uploads and the browser shell, so none of them exist on that host at all.
+//
+// Addressed by the project's instance-wide slug, one segment, so a shared site URL names no account.
+if (settings.PagesOrigin is not null)
+{
+    string pagesHost = new Uri(settings.PagesOrigin).Host;
+    app.Use(async (context, next) =>
+    {
+        if (!string.Equals(context.Request.Host.Host, pagesHost, StringComparison.OrdinalIgnoreCase))
+        { await next(context); return; }
+
+        // Nothing on this host answers to anything but a read. A site is files.
+        if (!HttpMethods.IsGet(context.Request.Method) && !HttpMethods.IsHead(context.Request.Method))
+        { context.Response.StatusCode = StatusCodes.Status405MethodNotAllowed; return; }
+
+        // The site's own containment. No API and no session live here, so the policy's job is to stop the
+        // site being framed and to stop a browser second-guessing a declared content type.
+        context.Response.Headers.ContentSecurityPolicy = "frame-ancestors 'none'";
+        context.Response.Headers.XContentTypeOptions = "nosniff";
+        context.Response.Headers["Referrer-Policy"] = "no-referrer";
+
+        string[] segments = context.Request.Path.Value?.Trim('/').Split('/', 2) ?? [];
+        if (segments.Length == 0 || segments[0].Length == 0)
+        { await PagesMiss(context, "Name a project: https://host/<project-slug>/"); return; }
+
+        ProjectInfo? project = await store.FindReadyProjectByGlobalSlugAsync(segments[0], context.RequestAborted);
+        // Anonymous, always: there is no session on this host to resolve. A site is therefore reachable
+        // only through a published page, and a project that published nothing is simply not here.
+        if (project is null ||
+            !(await DecideFor(context, null, project.Id, ProjectAction.ReadPage)).Allowed)
+        { await PagesMiss(context, "No site is published at that address."); return; }
+
+        // A directory asks for the configured index, which is what makes links inside a site work.
+        string requested = segments.Length > 1 ? segments[1] : "";
+        bool directory = requested.Length == 0 || requested.EndsWith('/');
+
+        await WithRepository(EndpointFor(project), context, async repository =>
+        {
+            PageConfigurationResult config = PageConfiguration.Read(ReadRepositoryFile(repository, PageConfiguration.Path));
+            // An invalid config unpublishes the page rather than falling back to defaults: a parse failure
+            // means nobody has said what may be served, and the safe reading of that is nothing.
+            if (!config.Ok || config.Settings!.Site is null)
+            { await PagesMiss(context, "No site is published at that address."); return; }
+
+            PageSite site = config.Settings.Site;
+            string path = site.Root + "/" + (directory ? requested + site.Index : requested);
+            // Checked against the configured root even though it was just built from it. The matcher is the
+            // one authority on what a page may serve, and a path that reached here another way must still
+            // pass it.
+            if (!PageConfiguration.AllowsSiteFile(config.Settings, path))
+            { await PagesMiss(context, "That file is not part of this site."); return; }
+
+            // The type comes from the extension, never from the bytes. A repository can name a file
+            // anything, and letting the file choose its own type is how a site serves script where the
+            // operator expected an image.
+            string? contentType = SiteContentTypes.For(path);
+            if (contentType is null) { await PagesMiss(context, "That file type is not served."); return; }
+
+            byte[]? content = ReadRepositoryFile(repository, path);
+            if (content is null) { await PagesMiss(context, "That file is not part of this site."); return; }
+
+            context.Response.ContentType = contentType;
+            context.Response.Headers.CacheControl = "no-cache";
+            context.Response.ContentLength = content.Length;
+            if (!HttpMethods.IsHead(context.Request.Method))
+                await context.Response.Body.WriteAsync(content, context.RequestAborted);
+        });
+    });
+}
+
 // The agent endpoint. Mounted ahead of the fallback so a request for it never receives the browser shell,
 // and answered here rather than left absent when the operator did not enable it, because the fallback would
 // otherwise serve HTML with a 200 to a client that asked for a protocol.
@@ -1711,6 +1889,7 @@ if (settings.Mcp)
         "; writes=" + (posture.AllowWrites ? "allowed" : "refused"));
 }
 else Console.WriteLine("MCP: off");
+Console.WriteLine(settings.PagesOrigin is null ? "PAGES: off" : "PAGES: " + settings.PagesOrigin + "/<project-slug>/");
 Console.WriteLine("READY: " + address);
 await app.WaitForShutdownAsync();
 return 0;
@@ -2254,6 +2433,53 @@ static async Task ApiError(HttpContext context, int status, string message)
 
 static string Origin(HttpContext context) => context.Request.Scheme + "://" + context.Request.Host.Value;
 
+/// <summary>
+/// Every refusal on the pages origin, in one shape. Plain text and always 404: a site that is not there, a
+/// project that published nothing, and a file outside the configured root must be indistinguishable, or
+/// the pages host becomes a way to enumerate what an instance holds.
+/// </summary>
+static async Task PagesMiss(HttpContext context, string message)
+{
+    context.Response.StatusCode = StatusCodes.Status404NotFound;
+    context.Response.ContentType = "text/plain; charset=utf-8";
+    await context.Response.WriteAsync(message, context.RequestAborted);
+}
+
+/// <summary>
+/// Collects the paths a page's allowlist admits, by walking what the repository actually holds and asking
+/// the matcher about each one. The other direction, expanding patterns into paths, would invent names that
+/// are not there and would be a second implementation of the only rule that matters.
+///
+/// <para>
+/// Bounded in both breadth and depth: a page lists at most 500 files and descends at most 16 directories,
+/// so a repository cannot make listing its own page expensive.
+/// </para>
+/// </summary>
+static void CollectPagePaths(Repository repository, PageSettings page, string directory, List<string> found, int depth = 0)
+{
+    if (found.Count >= 500 || depth > 16) return;
+    IReadOnlyList<GitTreeEntry>? entries;
+    try { entries = RepositoryView.Tree(repository, "HEAD", directory); }
+    catch (GitInputException) { return; }
+    if (entries is null) return;
+
+    foreach (GitTreeEntry entry in entries)
+    {
+        if (found.Count >= 500) return;
+        // The config's own directory is never walked, at any visibility.
+        if (entry.Path.Equals(PageConfiguration.ReservedDirectory, StringComparison.OrdinalIgnoreCase)) continue;
+        if (entry.Type == "tree") CollectPagePaths(repository, page, entry.Path, found, depth + 1);
+        else if (PageConfiguration.AllowsFile(page, entry.Path)) found.Add(entry.Path);
+    }
+}
+
+/// <summary>Reads one file from a repository's default branch, or null when it is not there.</summary>
+static byte[]? ReadRepositoryFile(Repository repository, string path)
+{
+    try { return RepositoryView.File(repository, "HEAD", path)?.Content; }
+    catch (GitInputException) { return null; }
+}
+
 McpSettingsResponse McpResponse(McpSettings current) =>
     new(current.Enabled, current.AllowWrites, current.AllowAnonymous, serverOrigin + McpPath);
 
@@ -2419,12 +2645,13 @@ sealed class McpEndpoint : IDisposable
 }
 
 sealed record Arguments(string Database, string Repositories, IPAddress ListenAddress, int ListenPort, string? Origin,
-    string? Certificate, string? CertificatePasswordFile, bool PublicBrowsing, bool PushToCreate, int SessionMinutes, bool Mcp)
+    string? Certificate, string? CertificatePasswordFile, bool PublicBrowsing, bool PushToCreate, int SessionMinutes, bool Mcp,
+    string? PagesOrigin)
 {
     public static bool TryParse(string[] values, out Arguments? result)
     {
         result = null;
-        if (values.Length is < 4 or > 20 || values.Length % 2 != 0) return false;
+        if (values.Length is < 4 or > 22 || values.Length % 2 != 0) return false;
         string? database = null;
         string? repositories = null;
         string? listen = null;
@@ -2435,6 +2662,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         string? pushToCreate = null;
         string? sessionMinutes = null;
         string? mcp = null;
+        string? pagesOrigin = null;
         HashSet<string> seen = new(StringComparer.Ordinal);
         for (int index = 0; index < values.Length; index += 2)
         {
@@ -2449,6 +2677,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             else if (values[index] == "--push-to-create") pushToCreate = values[index + 1];
             else if (values[index] == "--session-minutes") sessionMinutes = values[index + 1];
             else if (values[index] == "--mcp") mcp = values[index + 1];
+            else if (values[index] == "--pages-origin") pagesOrigin = values[index + 1];
             else return false;
         }
         if (string.IsNullOrWhiteSpace(database) || string.IsNullOrWhiteSpace(repositories)) return false;
@@ -2459,6 +2688,18 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         // Whether the forge hosts its Model Context Protocol endpoint at all. The operator's gate; the
         // administrator's switches beneath it live in the database and are edited in the browser.
         if (mcp is not null and not "true" and not "false") return false;
+        // Where project sites are served, on a hostname of their own. Repository-authored HTML cannot share
+        // an origin with the session cookie and the API, so this names a second host or the feature stays
+        // off. An https origin with no path, for the same reasons --origin takes one.
+        // Empty means unset, not malformed. A container passes every option it knows about and fills the
+        // value from the environment, so an operator who never configured a pages origin sends an empty
+        // string; refusing that would turn "I am not using this feature" into a server that will not start.
+        if (string.IsNullOrWhiteSpace(pagesOrigin)) pagesOrigin = null;
+        if (pagesOrigin is not null && (!Uri.TryCreate(pagesOrigin, UriKind.Absolute, out Uri? pagesUri) ||
+            pagesUri.Scheme != Uri.UriSchemeHttps || pagesUri.AbsolutePath != "/" ||
+            !string.IsNullOrEmpty(pagesUri.UserInfo) || !string.IsNullOrEmpty(pagesUri.Query) ||
+            !string.IsNullOrEmpty(pagesUri.Fragment)))
+            return false;
         // How long a signed-in browser stays signed in without being used. Bounded at both ends: below five
         // minutes nobody could get anything done, and the ceiling is the absolute lifetime a session can
         // reach however much it is used, so a larger number here would be a setting that did nothing.
@@ -2491,7 +2732,8 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         result = new(Path.GetFullPath(database), Path.GetFullPath(repositories), address, port,
             origin is null ? null : origin.TrimEnd('/'), certificate is null ? null : Path.GetFullPath(certificate),
             certificatePasswordFile is null ? null : Path.GetFullPath(certificatePasswordFile),
-            publicBrowsing == "true", pushToCreate == "true", window, mcp == "true");
+            publicBrowsing == "true", pushToCreate == "true", window, mcp == "true",
+            pagesOrigin);
         return true;
     }
 }
