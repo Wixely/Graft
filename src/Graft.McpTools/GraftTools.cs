@@ -276,6 +276,28 @@ public sealed class GraftTools
         return result.ToJsonString();
     }
 
+    [McpServerTool(Name = "graft_set_avatar")]
+    [Description("Sets a project's avatar from an image you already have as base64. PNG, GIF, JPEG or WebP, at most 2 MB and 4096 pixels on a side. Refused unless writes are allowed on this server.")]
+    public static async Task<string> SetAvatar(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("The image file's bytes, base64 encoded.")] string imageBase64,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowWrites) return Refused(graft, "setting a project's avatar");
+
+        byte[] bytes;
+        try { bytes = Convert.FromBase64String(imageBase64 ?? ""); }
+        catch (FormatException) { return Failure("The image must be base64 encoded."); }
+        if (bytes.Length == 0) return Failure("The image is empty.");
+
+        (bool ok, string response, int status) = await graft.SendBytesAsync(HttpMethod.Post,
+            "api/v4/projects/" + Encode(project) + "/avatar", bytes, "application/octet-stream", cancellationToken);
+        return ok
+            ? new JsonObject { ["project"] = project, ["avatar_set"] = true, ["bytes"] = bytes.Length }.ToJsonString()
+            : Failure(GraftClient.Describe(status, response));
+    }
+
     [McpServerTool(Name = "graft_list_members")]
     [Description("Lists who may work on a project and in what role. Only somebody who could change the membership can read it.")]
     public static async Task<string> ListMembers(

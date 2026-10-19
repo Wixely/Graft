@@ -482,6 +482,28 @@ async Task CheckGlobalSlug(string address, string apiToken, string readApiToken,
         Check(hidden.StatusCode == System.Net.HttpStatusCode.NotFound,
             "another account's private project answers the same way through its slug as it does by path");
 
+    // A project avatar through the API. The browser sets one through the resumable upload transport, which
+    // carries a receipt rather than bytes, so until now no API client could set an avatar at all.
+    using (HttpResponseMessage avatar = await ApiPutBytes(address, "/api/v4/projects/" + projectId + "/avatar", apiToken,
+        OnePixelPng(), "image/png"))
+    {
+        Check(avatar.IsSuccessStatusCode, "a project avatar can be set through the API");
+        using JsonDocument json = JsonDocument.Parse(await avatar.Content.ReadAsStreamAsync());
+        Check(json.RootElement.GetProperty("avatar_url").ValueKind != JsonValueKind.Null,
+            "and the project then reports an avatar URL");
+    }
+
+    // Validated by the same code the browser route uses, so anything that is not an image is refused
+    // rather than stored and served back later as one.
+    using (HttpResponseMessage notAnImage = await ApiPutBytes(address, "/api/v4/projects/" + projectId + "/avatar", apiToken,
+        Encoding.UTF8.GetBytes("<script>alert(1)</script>"), "image/png"))
+        Check(notAnImage.StatusCode == System.Net.HttpStatusCode.BadRequest, "content that is not an image is refused");
+
+    using (HttpResponseMessage denied = await ApiPutBytes(address, "/api/v4/projects/" + projectId + "/avatar", readApiToken,
+        OnePixelPng(), "image/png"))
+        Check(denied.StatusCode is System.Net.HttpStatusCode.NotFound or System.Net.HttpStatusCode.Forbidden,
+            "a token that may not manage the project cannot set its avatar");
+
     // Membership through the API. The browser has always been able to grant a role; a token could not, so
     // an agent could see a project and never who was allowed to work on it.
     using (HttpResponseMessage members = await ApiGet(address, "/api/v4/projects/" + projectId + "/members", apiToken))
@@ -1181,6 +1203,20 @@ async Task<HttpResponseMessage> ApiGet(string address, string path, string? toke
     HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false };
     HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
     HttpRequestMessage request = new(HttpMethod.Get, path);
+    if (token is not null) request.Headers.Add("PRIVATE-TOKEN", token);
+    HttpResponseMessage response = await client.SendAsync(request);
+    request.Dispose();
+    client.Dispose();
+    handler.Dispose();
+    return response;
+}
+
+async Task<HttpResponseMessage> ApiPutBytes(string address, string path, string? token, byte[] content, string contentType)
+{
+    HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false };
+    HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
+    HttpRequestMessage request = new(HttpMethod.Put, path) { Content = new ByteArrayContent(content) };
+    request.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue(contentType);
     if (token is not null) request.Headers.Add("PRIVATE-TOKEN", token);
     HttpResponseMessage response = await client.SendAsync(request);
     request.Dispose();

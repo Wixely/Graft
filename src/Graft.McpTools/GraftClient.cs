@@ -191,6 +191,31 @@ public sealed class GraftClient
     }
 
     /// <summary>
+    /// Sends a raw body rather than JSON, for the routes that take a file's bytes. The caller's token still
+    /// travels on the request exactly as it does everywhere else.
+    /// </summary>
+    public async Task<(bool Ok, string Body, int Status)> SendBytesAsync(
+        HttpMethod method,
+        string path,
+        byte[] content,
+        string contentType,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(content);
+        using HttpRequestMessage request = Build(method, path);
+        request.Content = new ByteArrayContent(content);
+        request.Content.Headers.ContentType = new MediaTypeHeaderValue(contentType);
+        try
+        {
+            using HttpResponseMessage response = await connection.Http.SendAsync(request, cancellationToken);
+            string text = await response.Content.ReadAsStringAsync(cancellationToken);
+            return (response.IsSuccessStatusCode, text, (int)response.StatusCode);
+        }
+        catch (HttpRequestException error) { return (false, "Graft could not be reached: " + error.Message, 0); }
+        catch (TaskCanceledException) { return (false, "Graft did not answer within the timeout.", 0); }
+    }
+
+    /// <summary>
     /// Reads a typed response through the source-generated contracts the server itself serializes with, so
     /// the shapes cannot drift apart and nothing here needs reflection at runtime.
     /// </summary>
