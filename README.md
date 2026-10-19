@@ -8,6 +8,15 @@ Graft is a planned locally hosted GitLab alternative in C#/.NET 10. It targets G
 
 Status as of **2026-09-20**: [MVP-08 packaging and resource validation](docs/validation/2026-09-19-mvp08-packaging-resources.md) conditionally passes. Windows NativeAOT interactive and Windows Service, Linux static-musl interactive/systemd, and rootless Podman paths are implemented and tested; the recorded Linux static binaries retain all 76 Git/API/project-creation and 36 recovery assertions. That Windows Git/API/browser workflow passed **135 assertions** under the runtime and NativeAOT at the time, including [administrator user creation and project membership](docs/validation/2026-09-19-user-membership.md), [personal access-token lifecycle](docs/validation/2026-09-19-personal-access-tokens.md), and [account credential lifecycle](docs/validation/2026-09-20-account-credentials.md). The GitLab 18.0.0 source fixture passes against Graft and a [live reference](docs/validation/2026-09-19-gitlab-18-live-reference.md), while pinned `glab` 1.58.0 passes against both. The rendered Blazor workflow and one-use [operator bootstrap](docs/validation/2026-09-19-operator-bootstrap.md) pass. The Linux 3.10.108 run is deferred. DnaX distribution and a real CA/DNS trust environment remain gates. Remote hosting and the project licence are undecided. The repository itself is public at github.com/Wixely/Graft.
 
+Status as of **2026-10-20**: the project page is now what it was always meant to be. A `.graft/project.json`
+in the repository says what the page offers, a file allowlist decides which files are reachable, and a
+folder in the repository can be served as a static website, GitHub Pages style, from a hostname of its own
+behind `--pages-origin`. Everything is deny by default: no allowlist means no files, and nothing outside the
+site folder is reachable at all. A page still cannot clone, show history or show a diff, because those walk
+the object graph and no filter makes a graph walk honour a path allowlist. See
+[project pages](docs/project-pages.md), a [worked sample](samples/project-page/SAMPLE.md) and
+[the evidence](docs/validation/2026-10-20-project-pages.md).
+
 Status as of **2026-10-19**: agent access is at parity with what a credential can do. The gap was never
 missing tools: almost every mutating route accepted a browser session and nothing else, so no token could
 edit a description, write a file or grant a role. Six capabilities were opened to tokens as GitLab-shaped

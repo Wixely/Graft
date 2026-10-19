@@ -58,6 +58,10 @@ services:
       # browser under Administration, Agent access, and changes there need no restart.
       - --mcp
       - ${GRAFT_MCP:-false}
+      # Where project sites are served, on a hostname of their own. Empty means no sites: repository HTML
+      # cannot share an origin with the session cookie and the API. See docs/project-pages.md.
+      - --pages-origin
+      - ${GRAFT_PAGES_ORIGIN:-}
     ports:
       - "127.0.0.1:8443:8443"
     volumes:

@@ -122,6 +122,11 @@ cloning and pushing. It is assigned automatically and the suite covers clone, pu
 collision rule; see [slug evidence](validation/2026-10-19-project-slugs.md) and
 [ADR 0010](decisions/0010-project-slugs.md).
 
+A project page is a curated surface over a repository, configured by `.graft/project.json` and published
+by a Maintainer. Its optional static site is served from a second hostname named by `--pages-origin`, off
+by default. The suite covers the matcher, the parser and both surfaces; see
+[project pages](project-pages.md) and [page evidence](validation/2026-10-20-project-pages.md).
+
 A browser session is an idle window, renewed by use, set by `--session-minutes` and defaulting to 12 hours
 with an absolute ceiling of 30 days from sign-in. It used to be a fifteen-minute countdown from sign-in that
 no amount of activity moved, which is what it looked like from a chair: being logged out mid-sentence. See

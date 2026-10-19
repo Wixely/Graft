@@ -1,6 +1,43 @@
 # Next-agent handoff
 
-Updated: 2026-10-19. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
+Updated: 2026-10-20. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
+
+## Added on 2026-10-20, project pages and their sites
+
+**The project page is now the thing ADR 0006 described.** It was a published flag and a listing entry: a
+private project with a published page appeared in the public browser, and the link led to a repository view
+that refused the reader. The config, the allowlist and the static site were designed and never built. They
+are now, apart from `features`. See [project pages](project-pages.md) for the user-facing guide,
+[the evidence](validation/2026-10-20-project-pages.md), and
+[samples/project-page](../samples/project-page/SAMPLE.md) for a repository that produces both surfaces.
+
+**`.graft/project.json` on the default branch says what a page offers**: a title, a description, a readme,
+a file allowlist, and a `site` folder. The config can only narrow, never publish, because authoring needs
+Developer and publishing needs Maintainer; a config able to publish would let a Developer expose a private
+project by pushing a commit.
+
+**One matcher, `PathMatcher`, answers every page decision.** `*` within a segment, `**` across, nothing else
+a metacharacter, no negation, whole-path comparison, and traversal normalising to nothing. Two matchers
+would be two answers and the leak would live in whichever one somebody forgot.
+
+**Sites need a second hostname, and `--pages-origin` is the gate.** Off by default. On that host there is no
+API, no session, no uploads and no browser shell, because the branch short-circuits before all of them; the
+`__Host-` session cookie cannot travel there either. Content types come from a fixed extension list rather
+than from the file. Empty is treated as unset, so a container that always passes the flag still starts.
+
+**The dead end is closed.** A page-only project is linked from the public browser to `/-/p/<slug>` rather
+than to a repository view that would refuse the reader.
+
+**Two things found on the way.** `CreateProjectWithRepositoryAsync` returned a project with an empty
+instance-wide slug, because the record was built by hand from the insert's arguments; fixed. And Chrome
+cannot be told through the automation server to accept the loopback certificate, so the browser check
+starts Chrome directly with `--ignore-certificate-errors` and `--host-resolver-rules`, which is also how a
+browser reaches the pages origin without DNS.
+
+**Still not built:** `features`, so naming one is an error, and the single-hostname fallback ADR 0006
+describes as a worse product.
+
+Suites: 464 Git/API/browser, 162 accounts and core, 41 operations, 96 MCP.
 
 ## Added on 2026-10-19, agent access brought to parity
 

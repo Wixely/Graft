@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "page": {
+    "title": "Lanternry",
+    "description": "A small library for hanging lights on things.",
+    "readme": "README.md",
+    "files": ["README.md", "docs/**/*.md", "compose.yaml"],
+    "site": { "root": "pages", "index": "index.html" }
+  }
+}

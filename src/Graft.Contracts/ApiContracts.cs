@@ -251,6 +251,22 @@ public sealed record PagePublishRequest(bool Published);
 /// owns should not grow a field only this server understands.</summary>
 public sealed record PageStateResponse(long ProjectId, bool Published);
 
+/// <summary>
+/// A published project page, as an anonymous reader sees it. Carries only what the page config named: there
+/// is no field here that could describe the repository behind it.
+/// </summary>
+public sealed record ProjectPageResponse(
+    string Title,
+    string Description,
+    /// <summary>The project's shareable address, which names no account.</summary>
+    string Slug,
+    /// <summary>The rendered readme the config named, when it named one that exists.</summary>
+    ReadmeResponse? Readme,
+    /// <summary>The files this page offers, already filtered to what the allowlist admits.</summary>
+    IReadOnlyList<string> Files,
+    /// <summary>Where this project's static site is served, or null when it publishes none.</summary>
+    [property: JsonPropertyName("site_url")] string? SiteUrl);
+
 /// <summary>One card in the public browser. Deliberately not the GitLab project shape: it carries only what
 /// a stranger is shown, so there is no field here that could accidentally describe a private project.</summary>
 public sealed record BrowseEntryResponse(
@@ -265,7 +281,9 @@ public sealed record BrowseEntryResponse(
     string Visibility,
     /// <summary>Whether the source itself is public. False means this project is listed because it publishes
     /// a page, and its repository is not readable.</summary>
-    bool SourcePublic);
+    bool SourcePublic,
+    /// <summary>The project's instance-wide slug, which addresses its page and names no account.</summary>
+    [property: JsonPropertyName("global_slug")] string GlobalSlug = "");
 
 public sealed record BrowseResponse(
     IReadOnlyList<BrowseEntryResponse> Projects,
@@ -328,6 +346,7 @@ public sealed record McpSettingsRequest(
 [JsonSerializable(typeof(VisibilityRequest))]
 [JsonSerializable(typeof(PagePublishRequest))]
 [JsonSerializable(typeof(PageStateResponse))]
+[JsonSerializable(typeof(ProjectPageResponse))]
 [JsonSerializable(typeof(BrowseResponse))]
 [JsonSerializable(typeof(McpSettingsResponse))]
 [JsonSerializable(typeof(McpSettingsRequest))]

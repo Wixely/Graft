@@ -1,0 +1,3 @@
+services:
+  lanternry:
+    image: lanternry:local

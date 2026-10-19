@@ -209,6 +209,7 @@ try
     await CheckTokenProjectSettings(address, aliceIdentity, bob.Username, bobPassword);
     // Last, because writing a file creates a branch and several checks above count branches.
     await CheckApiFileWrites(address, aliceIdentity, project.Id);
+    await CheckProjectPages(address, aliceIdentity, source);
 
     Console.WriteLine($"RESULT: PASS; assertions: {assertions}");
     Console.WriteLine("BOUNDARY: loopback HTTPS with an ephemeral untrusted certificate; one writer process and bounded repositories.");
@@ -217,6 +218,7 @@ try
 catch (Exception error)
 {
     Console.Error.WriteLine("RESULT: FAIL: " + error.GetType().Name + ": " + Redact(error.Message));
+    Console.Error.WriteLine(Redact(error.StackTrace ?? ""));
     return 1;
 }
 finally
@@ -287,6 +289,10 @@ ProcessStartInfo ServerStart()
     start.ArgumentList.Add(publicBrowsing ? "true" : "false");
     start.ArgumentList.Add("--push-to-create");
     start.ArgumentList.Add(pushToCreate ? "true" : "false");
+    // A pages origin is always configured for the suite, so the site assertions can reach it by Host
+    // header without a second listener or a hosts-file entry.
+    start.ArgumentList.Add("--pages-origin");
+    start.ArgumentList.Add("https://pages.graft.test");
     return start;
 }
 
@@ -341,6 +347,143 @@ async Task<(int ExitCode, string Output, string Errors)> RunGit(string directory
     {
         if (!process.HasExited) { process.Kill(entireProcessTree: true); await process.WaitForExitAsync(); }
     }
+}
+
+/// <summary>
+/// The project page and its static site: a curated surface over a repository that stays private, and a
+/// site served from a hostname of its own.
+///
+/// <para>
+/// Most of this is about what must not be reachable. A page is deny-by-default, so the assertions that
+/// matter are the ones where a file exists in the repository and the page refuses to serve it.
+/// </para>
+/// </summary>
+async Task CheckProjectPages(string address, AuthenticatedIdentity alice, string worktree)
+{
+    const string PagesHost = "pages.graft.test";
+    TokenGrant grant;
+    long pageProjectId;
+    string slug;
+    await using (GraftStore fixture = await GraftStore.OpenAsync(databasePath))
+    {
+        ProjectInfo created = await fixture.CreateProjectWithRepositoryAsync(alice, "pagesample", "Page sample",
+            (project, token) => { token.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, project.StorageId)); return Task.CompletedTask; },
+            "A private project with a public page.");
+        pageProjectId = created.Id;
+        slug = created.GlobalSlug;
+        grant = await fixture.CreateTokenAsync(alice, "pages", TokenScope.Api | TokenScope.WriteRepository, DateTimeOffset.UtcNow.AddHours(1));
+    }
+
+    // A repository holding both the things the page names and the things it must never serve.
+    string source = Path.Combine(root, "pages-source");
+    Directory.CreateDirectory(source);
+    await Git(source, ["init", "--initial-branch=main"]);
+    Directory.CreateDirectory(Path.Combine(source, ".graft"));
+    Directory.CreateDirectory(Path.Combine(source, "site"));
+    Directory.CreateDirectory(Path.Combine(source, "docs"));
+    Directory.CreateDirectory(Path.Combine(source, "src"));
+    File.WriteAllText(Path.Combine(source, ".graft", "project.json"), """
+        {"version":1,"page":{"title":"Sample","description":"Curated.","readme":"README.md",
+         "files":["README.md","docs/**/*.md"],"site":{"root":"site","index":"index.html"}}}
+        """);
+    File.WriteAllText(Path.Combine(source, "README.md"), "# Sample\n\nCurated page.\n");
+    File.WriteAllText(Path.Combine(source, "docs", "guide.md"), "# Guide\n");
+    File.WriteAllText(Path.Combine(source, "docs", "notes.txt"), "not markdown, must not be listed\n");
+    File.WriteAllText(Path.Combine(source, "src", "secret.cs"), "const string Key = \"must-never-be-served\";\n");
+    File.WriteAllText(Path.Combine(source, "site", "index.html"), "<!doctype html><title>Sample site</title><h1>Sample site</h1>\n");
+    File.WriteAllText(Path.Combine(source, "site", "style.css"), "body { color: #333; }\n");
+    File.WriteAllText(Path.Combine(source, "site", "payload.exe"), "not a servable type\n");
+    await Git(source, ["add", "."]);
+    await Git(source, ["commit", "-m", "Page config, curated files and a site"]);
+    await Git(source, ["push", AuthenticatedUrl(address, "alice", grant.Secret, "alice/pagesample.git"), "main"]);
+
+    // Nothing is public until the page is published, which is a database act and never a config one: a
+    // push must never be able to widen access.
+    using (HttpResponseMessage beforePublish = await PagesGet(address, null, "/api/graft/pages/" + slug))
+        Check(beforePublish.StatusCode == System.Net.HttpStatusCode.NotFound,
+            "a page is not served until it is published, however complete its config");
+    using (HttpResponseMessage siteBefore = await PagesGet(address, PagesHost, "/" + slug + "/"))
+        Check(siteBefore.StatusCode == System.Net.HttpStatusCode.NotFound, "and neither is its site");
+
+    await using (GraftStore fixture = await GraftStore.OpenAsync(databasePath))
+        await fixture.SetPagePublishedAsync(alice, pageProjectId, true);
+
+    // The curated page, to a reader with no credentials at all.
+    using (HttpResponseMessage page = await PagesGet(address, null, "/api/graft/pages/" + slug))
+    {
+        Check(page.IsSuccessStatusCode, "a published page is readable without an account (got " +
+            (int)page.StatusCode + ": " + Redact(await page.Content.ReadAsStringAsync()) + ")");
+        using JsonDocument json = JsonDocument.Parse(await page.Content.ReadAsStreamAsync());
+        Check(json.RootElement.GetProperty("title").GetString() == "Sample", "and carries the title its config gave it");
+        string[] files = [.. json.RootElement.GetProperty("files").EnumerateArray().Select(entry => entry.GetString()!)];
+        Check(files.Length == 2 && files.Contains("README.md") && files.Contains("docs/guide.md"),
+            "and lists exactly the files its allowlist admits");
+        Check(!files.Contains("src/secret.cs") && !files.Contains("docs/notes.txt") && !files.Contains(".graft/project.json"),
+            "and nothing else the repository happens to hold");
+        Check(json.RootElement.GetProperty("readme").ValueKind != JsonValueKind.Null, "the named readme is rendered");
+        Check(json.RootElement.GetProperty("site_url").GetString()!.Contains(PagesHost, StringComparison.Ordinal),
+            "and the site is advertised on the pages origin, not this one");
+    }
+
+    // Files, through the page. Named paths only.
+    using (HttpResponseMessage allowed = await PagesGet(address, null, "/api/graft/pages/" + slug + "/files/" + Uri.EscapeDataString("docs/guide.md")))
+        Check(allowed.IsSuccessStatusCode, "a page serves a file its allowlist names");
+    foreach (string refused in new[] { "src/secret.cs", "docs/notes.txt", ".graft/project.json" })
+        using (HttpResponseMessage denied = await PagesGet(address, null, "/api/graft/pages/" + slug + "/files/" + Uri.EscapeDataString(refused)))
+            Check(denied.StatusCode == System.Net.HttpStatusCode.NotFound, "and refuses one it does not: " + refused);
+
+    // The repository itself is untouched by any of this: a page grant reaches no repository surface.
+    using (HttpResponseMessage browse = await PagesGet(address, null, "/api/browser/projects/alice/pagesample"))
+        Check(browse.StatusCode == System.Net.HttpStatusCode.NotFound,
+            "a published page does not open the repository view");
+
+    // The site, on its own hostname.
+    using (HttpResponseMessage index = await PagesGet(address, PagesHost, "/" + slug + "/"))
+    {
+        Check(index.IsSuccessStatusCode, "a site is served from the pages origin");
+        Check(index.Content.Headers.ContentType?.MediaType == "text/html", "with the type its extension declares");
+        Check((await index.Content.ReadAsStringAsync()).Contains("Sample site", StringComparison.Ordinal),
+            "and is the file from the repository's site folder");
+    }
+    using (HttpResponseMessage style = await PagesGet(address, PagesHost, "/" + slug + "/style.css"))
+        Check(style.IsSuccessStatusCode && style.Content.Headers.ContentType?.MediaType == "text/css",
+            "a site's other files are served with their own types");
+
+    // Everything outside the configured root, however it is asked for.
+    foreach (string outside in new[] { "/src/secret.cs", "/README.md", "/.graft/project.json", "/../src/secret.cs", "/site/../src/secret.cs" })
+        using (HttpResponseMessage denied = await PagesGet(address, PagesHost, "/" + slug + outside))
+            Check(denied.StatusCode == System.Net.HttpStatusCode.NotFound,
+                "the pages origin serves nothing outside the site root: " + outside);
+
+    // A type that is not on the allowlist is refused rather than guessed at.
+    using (HttpResponseMessage unknown = await PagesGet(address, PagesHost, "/" + slug + "/payload.exe"))
+        Check(unknown.StatusCode == System.Net.HttpStatusCode.NotFound, "and no file whose extension it does not serve");
+
+    // The pages origin is not the forge. None of the application exists on that host.
+    foreach (string route in new[] { "/api/session", "/api/browse", "/healthz", "/-/login" })
+        using (HttpResponseMessage absent = await PagesGet(address, PagesHost, route))
+            Check(absent.StatusCode == System.Net.HttpStatusCode.NotFound,
+                "the pages origin carries no application route: " + route);
+
+    using (HttpResponseMessage headers = await PagesGet(address, PagesHost, "/" + slug + "/"))
+    {
+        Check(headers.Headers.TryGetValues("X-Content-Type-Options", out IEnumerable<string>? nosniff) && nosniff.Contains("nosniff"),
+            "a served site declines to have its types guessed");
+        Check(headers.Headers.TryGetValues("Content-Security-Policy", out IEnumerable<string>? policy) &&
+              policy.Any(value => value.Contains("frame-ancestors 'none'", StringComparison.Ordinal)),
+            "and cannot be framed");
+    }
+
+    // An invalid config unpublishes the page rather than serving it with defaults.
+    File.WriteAllText(Path.Combine(source, ".graft", "project.json"), """{"page":{"flies":["*"]}}""");
+    await Git(source, ["add", "."]);
+    await Git(source, ["commit", "-m", "Break the config"]);
+    await Git(source, ["push", AuthenticatedUrl(address, "alice", grant.Secret, "alice/pagesample.git"), "main"]);
+    using (HttpResponseMessage broken = await PagesGet(address, null, "/api/graft/pages/" + slug))
+        Check(broken.StatusCode == System.Net.HttpStatusCode.NotFound,
+            "an unparseable config unpublishes the page rather than serving it with defaults");
+    using (HttpResponseMessage brokenSite = await PagesGet(address, PagesHost, "/" + slug + "/"))
+        Check(brokenSite.StatusCode == System.Net.HttpStatusCode.NotFound, "and takes the site down with it");
 }
 
 /// <summary>
@@ -1204,6 +1347,26 @@ async Task<HttpResponseMessage> ApiGet(string address, string path, string? toke
     HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
     HttpRequestMessage request = new(HttpMethod.Get, path);
     if (token is not null) request.Headers.Add("PRIVATE-TOKEN", token);
+    HttpResponseMessage response = await client.SendAsync(request);
+    request.Dispose();
+    client.Dispose();
+    handler.Dispose();
+    return response;
+}
+
+/// <summary>
+/// A plain anonymous GET, optionally pretending to arrive at another hostname. The pages origin is
+/// selected by Host rather than by a second listener, so the suite needs no hosts-file entry to exercise
+/// the one thing that makes a site safe: that it is a different origin.
+/// </summary>
+async Task<HttpResponseMessage> PagesGet(string address, string? host, string path)
+{
+    HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false };
+    HttpClient client = new(handler) { Timeout = TimeSpan.FromSeconds(20) };
+    // An absolute URI, because a relative one plus a Host header makes HttpClient try to build the address
+    // out of the header and fail. The connection still goes to the real listener; only the Host differs.
+    HttpRequestMessage request = new(HttpMethod.Get, address.TrimEnd('/') + path);
+    if (host is not null) request.Headers.Host = host;
     HttpResponseMessage response = await client.SendAsync(request);
     request.Dispose();
     client.Dispose();

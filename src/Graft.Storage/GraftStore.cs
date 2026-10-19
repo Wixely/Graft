@@ -570,7 +570,11 @@ public sealed class GraftStore : IAsyncDisposable
         await AuditAsync(db, transaction, actor.UserId, "begin-create-project", "project", id.ToString(CultureInfo.InvariantCulture), "Private project metadata created in pending state.", now);
         await transaction.CommitAsync(cancellationToken);
 
-        ProjectInfo project = new(id, liveActor.UserId, liveActor.Username, slug, name, storageId);
+        // Carrying the slug it was just given, so a caller that uses the returned value can address the
+        // project by it immediately. Returning a blank here made the new project look as though it had no
+        // instance-wide name until somebody read it back.
+        ProjectInfo project = new(id, liveActor.UserId, liveActor.Username, slug, name, storageId,
+            null, ProjectVisibility.Private, false, globalSlug);
         if (initializeRepository is not null) await initializeRepository(project, cancellationToken);
 
         await using SqliteConnection readyDb = await OpenConnectionAsync(cancellationToken);

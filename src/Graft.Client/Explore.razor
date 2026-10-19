@@ -67,7 +67,11 @@ else
             <div class="list">
                 @foreach (BrowseEntryResponse entry in entries)
                 {
-                    <a class="list-item" href="@("/" + entry.Path)">
+                    @* A project listed only because it publishes a page has no readable repository, so the
+                       card links to the page rather than to a repository view that would refuse the reader. *@
+                    <a class="list-item" href="@(entry.SourcePublic || entry.GlobalSlug.Length == 0
+                        ? "/" + entry.Path
+                        : "/-/p/" + Uri.EscapeDataString(entry.GlobalSlug))">
                         <Avatar Url="@entry.AvatarUrl" Name="@entry.Name" />
                         <span class="list-item-main">
                             <strong>@entry.Name</strong>
