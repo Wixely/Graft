@@ -150,7 +150,7 @@ async Task CheckForge(string address, string token, string password)
     using (HttpResponseMessage listing = await Post(client, token, Request(3, "tools/list", "{}")))
     {
         using JsonDocument body = Parse(await listing.Content.ReadAsStringAsync());
-        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 12,
+        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 13,
             "the forge's endpoint advertises every tool");
     }
 
@@ -260,6 +260,24 @@ async Task CheckForge(string address, string token, string password)
     {
         using JsonDocument body = Parse(await reread.Content.ReadAsStringAsync());
         Check(Text(body).Contains("Edited by an agent", StringComparison.Ordinal), "and the change is what the next read returns");
+    }
+
+    // Writing repository content, which is the thing that turns an agent from a reader into something that
+    // can propose a change. On a branch of its own so the seeded history stays what the read tools assert.
+    using (HttpResponseMessage wrote = await Post(client, token, Call(17, "graft_write_file",
+        """{"project":"admin/shared","file":"docs/agent.md","content":"# Written by an agent\n","branch":"agent-work","message":"Add a note"}""")))
+    {
+        using JsonDocument body = Parse(await wrote.Content.ReadAsStringAsync());
+        string result = Text(body);
+        Check(result.Contains("\"commit_id\"", StringComparison.Ordinal), "an agent writes a file and is told the commit it made");
+        Check(result.Contains("\"created_branch\":true", StringComparison.Ordinal), "and that the branch was created for it");
+    }
+    using (HttpResponseMessage readBack = await Post(client, token, Call(18, "graft_read_file",
+        """{"project":"admin/shared","file":"docs/agent.md","reference":"agent-work"}""")))
+    {
+        using JsonDocument body = Parse(await readBack.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("Written by an agent", StringComparison.Ordinal),
+            "and reads back exactly what it wrote, through the tool that was already there");
     }
 
     // Allow anonymous callers. A stranger reads what is public and nothing else; the forge decides that,
@@ -399,7 +417,7 @@ async Task CheckStdio(string address, bool readOnly)
 
         using JsonDocument tools = await Exchange(client, Request(2, "tools/list", "{}"));
         int count = tools.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength();
-        Check(count == 12, label + " advertises every tool");
+        Check(count == 13, label + " advertises every tool");
 
         using JsonDocument read = await Exchange(client, Call(3, "graft_browse", """{"search":""}"""));
         Check(Text(read).Contains("admin/shared", StringComparison.Ordinal), label + " reads the public listing");
@@ -452,7 +470,7 @@ async Task CheckHttp(string address, string token)
     using (HttpResponseMessage listing = await Post(client, token, Request(3, "tools/list", "{}")))
     {
         using JsonDocument body = Parse(await listing.Content.ReadAsStringAsync());
-        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 12,
+        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 13,
             "the launcher's HTTP endpoint advertises every tool");
     }
 

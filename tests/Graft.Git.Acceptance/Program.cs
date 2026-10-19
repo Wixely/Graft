@@ -119,7 +119,7 @@ try
 
     await CheckApi(address, aliceApiToken.Secret, aliceReadApiToken.Secret, aliceToken.Secret, bobApiToken.Secret, project.Id, firstHead);
     // After the API checks, which assert on project counts this one would otherwise change.
-    await CheckGlobalSlug(address, aliceApiToken.Secret, bobToken.Secret, project.Id, source);
+    await CheckGlobalSlug(address, aliceApiToken.Secret, aliceReadApiToken.Secret, bobToken.Secret, project.Id, source);
     await CheckBrowser(address, "alice", alicePassword, project.Id);
     await CheckSessionRenewal(address, "alice", alicePassword);
     await CheckPersonalAccessTokens(address, "alice", alicePassword, project.Id);
@@ -207,6 +207,8 @@ try
     await CheckChunkedPush(address, aliceIdentity);
     address = await CheckPushToCreate(address, aliceIdentity, bob.Username, bobPassword);
     await CheckTokenProjectSettings(address, aliceIdentity, bob.Username, bobPassword);
+    // Last, because writing a file creates a branch and several checks above count branches.
+    await CheckApiFileWrites(address, aliceIdentity, project.Id);
 
     Console.WriteLine($"RESULT: PASS; assertions: {assertions}");
     Console.WriteLine("BOUNDARY: loopback HTTPS with an ephemeral untrusted certificate; one writer process and bounded repositories.");
@@ -342,11 +344,76 @@ async Task<(int ExitCode, string Output, string Errors)> RunGit(string directory
 }
 
 /// <summary>
+/// Writing repository content through the API rather than through a browser upload or a git push. This is
+/// the half of ADR 0005 that API clients never had, and it is what lets an agent propose a change at all.
+///
+/// <para>
+/// Runs late in the suite on purpose: a write creates a branch, and several checks above count branches.
+/// </para>
+/// </summary>
+async Task CheckApiFileWrites(string address, AuthenticatedIdentity alice, long projectId)
+{
+    // Fresh credentials, minted here rather than threaded in: the suite revokes tokens while exercising
+    // account administration, and a check this late cannot assume an earlier one still holds.
+    TokenGrant apiGrant;
+    TokenGrant readGrant;
+    await using (GraftStore fixture = await GraftStore.OpenAsync(databasePath))
+    {
+        apiGrant = await fixture.CreateTokenAsync(alice, "file-write-api", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1));
+        readGrant = await fixture.CreateTokenAsync(alice, "file-write-read", TokenScope.ReadApi, DateTimeOffset.UtcNow.AddHours(1));
+    }
+    string apiToken = apiGrant.Secret;
+    string readApiToken = readGrant.Secret;
+
+    // Writing a file through the API, which is the half of ADR 0005 that API clients never had: the browser
+    // commits through upload receipts, and nothing else could commit at all.
+    using (HttpResponseMessage written = await ApiPut(address, "/api/v4/projects/" + projectId + "/repository/files/" +
+        Uri.EscapeDataString("docs/written-by-api.md"), apiToken,
+        new { branch = "api-writes", commit_message = "Write a file through the API", encoding = "text", content = "# Written through the API\n" }))
+    {
+        Check(written.StatusCode == System.Net.HttpStatusCode.Created,
+            "a file can be written through the API (got " + (int)written.StatusCode + ": " + Redact(await written.Content.ReadAsStringAsync()) + ")");
+        using JsonDocument json = JsonDocument.Parse(await written.Content.ReadAsStreamAsync());
+        Check(json.RootElement.GetProperty("commit_id").GetString()!.Length == 40, "and the commit it made is reported back");
+        Check(json.RootElement.GetProperty("created_branch").GetBoolean(), "writing to a branch that is not there creates it");
+    }
+
+    // Read it back through the route that was already there, so the write is confirmed by the product
+    // rather than by its own response.
+    using (HttpResponseMessage read = await ApiGet(address, "/api/v4/projects/" + projectId + "/repository/files/" +
+        Uri.EscapeDataString("docs/written-by-api.md") + "?ref=api-writes", apiToken))
+    {
+        Check(read.IsSuccessStatusCode, "the written file reads back");
+        using JsonDocument json = JsonDocument.Parse(await read.Content.ReadAsStreamAsync());
+        string decoded = Encoding.UTF8.GetString(Convert.FromBase64String(json.RootElement.GetProperty("content").GetString()!));
+        Check(decoded == "# Written through the API\n", "with exactly the content that was sent");
+    }
+
+    // Base64 content, which is how an agent sends anything whose bytes must survive unchanged.
+    using (HttpResponseMessage encoded = await ApiPut(address, "/api/v4/projects/" + projectId + "/repository/files/" +
+        Uri.EscapeDataString("docs/encoded.txt"), apiToken,
+        new { branch = "api-writes", commit_message = "Write base64 content", encoding = "base64", content = Convert.ToBase64String(Encoding.UTF8.GetBytes("quotes \" and newlines\n")) }))
+        Check(encoded.StatusCode == System.Net.HttpStatusCode.Created, "base64 content is accepted");
+    using (HttpResponseMessage bad = await ApiPut(address, "/api/v4/projects/" + projectId + "/repository/files/" +
+        Uri.EscapeDataString("docs/bad.txt"), apiToken,
+        new { branch = "api-writes", commit_message = "Not base64", encoding = "base64", content = "not base64 at all!" }))
+        Check(bad.StatusCode == System.Net.HttpStatusCode.BadRequest, "and content that is not base64 is refused rather than stored");
+
+    // A read-only token may not write, and the refusal comes from the same scope rules a git push obeys.
+    using (HttpResponseMessage refused = await ApiPut(address, "/api/v4/projects/" + projectId + "/repository/files/" +
+        Uri.EscapeDataString("docs/denied.md"), readApiToken,
+        new { branch = "api-writes", commit_message = "Should not happen", content = "nope" }))
+        Check(refused.StatusCode == System.Net.HttpStatusCode.NotFound,
+            "a token that may not push cannot write a file either");
+
+}
+
+/// <summary>
 /// The instance-wide slug: a second name for a project that carries no account name, so a link can be
 /// shared without naming its owner. What matters here is that it is only a name. It must reach the same
 /// project, clone and push exactly as the owned path does, and change nothing about who may do either.
 /// </summary>
-async Task CheckGlobalSlug(string address, string apiToken, string pushToken, long projectId, string worktree)
+async Task CheckGlobalSlug(string address, string apiToken, string readApiToken, string pushToken, long projectId, string worktree)
 {
     string slug;
     using (HttpResponseMessage response = await ApiGet(address, "/api/v4/projects/" + projectId, apiToken))
