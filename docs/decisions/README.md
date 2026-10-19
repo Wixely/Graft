@@ -12,5 +12,6 @@ Preserve this history; supersede a decision explicitly instead of silently chang
 - [0008: The Model Context Protocol layer](0008-mcp-layer.md) — accepted and implemented; partly superseded by 0009
 - [0009: The Model Context Protocol endpoint inside the forge](0009-mcp-in-the-forge.md) — accepted and implemented; gated by the operator, switched by an administrator
 - [0010: Instance-wide project slugs](0010-project-slugs.md) — accepted and implemented; a second address for every project, with no owner in the URL
+- [0011: Bringing agent access to parity with the API](0011-agent-parity.md) — accepted and implemented; six capabilities opened to tokens, four deliberately withheld
 
 Open architecture choices are in [architecture.md](../architecture.md); they are not accepted decisions.

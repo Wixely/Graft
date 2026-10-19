@@ -1172,6 +1172,45 @@ app.MapGet("/api/v4/projects/{projectId}/repository/tree", async context =>
     });
 });
 
+// A project's avatar, for a token. The browser sets one through the resumable upload transport, which
+// carries an upload receipt rather than bytes and needs a browser antiforgery token, so no API client could
+// set an avatar at all. This is the plain-HTTP half ADR 0005 describes: the image arrives as the request
+// body, bounded before it is read, and is validated by exactly the same code the browser route uses.
+app.MapMethods("/api/v4/projects/{projectId}/avatar", ["POST", "PUT"], async context =>
+{
+    (bool unresolved, AuthenticatedIdentity? caller) = await AuthenticateApiOptional(context);
+    if (unresolved) return;
+    if (caller is null) { await ApiError(context, 401, "401 Unauthorized"); return; }
+    if (!caller.TokenScopes.HasFlag(TokenScope.Api))
+    { await ApiError(context, 403, "403 Forbidden: insufficient_scope"); return; }
+
+    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.ManageProject);
+    if (project is null) return;
+
+    // Refused on the declared length before a byte is read, so an oversized body is not streamed into
+    // memory first. The read is still bounded in case no length was declared.
+    if (context.Request.ContentLength > ImageContent.MaximumBytes)
+    { await ApiError(context, 413, "avatar exceeds the image limit"); return; }
+
+    byte[] bytes;
+    using (MemoryStream buffer = new())
+    {
+        await context.Request.Body.CopyToAsync(buffer, context.RequestAborted);
+        if (buffer.Length > ImageContent.MaximumBytes)
+        { await ApiError(context, 413, "avatar exceeds the image limit"); return; }
+        bytes = buffer.ToArray();
+    }
+
+    ValidatedImage? image = ImageContent.Validate(bytes);
+    if (image is null) { await ApiError(context, 400, "avatar must be a PNG, GIF, JPEG or WebP image"); return; }
+
+    try { await store.SetAvatarAsync(caller, AvatarOwner.Project, project.Details.Project.Id, image, context.RequestAborted); }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "404 Project Not Found"); return; }
+
+    ProjectDetails refreshed = (await store.GetReadyProjectAsync(project.Details.Project.Id, context.RequestAborted))!;
+    await context.Response.WriteAsJsonAsync(await ProjectResponseFor(context, refreshed), ApiJson.Default.ProjectResponse, null, context.RequestAborted);
+});
+
 // Who may work on a project, for a token. GitLab shapes these as /members with an access_level; Graft has
 // three named roles and reports both, so a GitLab client reads a number it understands and a person reads
 // a word. Membership is a Maintainer decision, which the store enforces, not this route.

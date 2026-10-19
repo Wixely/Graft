@@ -2,6 +2,40 @@
 
 Updated: 2026-10-19. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
 
+## Added on 2026-10-19, agent access brought to parity
+
+**The gap was never missing tools.** Every tool already mapped onto the token-authenticated surface; almost
+every *mutating* route in the server accepted a browser session and nothing else, so no credential could
+edit a description, write a file, or grant a role. Parity meant building the token half of capabilities the
+product already had. See [ADR 0011](decisions/0011-agent-parity.md) and
+[the evidence](validation/2026-10-19-agent-parity.md).
+
+**Six capabilities opened, eighteen tools now.** `PUT /api/v4/projects/:id` widened to `name`,
+`description` and `default_branch` beside `visibility`; `/api/v4/user` given a tool; file writes and commit
+diffs added; `/api/v4/projects/:id/members` added for list, grant and revoke; and a project avatar route
+that takes image bytes. All GitLab routes with GitLab meanings, deviations recorded in
+[compatibility.md](compatibility.md).
+
+**A product gap closed with it.** A description could be set at creation and never corrected, and a name
+could not be changed at all, by anybody. The browser gained a name and description form in the project
+settings tab, through a new `/api/projects/:id/details` route and `SetProjectDetailsAsync`.
+
+**Two of these needed the unbuilt half of ADR 0005.** Writing a file and setting an avatar were browser-only
+by transport, not policy: both routes take an upload receipt from the resumable queue, which needs a browser
+antiforgery token. The plain-HTTP path for API clients now exists for both, bounded before it reads and
+validated by the same code the browser uses.
+
+**Four capabilities stay withheld on purpose:** account administration, password resets, token issue and
+revocation, and the agent switches themselves. The first three would let an agent manufacture a credential
+beyond the one it was handed, which is the property ADR 0008 exists to protect; the fourth is circular.
+
+**Three traps worth knowing.** The file commit route was never plain JSON despite looking like it. The read
+and write sides of the files route disagreed about URL escaping, so a nested path written one way could not
+be read back the other. And the MCP suite asserts the advertised tool count in **three** places, so adding a
+tool and updating one of them fails somewhere unrelated.
+
+Suites: 433 Git/API/browser, 129 accounts, 41 operations, 96 MCP.
+
 ## Added on 2026-10-19, instance-wide project slugs
 
 **Every project has a second address, `/projects/<slug>`, with no account name in it.** Browsing, cloning

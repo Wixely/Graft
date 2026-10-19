@@ -8,6 +8,15 @@ Graft is a planned locally hosted GitLab alternative in C#/.NET 10. It targets G
 
 Status as of **2026-09-20**: [MVP-08 packaging and resource validation](docs/validation/2026-09-19-mvp08-packaging-resources.md) conditionally passes. Windows NativeAOT interactive and Windows Service, Linux static-musl interactive/systemd, and rootless Podman paths are implemented and tested; the recorded Linux static binaries retain all 76 Git/API/project-creation and 36 recovery assertions. That Windows Git/API/browser workflow passed **135 assertions** under the runtime and NativeAOT at the time, including [administrator user creation and project membership](docs/validation/2026-09-19-user-membership.md), [personal access-token lifecycle](docs/validation/2026-09-19-personal-access-tokens.md), and [account credential lifecycle](docs/validation/2026-09-20-account-credentials.md). The GitLab 18.0.0 source fixture passes against Graft and a [live reference](docs/validation/2026-09-19-gitlab-18-live-reference.md), while pinned `glab` 1.58.0 passes against both. The rendered Blazor workflow and one-use [operator bootstrap](docs/validation/2026-09-19-operator-bootstrap.md) pass. The Linux 3.10.108 run is deferred. DnaX distribution and a real CA/DNS trust environment remain gates. Remote hosting and the project licence are undecided. The repository itself is public at github.com/Wixely/Graft.
 
+Status as of **2026-10-19**: agent access is at parity with what a credential can do. The gap was never
+missing tools: almost every mutating route accepted a browser session and nothing else, so no token could
+edit a description, write a file or grant a role. Six capabilities were opened to tokens as GitLab-shaped
+routes, taking the tool set to eighteen, and the browser gained the name and description editing the
+product itself never had. Four capabilities stay deliberately out of reach of any agent: account
+administration, password resets, token issue and revocation, and the agent switches themselves. See
+[ADR 0011](docs/decisions/0011-agent-parity.md) and
+[the evidence](docs/validation/2026-10-19-agent-parity.md).
+
 Status as of **2026-10-19**: every project now has a second address with no account name in it,
 `/projects/<slug>`, so a link can be shared without naming its owner. Browsing, cloning and pushing all work
 through it and the owned `/<owner>/<slug>` path is unchanged. The slug is assigned automatically from the
