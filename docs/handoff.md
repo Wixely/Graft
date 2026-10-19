@@ -1,6 +1,41 @@
 # Next-agent handoff
 
-Updated: 2026-10-16. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
+Updated: 2026-10-19. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
+
+## Added on 2026-10-19, instance-wide project slugs
+
+**Every project has a second address, `/projects/<slug>`, with no account name in it.** Browsing, cloning
+and pushing all work through it, and the owned `/<owner>/<slug>` path is unchanged. Assigned automatically
+from the project's own path, with a short random suffix when that name is already held instance-wide. See
+[ADR 0010](decisions/0010-project-slugs.md) and [the evidence](validation/2026-10-19-project-slugs.md).
+
+**It is an alias, never a second set of rules.** Resolution by slug runs through the same permission
+decision, a concealed project answers the same way through both addresses, and push-to-create deliberately
+never fires on a slug because that path names no owner to create under. The Git transport needed no new
+route: `/projects/<slug>.git` is the same two segments as `/<owner>/<slug>.git`, so only the lookup differs.
+
+**The shared page does not redirect to the owned path**, which would put the username back in the address
+bar and defeat the point. Links built on that page, including commit pages, stay on the route the reader
+arrived by.
+
+**Migration 6 backfills existing projects**: each gets its own path where that is free instance-wide, else
+its path, two hyphens and its id. Two hyphens cannot occur in a project path, so no generated value can
+collide with a plain one. Exercised against a database built on the previous schema, including two projects
+sharing a path under different owners.
+
+**Account creation now refuses `projects`, `api`, `healthz`, `mcp` and `index.html`.** A namespace is a
+username at the root of the site, so an account called `projects` would own every link the slugs live under.
+There was no reserved list before; checked only on creation, so an instance that already has such an account
+keeps working.
+
+**Not done, and worth doing:** the shared page was never rendered in a browser this session, because both
+automation servers failed (Playwright stopped responding; Chrome DevTools cannot be told to accept the
+self-signed loopback certificate). The route templates and the share field are compiled into the client and
+every endpoint behind the page answers correctly, but the rendering is unverified by hand. **Next action,
+owner: implementation agent:** open `/projects/<slug>` against a running server, confirm the page renders,
+the links stay under `/projects/`, and the clone menu's share section shows the ownerless URLs.
+
+Suites: 405 Git/API/browser, 129 accounts, 41 operations, 82 MCP.
 
 ## Added on 2026-10-16, MCP in the forge
 

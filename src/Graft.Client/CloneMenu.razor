@@ -31,6 +31,31 @@
             </div>
         </div>
 
+        @* The short name, offered beside the owned one rather than instead of it. Both reach the same
+           project; this one carries no account name, which is what makes it the one to paste somewhere
+           public. It is not a secret and grants nothing: a private project stays private through it. *@
+        @if (ShareUrl.Length > 0)
+        {
+            <div class="clone-section">
+                <label class="clone-label" for="clone-share">Share without the owner's name</label>
+                <div class="clone-row">
+                    <input id="clone-share" readonly value="@ShareUrl" @ref="shareField" @onfocus="() => SelectAll(shareField)" />
+                    <button type="button" class="icon-button" title="Copy the shareable link"
+                            aria-label="Copy the shareable link" @onclick="() => Copy(ShareUrl, nameof(ShareUrl))">
+                        <Icon Name="@(copied == nameof(ShareUrl) ? "check" : "copy")" />
+                    </button>
+                </div>
+                <div class="clone-row">
+                    <label class="visually-hidden" for="clone-share-git">Clone URL without the owner's name</label>
+                    <input id="clone-share-git" readonly value="@ShareCloneUrl" @ref="shareCloneField" @onfocus="() => SelectAll(shareCloneField)" />
+                    <button type="button" class="icon-button" title="Copy the shareable clone URL"
+                            aria-label="Copy the shareable clone URL" @onclick="() => Copy(ShareCloneUrl, nameof(ShareCloneUrl))">
+                        <Icon Name="@(copied == nameof(ShareCloneUrl) ? "check" : "copy")" />
+                    </button>
+                </div>
+            </div>
+        }
+
         <div class="clone-section">
             <span class="clone-label">Open in an editor</span>
             @* These are the handler URLs each editor registers with the operating system. Nothing here can
@@ -78,9 +103,19 @@
     /// <summary>The branch in view, offered as a single-branch clone. Empty hides that option.</summary>
     [Parameter] public string Branch { get; set; } = "";
 
+    /// <summary>The project's page under its instance-wide slug, which names no account. Empty hides the
+    /// section, so a server or a project without one simply does not offer it.</summary>
+    [Parameter] public string ShareUrl { get; set; } = "";
+
     private ElementReference urlField;
     private ElementReference commandField;
     private ElementReference branchField;
+    private ElementReference shareField;
+    private ElementReference shareCloneField;
+
+    /// <summary>The same slug as a clone URL. Graft's Git routes answer on the shared page's own address
+    /// with <c>.git</c> after it, exactly as they do for the owned path.</summary>
+    private string ShareCloneUrl => ShareUrl.Length == 0 ? "" : ShareUrl + ".git";
     private string copied = "";
     private bool failed;
 

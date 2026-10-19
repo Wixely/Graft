@@ -1,4 +1,7 @@
 @page "/{Namespace}/{Slug}/-/commit/{Sha}"
+@* The same commit under the project's instance-wide slug, so following a link from a shared page does not
+   put the owner back in the address. *@
+@page "/projects/{Slug}/-/commit/{Sha}"
 @inject GraftApi Api
 @inject NavigationManager Navigation
 
@@ -153,7 +156,12 @@ else
     private bool loading = true;
     private string message = "";
 
-    private string ProjectUrl => $"/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
+    /// <summary>Whether the reader arrived by the instance-wide slug; the owned route always has a namespace.</summary>
+    private bool ViaSlug => Namespace.Length == 0;
+
+    private string ProjectUrl => ViaSlug
+        ? $"/projects/{Uri.EscapeDataString(Slug)}"
+        : $"/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
     private string CommitUrl(string sha) => $"{ProjectUrl}/-/commit/{sha}";
 
     private static string StatusClass(string status) => status switch
@@ -177,15 +185,30 @@ else
         message = "";
         try
         {
-            // The project has to be resolved by path before the commit can be asked for by id, because the
-            // diff route is addressed by project id like the rest of the browser API.
-            ProjectResponse[]? projects = await Api.GetAsync("api/projects", ApiJson.Default.ProjectResponseArray);
-            ProjectResponse? project = projects?.FirstOrDefault(item =>
-                string.Equals(item.Path, Slug, StringComparison.Ordinal) &&
-                string.Equals(item.Namespace.Path, Namespace, StringComparison.Ordinal));
-            if (project is null) { message = "That repository could not be found."; return; }
+            // The project has to be resolved before the commit can be asked for by id, because the diff
+            // route is addressed by project id like the rest of the browser API.
+            long projectId;
+            if (ViaSlug)
+            {
+                // The slug route resolves through the same endpoint the project page uses, so it answers
+                // for any reader the project is visible to rather than only for its own members.
+                (bool reached, RepositoryPageResponse? page) =
+                    await Api.GetOptionalAsync($"api/graft/slugs/{Uri.EscapeDataString(Slug)}", ApiJson.Default.RepositoryPageResponse);
+                if (!reached) { message = "Graft could not be reached."; return; }
+                if (page is null) { message = "That repository could not be found."; return; }
+                projectId = page.Project.Id;
+            }
+            else
+            {
+                ProjectResponse[]? projects = await Api.GetAsync("api/projects", ApiJson.Default.ProjectResponseArray);
+                ProjectResponse? project = projects?.FirstOrDefault(item =>
+                    string.Equals(item.Path, Slug, StringComparison.Ordinal) &&
+                    string.Equals(item.Namespace.Path, Namespace, StringComparison.Ordinal));
+                if (project is null) { message = "That repository could not be found."; return; }
+                projectId = project.Id;
+            }
 
-            diff = await Api.GetAsync($"api/browser/projects/{project.Id}/commit/{Uri.EscapeDataString(Sha)}",
+            diff = await Api.GetAsync($"api/browser/projects/{projectId}/commit/{Uri.EscapeDataString(Sha)}",
                 ApiJson.Default.CommitDiffResponse);
             if (diff is null) message = "That commit could not be found in this repository.";
         }

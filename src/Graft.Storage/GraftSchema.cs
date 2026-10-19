@@ -4,7 +4,7 @@ namespace Graft.Storage;
 
 public static class GraftSchema
 {
-    public static DnaXMigrationManifest Manifest { get; } = new(5,
+    public static DnaXMigrationManifest Manifest { get; } = new(6,
     [
         DnaXMigration.Sql(1, "initial-identity-project-schema", "Create identity and private project schema", """
             CREATE TABLE Users (
@@ -123,6 +123,28 @@ public static class GraftSchema
                 UpdatedByUserId INTEGER NULL REFERENCES Users(Id),
                 UpdatedAtUtc TEXT NOT NULL
             );
+            """),
+        // A second, instance-wide name for a project, so it can be shared as /projects/<slug> without the
+        // owner's username in the link. It is an alias and nothing more: the owning namespace still exists,
+        // still works, and still decides who may see the project.
+        //
+        // Every project gets one, including the ones that existed before this migration. The backfill gives
+        // each project its own path where that path is free instance-wide, and otherwise its path, two
+        // hyphens and its id. Two hyphens cannot appear in a project path, which is what makes the fallback
+        // safe: no generated value can collide with a plain path, and ids make them unique among themselves.
+        //
+        // The index is UNIQUE and the column is nullable only because the backfill below fills it in two
+        // passes; SQLite treats NULLs as distinct, so the intermediate state is legal. Every write after
+        // this migration sets it.
+        DnaXMigration.Sql(6, "project-global-slug", "Give every project an instance-wide slug", """
+            ALTER TABLE Projects ADD COLUMN GlobalSlug TEXT NULL;
+
+            UPDATE Projects SET GlobalSlug = NormalizedSlug
+            WHERE Id IN (SELECT MIN(Id) FROM Projects GROUP BY NormalizedSlug);
+
+            UPDATE Projects SET GlobalSlug = NormalizedSlug || '--' || Id WHERE GlobalSlug IS NULL;
+
+            CREATE UNIQUE INDEX IX_Projects_GlobalSlug ON Projects(GlobalSlug);
             """)
     ]);
 }
