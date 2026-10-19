@@ -246,6 +246,60 @@ public sealed class GraftTools
             : Failure(GraftClient.Describe(status, response));
     }
 
+    [McpServerTool(Name = "graft_update_project")]
+    [Description("Changes a project's name, description, or the branch it opens at. Only the values given are changed; leave one empty to leave it alone. None of these move the project or change any link to it. Refused unless writes are allowed on this server.")]
+    public static async Task<string> UpdateProject(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("New human readable name. Empty leaves it unchanged.")] string name,
+        [Description("New description. Empty leaves it unchanged; pass a single space to clear it.")] string description,
+        [Description("Branch the project should open at. Empty leaves it unchanged; the word 'default' clears the preference and lets the repository decide.")] string defaultBranch,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowWrites) return Refused(graft, "changing a project's name, description or default branch");
+
+        JsonObject body = [];
+        if (!string.IsNullOrEmpty(name)) body["name"] = name;
+        // A single space means "make it empty", because an empty argument has to mean "leave this alone"
+        // for a tool whose parameters are all required strings.
+        if (!string.IsNullOrEmpty(description)) body["description"] = description.Trim();
+        if (!string.IsNullOrEmpty(defaultBranch))
+            body["default_branch"] = defaultBranch == "default" ? null : defaultBranch;
+        if (body.Count == 0) return Failure("Give at least one of name, description or default branch.");
+
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Put,
+            "api/v4/projects/" + Encode(project), body, cancellationToken);
+        if (!ok) return Failure(GraftClient.Describe(status, response));
+
+        JsonObject result = new() { ["project"] = project };
+        foreach (KeyValuePair<string, JsonNode?> change in body) result[change.Key] = change.Value?.DeepClone();
+        return result.ToJsonString();
+    }
+
+    [McpServerTool(Name = "graft_whoami")]
+    [Description("Reports the account this server's credential belongs to, and whether it is an administrator. Use it to check what the agent is allowed to do before trying something.")]
+    public static async Task<string> WhoAmI(GraftClient graft, CancellationToken cancellationToken)
+    {
+        if (graft.Anonymous)
+            return new JsonObject
+            {
+                ["authenticated"] = false,
+                ["note"] = "This server was given no credential, so Graft is answering as it would any stranger: only public projects are visible."
+            }.ToJsonString();
+
+        (UserResponse? user, string? error) = await graft.GetAsync("api/v4/user", ApiJson.Default.UserResponse, cancellationToken);
+        if (error is not null) return Failure(error);
+        return new JsonObject
+        {
+            ["authenticated"] = true,
+            ["username"] = user!.Username,
+            ["name"] = user.Name,
+            ["state"] = user.State,
+            ["web_url"] = user.WebUrl,
+            ["writes_allowed"] = graft.AllowWrites
+        }.ToJsonString();
+    }
+
     [McpServerTool(Name = "graft_set_page_published")]
     [Description("Publishes or withdraws a project's curated page. A published page lists the project for everyone even when its repository stays private, and it exposes no source. Refused unless writes are allowed on this server.")]
     public static async Task<string> SetPagePublished(

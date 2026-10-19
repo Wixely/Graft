@@ -150,7 +150,7 @@ async Task CheckForge(string address, string token, string password)
     using (HttpResponseMessage listing = await Post(client, token, Request(3, "tools/list", "{}")))
     {
         using JsonDocument body = Parse(await listing.Content.ReadAsStringAsync());
-        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 10,
+        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 12,
             "the forge's endpoint advertises every tool");
     }
 
@@ -191,6 +191,26 @@ async Task CheckForge(string address, string token, string password)
             "writes are refused by default, and the refusal names the administrator page rather than a flag");
     }
 
+    // Who the credential belongs to. An agent that cannot ask this has to infer its own permissions from
+    // what fails, which is how an agent ends up retrying something it was never allowed to do.
+    using (HttpResponseMessage who = await Post(client, token, Call(13, "graft_whoami", "{}")))
+    {
+        using JsonDocument body = Parse(await who.Content.ReadAsStringAsync());
+        string result = Text(body);
+        Check(result.Contains("\"username\":\"admin\"", StringComparison.Ordinal), "an agent can ask which account it is acting as");
+        Check(result.Contains("\"writes_allowed\":false", StringComparison.Ordinal),
+            "and is told whether writes are permitted before it tries one");
+    }
+
+    // Project text, through the tool. Refused while the administrator has writes off, like every other
+    // mutating tool, and the refusal names the page rather than a flag.
+    using (HttpResponseMessage refused = await Post(client, token, Call(14, "graft_update_project",
+        """{"project":"admin/shared","name":"","description":"Edited by an agent","defaultBranch":""}""")))
+    {
+        using JsonDocument body = Parse(await refused.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("read-only", StringComparison.Ordinal), "editing project text is refused while writes are off");
+    }
+
     // The administrator's switches, through the browser route. A token is the wrong credential for it.
     using (HttpRequestMessage byToken = new(HttpMethod.Get, "/api/graft/admin/mcp"))
     {
@@ -225,6 +245,21 @@ async Task CheckForge(string address, string token, string password)
         using JsonDocument body = Parse(await write.Content.ReadAsStringAsync());
         Check(Text(body).Contains("\"page_published\":true", StringComparison.Ordinal),
             "once an administrator allows writes, a write performs without a restart");
+    }
+
+    // And the project text now that writes are permitted. Addressed by the instance-wide slug, which the
+    // REST surface accepts wherever it accepts a path, so an agent can use the name it was given.
+    using (HttpResponseMessage edited = await Post(client, token, Call(15, "graft_update_project",
+        """{"project":"shared","name":"","description":"Edited by an agent","defaultBranch":""}""")))
+    {
+        using JsonDocument body = Parse(await edited.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("Edited by an agent", StringComparison.Ordinal),
+            "an agent edits a project's description once writes are allowed");
+    }
+    using (HttpResponseMessage reread = await Post(client, token, Call(16, "graft_get_project", """{"project":"admin/shared"}""")))
+    {
+        using JsonDocument body = Parse(await reread.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("Edited by an agent", StringComparison.Ordinal), "and the change is what the next read returns");
     }
 
     // Allow anonymous callers. A stranger reads what is public and nothing else; the forge decides that,
@@ -364,7 +399,7 @@ async Task CheckStdio(string address, bool readOnly)
 
         using JsonDocument tools = await Exchange(client, Request(2, "tools/list", "{}"));
         int count = tools.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength();
-        Check(count == 10, label + " advertises every tool");
+        Check(count == 12, label + " advertises every tool");
 
         using JsonDocument read = await Exchange(client, Call(3, "graft_browse", """{"search":""}"""));
         Check(Text(read).Contains("admin/shared", StringComparison.Ordinal), label + " reads the public listing");
@@ -417,7 +452,7 @@ async Task CheckHttp(string address, string token)
     using (HttpResponseMessage listing = await Post(client, token, Request(3, "tools/list", "{}")))
     {
         using JsonDocument body = Parse(await listing.Content.ReadAsStringAsync());
-        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 10,
+        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 12,
             "the launcher's HTTP endpoint advertises every tool");
     }
 

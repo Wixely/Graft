@@ -112,6 +112,10 @@ public sealed record TokenResponse(long Id, string Name, string[] Scopes, DateTi
 public sealed record ProjectCreateRequest(string? Name, string? Path, string? Description, string? Visibility);
 public sealed record MembershipSetRequest(string Username, string Role);
 
+/// <summary>A project's human-facing text. A null field is left alone, so one can be changed without
+/// resending the other.</summary>
+public sealed record ProjectDetailsRequest(string? Name, string? Description);
+
 /// <summary>Names the account a project should be handed to. The project path changes with its owner.</summary>
 public sealed record OwnershipTransferRequest(string Username);
 
@@ -294,6 +298,7 @@ public sealed record McpSettingsRequest(
 [JsonSerializable(typeof(TokenResponse[]))]
 [JsonSerializable(typeof(ProjectCreateRequest))]
 [JsonSerializable(typeof(MembershipSetRequest))]
+[JsonSerializable(typeof(ProjectDetailsRequest))]
 [JsonSerializable(typeof(OwnershipTransferRequest))]
 [JsonSerializable(typeof(DefaultBranchRequest))]
 [JsonSerializable(typeof(ProjectMemberResponse[]))]

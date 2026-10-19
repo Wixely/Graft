@@ -273,6 +273,26 @@ else
         </div>
 
         <div class="panel">
+            <div class="panel-header"><Icon Name="settings" /><h2>Name and description</h2></div>
+            <div class="panel-body">
+                <p class="secondary-text">
+                    How this project is listed and described. Neither is part of its address, so changing
+                    them moves nothing and breaks no link.
+                </p>
+                <form class="form" @onsubmit="SaveDetails" @onsubmit:preventDefault>
+                    <label for="project-name">Name</label>
+                    <input id="project-name" @bind="nameChoice" required maxlength="200" />
+                    <label for="project-description">Description</label>
+                    <input id="project-description" @bind="descriptionChoice" maxlength="2000" />
+                    <p class="field-hint">Shown in listings and on the project page. It may be left empty.</p>
+                    <div class="form-actions">
+                        <button type="submit" disabled="@(busy || !DetailsChanged)">Save name and description</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <div class="panel">
             <div class="panel-header"><Icon Name="branch" /><h2>Default branch</h2></div>
             <div class="panel-body">
                 <p class="secondary-text">
@@ -394,6 +414,8 @@ else
     private string tab = "code";
     private string branch = "";
     private string defaultBranchChoice = "";
+    private string nameChoice = "";
+    private string descriptionChoice = "";
     private string visibilityChoice = "private";
     private string path = "";
     private string filePath = "";
@@ -514,6 +536,8 @@ else
         // The payload reports the branch actually in effect, whether that came from the stored preference
         // or from convention, so the settings selector starts on what the project is really opening at.
         defaultBranchChoice = repo?.Project.DefaultBranch ?? "";
+        nameChoice = repo?.Project.Name ?? "";
+        descriptionChoice = repo?.Project.Description ?? "";
         visibilityChoice = repo?.Project.Visibility ?? "private";
         if (repo?.CanManage == true) await LoadMembers(repo.Project.Id);
     }
@@ -563,6 +587,25 @@ else
             ApiResult result = await Api.PostAsync($"api/projects/{repo.Project.Id}/page",
                 new PagePublishRequest(published), ApiJson.Default.PagePublishRequest,
                 published ? "The project page is published." : "The project page is withdrawn.");
+            Report(result);
+            if (result.Ok) await Load();
+        }
+        finally { busy = false; }
+    }
+
+    private bool DetailsChanged => repo is not null &&
+        (nameChoice != repo.Project.Name || descriptionChoice != repo.Project.Description);
+
+    private async Task SaveDetails()
+    {
+        if (busy || repo is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/projects/{repo.Project.Id}/details",
+                new ProjectDetailsRequest(nameChoice, descriptionChoice), ApiJson.Default.ProjectDetailsRequest,
+                "Name and description saved.");
             Report(result);
             if (result.Ok) await Load();
         }

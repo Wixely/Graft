@@ -766,6 +766,52 @@ public sealed class GraftStore : IAsyncDisposable
     }
 
     /// <summary>
+    /// Changes a project's human-facing text: the name it is listed under and the sentence describing it.
+    /// Neither is an address, so neither moves the project or changes any link to it; the path and the
+    /// instance-wide slug are untouched.
+    ///
+    /// <para>
+    /// Maintainer-equivalent, like the other project settings. A null leaves that field alone, so a caller
+    /// can change one without having to resend the other and race somebody who edited it.
+    /// </para>
+    /// </summary>
+    public async Task SetProjectDetailsAsync(
+        AuthenticatedIdentity actor,
+        long projectId,
+        string? name,
+        string? description,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(actor);
+        if (name is null && description is null) return;
+        if (name is not null && (string.IsNullOrWhiteSpace(name) || name.Length > 200))
+            throw new ArgumentException("A project name is 1 to 200 characters.", nameof(name));
+        if (description is not null && description.Length > 2_000)
+            throw new ArgumentException("A project description is at most 2000 characters.", nameof(description));
+
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
+        PermissionDecision permission = await DecideAsync(db, transaction, actor, projectId, ProjectAction.ManageProject, cancellationToken);
+        if (!permission.Allowed) throw new UnauthorizedAccessException(permission.Explanation);
+
+        string now = Now();
+        if (name is not null)
+            await db.ExecuteAsync("UPDATE Projects SET Name = @Value WHERE Id = @Id;",
+                new ProjectTextParameters(projectId, name), transaction);
+        if (description is not null)
+            await db.ExecuteAsync("UPDATE Projects SET Description = @Value WHERE Id = @Id;",
+                new ProjectTextParameters(projectId, description), transaction);
+
+        // The audit says which fields moved rather than quoting them: a description can be two thousand
+        // characters, and an audit log is not the place to keep a second copy of one.
+        await AuditAsync(db, transaction, actor.UserId, "set-project-details", "project",
+            projectId.ToString(CultureInfo.InvariantCulture),
+            "Changed: " + string.Join(", ", new[] { name is null ? null : "name", description is null ? null : "description" }
+                .Where(field => field is not null)) + ".", now);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
+    /// <summary>
     /// Publishes or withdraws the project page: the curated surface that can exist over a private
     /// repository. Maintainer-equivalent, for the same reason as visibility.
     /// </summary>

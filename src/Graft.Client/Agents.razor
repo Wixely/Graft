@@ -64,9 +64,11 @@ else
 
                 <label class="checkbox"><input type="checkbox" @bind="allowWrites" /> Allow writes</label>
                 <p class="field-hint">
-                    Lets agents create projects, change who can see a project, and publish or withdraw project
-                    pages, within what each caller's token already permits. Off, every tool that changes
-                    something is refused and names this switch.
+                    Lets agents create projects, edit a project's name, description and default branch,
+                    change who can see a project, and publish or withdraw project pages, within what each
+                    caller's token already permits. Off, every tool that changes something is refused and
+                    names this switch. Agents never administer accounts or issue tokens, whatever this is
+                    set to.
                 </p>
 
                 <label class="checkbox"><input type="checkbox" @bind="allowAnonymous" /> Serve callers with no token</label>
