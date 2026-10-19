@@ -276,6 +276,66 @@ public sealed class GraftTools
         return result.ToJsonString();
     }
 
+    [McpServerTool(Name = "graft_read_commit")]
+    [Description("Reads what one commit changed: the files it touched and the lines it added and removed. Large or binary files are reported rather than printed.")]
+    public static async Task<string> ReadCommit(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("The full 40-character commit id, as graft_list_commits reports it.")] string commit,
+        [Description("For a merge, which parent to compare against: 0 is the first. Ignored for an ordinary commit.")] int parent,
+        CancellationToken cancellationToken)
+    {
+        if (parent is < 0 or > 15) return Failure("parent must be between 0 and 15.");
+        string path = "api/v4/projects/" + Encode(project) + "/repository/commits/" +
+            Uri.EscapeDataString((commit ?? "").Trim()) + "/diff" + (parent == 0 ? "" : "?parent=" + parent.ToString(CultureInfo.InvariantCulture));
+        (CommitDiffResponse? diff, string? error) = await graft.GetAsync(path, ApiJson.Default.CommitDiffResponse, cancellationToken);
+        if (error is not null) return Failure(error);
+
+        return new JsonObject
+        {
+            ["commit"] = diff!.Commit.Id,
+            ["title"] = diff.Commit.Title,
+            ["author"] = diff.Commit.AuthorName,
+            ["compared_against"] = diff.ParentId,
+            ["added"] = diff.Added,
+            ["removed"] = diff.Removed,
+            // Said out loud: a truncated diff that looked complete would have an agent conclude a file was
+            // untouched when the server simply stopped listing.
+            ["truncated"] = diff.Truncated,
+            ["files"] = Array(diff.Files, file => new JsonObject
+            {
+                ["path"] = file.Path,
+                ["status"] = file.Status,
+                ["added"] = file.Added,
+                ["removed"] = file.Removed,
+                ["binary"] = file.IsBinary,
+                ["too_large"] = file.TooLarge,
+                ["diff"] = file.IsBinary || file.TooLarge ? null : Unified(file)
+            })
+        }.ToJsonString();
+    }
+
+    /// <summary>
+    /// The hunks of one file as ordinary unified diff text. An agent reads diffs far better as the format
+    /// every tool prints than as a tree of line objects it has to reassemble.
+    /// </summary>
+    private static string Unified(DiffFileResponse file)
+    {
+        StringBuilder text = new();
+        foreach (DiffHunkResponse hunk in file.Hunks)
+        {
+            text.Append(hunk.Header).Append('\n');
+            foreach (DiffLineResponse line in hunk.Lines)
+            {
+                // Kind is already the marker a unified diff prints: '+', '-' or a space for context.
+                text.Append(line.Kind.Length == 1 ? line.Kind[0] : ' ');
+                text.Append(line.Text).Append('\n');
+                if (line.NoNewline) text.Append("\\ No newline at end of file\n");
+            }
+        }
+        return text.ToString();
+    }
+
     [McpServerTool(Name = "graft_write_file")]
     [Description("Writes one text file into a project and commits it, creating the file or replacing it. The branch must already exist unless the repository is empty. Refused unless writes are allowed on this server.")]
     public static async Task<string> WriteFile(

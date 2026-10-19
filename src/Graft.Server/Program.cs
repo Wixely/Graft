@@ -1172,6 +1172,49 @@ app.MapGet("/api/v4/projects/{projectId}/repository/tree", async context =>
     });
 });
 
+// What one commit changed, for a token. The browser has had this since commits became linkable; without it
+// an agent can see that a commit exists and never what it did, which is the one question worth asking
+// about a commit.
+app.MapGet("/api/v4/projects/{projectId}/repository/commits/{sha}/diff", async context =>
+{
+    // BrowseRepository, not ReadRest: a diff prints the contents of the files a commit touched, so a page
+    // grant can never reach it. The same rule the browser route applies.
+    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.BrowseRepository);
+    if (project is null) return;
+    if (!await OnlyQuery(context, "parent")) return;
+
+    string sha = context.Request.RouteValues["sha"]?.ToString() ?? "";
+    // A merge has more than one parent and no single answer to "what changed", so the caller says which
+    // side it wants rather than the server picking one silently.
+    int parent = int.TryParse(context.Request.Query["parent"].ToString(),
+        System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out int requested)
+        ? requested : 0;
+    if (parent is < 0 or > 15) { await ApiError(context, 400, "parent must be 0 to 15"); return; }
+
+    await WithRepository(project.Endpoint, context, async repository =>
+    {
+        string? commitId = Limits.IsId(sha) && repository.Objects.ContainsKey(sha) ? sha : null;
+        if (commitId is null) { await ApiError(context, 404, "404 Commit Not Found"); return; }
+
+        CommitDiff diff;
+        try { diff = RepositoryDiff.ForCommit(repository, commitId, parent); }
+        catch (GitInputException) { await ApiError(context, 404, "404 Commit Not Found"); return; }
+
+        DiffFileResponse[] files = diff.Files.Select(file => new DiffFileResponse(
+            file.Path, file.Status, file.OldMode, file.NewMode, file.IsBinary, file.TooLarge,
+            file.Added, file.Removed,
+            file.Hunks.Select(hunk => new DiffHunkResponse(HunkHeader(hunk),
+                hunk.Lines.Select(line => new DiffLineResponse(
+                    line.Kind.ToString(), line.Text, line.OldLine, line.NewLine, line.NoNewline)).ToArray()))
+                .ToArray())).ToArray();
+
+        CommitDiffResponse response = new(await ProjectResponseForLocked(context, project.Details, repository),
+            CommitResponseFor(context, project.Details, diff.Commit),
+            diff.ParentId, files, diff.Truncated, files.Sum(file => file.Added), files.Sum(file => file.Removed));
+        await context.Response.WriteAsJsonAsync(response, ApiJson.Default.CommitDiffResponse, null, context.RequestAborted);
+    });
+});
+
 // Writing one file, in GitLab's shape, with the content in the request rather than as an upload receipt.
 // ADR 0005 put the resumable transport in the browser and plain HTTP in front of API clients; this is that
 // second half for repository content, and it is what lets an agent propose a change at all.
