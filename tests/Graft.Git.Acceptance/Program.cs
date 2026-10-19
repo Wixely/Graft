@@ -482,6 +482,47 @@ async Task CheckGlobalSlug(string address, string apiToken, string readApiToken,
         Check(hidden.StatusCode == System.Net.HttpStatusCode.NotFound,
             "another account's private project answers the same way through its slug as it does by path");
 
+    // Membership through the API. The browser has always been able to grant a role; a token could not, so
+    // an agent could see a project and never who was allowed to work on it.
+    using (HttpResponseMessage members = await ApiGet(address, "/api/v4/projects/" + projectId + "/members", apiToken))
+    {
+        Check(members.IsSuccessStatusCode, "members can be listed through the API");
+        using JsonDocument json = JsonDocument.Parse(await members.Content.ReadAsStreamAsync());
+        Check(json.RootElement.EnumerateArray().Any(member => member.GetProperty("username").GetString() == "bob"),
+            "and the existing member is there");
+    }
+
+    using (HttpResponseMessage granted = await ApiPost(address, "/api/v4/projects/" + projectId + "/members", apiToken,
+        new { username = "carol", role = "reporter" }))
+    {
+        Check(granted.IsSuccessStatusCode, "a role can be granted through the API");
+        using JsonDocument json = JsonDocument.Parse(await granted.Content.ReadAsStreamAsync());
+        Check(json.RootElement.GetProperty("role").GetString() == "reporter", "and the granted role is reported back");
+    }
+
+    // An account that is not there is a bad request rather than the project's own not-found, which would
+    // say something untrue about the project.
+    using (HttpResponseMessage absent = await ApiPost(address, "/api/v4/projects/" + projectId + "/members", apiToken,
+        new { username = "nobody-at-all", role = "reporter" }))
+        Check(absent.StatusCode == System.Net.HttpStatusCode.BadRequest, "granting to an account that is not there is a bad request");
+    using (HttpResponseMessage badRole = await ApiPost(address, "/api/v4/projects/" + projectId + "/members", apiToken,
+        new { username = "carol", role = "owner" }))
+        Check(badRole.StatusCode == System.Net.HttpStatusCode.BadRequest, "and a role Graft does not have is refused by name");
+
+    using (HttpResponseMessage removed = await ApiDelete(address, "/api/v4/projects/" + projectId + "/members/carol", apiToken))
+        Check(removed.StatusCode == System.Net.HttpStatusCode.NoContent, "a role can be taken away through the API");
+    using (HttpResponseMessage after = await ApiGet(address, "/api/v4/projects/" + projectId + "/members", apiToken))
+    {
+        using JsonDocument json = JsonDocument.Parse(await after.Content.ReadAsStreamAsync());
+        Check(!json.RootElement.EnumerateArray().Any(member => member.GetProperty("username").GetString() == "carol"),
+            "and the listing reflects it");
+    }
+
+    // Reading the membership is itself a Maintainer-equivalent act, so a token that may only read the
+    // project cannot enumerate who works on it.
+    using (HttpResponseMessage denied = await ApiGet(address, "/api/v4/projects/" + projectId + "/members", readApiToken))
+        Check(denied.StatusCode == System.Net.HttpStatusCode.NotFound, "a read-only token cannot enumerate a project's members");
+
     // A project's text, after it was created. Until this route accepted them, a description could be set
     // once and never corrected, and the name could not be changed at all.
     using (HttpResponseMessage updated = await ApiPut(address, "/api/v4/projects/" + projectId, apiToken,
@@ -1140,6 +1181,19 @@ async Task<HttpResponseMessage> ApiGet(string address, string path, string? toke
     HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false };
     HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
     HttpRequestMessage request = new(HttpMethod.Get, path);
+    if (token is not null) request.Headers.Add("PRIVATE-TOKEN", token);
+    HttpResponseMessage response = await client.SendAsync(request);
+    request.Dispose();
+    client.Dispose();
+    handler.Dispose();
+    return response;
+}
+
+async Task<HttpResponseMessage> ApiDelete(string address, string path, string? token)
+{
+    HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false };
+    HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
+    HttpRequestMessage request = new(HttpMethod.Delete, path);
     if (token is not null) request.Headers.Add("PRIVATE-TOKEN", token);
     HttpResponseMessage response = await client.SendAsync(request);
     request.Dispose();

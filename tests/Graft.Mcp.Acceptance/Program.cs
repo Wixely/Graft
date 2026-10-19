@@ -150,7 +150,7 @@ async Task CheckForge(string address, string token, string password)
     using (HttpResponseMessage listing = await Post(client, token, Request(3, "tools/list", "{}")))
     {
         using JsonDocument body = Parse(await listing.Content.ReadAsStringAsync());
-        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 14,
+        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 17,
             "the forge's endpoint advertises every tool");
     }
 
@@ -278,6 +278,23 @@ async Task CheckForge(string address, string token, string password)
         using JsonDocument body = Parse(await readBack.Content.ReadAsStringAsync());
         Check(Text(body).Contains("Written by an agent", StringComparison.Ordinal),
             "and reads back exactly what it wrote, through the tool that was already there");
+    }
+
+    // Membership, which an agent could previously neither read nor change.
+    using (HttpResponseMessage listed = await Post(client, token, Call(22, "graft_list_members", """{"project":"admin/shared"}""")))
+    {
+        using JsonDocument body = Parse(await listed.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("\"count\"", StringComparison.Ordinal), "an agent reads who may work on a project");
+    }
+    using (HttpResponseMessage granted = await Post(client, token, Call(23, "graft_set_member",
+        """{"project":"admin/shared","username":"admin","role":"maintainer"}""")))
+    {
+        using JsonDocument body = Parse(await granted.Content.ReadAsStringAsync());
+        // The owner already has everything, so Graft refuses this rather than storing a redundant row. What
+        // is asserted is that the tool reports the server's reason instead of claiming success.
+        string result = Text(body);
+        Check(result.Contains("error", StringComparison.Ordinal) || result.Contains("\"role\":\"maintainer\"", StringComparison.Ordinal),
+            "granting a role either works or says why, and never silently does nothing");
     }
 
     // What a commit changed. An agent could already see that a commit exists; this is the first time it can
@@ -449,7 +466,7 @@ async Task CheckStdio(string address, bool readOnly)
 
         using JsonDocument tools = await Exchange(client, Request(2, "tools/list", "{}"));
         int count = tools.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength();
-        Check(count == 14, label + " advertises every tool");
+        Check(count == 17, label + " advertises every tool");
 
         using JsonDocument read = await Exchange(client, Call(3, "graft_browse", """{"search":""}"""));
         Check(Text(read).Contains("admin/shared", StringComparison.Ordinal), label + " reads the public listing");
@@ -502,7 +519,7 @@ async Task CheckHttp(string address, string token)
     using (HttpResponseMessage listing = await Post(client, token, Request(3, "tools/list", "{}")))
     {
         using JsonDocument body = Parse(await listing.Content.ReadAsStringAsync());
-        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 14,
+        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 17,
             "the launcher's HTTP endpoint advertises every tool");
     }
 
