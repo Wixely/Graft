@@ -112,6 +112,45 @@ The address is the project's instance-wide slug, so a shared site URL names no a
 https://pages.example.com/<project-slug>/
 ```
 
+## Linking back to the forge
+
+A site that writes the forge's hostname into a link is wrong the day that hostname changes, and a site is
+content somebody wrote once. So Graft answers two paths under the project itself, and resolves them at
+request time to wherever the forge is now.
+
+| Path | What it does |
+| --- | --- |
+| `/<slug>/-/repo` | Redirects to the project's page on the forge. |
+| `/<slug>/-/graft.json` | Returns the forge's origin and the project's URLs, for a site that would rather render its own link. |
+
+From a page at the site's root, that is an ordinary relative link with no host in it:
+
+```html
+<a href="-/repo">This project on Graft</a>
+```
+
+From a page in a subdirectory, use the absolute form, `/<slug>/-/repo`. It names the project's slug, which
+is stable, and still names no host.
+
+The JSON is same-origin, so a page can simply fetch it:
+
+```json
+{
+  "slug": "lanternry",
+  "name": "Lanternry",
+  "forge": "https://graft.example.com",
+  "project": "https://graft.example.com/projects/lanternry",
+  "page": "https://graft.example.com/-/p/lanternry"
+}
+```
+
+Both are resolved before any file is looked up, so a repository cannot shadow them with a file of the same
+name. `-` is already Graft's namespace for its own routes.
+
+The redirect goes to the **page** rather than to the repository view, because a site exists only where a
+page is published, and a page-only project would refuse the repository view to whoever followed the link.
+The page links onward to the source for anyone allowed to see it.
+
 ## Trying it
 
 A complete worked example lives in [samples/project-page](../samples/project-page/SAMPLE.md): a config, a

@@ -1779,6 +1779,41 @@ if (settings.PagesOrigin is not null)
         string requested = segments.Length > 1 ? segments[1] : "";
         bool directory = requested.Length == 0 || requested.EndsWith('/');
 
+        // Links back to the forge, resolved here rather than written into the repository.
+        //
+        // A site that hard-codes the forge's hostname is wrong the day that hostname changes, and the whole
+        // point of a site is that it is content somebody wrote once. These paths let an author link to the
+        // project without naming a host: Graft answers with wherever the forge actually is now.
+        //
+        // Under `-`, which is already Graft's namespace for its own routes, and resolved before any file
+        // lookup so a repository cannot shadow them with a file of the same name.
+        if (requested is "-/repo" or "-/repo/" or "-/graft.json")
+        {
+            string projectUrl = serverOrigin + GlobalPrefix + "/" + Uri.EscapeDataString(project.GlobalSlug);
+            string pageUrl = serverOrigin + "/-/p/" + Uri.EscapeDataString(project.GlobalSlug);
+            if (requested == "-/graft.json")
+            {
+                // For a site that would rather render the link itself than follow a redirect. Same origin,
+                // so a page can simply fetch it.
+                context.Response.ContentType = "application/json; charset=utf-8";
+                await context.Response.WriteAsync(new System.Text.Json.Nodes.JsonObject
+                {
+                    ["slug"] = project.GlobalSlug,
+                    ["name"] = project.Name,
+                    ["forge"] = serverOrigin,
+                    ["project"] = projectUrl,
+                    ["page"] = pageUrl
+                }.ToJsonString(), context.RequestAborted);
+                return;
+            }
+            // The page rather than the repository view, because a site exists only where a page is
+            // published, and a page-only project would refuse the repository view to the reader who
+            // followed the link. The page links onward to the source for anyone allowed to see it.
+            context.Response.StatusCode = StatusCodes.Status302Found;
+            context.Response.Headers.Location = pageUrl;
+            return;
+        }
+
         await WithRepository(EndpointFor(project), context, async repository =>
         {
             PageConfigurationResult config = PageConfiguration.Read(ReadRepositoryFile(repository, PageConfiguration.Path));
