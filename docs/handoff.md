@@ -20,7 +20,7 @@ that a 404 is ambiguous by design. Depth lives in the topics.
 `/llms.txt` is on the forge and not on the pages origin: it describes how Graft works, not what an instance
 holds. The tool set is 19.
 
-Suites: 474 Git/API/browser, 162 accounts and core, 41 operations, 101 MCP.
+Suites: 477 Git/API/browser, 162 accounts and core, 41 operations, 101 MCP.
 
 ## Added on 2026-10-20, project pages and their sites
 

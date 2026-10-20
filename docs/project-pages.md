@@ -106,6 +106,14 @@ Within it:
 - Responses carry `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and
   `frame-ancestors 'none'`.
 
+The root of the pages origin belongs to no project, so it redirects to the forge. Someone who trims a site's
+URL back to the host lands somewhere useful rather than on an explanation of the URL shape. An unknown
+project is still a 404, so the redirect never hides a typo.
+
+The root of the pages origin belongs to no project, so it redirects to the forge. Somebody who trims a
+site's URL back to the host lands somewhere useful rather than on an explanation of a URL shape they cannot
+act on. An unknown project is still a 404, so the redirect never hides a typo.
+
 The address is the project's instance-wide slug, so a shared site URL names no account:
 
 ```

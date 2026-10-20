@@ -22,7 +22,7 @@ It is now, apart from `features`:
 | Suite | Before | After |
 | --- | --- | --- |
 | Accounts and core | 129 | **162** |
-| Git/API/browser | 433 | **469** |
+| Git/API/browser | 433 | **477** |
 | MCP | 96 | 96 |
 | Operations | 41 | 41 |
 
@@ -36,6 +36,7 @@ The HTTP assertions drive a real repository holding both the things the page nam
 never serve:
 
 - Nothing is served before the page is published, however complete the config.
+- The pages root redirects to the forge, while an unknown project stays a 404.
 - `/<slug>/-/repo` answers 302 to the project's page on the forge as it is addressed now, and
   `/<slug>/-/graft.json` reports the forge's origin, so a site never has to name a hostname.
 - The page lists exactly the two allowlisted files, and `src/secret.cs`, `docs/notes.txt` and

@@ -494,6 +494,19 @@ async Task CheckProjectPages(string address, AuthenticatedIdentity alice, string
     using (HttpResponseMessage unknown = await PagesGet(address, PagesHost, "/" + slug + "/payload.exe"))
         Check(unknown.StatusCode == System.Net.HttpStatusCode.NotFound, "and no file whose extension it does not serve");
 
+    // The root of the pages origin belongs to no project. A reader who trimmed a site's URL back to it is
+    // sent to the forge rather than told the URL shape they cannot act on.
+    using (HttpResponseMessage root = await PagesGet(address, PagesHost, "/"))
+    {
+        Check(root.StatusCode == System.Net.HttpStatusCode.Found, "the pages root redirects rather than explaining itself");
+        // Trimmed on both sides: a Uri normalises an empty path to "/", so the header reads
+        // https://host:port/ where the address the suite holds has no trailing slash.
+        Check((root.Headers.Location?.ToString() ?? "").TrimEnd('/') == address.TrimEnd('/'), "and lands on the forge");
+    }
+    // A project that is not there stays a miss, so the redirect never hides a typo or answers a probe.
+    using (HttpResponseMessage unknown = await PagesGet(address, PagesHost, "/no-such-project/"))
+        Check(unknown.StatusCode == System.Net.HttpStatusCode.NotFound, "while an unknown project is still not found");
+
     // The pages origin is not the forge. None of the application exists on that host.
     foreach (string route in new[] { "/api/session", "/api/browse", "/healthz", "/-/login" })
         using (HttpResponseMessage absent = await PagesGet(address, PagesHost, route))
