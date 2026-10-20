@@ -34,10 +34,14 @@ cannot be told through the automation server to accept the loopback certificate,
 starts Chrome directly with `--ignore-certificate-errors` and `--host-resolver-rules`, which is also how a
 browser reaches the pages origin without DNS.
 
+**A site links back to the forge without naming it.** `/<slug>/-/repo` redirects to the project's page
+and `/<slug>/-/graft.json` reports where the forge is, both resolved before any file lookup so a
+repository cannot shadow them. A site that hard-coded the hostname would be wrong the day it changed.
+
 **Still not built:** `features`, so naming one is an error, and the single-hostname fallback ADR 0006
 describes as a worse product.
 
-Suites: 464 Git/API/browser, 162 accounts and core, 41 operations, 96 MCP.
+Suites: 469 Git/API/browser, 162 accounts and core, 41 operations, 96 MCP.
 
 ## Added on 2026-10-19, agent access brought to parity
 

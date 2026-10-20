@@ -455,6 +455,23 @@ async Task CheckProjectPages(string address, AuthenticatedIdentity alice, string
             Check(denied.StatusCode == System.Net.HttpStatusCode.NotFound,
                 "the pages origin serves nothing outside the site root: " + outside);
 
+    // Linking back to the forge without naming it. A site that hard-codes the forge's hostname is wrong
+    // the day that hostname changes, so Graft answers these itself with wherever the forge is now.
+    using (HttpResponseMessage back = await PagesGet(address, PagesHost, "/" + slug + "/-/repo"))
+    {
+        Check(back.StatusCode == System.Net.HttpStatusCode.Found, "a site can link back to the project without naming a host");
+        string target = back.Headers.Location?.ToString() ?? "";
+        Check(target.StartsWith(address.TrimEnd('/'), StringComparison.Ordinal) && target.EndsWith("/-/p/" + slug, StringComparison.Ordinal),
+            "and is sent to the project's page on the forge as it is addressed today");
+    }
+    using (HttpResponseMessage describe = await PagesGet(address, PagesHost, "/" + slug + "/-/graft.json"))
+    {
+        Check(describe.IsSuccessStatusCode, "a site can also read where the forge is, to render its own link");
+        using JsonDocument json = JsonDocument.Parse(await describe.Content.ReadAsStreamAsync());
+        Check(json.RootElement.GetProperty("forge").GetString() == address.TrimEnd('/'), "which reports the forge's current origin");
+        Check(json.RootElement.GetProperty("slug").GetString() == slug, "and the project it belongs to");
+    }
+
     // A type that is not on the allowlist is refused rather than guessed at.
     using (HttpResponseMessage unknown = await PagesGet(address, PagesHost, "/" + slug + "/payload.exe"))
         Check(unknown.StatusCode == System.Net.HttpStatusCode.NotFound, "and no file whose extension it does not serve");
@@ -1361,7 +1378,9 @@ async Task<HttpResponseMessage> ApiGet(string address, string path, string? toke
 /// </summary>
 async Task<HttpResponseMessage> PagesGet(string address, string? host, string path)
 {
-    HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false };
+    // Redirects are not followed: the pages origin answers one with a link back to the forge, and following
+    // it would hide both the status and the target this is checking.
+    HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false, AllowAutoRedirect = false };
     HttpClient client = new(handler) { Timeout = TimeSpan.FromSeconds(20) };
     // An absolute URI, because a relative one plus a Host header makes HttpClient try to build the address
     // out of the header and fail. The connection still goes to the real listener; only the Host differs.

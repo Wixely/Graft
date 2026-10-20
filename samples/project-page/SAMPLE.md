@@ -70,5 +70,7 @@ curl -k -H "Host: pages.example.test" https://127.0.0.1:7443/lanternry/
 - The page lists exactly three files, and the repository's other files are absent rather than hidden.
 - `README.md` is rendered because the config named it. A project's readme is **not** shown by default.
 - The site's own links and stylesheet work, because the configured index answers for a directory.
+- The site links back to the project with `<a href="-/repo">`, which names no hostname. Graft resolves it to
+  wherever the forge is, so moving the forge to a new domain does not make the site wrong.
 - On the pages host, `/api/session`, `/healthz` and every other application route answer 404. That host
   carries the site and nothing else.
