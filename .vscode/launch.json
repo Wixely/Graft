@@ -27,6 +27,23 @@
       }
     },
     {
+      "name": "Debug project pages",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build browser fixture",
+      "program": "${workspaceFolder}/tests/Graft.Browser.Fixture/bin/Debug/net10.0/Graft.Browser.Fixture.dll",
+      "args": [
+        "${workspaceFolder}/src/Graft.Server/bin/Debug/net10.0/Graft.Server.dll"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "internalConsole",
+      "serverReadyAction": {
+        "action": "openExternally",
+        "pattern": "PAGE:\\s+(https://127\\.0\\.0\\.1:[0-9]+/-/p/page-only)",
+        "uriFormat": "%s"
+      }
+    },
+    {
       "name": "Debug MVP-04 accounts and permissions",
       "type": "coreclr",
       "request": "launch",

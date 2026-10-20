@@ -8,9 +8,34 @@ In **Run and Debug**, select **Debug production browser fixture**, then press **
 
 Set server breakpoints in `experiments/ui-server`. The browser client is published in Release mode and embedded; browser-side Razor/C# debugging and hot reload are not configured. Restart debugging after client changes to rebuild embedded assets.
 
+## Project pages
+
+Select **Debug project pages** and press **F5**. It runs the same disposable fixture and opens the project
+page for `page-only`, a private project carrying the committed
+[samples/project-page](../samples/project-page/SAMPLE.md) repository: a `.graft/project.json`, a readme, two
+allowlisted files, a four-file site, and a `src/Secrets.cs` that must never appear on either surface.
+
+The console prints both halves, because the site is on a different origin from the forge:
+
+```text
+PAGE: https://127.0.0.1:<port>/-/p/page-only
+SITE: https://localhost:<port>/page-only/
+```
+
+**That is one listener under two names.** The fixture passes `--pages-origin https://localhost:<port>` while
+the forge listens on `127.0.0.1`. A browser treats those as different origins, which is the only property a
+project site depends on, and the generated certificate already covers both names. So there is a working
+pages origin with no hosts file to edit and no second certificate. A real deployment uses a real second
+hostname.
+
+Useful breakpoints: `PageConfiguration.Read` for the config, `PathMatcher.Walk` for an allowlist decision,
+and the pages middleware in `Graft.Server/Program.cs`, which is the branch that short-circuits everything
+else when the request arrives on the pages host.
+
 | Launch option | Behavior |
 | --- | --- |
 | Debug production browser fixture | Runs the current Graft server with a disposable account and seeded text, hostile HTML and binary repository content, then opens the rendered UI. |
+| Debug project pages | Runs the same fixture with a pages origin configured and the sample page repository pushed, then opens the published project page. |
 | Debug MVP-04 accounts and permissions | Runs the disposable SQLite acceptance flow for accounts, projects, sessions, tokens, roles and revocation. |
 | Debug MVP-06 repository UI and API | Runs the real Git client, GitLab-style API and browser-session/repository checks against a disposable HTTPS server, SQLite database and durable object/ref directory. |
 | Debug MVP-07 import and recovery | Runs synthetic bundle inventory, repeatable Git HTTPS import, quiescence, backup/tamper/restore and rollback checks through the admin CLI. |
