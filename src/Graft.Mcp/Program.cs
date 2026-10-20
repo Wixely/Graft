@@ -185,7 +185,12 @@ async Task<int> RunHttp(McpArguments options, GraftConnection graft)
 // server that starts cleanly and advertises no tools at all, which looks like a configuration problem for
 // as long as it takes somebody to find this comment.
 static IMcpServerBuilder Register(IServiceCollection services) =>
-    services.AddMcpServer(options => options.ServerInfo = new() { Name = "graft", Version = "1.0.0" })
+    services.AddMcpServer(options =>
+        {
+            options.ServerInfo = new() { Name = "graft", Version = "1.0.0" };
+            // The same instructions the forge's own endpoint sends, from the same source.
+            options.ServerInstructions = GraftGuide.Instructions;
+        })
         .WithTools<GraftTools>();
 
 /// <summary>

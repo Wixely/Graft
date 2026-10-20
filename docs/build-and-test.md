@@ -105,6 +105,28 @@ through them is bounded by its token's scopes, the project permission, and the a
 Account administration, token issue and the agent switches themselves are deliberately not among them; see
 [ADR 0011](decisions/0011-agent-parity.md).
 
+## What an agent is told
+
+Graft explains itself, so an agent does not have to learn the forge by failing. One source,
+`GraftGuide` in `src/Graft.McpTools`, feeds three surfaces:
+
+| Surface | Who it is for |
+| --- | --- |
+| Protocol handshake | Every MCP client, before it calls anything. Carries the overview as `ServerInstructions`. |
+| `graft_help` tool | An agent that wants depth: `addressing`, `permissions`, `visibility`, `pages`, `writing`, `limits`. |
+| `GET /llms.txt` | Anything that reads a URL rather than speaking the protocol. The whole guide, unauthenticated. |
+
+The overview is short on purpose. It is sent at the start of every session whether it is wanted or not, so
+it carries only what changes an agent's behaviour: start with `graft_whoami`, the three ways to address a
+project, that writes may be switched off entirely, that a refusal names what would permit the action, and
+that a 404 is deliberately ambiguous. Everything longer is a topic the agent can ask for.
+
+They are the same text because they read the same constant. A guide that drifts between surfaces is worse
+than no guide, because an agent cannot tell which copy is stale.
+
+`/llms.txt` is served from the forge, unauthenticated like the licences, and not from the pages origin:
+it describes how Graft works rather than what an instance holds.
+
 A fourth suite drives the forge's own endpoint, changing the administrator's switches over the real admin
 route, and then the launcher over both of its transports, launching it as a child process the way a client
 would:

@@ -17,6 +17,11 @@ the object graph and no filter makes a graph walk honour a path allowlist. See
 [project pages](docs/project-pages.md), a [worked sample](samples/project-page/SAMPLE.md) and
 [the evidence](docs/validation/2026-10-20-project-pages.md).
 
+Graft also explains itself to agents, so one need not learn the forge by failing. The Model Context
+Protocol handshake carries a short overview, a `graft_help` tool serves topics on demand, and `/llms.txt`
+publishes the whole guide unauthenticated for anything that reads a URL rather than speaking the protocol.
+All three read the same text, because a guide that drifts between surfaces is worse than none.
+
 Status as of **2026-10-19**: agent access is at parity with what a credential can do. The gap was never
 missing tools: almost every mutating route accepted a browser session and nothing else, so no token could
 edit a description, write a file or grant a role. Six capabilities were opened to tokens as GitLab-shaped

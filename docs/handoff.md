@@ -2,6 +2,26 @@
 
 Updated: 2026-10-20. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
 
+## Added on 2026-10-20, Graft explains itself to agents
+
+**An agent no longer has to learn the forge by failing.** One source, `GraftGuide` in
+`src/Graft.McpTools`, feeds three surfaces: the protocol handshake carries a short overview as
+`ServerInstructions`, `graft_help` serves six topics on demand, and `GET /llms.txt` publishes the whole
+guide unauthenticated for anything that reads a URL rather than speaking the protocol.
+
+**Same text everywhere, because they read the same constant.** A guide that drifts between surfaces is
+worse than none, since an agent cannot tell which copy is stale.
+
+**The overview is deliberately short**, because it is sent at the start of every session whether it is
+wanted or not. It carries what changes behaviour: start with `graft_whoami`, the three ways to address a
+project, that writes may be switched off entirely, that a refusal names what would permit the action, and
+that a 404 is ambiguous by design. Depth lives in the topics.
+
+`/llms.txt` is on the forge and not on the pages origin: it describes how Graft works, not what an instance
+holds. The tool set is 19.
+
+Suites: 474 Git/API/browser, 162 accounts and core, 41 operations, 101 MCP.
+
 ## Added on 2026-10-20, project pages and their sites
 
 **The project page is now the thing ADR 0006 described.** It was a published flag and a listing entry: a

@@ -114,7 +114,13 @@ if (settings.Mcp)
         McpSettings live = context.Items[McpSettingsItem] as McpSettings ?? McpSettings.Default with { AllowWrites = false };
         return new GraftClient(mcpEndpoint.Connection, McpToken(context.Request), live.AllowWrites);
     });
-    builder.Services.AddMcpServer(options => options.ServerInfo = new() { Name = "graft", Version = "1.0.0" })
+    builder.Services.AddMcpServer(options =>
+    {
+        options.ServerInfo = new() { Name = "graft", Version = "1.0.0" };
+        // Carried in the handshake, so a client knows how this forge works before it calls anything, and
+        // without spending a tool call to find out. The longer material is behind graft_help.
+        options.ServerInstructions = GraftGuide.Instructions;
+    })
         .WithTools<GraftTools>()
         .WithHttpTransport(http => http.Stateless = true);
 }
@@ -240,6 +246,20 @@ app.MapGet("/healthz", async context =>
 // Several of the licences this build redistributes under bind the binary rather than the source tree, so the
 // attribution has to be reachable from a running server and not only from the repository. Unauthenticated
 // deliberately: a notice nobody can read without credentials does not discharge the obligation.
+// How this forge works, for an agent that does not speak the Model Context Protocol. `llms.txt` is the
+// convention for exactly this: one plain document at a predictable address that a crawler or an assistant
+// can read without discovering an API first.
+//
+// Unauthenticated, like the licences, because a guide nobody can read without credentials helps nobody, and
+// it describes how Graft works rather than what this instance holds. Agents reaching Graft through MCP get
+// the same text in their handshake and need not fetch this at all.
+app.MapGet("/llms.txt", async context =>
+{
+    if (!await OnlyQuery(context)) return;
+    context.Response.ContentType = "text/plain; charset=utf-8";
+    await context.Response.WriteAsync(GraftGuide.Full(), context.RequestAborted);
+});
+
 app.MapGet("/-/licences", async context =>
 {
     if (!await OnlyQuery(context)) return;

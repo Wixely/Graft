@@ -455,6 +455,24 @@ async Task CheckProjectPages(string address, AuthenticatedIdentity alice, string
             Check(denied.StatusCode == System.Net.HttpStatusCode.NotFound,
                 "the pages origin serves nothing outside the site root: " + outside);
 
+    // The guide an agent reads when it does not speak the Model Context Protocol. Unauthenticated, because
+    // a guide nobody can read without credentials helps nobody, and it describes how Graft works rather
+    // than what this instance holds.
+    using (HttpResponseMessage guide = await PagesGet(address, null, "/llms.txt"))
+    {
+        Check(guide.IsSuccessStatusCode, "the forge publishes a guide for agents at /llms.txt");
+        Check(guide.Content.Headers.ContentType?.MediaType == "text/plain", "as plain text");
+        string text = await guide.Content.ReadAsStringAsync();
+        Check(text.Contains("graft_whoami", StringComparison.Ordinal) && text.Contains("instance-wide slug", StringComparison.Ordinal),
+            "carrying the same overview the protocol handshake sends");
+        Check(text.Contains(".graft/project.json", StringComparison.Ordinal),
+            "and every topic in one document, since a reader here cannot ask for one");
+    }
+    // It describes the product, not this server's contents, so it stays off the pages origin where only a
+    // project's own site lives.
+    using (HttpResponseMessage elsewhere = await PagesGet(address, PagesHost, "/llms.txt"))
+        Check(elsewhere.StatusCode == System.Net.HttpStatusCode.NotFound, "and is not served from the pages origin");
+
     // Linking back to the forge without naming it. A site that hard-codes the forge's hostname is wrong
     // the day that hostname changes, so Graft answers these itself with wherever the forge is now.
     using (HttpResponseMessage back = await PagesGet(address, PagesHost, "/" + slug + "/-/repo"))

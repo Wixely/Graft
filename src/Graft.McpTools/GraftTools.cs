@@ -467,6 +467,25 @@ public sealed class GraftTools
         catch (System.Text.Json.JsonException) { return new JsonObject { ["project"] = project, ["path"] = file, ["committed"] = true }.ToJsonString(); }
     }
 
+    [McpServerTool(Name = "graft_help")]
+    [Description("Explains how this forge works: addressing a project, what bounds an agent, visibility, project pages, changing things, and limits. Call it with no topic for the list.")]
+    public static string Help(
+        [Description("One of: addressing, permissions, visibility, pages, writing, limits. Empty returns the overview and the list of topics.")] string topic)
+    {
+        string name = (topic ?? "").Trim();
+        if (name.Length == 0)
+            return new JsonObject
+            {
+                ["overview"] = GraftGuide.Instructions,
+                ["topics"] = Array([.. GraftGuide.Topics.Keys], key => new JsonObject { ["topic"] = key })
+            }.ToJsonString();
+
+        if (!GraftGuide.Topics.TryGetValue(name, out string? document))
+            return Failure("No such topic. Try one of: " + string.Join(", ", GraftGuide.Topics.Keys) + ".");
+
+        return new JsonObject { ["topic"] = name, ["guide"] = document }.ToJsonString();
+    }
+
     [McpServerTool(Name = "graft_whoami")]
     [Description("Reports the account this server's credential belongs to, and whether it is an administrator. Use it to check what the agent is allowed to do before trying something.")]
     public static async Task<string> WhoAmI(GraftClient graft, CancellationToken cancellationToken)
