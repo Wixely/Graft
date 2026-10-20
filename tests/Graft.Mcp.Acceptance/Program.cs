@@ -150,7 +150,7 @@ async Task CheckForge(string address, string token, string password)
     using (HttpResponseMessage listing = await Post(client, token, Request(3, "tools/list", "{}")))
     {
         using JsonDocument body = Parse(await listing.Content.ReadAsStringAsync());
-        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 18,
+        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 19,
             "the forge's endpoint advertises every tool");
     }
 
@@ -189,6 +189,38 @@ async Task CheckForge(string address, string token, string password)
         string result = Text(body);
         Check(result.Contains("read-only", StringComparison.Ordinal) && result.Contains("Agent access", StringComparison.Ordinal),
             "writes are refused by default, and the refusal names the administrator page rather than a flag");
+    }
+
+    // How the forge works, carried in the handshake so a client knows before it calls anything. An agent
+    // that has to discover addressing and permissions by failing will fail in ways that look like bugs.
+    using (HttpResponseMessage handshake = await Post(client, token, Initialize(30)))
+    {
+        using JsonDocument body = Parse(await handshake.Content.ReadAsStringAsync());
+        string instructions = body.RootElement.GetProperty("result").GetProperty("instructions").GetString() ?? "";
+        Check(instructions.Contains("graft_whoami", StringComparison.Ordinal),
+            "the handshake tells a client where to start");
+        Check(instructions.Contains("instance-wide slug", StringComparison.Ordinal),
+            "and how a project is addressed, before a tool call is spent finding out");
+    }
+
+    // The same material in depth, on demand, so the handshake can stay short.
+    using (HttpResponseMessage topics = await Post(client, token, Call(31, "graft_help", """{"topic":""}""")))
+    {
+        using JsonDocument body = Parse(await topics.Content.ReadAsStringAsync());
+        string result = Text(body);
+        Check(result.Contains("\"topics\"", StringComparison.Ordinal) && result.Contains("pages", StringComparison.Ordinal),
+            "an agent can list the topics the guide covers");
+    }
+    using (HttpResponseMessage pagesTopic = await Post(client, token, Call(32, "graft_help", """{"topic":"pages"}""")))
+    {
+        using JsonDocument body = Parse(await pagesTopic.Content.ReadAsStringAsync());
+        Check(Text(body).Contains(".graft/project.json", StringComparison.Ordinal), "and read one in full");
+    }
+    using (HttpResponseMessage missing = await Post(client, token, Call(33, "graft_help", """{"topic":"nonsense"}""")))
+    {
+        using JsonDocument body = Parse(await missing.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("Try one of", StringComparison.Ordinal),
+            "and a topic that does not exist is answered with the ones that do");
     }
 
     // Who the credential belongs to. An agent that cannot ask this has to infer its own permissions from
@@ -466,7 +498,7 @@ async Task CheckStdio(string address, bool readOnly)
 
         using JsonDocument tools = await Exchange(client, Request(2, "tools/list", "{}"));
         int count = tools.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength();
-        Check(count == 18, label + " advertises every tool");
+        Check(count == 19, label + " advertises every tool");
 
         using JsonDocument read = await Exchange(client, Call(3, "graft_browse", """{"search":""}"""));
         Check(Text(read).Contains("admin/shared", StringComparison.Ordinal), label + " reads the public listing");
@@ -519,7 +551,7 @@ async Task CheckHttp(string address, string token)
     using (HttpResponseMessage listing = await Post(client, token, Request(3, "tools/list", "{}")))
     {
         using JsonDocument body = Parse(await listing.Content.ReadAsStringAsync());
-        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 18,
+        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 19,
             "the launcher's HTTP endpoint advertises every tool");
     }
 
