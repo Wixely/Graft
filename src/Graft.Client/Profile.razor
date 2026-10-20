@@ -1,6 +1,7 @@
 @page "/-/profile"
 @inject GraftApi Api
 @inject NavigationManager Navigation
+@inject IJSRuntime JS
 
 <PageTitle>Profile &middot; Graft</PageTitle>
 
@@ -43,11 +44,40 @@ else if (Api.Authenticated)
 
     @if (tab == "tokens")
     {
+        @* The token's secret is never put on this page. It waits on the server for one read, and the button
+           below fetches it straight into the clipboard. A token nobody copies therefore never reaches the
+           browser, and a copied one is never in the document for a screenshot or an extension to find. *@
         @if (created is not null)
         {
             <div class="secret" role="status">
-                <strong>Copy this token now. It will not be shown again.</strong>
-                <code>@created.Secret</code>
+                @if (collected)
+                {
+                    <strong>Copied. @created.Name is ready to use.</strong>
+                    <p class="field-hint">The secret is no longer available anywhere. Create another token if you lose it.</p>
+                }
+                else if (fallbackSecret is not null)
+                {
+                    @* Only when the clipboard refused. The alternative is the reader losing a token they
+                       just made, which is worse than showing it once with a warning. *@
+                    <strong>The clipboard refused the copy. Take this now, it will not be shown again.</strong>
+                    <code>@fallbackSecret</code>
+                    <div class="form-actions">
+                        <button type="button" class="secondary" @onclick="() => { fallbackSecret = null; collected = true; }">I have it</button>
+                    </div>
+                }
+                else
+                {
+                    <strong>@created.Name is created. Copy it now.</strong>
+                    <p class="field-hint">
+                        The secret is held for five minutes and can be read once. It is never shown on this
+                        page, so copy it straight to the clipboard.
+                    </p>
+                    <div class="form-actions">
+                        <button type="button" @onclick="CopyToken" disabled="@busy">
+                            <Icon Name="copy" />Copy the token
+                        </button>
+                    </div>
+                }
             </div>
         }
 
@@ -133,6 +163,10 @@ else if (Api.Authenticated)
 @code {
     private TokenResponse[] tokens = [];
     private TokenCreatedResponse? created;
+    /// <summary>Set once the secret has reached the clipboard, so the panel stops offering it.</summary>
+    private bool collected;
+    /// <summary>Held only when the clipboard refused, which is the one case the secret has to be shown.</summary>
+    private string? fallbackSecret;
     private string tab = "tokens";
     private string tokenName = "";
     private int tokenLifetimeDays = 30;
@@ -189,6 +223,8 @@ else if (Api.Authenticated)
         busy = true;
         message = "";
         created = null;
+        collected = false;
+        fallbackSecret = null;
         try
         {
             ApiResult<TokenCreatedResponse> result = await Api.SendAsync(HttpMethod.Post, "api/tokens",
@@ -199,6 +235,43 @@ else if (Api.Authenticated)
             created = result.Value;
             tokenName = "";
             await LoadTokens();
+        }
+        finally { busy = false; }
+    }
+
+    /// <summary>
+    /// Fetches the new token's secret and puts it on the clipboard without it ever entering the document.
+    ///
+    /// <para>
+    /// The secret is held in a local for the few lines it takes to hand it to the clipboard, and is not
+    /// kept in a field, so nothing renders it and nothing retains it. The server's handle is single use, so
+    /// this button works once; the clipboard failing is the one case where the value has to be shown, since
+    /// the alternative is losing a token that cannot be produced again.
+    /// </para>
+    /// </summary>
+    private async Task CopyToken()
+    {
+        if (busy || created is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult<TokenRevealResponse> result = await Api.SendAsync(HttpMethod.Post, "api/tokens/reveal",
+                new TokenRevealRequest(created.Reveal), ApiJson.Default.TokenRevealRequest,
+                ApiJson.Default.TokenRevealResponse, "Copied.");
+            if (!result.Ok || result.Value is null)
+            {
+                Report(new ApiResult(false, result.Message));
+                return;
+            }
+
+            string secret = result.Value.Secret;
+            bool copied;
+            try { copied = await JS.InvokeAsync<bool>("graftClipboard.copy", secret); }
+            catch (JSException) { copied = false; }
+
+            if (copied) collected = true;
+            else fallbackSecret = secret;
         }
         finally { busy = false; }
     }

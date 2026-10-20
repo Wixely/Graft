@@ -52,6 +52,19 @@ RequestThrottle loginThrottle = new(20);
 RequestThrottle browseThrottle = new(240);
 string? serverOrigin = null;
 const string SessionCookie = "__Host-graft-session";
+
+// Secrets of tokens their owner has just created and not yet copied.
+//
+// A token's secret exists exactly once: the database holds only a digest, so nothing can produce it again
+// afterwards. It used to travel in the creation response and be written into the page so it could be read
+// and copied, which put it in the DOM, in a screenshot, and in anything that walks the document.
+//
+// Instead it waits here, in memory and never on disk, for one read and a few minutes. A token nobody
+// copies therefore never reaches a browser at all, and one that is copied goes to the clipboard without
+// ever being rendered. Lost on restart by design: a secret that survived a restart would be a secret store,
+// and Graft is deliberately not one.
+ConcurrentDictionary<string, PendingSecret> pendingSecrets = new(StringComparer.Ordinal);
+TimeSpan pendingSecretWindow = TimeSpan.FromMinutes(5);
 // The forge's own Model Context Protocol endpoint. Mounted only when the operator asked for it, and then
 // governed by the administrator's stored switches, which the middleware in front of it reads per request.
 const string McpPath = "/mcp";
@@ -518,12 +531,51 @@ app.MapPost("/api/tokens", async context =>
     {
         TokenGrant token = await store.CreateTokenAsync(browser.Value.Identity, request.Name.Trim(), scopes,
             DateTimeOffset.UtcNow.AddDays(request.ExpiresInDays), context.RequestAborted);
+        // The secret stays here rather than travelling with the response, and the caller is handed a
+        // one-time claim on it. See the note beside pendingSecrets for why.
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        foreach (KeyValuePair<string, PendingSecret> stale in pendingSecrets)
+            if (stale.Value.ExpiresAtUtc <= now) pendingSecrets.TryRemove(stale.Key, out _);
+        // A ceiling as well as an expiry, so a script that creates tokens in a loop cannot grow this
+        // without bound before the first of them expires.
+        if (pendingSecrets.Count >= 512) { await ApiError(context, 429, "too many uncollected tokens; wait a moment"); return; }
+
+        string reveal = Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(16));
+        pendingSecrets[reveal] = new(browser.Value.Identity.UserId, token.Secret, now.Add(pendingSecretWindow));
+
         context.Response.StatusCode = StatusCodes.Status201Created;
         await context.Response.WriteAsJsonAsync(new TokenCreatedResponse(
-            token.Id, request.Name.Trim(), token.Secret, TokenScopeNames(token.Scopes), token.ExpiresAtUtc),
+            token.Id, request.Name.Trim(), reveal, TokenScopeNames(token.Scopes), token.ExpiresAtUtc),
             ApiJson.Default.TokenCreatedResponse, null, context.RequestAborted);
     }
     catch (ArgumentException) { await ApiError(context, 400, "token"); }
+});
+
+// Claims the secret of a token just created, once. The handle is removed before the secret is written, so
+// a second attempt finds nothing even if the first never reached the caller; losing a secret to a dropped
+// response is the safe failure, and creating another token costs nothing.
+app.MapPost("/api/tokens/reveal", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    TokenRevealRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.TokenRevealRequest, context.RequestAborted);
+    if (request?.Reveal is not { Length: > 0 } handle) { await ApiError(context, 400, "reveal"); return; }
+
+    // Removed first, so the single use is settled before anything can go wrong with the response.
+    if (!pendingSecrets.TryRemove(handle, out PendingSecret? pending))
+    { await ApiError(context, 404, "that token's secret is no longer available"); return; }
+
+    // Expiry and ownership are checked after removal, so a handle probed by the wrong account is spent
+    // rather than left for its owner to find missing later.
+    if (pending.ExpiresAtUtc <= DateTimeOffset.UtcNow || pending.UserId != browser.Value.Identity.UserId)
+    { await ApiError(context, 404, "that token's secret is no longer available"); return; }
+
+    await context.Response.WriteAsJsonAsync(new TokenRevealResponse(pending.Secret),
+        ApiJson.Default.TokenRevealResponse, null, context.RequestAborted);
 });
 
 app.MapDelete("/api/tokens/{tokenId:long}", async context =>
@@ -2708,6 +2760,12 @@ sealed class McpEndpoint : IDisposable
 
     public void Dispose() => connection?.Dispose();
 }
+
+/// <summary>
+/// A token secret waiting to be collected: whose it is, what it is, and when it stops existing. Memory
+/// only, so a restart discards every one of them.
+/// </summary>
+sealed record PendingSecret(long UserId, string Secret, DateTimeOffset ExpiresAtUtc);
 
 sealed record Arguments(string Database, string Repositories, IPAddress ListenAddress, int ListenPort, string? Origin,
     string? Certificate, string? CertificatePasswordFile, bool PublicBrowsing, bool PushToCreate, int SessionMinutes, bool Mcp,

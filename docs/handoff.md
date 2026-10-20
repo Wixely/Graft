@@ -1,6 +1,29 @@
 # Next-agent handoff
 
-Updated: 2026-10-20. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
+Updated: 2026-10-21. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
+
+## Added on 2026-10-21, copying a token without putting it in the page
+
+**A token's secret no longer travels with its creation response.** It waits in server memory, for one read
+and five minutes, and the browser claims it with `POST /api/tokens/reveal` when the owner presses Copy. The
+value goes straight to the clipboard and is never rendered, so it is not in the DOM, not in a screenshot,
+and not reachable by anything that walks the document.
+
+**A token nobody copies never reaches a browser at all**, which is the part that would be hard to retrofit
+later. The creation response carries a one-time handle instead of a secret.
+
+**The handle is removed before the secret is written to the response**, so a dropped response loses the
+secret rather than leaving a second claim behind. Losing it is the safe failure: creating another token
+costs nothing, and the database only ever held a digest, so nothing could produce the old one anyway.
+
+**The one case the secret is shown is when the clipboard refuses.** Then it is rendered with a warning and
+an acknowledgement button, because the alternative is the reader losing a token they just made. That is the
+honest fallback rather than a silent failure.
+
+Memory only, never the database: a secret that survived a restart would make Graft a secret store, and it
+is deliberately not one. Bounded at 512 uncollected secrets, with expiry pruned on each creation.
+
+Git suite 477 -> 481.
 
 ## Added on 2026-10-20, Graft explains itself to agents
 
