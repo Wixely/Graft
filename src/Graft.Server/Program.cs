@@ -1786,7 +1786,17 @@ if (settings.PagesOrigin is not null)
 
         string[] segments = context.Request.Path.Value?.Trim('/').Split('/', 2) ?? [];
         if (segments.Length == 0 || segments[0].Length == 0)
-        { await PagesMiss(context, "Name a project: https://host/<project-slug>/"); return; }
+        {
+            // The root of the pages origin belongs to no project, and a reader who trimmed a site's URL
+            // back to it is looking for whatever this host is. Send them to the forge rather than
+            // explaining the URL shape to somebody who cannot act on it.
+            //
+            // Found rather than Moved Permanently: this address may yet serve something of its own, and a
+            // permanent redirect is the one thing a browser will not let us take back.
+            context.Response.StatusCode = StatusCodes.Status302Found;
+            context.Response.Headers.Location = serverOrigin;
+            return;
+        }
 
         ProjectInfo? project = await store.FindReadyProjectByGlobalSlugAsync(segments[0], context.RequestAborted);
         // Anonymous, always: there is no session on this host to resolve. A site is therefore reachable
