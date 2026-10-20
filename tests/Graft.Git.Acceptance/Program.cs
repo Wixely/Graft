@@ -1407,6 +1407,20 @@ async Task<HttpResponseMessage> ApiGet(string address, string path, string? toke
 /// selected by Host rather than by a second listener, so the suite needs no hosts-file entry to exercise
 /// the one thing that makes a site safe: that it is a different origin.
 /// </summary>
+/// <summary>Claims a newly created token's secret, which the creation response deliberately withholds.</summary>
+async Task<string> RevealSecret(HttpClient client, string csrf, string reveal)
+{
+    using HttpRequestMessage request = new(HttpMethod.Post, "/api/tokens/reveal")
+    {
+        Content = JsonContent.Create(new { reveal })
+    };
+    request.Headers.Add("Origin", client.BaseAddress!.ToString().TrimEnd('/'));
+    request.Headers.Add("X-Graft-CSRF", csrf);
+    using HttpResponseMessage response = await client.SendAsync(request);
+    using JsonDocument json = JsonDocument.Parse(await response.Content.ReadAsStreamAsync());
+    return json.RootElement.GetProperty("secret").GetString()!;
+}
+
 async Task<HttpResponseMessage> PagesGet(string address, string? host, string path)
 {
     // Redirects are not followed: the pages origin answers one with a link back to the forge, and following
@@ -1773,7 +1787,17 @@ async Task CheckUserAdministration(string address, string adminPassword, string 
         request.Headers.Add("X-Graft-CSRF", csrf);
         using HttpResponseMessage response = await userClient.SendAsync(request);
         using JsonDocument json = JsonDocument.Parse(await response.Content.ReadAsStreamAsync());
-        return json.RootElement.GetProperty("secret").GetString()!;
+        // The secret does not travel with the creation response. It is claimed once, afterwards, which is
+        // what keeps it out of the page that would otherwise have to render it to be copied.
+        using HttpRequestMessage reveal = new(HttpMethod.Post, "/api/tokens/reveal")
+        {
+            Content = JsonContent.Create(new { reveal = json.RootElement.GetProperty("reveal").GetString() })
+        };
+        reveal.Headers.Add("Origin", address);
+        reveal.Headers.Add("X-Graft-CSRF", csrf);
+        using HttpResponseMessage revealed = await userClient.SendAsync(reveal);
+        using JsonDocument secret = JsonDocument.Parse(await revealed.Content.ReadAsStreamAsync());
+        return secret.RootElement.GetProperty("secret").GetString()!;
     }
 
     using (HttpResponseMessage response = await LoginUser(createdPassword)) Check(response.IsSuccessStatusCode, "browser-created user can log in");
@@ -1956,12 +1980,41 @@ async Task CheckPersonalAccessTokens(string address, string username, string pas
         using HttpResponseMessage response = await client.SendAsync(create);
         using JsonDocument json = JsonDocument.Parse(await response.Content.ReadAsStreamAsync());
         tokenId = json.RootElement.GetProperty("id").GetInt64();
-        tokenSecret = json.RootElement.GetProperty("secret").GetString()!;
         DateTimeOffset expiry = json.RootElement.GetProperty("expires_at_utc").GetDateTimeOffset();
-        Check(response.StatusCode == HttpStatusCode.Created && tokenSecret.StartsWith("graft_pat_", StringComparison.Ordinal) &&
+        // The creation response carries a one-time claim rather than the secret itself, so a token nobody
+        // collects never reaches the browser and a collected one never has to be rendered to be copied.
+        Check(!json.RootElement.TryGetProperty("secret", out _), "creating a token does not return its secret");
+        string reveal = json.RootElement.GetProperty("reveal").GetString()!;
+        Check(response.StatusCode == HttpStatusCode.Created &&
             json.RootElement.GetProperty("scopes")[0].GetString() == "read_repository" &&
             expiry > DateTimeOffset.UtcNow.AddDays(29) && expiry <= DateTimeOffset.UtcNow.AddDays(31),
             "browser creates scoped expiring personal token");
+
+        tokenSecret = await RevealSecret(client, csrf, reveal);
+        Check(tokenSecret.StartsWith("graft_pat_", StringComparison.Ordinal), "the secret is claimed once, afterwards");
+
+        // Single use, so a stolen or replayed handle is worth nothing after its owner has collected.
+        using (HttpRequestMessage again = new(HttpMethod.Post, "/api/tokens/reveal")
+        {
+            Content = JsonContent.Create(new { reveal })
+        })
+        {
+            again.Headers.Add("Origin", address);
+            again.Headers.Add("X-Graft-CSRF", csrf);
+            using HttpResponseMessage replay = await client.SendAsync(again);
+            Check(replay.StatusCode == HttpStatusCode.NotFound, "and a second claim on the same handle finds nothing");
+        }
+
+        // The claim is a browser act like every other token operation, so it needs the CSRF header.
+        using (HttpRequestMessage noCsrf = new(HttpMethod.Post, "/api/tokens/reveal")
+        {
+            Content = JsonContent.Create(new { reveal = "0123456789abcdef0123456789abcdef" })
+        })
+        {
+            noCsrf.Headers.Add("Origin", address);
+            using HttpResponseMessage refused = await client.SendAsync(noCsrf);
+            Check(refused.StatusCode == HttpStatusCode.Forbidden, "claiming a secret without the CSRF header is refused");
+        }
     }
     using (HttpResponseMessage response = await client.GetAsync("/api/tokens"))
     {

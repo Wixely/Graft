@@ -107,7 +107,16 @@ public sealed record UserAccountResponse(long Id, string Username, bool IsAdmini
 public sealed record PasswordChangeRequest(string CurrentPassword, string NewPassword);
 public sealed record PasswordResetRequest(string NewPassword);
 public sealed record TokenCreateRequest(string Name, string[] Scopes, int ExpiresInDays);
-public sealed record TokenCreatedResponse(long Id, string Name, string Secret, string[] Scopes, DateTimeOffset ExpiresAtUtc);
+/// <summary>
+/// A token that was just created. It carries no secret: the secret is fetched once, on demand, with
+/// <see cref="Reveal"/>, so a token nobody copies never reaches the browser at all and a copied one never
+/// has to be put in the page to be copied.
+/// </summary>
+public sealed record TokenCreatedResponse(long Id, string Name, string Reveal, string[] Scopes, DateTimeOffset ExpiresAtUtc);
+
+/// <summary>Claims the one-time secret of a token just created. The handle is single use and short lived.</summary>
+public sealed record TokenRevealRequest(string Reveal);
+public sealed record TokenRevealResponse(string Secret);
 public sealed record TokenResponse(long Id, string Name, string[] Scopes, DateTimeOffset ExpiresAtUtc, DateTimeOffset CreatedAtUtc);
 public sealed record ProjectCreateRequest(string? Name, string? Path, string? Description, string? Visibility);
 public sealed record MembershipSetRequest(string Username, string Role);
@@ -326,6 +335,8 @@ public sealed record McpSettingsRequest(
 [JsonSerializable(typeof(PasswordResetRequest))]
 [JsonSerializable(typeof(TokenCreateRequest))]
 [JsonSerializable(typeof(TokenCreatedResponse))]
+[JsonSerializable(typeof(TokenRevealRequest))]
+[JsonSerializable(typeof(TokenRevealResponse))]
 [JsonSerializable(typeof(TokenResponse[]))]
 [JsonSerializable(typeof(ProjectCreateRequest))]
 [JsonSerializable(typeof(MembershipSetRequest))]
