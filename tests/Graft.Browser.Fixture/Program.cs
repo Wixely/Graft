@@ -36,6 +36,11 @@ string repositoriesRoot = Path.Combine(root, "repositories");
 string gitConfig = Path.Combine(root, "empty.gitconfig");
 Directory.CreateDirectory(root);
 File.WriteAllText(gitConfig, "");
+
+// The port is chosen here rather than by the server, because the pages origin has to be named before the
+// server starts and it has to carry the same port.
+int port = FreePort();
+string pagesOrigin = "https://localhost:" + port.ToString(System.Globalization.CultureInfo.InvariantCulture);
 Process? server = null;
 Task? outputReader = null;
 Task<string>? errorReader = null;
@@ -103,10 +108,38 @@ try
     await Git(source, ["remote", "add", "origin", AuthenticatedUrl(address, username, token.Secret, username + "/seeded.git")]);
     await Git(source, ["push", "origin", "main"]);
 
+    // The page-only project gets the committed sample pushed into it, so the fixture shows a real curated
+    // page and a real site rather than an empty page that is technically correct and demonstrates nothing.
+    string sample = Path.Combine(root, "page-sample");
+    Directory.CreateDirectory(Path.Combine(sample, ".graft"));
+    Directory.CreateDirectory(Path.Combine(sample, "pages"));
+    Directory.CreateDirectory(Path.Combine(sample, "docs"));
+    Directory.CreateDirectory(Path.Combine(sample, "src"));
+    await Git(sample, ["init", "--initial-branch=main"]);
+    File.WriteAllBytes(Path.Combine(sample, ".graft", "project.json"), Fixture("sample/project.json"));
+    File.WriteAllBytes(Path.Combine(sample, "README.md"), Fixture("sample/README.md"));
+    File.WriteAllBytes(Path.Combine(sample, "compose.yaml"), Fixture("sample/compose.yaml"));
+    File.WriteAllBytes(Path.Combine(sample, "docs", "guide.md"), Fixture("sample/docs-guide.md"));
+    File.WriteAllBytes(Path.Combine(sample, "pages", "index.html"), Fixture("sample/pages-index.html"));
+    File.WriteAllBytes(Path.Combine(sample, "pages", "about.html"), Fixture("sample/pages-about.html"));
+    File.WriteAllBytes(Path.Combine(sample, "pages", "style.css"), Fixture("sample/pages-style.css"));
+    File.WriteAllBytes(Path.Combine(sample, "pages", "lantern.svg"), Fixture("sample/pages-lantern.svg"));
+    // Present so that the allowlist can be seen refusing something, rather than only admitting things.
+    File.WriteAllText(Path.Combine(sample, "src", "Secrets.cs"),
+        "// If this appears on the page or the site, the allowlist failed.\nconst string Key = \"never-served\";\n");
+    await Git(sample, ["add", "."]);
+    await Git(sample, ["commit", "-m", "A site in the pages folder, and a page config"]);
+    await Git(sample, ["push", AuthenticatedUrl(address, username, token.Secret, username + "/page-only.git"), "main"]);
+
     // Echo the credentials only when they are the throwaway defaults, so a supplied password is never logged.
     Console.WriteLine(password == DefaultPassword
         ? $"FIXTURE: username={username}; password={password}; project={username}/seeded"
         : $"FIXTURE: username={username}; password=(from GRAFT_BROWSER_FIXTURE_PASSWORD); project={username}/seeded");
+    // Both halves of the project page, printed so a developer does not have to work out either address.
+    // The page is on the forge; the site is on the pages origin, which is the same listener under a name a
+    // browser treats as a different origin.
+    Console.WriteLine("PAGE: " + address + "/-/p/page-only");
+    Console.WriteLine("SITE: " + pagesOrigin + "/page-only/");
     Console.WriteLine("READY: " + address + "/projects");
     Console.WriteLine("Press Enter to stop and remove the disposable fixture.");
     await Console.In.ReadLineAsync();
@@ -160,6 +193,14 @@ async Task<string> StartServer()
     // It is off by default in the product, and a fixture is not a deployment.
     start.ArgumentList.Add("--public-browsing");
     start.ArgumentList.Add("true");
+    // The forge listens on a port this fixture chose, so it can also name a pages origin on the same port.
+    start.ArgumentList.Add("--listen");
+    start.ArgumentList.Add("https://127.0.0.1:" + port.ToString(System.Globalization.CultureInfo.InvariantCulture));
+    // `localhost` and `127.0.0.1` are the same listener and are covered by the same generated certificate,
+    // but they are different origins to a browser, which is the only property a project site depends on.
+    // So a developer gets a working pages origin with no hosts file to edit and no second certificate.
+    start.ArgumentList.Add("--pages-origin");
+    start.ArgumentList.Add(pagesOrigin);
     server = Process.Start(start)!;
     Process active = server;
     errorReader = active.StandardError.ReadToEndAsync();
@@ -227,3 +268,12 @@ static byte[] Fixture(string name)
 static string AuthenticatedUrl(string address, string username, string token, string path) =>
     address.Replace("https://", "https://" + Uri.EscapeDataString(username) + ":" + Uri.EscapeDataString(token) + "@", StringComparison.Ordinal) + "/" + path;
 static string Redact(string message) => message.Contains("graft_pat_", StringComparison.Ordinal) ? "credential-bearing operation failed" : message;
+
+/// <summary>A free loopback port, so the fixture can name the pages origin before the server starts.</summary>
+static int FreePort()
+{
+    using System.Net.Sockets.Socket probe = new(System.Net.Sockets.AddressFamily.InterNetwork,
+        System.Net.Sockets.SocketType.Stream, System.Net.Sockets.ProtocolType.Tcp);
+    probe.Bind(new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 0));
+    return ((System.Net.IPEndPoint)probe.LocalEndPoint!).Port;
+}

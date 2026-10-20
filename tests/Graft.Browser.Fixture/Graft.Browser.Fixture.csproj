@@ -13,6 +13,16 @@
          repository rather than a synthetic placeholder. -->
     <EmbeddedResource Include="Fixtures/README.md" LogicalName="fixture/README.md" />
     <EmbeddedResource Include="../../docs/assets/graft-readme-blue.png" LogicalName="fixture/graft-readme-blue.png" />
+    <!-- The committed project-page sample, so the fixture serves the same repository the documentation
+         shows rather than a second copy that can drift from it. -->
+    <EmbeddedResource Include="../../samples/project-page/.graft/project.json" LogicalName="sample/project.json" />
+    <EmbeddedResource Include="../../samples/project-page/README.md" LogicalName="sample/README.md" />
+    <EmbeddedResource Include="../../samples/project-page/compose.yaml" LogicalName="sample/compose.yaml" />
+    <EmbeddedResource Include="../../samples/project-page/docs/guide.md" LogicalName="sample/docs-guide.md" />
+    <EmbeddedResource Include="../../samples/project-page/pages/index.html" LogicalName="sample/pages-index.html" />
+    <EmbeddedResource Include="../../samples/project-page/pages/about.html" LogicalName="sample/pages-about.html" />
+    <EmbeddedResource Include="../../samples/project-page/pages/style.css" LogicalName="sample/pages-style.css" />
+    <EmbeddedResource Include="../../samples/project-page/pages/lantern.svg" LogicalName="sample/pages-lantern.svg" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../../src/Graft.Core/Graft.Core.csproj" />
