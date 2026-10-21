@@ -13,7 +13,10 @@ single-use handle rather than the secret; pressing Copy claims it with one reque
 to the clipboard. A token nobody copies therefore never reaches the browser, and a copied one is never in
 the document for a screenshot or an extension to find. The secret waits in server memory for five minutes
 and one read, never on disk, and is shown only if the clipboard refuses, because losing a token that cannot
-be produced again is worse.
+be produced again is worse. Separately, an operator can now switch on
+`--recoverable-tokens`, which keeps each new token's secret encrypted so its owner can copy it again with
+their account password. Off by default, because with it on the database and its key ring together are every
+token on the instance; see [ADR 0012](docs/decisions/0012-recoverable-tokens.md).
 
 Status as of **2026-10-20**: the project page is now what it was always meant to be. A `.graft/project.json`
 in the repository says what the page offers, a file allowlist decides which files are reachable, and a

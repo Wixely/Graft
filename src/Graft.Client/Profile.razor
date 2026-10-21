@@ -47,12 +47,12 @@ else if (Api.Authenticated)
         @* The token's secret is never put on this page. It waits on the server for one read, and the button
            below fetches it straight into the clipboard. A token nobody copies therefore never reaches the
            browser, and a copied one is never in the document for a screenshot or an extension to find. *@
-        @if (created is not null)
+        @if (created is not null || fallbackSecret is not null)
         {
             <div class="secret" role="status">
-                @if (collected)
+                @if (fallbackSecret is null && collected)
                 {
-                    <strong>Copied. @created.Name is ready to use.</strong>
+                    <strong>Copied. @created!.Name is ready to use.</strong>
                     <p class="field-hint">The secret is no longer available anywhere. Create another token if you lose it.</p>
                 }
                 else if (fallbackSecret is not null)
@@ -67,7 +67,7 @@ else if (Api.Authenticated)
                 }
                 else
                 {
-                    <strong>@created.Name is created. Copy it now.</strong>
+                    <strong>@created!.Name is created. Copy it now.</strong>
                     <p class="field-hint">
                         The secret is held for five minutes and can be read once. It is never shown on this
                         page, so copy it straight to the clipboard.
@@ -78,6 +78,28 @@ else if (Api.Authenticated)
                         </button>
                     </div>
                 }
+            </div>
+        }
+
+        @* Confirming the account password before an existing secret is produced. A session alone must not
+           become every credential the account holds, so this is asked for every read. *@
+        @if (secretFor is not null)
+        {
+            <div class="panel">
+                <div class="panel-header"><Icon Name="key" /><h2>Copy @secretFor.Name</h2></div>
+                <div class="panel-body">
+                    <p class="secondary-text">
+                        Confirm your password. The secret goes straight to the clipboard and is not shown here.
+                    </p>
+                    <form class="form" @onsubmit="CopyExisting" @onsubmit:preventDefault>
+                        <label for="secret-password">Your password</label>
+                        <input id="secret-password" type="password" @bind="secretPassword" required maxlength="256" autocomplete="current-password" />
+                        <div class="form-actions">
+                            <button type="submit" disabled="@busy">@(busy ? "Copying…" : "Copy to clipboard")</button>
+                            <button type="button" class="secondary" @onclick="CancelSecret" disabled="@busy">Cancel</button>
+                        </div>
+                    </form>
+                </div>
             </div>
         }
 
@@ -126,6 +148,15 @@ else if (Api.Authenticated)
                                 <small>@string.Join(", ", token.Scopes) &middot; expires @token.ExpiresAtUtc.ToString("yyyy-MM-dd")</small>
                             </span>
                             <span class="list-item-actions">
+                                @* Offered only where the secret was kept, which depends on what the
+                                   operator had configured when this token was issued. A token without it
+                                   cannot be read back by anyone, including an administrator. *@
+                                @if (token.Recoverable)
+                                {
+                                    <button type="button" class="secondary" @onclick="() => AskForSecret(token)" disabled="@busy">
+                                        <Icon Name="copy" />Copy
+                                    </button>
+                                }
                                 <button type="button" class="secondary" @onclick="() => RevokeToken(token)" disabled="@busy">Revoke</button>
                             </span>
                         </div>
@@ -167,6 +198,9 @@ else if (Api.Authenticated)
     private bool collected;
     /// <summary>Held only when the clipboard refused, which is the one case the secret has to be shown.</summary>
     private string? fallbackSecret;
+    /// <summary>The token whose secret is being asked for, while the password is confirmed.</summary>
+    private TokenResponse? secretFor;
+    private string secretPassword = "";
     private string tab = "tokens";
     private string tokenName = "";
     private int tokenLifetimeDays = 30;
@@ -272,6 +306,57 @@ else if (Api.Authenticated)
 
             if (copied) collected = true;
             else fallbackSecret = secret;
+        }
+        finally { busy = false; }
+    }
+
+    private void AskForSecret(TokenResponse token)
+    {
+        secretFor = token;
+        secretPassword = "";
+        message = "";
+    }
+
+    private void CancelSecret()
+    {
+        secretFor = null;
+        secretPassword = "";
+    }
+
+    /// <summary>
+    /// Reads an existing token's secret and puts it on the clipboard, never in the page. The password is
+    /// cleared whatever happens, and the secret lives in a local for the few lines it takes to copy it.
+    /// </summary>
+    private async Task CopyExisting()
+    {
+        if (busy || secretFor is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult<TokenRevealResponse> result = await Api.SendAsync(HttpMethod.Post,
+                $"api/tokens/{secretFor.Id}/secret", new TokenSecretRequest(secretPassword),
+                ApiJson.Default.TokenSecretRequest, ApiJson.Default.TokenRevealResponse, "Copied.");
+            secretPassword = "";
+            if (!result.Ok || result.Value is null) { Report(new ApiResult(false, result.Message)); return; }
+
+            bool copied;
+            try { copied = await JS.InvokeAsync<bool>("graftClipboard.copy", result.Value.Secret); }
+            catch (JSException) { copied = false; }
+
+            if (copied)
+            {
+                Report(ApiResult.Accepted($"{secretFor.Name} copied to the clipboard."));
+                secretFor = null;
+            }
+            else
+            {
+                // Shown only because the clipboard refused, and the reader would otherwise have confirmed a
+                // password for nothing.
+                fallbackSecret = result.Value.Secret;
+                created = null;
+                secretFor = null;
+            }
         }
         finally { busy = false; }
     }

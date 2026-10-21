@@ -33,7 +33,7 @@ if (args.Length == 1 && args[0] == "--licences")
 
 if (!Arguments.TryParse(args, out Arguments? parsedSettings))
 {
-    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>] [--mcp true|false] [--pages-origin <https origin>].");
+    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>] [--mcp true|false] [--pages-origin <https origin>] [--recoverable-tokens true|false].");
     Console.Error.WriteLine("       Graft.Server --licences  prints the third-party notices this build redistributes.");
     return 2;
 }
@@ -157,6 +157,14 @@ builder.WebHost.ConfigureKestrel(options =>
 });
 
 await using WebApplication app = builder.Build();
+
+// How a recoverable token's secret is kept, when an operator has asked for that. The key ring already
+// exists for antiforgery and lives beside the database in the state directory, which bounds what this
+// protects against: a stolen database alone, or a dump of one, rather than a stolen machine. The honest
+// framing is in ADR 0012, and the switch is off unless somebody turned it on.
+IDataProtector? tokenProtector = settings.RecoverableTokens
+    ? app.Services.GetRequiredService<IDataProtectionProvider>().CreateProtector("graft.token.recovery.v1")
+    : null;
 app.Use(async (context, next) =>
 {
     context.Response.Headers.CacheControl = "no-store";
@@ -511,7 +519,8 @@ app.MapGet("/api/tokens", async context =>
     if (!await OnlyQuery(context)) return;
     IReadOnlyList<PersonalAccessToken> tokens = await store.ListActiveTokensAsync(browser.Value.Identity, context.RequestAborted);
     TokenResponse[] response = tokens.Select(token => new TokenResponse(
-        token.Id, token.Name, TokenScopeNames(token.Scopes), token.ExpiresAtUtc, token.CreatedAtUtc)).ToArray();
+        token.Id, token.Name, TokenScopeNames(token.Scopes), token.ExpiresAtUtc, token.CreatedAtUtc,
+        token.Recoverable)).ToArray();
     await context.Response.WriteAsJsonAsync(response, ApiJson.Default.TokenResponseArray, null, context.RequestAborted);
 });
 
@@ -530,7 +539,8 @@ app.MapPost("/api/tokens", async context =>
     try
     {
         TokenGrant token = await store.CreateTokenAsync(browser.Value.Identity, request.Name.Trim(), scopes,
-            DateTimeOffset.UtcNow.AddDays(request.ExpiresInDays), context.RequestAborted);
+            DateTimeOffset.UtcNow.AddDays(request.ExpiresInDays), context.RequestAborted,
+            tokenProtector is null ? null : tokenProtector.Protect);
         // The secret stays here rather than travelling with the response, and the caller is handed a
         // one-time claim on it. See the note beside pendingSecrets for why.
         DateTimeOffset now = DateTimeOffset.UtcNow;
@@ -575,6 +585,47 @@ app.MapPost("/api/tokens/reveal", async context =>
     { await ApiError(context, 404, "that token's secret is no longer available"); return; }
 
     await context.Response.WriteAsJsonAsync(new TokenRevealResponse(pending.Secret),
+        ApiJson.Default.TokenRevealResponse, null, context.RequestAborted);
+});
+
+// Reads back an existing token's secret, where the operator has asked for recoverable tokens and this
+// token was issued while that was so. Off by default, and a token issued with it off can never be read
+// here however the setting changes afterwards.
+//
+// The account password is required on top of the session. Without it, anyone holding a signed-in browser
+// could harvest every token the account has, silently; with it, the worst a stolen session does is what it
+// always did, which is create new tokens that show up in the list and the audit log.
+app.MapPost("/api/tokens/{tokenId:long}/secret", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    TokenSecretRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.TokenSecretRequest, context.RequestAborted);
+    if (request?.Password is not { Length: > 0 }) { await ApiError(context, 400, "password"); return; }
+
+    // Rate limited on the same throttle as signing in, because this route takes a password and would
+    // otherwise be a quieter place to guess one.
+    if (!loginThrottle.TryEnter(DateTimeOffset.UtcNow)) { await ApiError(context, 429, "too many attempts"); return; }
+
+    if (tokenProtector is null)
+    { await ApiError(context, 404, "this server does not keep token secrets"); return; }
+
+    long tokenId = Convert.ToInt64(context.Request.RouteValues["tokenId"], System.Globalization.CultureInfo.InvariantCulture);
+    string? cipher;
+    try { cipher = await store.ReadTokenCipherAsync(browser.Value.Identity, tokenId, request.Password, context.RequestAborted); }
+    catch (UnauthorizedAccessException) { await ApiError(context, 403, "the password was not accepted"); return; }
+    if (cipher is null) { await ApiError(context, 404, "that token's secret was not kept"); return; }
+
+    string secret;
+    // A cipher this server cannot unprotect is one encrypted under a key ring it no longer has, which is
+    // the same outcome as never having kept it: the token still works, it just cannot be read again.
+    try { secret = tokenProtector.Unprotect(cipher); }
+    catch (CryptographicException) { await ApiError(context, 404, "that token's secret can no longer be read"); return; }
+
+    await context.Response.WriteAsJsonAsync(new TokenRevealResponse(secret),
         ApiJson.Default.TokenRevealResponse, null, context.RequestAborted);
 });
 
@@ -2006,6 +2057,9 @@ if (settings.Mcp)
         "; writes=" + (posture.AllowWrites ? "allowed" : "refused"));
 }
 else Console.WriteLine("MCP: off");
+Console.WriteLine("TOKENS: " + (settings.RecoverableTokens
+    ? "secrets kept and readable by their owner with a password"
+    : "secrets unrecoverable once issued"));
 Console.WriteLine(settings.PagesOrigin is null ? "PAGES: off" : "PAGES: " + settings.PagesOrigin + "/<project-slug>/");
 Console.WriteLine("READY: " + address);
 await app.WaitForShutdownAsync();
@@ -2769,12 +2823,12 @@ sealed record PendingSecret(long UserId, string Secret, DateTimeOffset ExpiresAt
 
 sealed record Arguments(string Database, string Repositories, IPAddress ListenAddress, int ListenPort, string? Origin,
     string? Certificate, string? CertificatePasswordFile, bool PublicBrowsing, bool PushToCreate, int SessionMinutes, bool Mcp,
-    string? PagesOrigin)
+    string? PagesOrigin, bool RecoverableTokens)
 {
     public static bool TryParse(string[] values, out Arguments? result)
     {
         result = null;
-        if (values.Length is < 4 or > 22 || values.Length % 2 != 0) return false;
+        if (values.Length is < 4 or > 24 || values.Length % 2 != 0) return false;
         string? database = null;
         string? repositories = null;
         string? listen = null;
@@ -2786,6 +2840,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         string? sessionMinutes = null;
         string? mcp = null;
         string? pagesOrigin = null;
+        string? recoverableTokens = null;
         HashSet<string> seen = new(StringComparer.Ordinal);
         for (int index = 0; index < values.Length; index += 2)
         {
@@ -2801,6 +2856,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             else if (values[index] == "--session-minutes") sessionMinutes = values[index + 1];
             else if (values[index] == "--mcp") mcp = values[index + 1];
             else if (values[index] == "--pages-origin") pagesOrigin = values[index + 1];
+            else if (values[index] == "--recoverable-tokens") recoverableTokens = values[index + 1];
             else return false;
         }
         if (string.IsNullOrWhiteSpace(database) || string.IsNullOrWhiteSpace(repositories)) return false;
@@ -2811,6 +2867,9 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         // Whether the forge hosts its Model Context Protocol endpoint at all. The operator's gate; the
         // administrator's switches beneath it live in the database and are edited in the browser.
         if (mcp is not null and not "true" and not "false") return false;
+        // Whether a token's secret stays readable after it is issued. Off by default, and off is the only
+        // state in which losing a token is not also a way to read somebody else's: see ADR 0012.
+        if (recoverableTokens is not null and not "true" and not "false") return false;
         // Where project sites are served, on a hostname of their own. Repository-authored HTML cannot share
         // an origin with the session cookie and the API, so this names a second host or the feature stays
         // off. An https origin with no path, for the same reasons --origin takes one.
@@ -2856,7 +2915,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             origin is null ? null : origin.TrimEnd('/'), certificate is null ? null : Path.GetFullPath(certificate),
             certificatePasswordFile is null ? null : Path.GetFullPath(certificatePasswordFile),
             publicBrowsing == "true", pushToCreate == "true", window, mcp == "true",
-            pagesOrigin);
+            pagesOrigin, recoverableTokens == "true");
         return true;
     }
 }

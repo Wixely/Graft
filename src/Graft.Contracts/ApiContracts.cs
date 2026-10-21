@@ -117,7 +117,14 @@ public sealed record TokenCreatedResponse(long Id, string Name, string Reveal, s
 /// <summary>Claims the one-time secret of a token just created. The handle is single use and short lived.</summary>
 public sealed record TokenRevealRequest(string Reveal);
 public sealed record TokenRevealResponse(string Secret);
-public sealed record TokenResponse(long Id, string Name, string[] Scopes, DateTimeOffset ExpiresAtUtc, DateTimeOffset CreatedAtUtc);
+public sealed record TokenResponse(long Id, string Name, string[] Scopes, DateTimeOffset ExpiresAtUtc, DateTimeOffset CreatedAtUtc,
+    /// <summary>Whether this token's secret can still be produced, which is true only where the operator had
+    /// asked for recoverable tokens when it was issued.</summary>
+    bool Recoverable = false);
+
+/// <summary>Reads back an existing token's secret. The account password is required: a session alone must
+/// not turn into every credential the account holds.</summary>
+public sealed record TokenSecretRequest(string Password);
 public sealed record ProjectCreateRequest(string? Name, string? Path, string? Description, string? Visibility);
 public sealed record MembershipSetRequest(string Username, string Role);
 
@@ -336,6 +343,7 @@ public sealed record McpSettingsRequest(
 [JsonSerializable(typeof(TokenCreateRequest))]
 [JsonSerializable(typeof(TokenCreatedResponse))]
 [JsonSerializable(typeof(TokenRevealRequest))]
+[JsonSerializable(typeof(TokenSecretRequest))]
 [JsonSerializable(typeof(TokenRevealResponse))]
 [JsonSerializable(typeof(TokenResponse[]))]
 [JsonSerializable(typeof(ProjectCreateRequest))]

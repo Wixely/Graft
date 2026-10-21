@@ -222,7 +222,10 @@ public sealed record SessionGrant(string Secret, DateTimeOffset ExpiresAtUtc);
 /// honouring it, and the two disagreeing is how a live session turns into an anonymous request.</summary>
 public sealed record ResolvedSession(AuthenticatedIdentity Identity, DateTimeOffset ExpiresAtUtc, bool Renewed);
 public sealed record TokenGrant(long Id, string Secret, TokenScope Scopes, DateTimeOffset ExpiresAtUtc);
-public sealed record PersonalAccessToken(long Id, string Name, TokenScope Scopes, DateTimeOffset ExpiresAtUtc, DateTimeOffset CreatedAtUtc);
+public sealed record PersonalAccessToken(long Id, string Name, TokenScope Scopes, DateTimeOffset ExpiresAtUtc, DateTimeOffset CreatedAtUtc,
+    /// <summary>Whether this token's secret can still be produced. True only where an operator had asked
+    /// for recoverable tokens when it was issued, so it is a property of the token and not of the server.</summary>
+    bool Recoverable = false);
 
 /// <summary>
 /// The administrator's switches for the forge's own Model Context Protocol endpoint. These exist only
