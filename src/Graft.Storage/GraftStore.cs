@@ -328,12 +328,23 @@ public sealed class GraftStore : IAsyncDisposable
             """, new RevokeSecretParameters(Digest(secret), Now()));
     }
 
+    /// <summary>
+    /// Issues a personal access token. The secret is returned once and stored only as a digest.
+    ///
+    /// <para>
+    /// <paramref name="protect"/> is how an operator who has asked for recoverable tokens keeps a secret
+    /// readable afterwards: the caller encrypts, this stores the result, and the store never holds a key or
+    /// sees a recoverable secret in the clear. Null, which is the default and the normal case, means the
+    /// secret is unrecoverable the moment this returns.
+    /// </para>
+    /// </summary>
     public async Task<TokenGrant> CreateTokenAsync(
         AuthenticatedIdentity actor,
         string name,
         TokenScope scopes,
         DateTimeOffset expiresAtUtc,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        Func<string, string>? protect = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         if (name.Length > 100) throw new ArgumentException("Token names cannot exceed 100 characters.", nameof(name));
@@ -348,10 +359,10 @@ public sealed class GraftStore : IAsyncDisposable
         string secret = NewSecret("graft_pat_");
         string now = Now();
         long id = await db.QuerySingleAsync<long>("""
-            INSERT INTO AccessTokens (UserId, Name, SecretDigest, Scopes, ExpiresAtUtc, RevokedAtUtc, CreatedAtUtc)
-            VALUES (@UserId, @Name, @SecretDigest, @Scopes, @ExpiresAtUtc, NULL, @CreatedAtUtc)
+            INSERT INTO AccessTokens (UserId, Name, SecretDigest, Scopes, ExpiresAtUtc, RevokedAtUtc, CreatedAtUtc, SecretCipher)
+            VALUES (@UserId, @Name, @SecretDigest, @Scopes, @ExpiresAtUtc, NULL, @CreatedAtUtc, @SecretCipher)
             RETURNING Id;
-            """, new TokenParameters(actor.UserId, name, Digest(secret), (int)scopes, expiresAtUtc.ToString("O"), now), transaction);
+            """, new TokenParameters(actor.UserId, name, Digest(secret), (int)scopes, expiresAtUtc.ToString("O"), now, protect?.Invoke(secret)), transaction);
         await AuditAsync(db, transaction, actor.UserId, "create-token", "token", id.ToString(CultureInfo.InvariantCulture), "Personal token created.", now);
         await transaction.CommitAsync(cancellationToken);
         return new(id, secret, scopes, expiresAtUtc);
@@ -374,6 +385,54 @@ public sealed class GraftStore : IAsyncDisposable
             : new(row.Id, row.Username, row.IsAdministrator != 0, IdentityKind.PersonalAccessToken, (TokenScope)row.Scopes);
     }
 
+    /// <summary>
+    /// Returns the stored cipher of one of the caller's own live tokens, after checking their password.
+    ///
+    /// <para>
+    /// The password is required because a session is not enough. Without it, anyone who obtained a signed-in
+    /// browser could read every token the account holds, silently and all at once; today the worst they can
+    /// do is create new ones, which are visible in the list and in the audit log. Recoverable tokens must not
+    /// quietly turn session theft into credential theft.
+    /// </para>
+    ///
+    /// <para>
+    /// Returns null where the token is not the caller's, is revoked or expired, or was issued while the
+    /// operator had not asked for recoverable tokens. Throws when the password is wrong.
+    /// </para>
+    /// </summary>
+    public async Task<string?> ReadTokenCipherAsync(
+        AuthenticatedIdentity actor,
+        long tokenId,
+        string password,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(actor);
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        AuthenticatedIdentity liveActor = await RequireLiveIdentityAsync(db, null, actor, cancellationToken);
+
+        UserCredentialRow? user = await db.QuerySingleOrDefaultAsync<UserCredentialRow>("""
+            SELECT Id, Username, PasswordHash, IsAdministrator, Disabled
+            FROM Users WHERE Id = @Id;
+            """, new IdParameters(liveActor.UserId));
+        if (user is null || !PasswordHash.Verify(password, user.PasswordHash))
+            throw new UnauthorizedAccessException("The password was not accepted.");
+
+        string? cipher = await db.QuerySingleOrDefaultAsync<string>("""
+            SELECT SecretCipher
+            FROM AccessTokens
+            WHERE Id = @Id AND UserId = @UserId AND RevokedAtUtc IS NULL AND ExpiresAtUtc > @NowUtc;
+            """, new TokenCipherParameters(tokenId, liveActor.UserId, Now()));
+        if (cipher is not { Length: > 0 }) return null;
+
+        // Audited, because reading a credential is an event somebody should be able to see afterwards. The
+        // secret itself is never written here, only that it was read.
+        await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
+        await AuditAsync(db, transaction, liveActor.UserId, "reveal-token", "token",
+            tokenId.ToString(CultureInfo.InvariantCulture), "Token secret read by its owner.", Now());
+        await transaction.CommitAsync(cancellationToken);
+        return cipher;
+    }
+
     public async Task<IReadOnlyList<PersonalAccessToken>> ListActiveTokensAsync(
         AuthenticatedIdentity actor,
         CancellationToken cancellationToken = default)
@@ -381,14 +440,15 @@ public sealed class GraftStore : IAsyncDisposable
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
         AuthenticatedIdentity liveActor = await RequireLiveIdentityAsync(db, null, actor, cancellationToken);
         IEnumerable<TokenRow> rows = await db.QueryAsync<TokenRow>("""
-            SELECT Id, Name, Scopes, ExpiresAtUtc, CreatedAtUtc
+            SELECT Id, Name, Scopes, ExpiresAtUtc, CreatedAtUtc, SecretCipher
             FROM AccessTokens
             WHERE UserId = @UserId AND RevokedAtUtc IS NULL AND ExpiresAtUtc > @NowUtc
             ORDER BY Id DESC;
             """, new ActiveTokensParameters(liveActor.UserId, Now()));
         return rows.Select(row => new PersonalAccessToken(row.Id, row.Name, (TokenScope)row.Scopes,
             DateTimeOffset.Parse(row.ExpiresAtUtc, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
-            DateTimeOffset.Parse(row.CreatedAtUtc, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind))).ToArray();
+            DateTimeOffset.Parse(row.CreatedAtUtc, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+            row.SecretCipher is { Length: > 0 })).ToArray();
     }
 
     public async Task RevokeOwnTokenAsync(
@@ -1414,6 +1474,7 @@ internal sealed class TokenRow
     public long Scopes { get; set; }
     public string ExpiresAtUtc { get; set; } = "";
     public string CreatedAtUtc { get; set; } = "";
+    public string? SecretCipher { get; set; }
 }
 internal sealed class ProjectOwnerRow { public long OwnerUserId { get; set; } }
 internal sealed class ProjectAccessRow
@@ -1449,7 +1510,7 @@ internal sealed record SessionParameters(long UserId, string SecretDigest, strin
 internal sealed record ResolveSecretParameters(string SecretDigest, string NowUtc);
 internal sealed record RenewSessionParameters(string SecretDigest, string ExpiresAtUtc);
 internal sealed record RevokeSecretParameters(string SecretDigest, string RevokedAtUtc);
-internal sealed record TokenParameters(long UserId, string Name, string SecretDigest, int Scopes, string ExpiresAtUtc, string CreatedAtUtc);
+internal sealed record TokenParameters(long UserId, string Name, string SecretDigest, int Scopes, string ExpiresAtUtc, string CreatedAtUtc, string? SecretCipher);
 internal sealed record IdParameters(long Id);
 internal sealed record RevokeByIdParameters(long Id, string RevokedAtUtc);
 internal sealed record RevokeOwnTokenParameters(long Id, long UserId, string RevokedAtUtc);
@@ -1481,3 +1542,4 @@ internal sealed class SettingRow
     public string Name { get; set; } = "";
     public string Value { get; set; } = "";
 }
+internal sealed record TokenCipherParameters(long Id, long UserId, string NowUtc);

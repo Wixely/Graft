@@ -12,6 +12,13 @@ and not reachable by anything that walks the document.
 **A token nobody copies never reaches a browser at all**, which is the part that would be hard to retrofit
 later. The creation response carries a one-time handle instead of a secret.
 
+**And an existing token can be copied, where an operator asked for that.** `--recoverable-tokens true` keeps
+each new token's secret encrypted, and its owner reads it back with their account password; off by default,
+and a token issued while it was off can never be read back. The password is the decision that makes it
+defensible: without it a stolen session would be every credential the account holds. See
+[ADR 0012](decisions/0012-recoverable-tokens.md) and
+[the evidence](validation/2026-10-21-recoverable-tokens.md).
+
 **The handle is removed before the secret is written to the response**, so a dropped response loses the
 secret rather than leaving a second claim behind. Losing it is the safe failure: creating another token
 costs nothing, and the database only ever held a digest, so nothing could produce the old one anyway.
@@ -23,7 +30,7 @@ honest fallback rather than a silent failure.
 Memory only, never the database: a secret that survived a restart would make Graft a secret store, and it
 is deliberately not one. Bounded at 512 uncollected secrets, with expiry pruned on each creation.
 
-Git suite 477 -> 481.
+Git suite 477 -> 483.
 
 ## Added on 2026-10-20, Graft explains itself to agents
 

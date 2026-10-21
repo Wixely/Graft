@@ -4,7 +4,7 @@ namespace Graft.Storage;
 
 public static class GraftSchema
 {
-    public static DnaXMigrationManifest Manifest { get; } = new(6,
+    public static DnaXMigrationManifest Manifest { get; } = new(7,
     [
         DnaXMigration.Sql(1, "initial-identity-project-schema", "Create identity and private project schema", """
             CREATE TABLE Users (
@@ -145,6 +145,16 @@ public static class GraftSchema
             UPDATE Projects SET GlobalSlug = NormalizedSlug || '--' || Id WHERE GlobalSlug IS NULL;
 
             CREATE UNIQUE INDEX IX_Projects_GlobalSlug ON Projects(GlobalSlug);
+            """),
+        // Where a token's secret is kept when, and only when, an operator has asked for recoverable tokens.
+        // Null is the normal state and the only state for every token created before that was switched on,
+        // which is why recoverability is a property of each token rather than of the server: a column that
+        // was filled only sometimes cannot be read as "the setting is on now".
+        //
+        // The server encrypts before this is written and decrypts after it is read; the store never sees a
+        // recoverable secret in the clear and holds no key.
+        DnaXMigration.Sql(7, "token-secret-cipher", "Let an operator keep token secrets recoverable", """
+            ALTER TABLE AccessTokens ADD COLUMN SecretCipher TEXT NULL;
             """)
     ]);
 }

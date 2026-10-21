@@ -108,6 +108,35 @@ MCP: https://graft.example.internal:8443/mcp; enabled=true; credentials=required
 
 For a client that launches its MCP server locally over stdio, `Graft.Mcp` remains a separate executable; see [build-and-test](build-and-test.md). It is not in the container image. See [ADR 0009](decisions/0009-mcp-in-the-forge.md) for why the endpoint moved into the forge and what it keeps from [ADR 0008](decisions/0008-mcp-layer.md).
 
+### Optional recoverable token secrets
+
+A personal access token's secret normally exists once: the database keeps only a digest, so a lost token
+means issuing a new one. An operator can change that:
+
+```sh
+GRAFT_RECOVERABLE_TOKENS=true
+```
+
+or `--recoverable-tokens true`. Each token issued afterwards has its secret kept, encrypted with the
+data-protection key ring, and its owner can read it back with their account password.
+
+**Know what this costs before turning it on.** With it on, the database together with that key ring is
+equivalent to every token on the instance. The key ring lives beside the database in the state directory,
+so this defends a database that leaks on its own, a copied file or a stray backup, and not somebody who
+takes the whole directory. Off, none of that applies and nothing is kept.
+
+Tokens issued before it was switched on can never be read back, because their secrets were never kept, so
+the interface offers Copy only where there is something to copy. An administrator cannot read another
+account's tokens. Every read is audited as `reveal-token`, recording the act rather than the secret.
+
+The forge prints which it is doing at startup:
+
+```text
+TOKENS: secrets unrecoverable once issued
+```
+
+See [ADR 0012](decisions/0012-recoverable-tokens.md).
+
 ### Optional project sites
 
 A project page can serve a static site from a folder in its repository. That is repository-authored HTML,

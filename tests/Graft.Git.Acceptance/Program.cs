@@ -2005,6 +2005,22 @@ async Task CheckPersonalAccessTokens(string address, string username, string pas
             Check(replay.StatusCode == HttpStatusCode.NotFound, "and a second claim on the same handle finds nothing");
         }
 
+        // Recoverable secrets are off unless an operator asked for them, and this suite's server did not.
+        // So a token issued here can never be read back, by its owner or anybody else.
+        Check(!json.RootElement.TryGetProperty("recoverable", out JsonElement recoverable) || !recoverable.GetBoolean(),
+            "a token is not recoverable unless the operator asked for that");
+        using (HttpRequestMessage secret = new(HttpMethod.Post, $"/api/tokens/{tokenId}/secret")
+        {
+            Content = JsonContent.Create(new { password })
+        })
+        {
+            secret.Headers.Add("Origin", address);
+            secret.Headers.Add("X-Graft-CSRF", csrf);
+            using HttpResponseMessage refused = await client.SendAsync(secret);
+            Check(refused.StatusCode == HttpStatusCode.NotFound,
+                "and reading an existing token's secret is refused on a server that keeps none");
+        }
+
         // The claim is a browser act like every other token operation, so it needs the CSRF header.
         using (HttpRequestMessage noCsrf = new(HttpMethod.Post, "/api/tokens/reveal")
         {
