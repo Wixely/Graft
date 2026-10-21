@@ -36,7 +36,7 @@ TOKENS: secrets kept and readable by their owner with a password
 
 | Step | Result |
 | --- | --- |
-| Create a token, claim it at creation | `graft_pat_6feba473…`, 74 characters |
+| Create a token, claim it at creation | a `graft_pat_` secret, 74 characters |
 | List tokens | `"recoverable": true` |
 | Read it back with the wrong password | `403` |
 | Read it back with the right password | the identical secret |
