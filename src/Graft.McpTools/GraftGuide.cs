@@ -173,10 +173,15 @@ public static class GraftGuide
             `graft_set_visibility` and `graft_set_page_published` change who can see a project. Both widen
             access to strangers, so prefer to propose them rather than perform them unprompted.
 
-            There is no tool that deletes a project, and that is a decision rather than an omission. The
-            product can delete one, from the browser or over the API with a person's own credential, and it
-            is irreversible. An agent holding a token should not be one keystroke from ending a repository,
-            so the capability stops at this boundary. Renaming a project does not exist at all yet.
+            `graft_create_branch` points a new branch at a commit that already exists. It writes no content:
+            use it to open a place to work, then `graft_write_file` to put something there. `graft_write_file`
+            also creates a branch when the one it is given does not exist, so you need this only when you
+            want to start from somewhere other than the default branch.
+
+            There is no tool that deletes a project or a branch, and neither is an omission. The product can
+            do both, from the browser or over the API with a person's own credential. An agent holding a
+            token should not be one call away from ending a repository or removing the branch somebody is
+            working on, so the capability stops at this boundary. Renaming a project does not exist at all.
             """,
 
         ["collaboration"] = """
@@ -206,6 +211,29 @@ public static class GraftGuide
             `graft_read_merge_request` reports `merge_method` before anything is merged, so you can tell
             which of those three a proposal is in without attempting it. A listing does not: deciding costs
             three tree walks per proposal, so a list reports `unchecked` and you read one to find out.
+
+            ## Reviewing a line rather than a change
+
+            `graft_comment` takes a file, a line and a side together, which puts the comment on that line of
+            the proposal's diff. The paths and the line numbers come from `graft_read_merge_request`. Side
+            is `old` for a line the change removed and `new` for one it added or left alone.
+
+            A line comment records the commit the diff was computed from. When the branch is pushed to
+            afterwards, the comment is reported as outdated rather than moved: the line it named may now be
+            a different line, and quietly re-anchoring it would put your words against somebody else's code.
+            Expect to re-read a proposal after a push rather than assuming your earlier comments still point
+            where you left them.
+
+            ## Approvals, and why you cannot give one
+
+            A project can require a number of approvals before a merge request may be merged. An approval
+            counts only while the commit it was given against is still the branch tip, so pushing to a
+            proposal supersedes the approvals of what came before, and an author cannot approve their own.
+
+            There is no tool to approve. That is deliberate: an approval exists to record that a person
+            looked, and a gate an agent could satisfy would not be a gate. You can read how many are
+            outstanding from `approvals_left`, and you can merge once people have approved, but the approval
+            itself is theirs to give.
             """,
 
         ["limits"] = """

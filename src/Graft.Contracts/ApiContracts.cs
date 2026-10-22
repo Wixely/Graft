@@ -98,9 +98,12 @@ public sealed record SessionResponse(
     /// <summary>Whether this server's operator permits publishing and serves a public listing. A property of
     /// the server, not of the caller, so it is reported to an anonymous caller as well.</summary>
     bool PublicBrowsing = false,
-    /// <summary>Whether this server's operator started it with the Model Context Protocol endpoint available.
+    /// <summary>Whether this server.s operator started it with the Model Context Protocol endpoint available.
     /// Also a property of the server; the administrator settings behind it are read separately.</summary>
-    bool McpAvailable = false);
+    bool McpAvailable = false,
+    /// <summary>Whether this server.s operator allowed it to make outbound requests on a project.s behalf.
+    /// False hides the hook controls rather than offering a setting the server would refuse.</summary>
+    bool WebhooksAvailable = false);
 public sealed record LoginRequest(string Username, string Password);
 public sealed record UserCreateRequest(string Username, string Password);
 public sealed record UserAccountResponse(long Id, string Username, bool IsAdministrator, bool Disabled);
@@ -261,7 +264,11 @@ public sealed record RepositoryPageResponse(
     /// <summary>Whether this caller may open an issue, propose a merge or comment. Weaker than
     /// <see cref="CanPush"/>: a Reporter holds this and cannot push, so the two are reported separately
     /// rather than one standing in for the other.</summary>
-    bool CanParticipate = false);
+    bool CanParticipate = false,
+    /// <summary>How many approvals this project requires before a merge request may be merged. Carried here
+    /// so the settings form starts on the stored value rather than on zero, which would quietly remove the
+    /// gate the first time anybody saved the form.</summary>
+    [property: JsonPropertyName("approvals_required")] int ApprovalsRequired = 0);
 
 public sealed record VisibilityRequest(string? Visibility);
 public sealed record PagePublishRequest(bool Published);
@@ -405,17 +412,76 @@ public sealed record MergeRequestResponse(
     [property: JsonPropertyName("merge_method")] string MergeMethod = "unresolved",
     /// <summary>The paths both branches changed, which is the whole reason a merge is refused when it is.</summary>
     IReadOnlyList<string>? Conflicts = null,
-    [property: JsonPropertyName("user_notes_count")] long UserNotesCount = 0);
+    [property: JsonPropertyName("user_notes_count")] long UserNotesCount = 0,
+    /// <summary>How many current approvals this project requires. Zero means none.</summary>
+    [property: JsonPropertyName("approvals_required")] int ApprovalsRequired = 0,
+    /// <summary>How many more current approvals are needed. Zero means the gate is satisfied, or absent.</summary>
+    [property: JsonPropertyName("approvals_left")] int ApprovalsLeft = 0,
+    /// <summary>Everyone who has approved, stale approvals included. Null in a listing, which does not
+    /// load them, exactly as it does not decide mergeability.</summary>
+    [property: JsonPropertyName("approved_by")] IReadOnlyList<ApprovalResponse>? ApprovedBy = null);
 
 public sealed record IssuePageResponse(IReadOnlyList<IssueResponse> Issues, long Total, int Page, int PerPage);
 public sealed record MergeRequestPageResponse(IReadOnlyList<MergeRequestResponse> MergeRequests, long Total, int Page, int PerPage);
 
-/// <summary>A comment. GitLab calls these notes and the API path says so.</summary>
+/// <summary>
+/// A comment. GitLab calls these notes and the API path says so.
+///
+/// <para>
+/// The <c>position</c> fields are null together for a comment on the whole thing. When set, the comment was
+/// written against one line of one file as it looked at <c>anchor_commit_sha</c>; <c>outdated</c> says that
+/// commit is no longer the branch tip, so the line it points at may no longer be the line it was about.
+/// </para>
+/// </summary>
 public sealed record NoteResponse(
     long Id,
     string Body,
     UserResponse Author,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt,
+    string? Path = null,
+    int? Line = null,
+    /// <summary><c>old</c> or <c>new</c>.</summary>
+    string? Side = null,
+    [property: JsonPropertyName("anchor_commit_sha")] string? AnchorCommitSha = null,
+    bool Outdated = false);
+
+/// <summary>One person's approval, and whether it still counts.</summary>
+public sealed record ApprovalResponse(
+    [property: JsonPropertyName("user_id")] long UserId,
+    string Username,
+    [property: JsonPropertyName("source_commit_sha")] string SourceCommitSha,
+    /// <summary>False when the branch has moved since, in which case this approval is shown but does not
+    /// count towards the number the project requires.</summary>
+    bool Current,
     [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt);
+
+/// <summary>How many approvals a project requires before a merge. Zero removes the gate.</summary>
+public sealed record ApprovalsRequiredRequest(
+    [property: JsonPropertyName("approvals_before_merge")] int ApprovalsBeforeMerge);
+
+/// <summary>
+/// A registered webhook. The signing secret is never reported: it is written once when the hook is made
+/// and read afterwards only by the sender.
+/// </summary>
+public sealed record WebhookResponse(
+    long Id,
+    string Url,
+    /// <summary>The events this hook asked for, as names: <c>push</c>, <c>issue</c>, <c>merge_request</c>,
+    /// <c>comment</c>.</summary>
+    IReadOnlyList<string> Events,
+    bool Active,
+    [property: JsonPropertyName("created_by")] string CreatedBy,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt,
+    /// <summary>The HTTP status of the last attempt, or null when nothing has been attempted yet.</summary>
+    [property: JsonPropertyName("last_status")] int? LastStatus,
+    [property: JsonPropertyName("last_error")] string? LastError,
+    [property: JsonPropertyName("last_delivered_at")] DateTimeOffset? LastDeliveredAt);
+
+/// <summary>
+/// Registers a hook. The secret is required and is the key the receiver will check the signature with, so
+/// it is chosen by whoever configures both ends rather than generated here.
+/// </summary>
+public sealed record WebhookCreateRequest(string? Url, string? Secret, string[]? Events);
 
 public sealed record IssueCreateRequest(string? Title, string? Description);
 
@@ -428,7 +494,16 @@ public sealed record IssueUpdateRequest(
     string? Description,
     [property: JsonPropertyName("state_event")] string? StateEvent);
 
-public sealed record NoteCreateRequest(string? Body);
+/// <summary>
+/// Adds a comment. The three position fields are given together or not at all; together they anchor the
+/// comment to one line of one file, and the server records the branch tip the diff was computed from.
+/// </summary>
+public sealed record NoteCreateRequest(
+    string? Body,
+    string? Path = null,
+    int? Line = null,
+    /// <summary><c>old</c> or <c>new</c>: which side of the diff the line sits on.</summary>
+    string? Side = null);
 
 public sealed record MergeRequestCreateRequest(
     [property: JsonPropertyName("source_branch")] string? SourceBranch,
@@ -436,12 +511,25 @@ public sealed record MergeRequestCreateRequest(
     string? Title,
     string? Description);
 
+/// <summary>
+/// Names a new branch and what it should point at. <c>Ref</c> is GitLab's spelling and takes a branch
+/// name, a tag or a commit id; absent means the project's default branch.
+/// </summary>
+public sealed record BranchCreateRequest(string? Branch, string? Ref);
+
+/// <summary>Asks for a merge, and optionally for the source branch to go with it.</summary>
+public sealed record MergeAcceptRequest(
+    [property: JsonPropertyName("should_remove_source_branch")] bool ShouldRemoveSourceBranch = false);
+
 /// <summary>What a merge produced, or why it could not happen.</summary>
 public sealed record MergeResultResponse(
     MergeRequestResponse MergeRequest,
     /// <summary><c>fast_forward</c> or <c>three_way</c>: how the target branch actually moved.</summary>
     string Method,
-    [property: JsonPropertyName("merge_commit_sha")] string? MergeCommitSha);
+    [property: JsonPropertyName("merge_commit_sha")] string? MergeCommitSha,
+    /// <summary>Whether the source branch was removed afterwards. False when it was not asked for, and
+    /// also when it was asked for and refused, which happens when the source is the default branch.</summary>
+    [property: JsonPropertyName("source_branch_removed")] bool SourceBranchRemoved = false);
 
 /// <summary>A proposal and what it would change, measured from the point the two branches last agreed.</summary>
 public sealed record MergeRequestChangesResponse(
@@ -515,4 +603,12 @@ public sealed record MergeRequestChangesResponse(
 [JsonSerializable(typeof(IssueUpdateRequest))]
 [JsonSerializable(typeof(NoteCreateRequest))]
 [JsonSerializable(typeof(MergeRequestCreateRequest))]
+[JsonSerializable(typeof(BranchCreateRequest))]
+[JsonSerializable(typeof(ApprovalsRequiredRequest))]
+[JsonSerializable(typeof(WebhookCreateRequest))]
+[JsonSerializable(typeof(WebhookResponse))]
+[JsonSerializable(typeof(WebhookResponse[]))]
+[JsonSerializable(typeof(ApprovalResponse))]
+[JsonSerializable(typeof(MergeAcceptRequest))]
+[JsonSerializable(typeof(BranchResponse))]
 public partial class ApiJson : JsonSerializerContext;

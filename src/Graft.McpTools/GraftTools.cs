@@ -639,26 +639,75 @@ public sealed class GraftTools
     }
 
     [McpServerTool(Name = "graft_comment")]
-    [Description("Adds a comment to an issue or a merge request. Needs membership. Refused unless writes are allowed on this server.")]
+    [Description("Adds a comment to an issue or a merge request. Give file, line and side together to put the comment on one line of a merge request's diff, or leave all three empty to comment on the whole thing. Needs membership. Refused unless writes are allowed on this server.")]
     public static async Task<string> Comment(
         GraftClient graft,
         [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
         [Description("Either issue or merge_request.")] string subject,
         [Description("The number of the issue or merge request, as shown in the project.")] long number,
         [Description("What to say.")] string body,
+        [Description("Optional: the file to comment on, as graft_read_merge_request reports its path. Empty comments on the whole thing.")] string file,
+        [Description("Optional: the line number within that file. Zero when commenting on the whole thing.")] long line,
+        [Description("Optional: old for a removed line, new for an added or unchanged one. Empty when commenting on the whole thing.")] string side,
         CancellationToken cancellationToken)
     {
         if (!graft.AllowWrites) return Refused(graft, "commenting");
         if (subject is not ("issue" or "merge_request")) return Failure("subject must be issue or merge_request.");
         if (string.IsNullOrWhiteSpace(body)) return Failure("body is required.");
 
+        bool anchored = !string.IsNullOrWhiteSpace(file) || line > 0 || !string.IsNullOrWhiteSpace(side);
+        if (anchored)
+        {
+            if (string.IsNullOrWhiteSpace(file) || line <= 0 || side is not ("old" or "new"))
+                return Failure("A comment on a line needs file, a line above zero, and side of old or new, together.");
+            if (subject != "merge_request") return Failure("Only a merge request has a diff to comment on.");
+        }
+
+        JsonObject payload = new() { ["body"] = body };
+        if (anchored)
+        {
+            payload["path"] = file.Trim();
+            payload["line"] = line;
+            payload["side"] = side;
+        }
         string path = "api/v4/projects/" + Encode(project) +
             (subject == "issue" ? "/issues/" : "/merge_requests/") + Number(number) + "/notes";
-        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Post, path,
-            new JsonObject { ["body"] = body }, cancellationToken);
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Post, path, payload, cancellationToken);
         return ok
-            ? new JsonObject { ["commented"] = true, ["subject"] = subject, ["number"] = number }.ToJsonString()
+            ? new JsonObject
+            {
+                ["commented"] = true,
+                ["subject"] = subject,
+                ["number"] = number,
+                ["file"] = anchored ? file.Trim() : null,
+                ["line"] = anchored ? line : null
+            }.ToJsonString()
             : Failure(GraftClient.Describe(status, response));
+    }
+
+    [McpServerTool(Name = "graft_create_branch")]
+    [Description("Creates a branch pointing at an existing commit, branch or tag. Writes no content; use graft_write_file to put something on it. Refused unless writes are allowed on this server.")]
+    public static async Task<string> CreateBranch(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("The name for the new branch.")] string branch,
+        [Description("What it should start from: a branch, a tag or a commit id. Empty uses the project's default branch.")] string from,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowWrites) return Refused(graft, "creating a branch");
+        if (string.IsNullOrWhiteSpace(branch)) return Failure("branch is required.");
+
+        JsonObject body = new() { ["branch"] = branch.Trim() };
+        if (!string.IsNullOrWhiteSpace(from)) body["ref"] = from.Trim();
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Post,
+            "api/v4/projects/" + Encode(project) + "/repository/branches", body, cancellationToken);
+        if (!ok) return Failure(GraftClient.Describe(status, response));
+        return Created(response, ApiJson.Default.BranchResponse, created => new JsonObject
+        {
+            ["created"] = true,
+            ["branch"] = created.Name,
+            ["commit"] = created.Commit.Id
+        });
     }
 
     [McpServerTool(Name = "graft_list_merge_requests")]

@@ -16,5 +16,7 @@ Preserve this history; supersede a decision explicitly instead of silently chang
 - [0012: Recoverable token secrets](0012-recoverable-tokens.md) — accepted and implemented; off by default, and what it costs when it is on
 - [0013: Deleting a project, and reading the audit trail](0013-project-deletion-and-audit.md) — accepted and implemented; the owner or an administrator, irreversible, and withheld from agents
 - [0014: Issues, merge requests, and a merge that says what it cannot do](0014-collaboration.md) — accepted and implemented; reading follows the repository, writing needs membership, and conflicts are named rather than guessed at
+- [0015: Closing the review journey](0015-review-journey.md) — accepted and implemented; the diff on the page, line comments that age rather than move, approvals superseded by a push, and branches managed without a Git client
+- [0016: Webhooks](0016-webhooks.md) — accepted and implemented; off by default, signed over the body, and a notification rather than a guarantee
 
 Open architecture choices are in [architecture.md](../architecture.md); they are not accepted decisions.

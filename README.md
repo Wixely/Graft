@@ -8,6 +8,21 @@ Graft is a planned locally hosted GitLab alternative in C#/.NET 10. It targets G
 
 Status as of **2026-09-20**: [MVP-08 packaging and resource validation](docs/validation/2026-09-19-mvp08-packaging-resources.md) conditionally passes. Windows NativeAOT interactive and Windows Service, Linux static-musl interactive/systemd, and rootless Podman paths are implemented and tested; the recorded Linux static binaries retain all 76 Git/API/project-creation and 36 recovery assertions. That Windows Git/API/browser workflow passed **135 assertions** under the runtime and NativeAOT at the time, including [administrator user creation and project membership](docs/validation/2026-09-19-user-membership.md), [personal access-token lifecycle](docs/validation/2026-09-19-personal-access-tokens.md), and [account credential lifecycle](docs/validation/2026-09-20-account-credentials.md). The GitLab 18.0.0 source fixture passes against Graft and a [live reference](docs/validation/2026-09-19-gitlab-18-live-reference.md), while pinned `glab` 1.58.0 passes against both. The rendered Blazor workflow and one-use [operator bootstrap](docs/validation/2026-09-19-operator-bootstrap.md) pass. The Linux 3.10.108 run is deferred. DnaX distribution and a real CA/DNS trust environment remain gates. Remote hosting and the project licence are undecided. The repository itself is public at github.com/Wixely/Graft.
 
+Status as of **2026-10-22**, later the same day: the review journey works end to end. The merge request
+page renders the diff rather than only listing which files changed. A comment can sit on a line, and when
+the branch is pushed to afterwards it is reported as written against an earlier version rather than
+silently re-anchored to whatever now occupies that line number. A project can require approvals, which
+count only while the commit they were given against is still the one being merged, so a push supersedes
+them; an author cannot approve their own. Branches can be created and removed without a Git client, and a
+merge can take the source branch with it.
+
+A project can also ask to be told. `--webhooks true`, off by default, lets a Maintainer register a hook for
+pushes, issues, merge requests and comments; each delivery carries an HMAC over its exact body so a
+receiver can tell a real one from anything else that found its address. Turning the switch on lets a
+project Maintainer make the server call an address of their choosing, which is why it is the operator's.
+See [ADR 0015](docs/decisions/0015-review-journey.md), [ADR 0016](docs/decisions/0016-webhooks.md) and
+[the evidence](docs/validation/2026-10-22-review.md).
+
 Status as of **2026-10-22**: Graft hosts the conversation about the code, not just the code. A project now
 has issues, merge requests and comments on both, numbered from one within that project. Reading them
 follows the repository, so a public project's issues are readable by a stranger; writing on them needs

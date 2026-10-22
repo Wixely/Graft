@@ -740,3 +740,23 @@ nav[aria-label="Path"] .link:last-of-type { color: var(--text); font-weight: 600
 /* A list with no markers, for a short run of file paths inside a panel. */
 ul.plain { margin: 0; padding: 0; list-style: none; }
 ul.plain li + li { margin-top: var(--space-1); }
+
+/* Commenting on a line of a diff. The gutter holds an affordance that stays out of the way until the row
+   is hovered or the button itself is focused, so reading a diff is not a wall of plus signs. */
+.diff-gutter { width: 22px; padding: 0; text-align: center; user-select: none; }
+.line-comment {
+    width: 16px; height: 16px; padding: 0; line-height: 14px;
+    font-size: 12px; font-weight: 700; border-radius: 3px;
+    color: var(--accent-text); background: var(--accent); border: 0;
+    opacity: 0; transition: opacity .1s;
+}
+.diff tr:hover .line-comment, .line-comment:focus-visible { opacity: 1; }
+.diff-comment > td { padding: 0; background: var(--sunken); border-top: 1px solid var(--border-muted); }
+.diff-comment .list-item { border: 0; }
+.diff-comment .form { padding: var(--space-3); }
+.diff-comment pre.commit-message { margin: 0; }
+
+/* A short set of checkboxes that belong together, with the legend reading as an ordinary field label. */
+.checkbox-group { margin: 0; padding: 0; border: 0; }
+.checkbox-group legend { padding: 0 0 var(--space-1); font-size: 12px; font-weight: 600; }
+.checkbox-group .checkbox { display: inline-flex; align-items: center; gap: var(--space-1); margin-right: var(--space-3); }
