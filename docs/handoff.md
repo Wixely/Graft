@@ -2,6 +2,40 @@
 
 Updated: 2026-10-22. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
 
+## Added on 2026-10-22, the review journey end to end
+
+Walking the merge request journey the same day it was built found five gaps, and all five are closed. See
+[ADR 0015](decisions/0015-review-journey.md) and [ADR 0016](decisions/0016-webhooks.md).
+
+**The proposal page shows the change.** It had listed which files differed and by how much and rendered
+none of the diff, so review happened by cloning. The hunks had been in the response since merge requests
+existed; this was presentation, and it was the most valuable thing on the list.
+
+**A comment can name a line, and ages rather than moves.** It records the commit the diff was computed
+from, and the anchor is the server's reading rather than a value the client sends. After a push the comment
+is reported as outdated and shown beside the file instead of inside the diff. Re-anchoring it by tracking
+the line is what other forges do and is how a comment ends up against code its author never saw.
+
+**Approvals count only against the branch being merged.** A push supersedes them, and a superseded approval
+is shown and labelled rather than deleted. An author cannot approve their own; approving needs the
+permission to push, because an approval is what permits a merge. The gate is re-read inside the merge path,
+so a client that never asks cannot merge past it.
+
+**Branches can be created and deleted without a Git client**, and a merge can take the source branch with
+it, inside the same lock as the merge. Deleting refuses the branch the project opens at.
+
+**A project can ask to be told.** `--webhooks true`, off by default, because turning it on lets a project
+Maintainer make this server call an address of their choosing. Deliveries are queued and signed with an
+HMAC over the exact body. The queue is bounded, in memory and lost on restart: this is a notification
+mechanism and says so rather than implying delivery.
+
+The agent surface gained `graft_create_branch` and a `graft_comment` that can name a line, taking it to 29
+tools. There is deliberately no tool to approve and none to delete a branch.
+
+Migration 9 adds approvals and comment anchors; migration 10 adds webhooks. Manifest version 10.
+
+Git suite 556 to 603. The other three are unchanged.
+
 ## Added on 2026-10-22, the forge gained a conversation
 
 **Graft can now be asked what it does not do, and the answer is written down.**
@@ -568,10 +602,11 @@ Continue to use the ignored reproducible DnaX feed until the user or DnaX mainta
 | ~~`.graft` config and file allowlist~~ | Done 2026-10-20 | [Evidence](validation/2026-10-20-project-pages.md) |
 | ~~Custom static site on a pages origin~~ | Done 2026-10-20 | [Evidence](validation/2026-10-20-project-pages.md) |
 | Git's indent heuristic in the diff | Implementation agent | `tests/Graft.Diff.Fuzz` agrees with `git diff` at its default settings as closely as it already does with the heuristic turned off |
-| Line-level comments on a diff | Implementation agent | A comment anchors to a file and line on a merge request, and survives the branch moving underneath it in a way somebody can predict |
+| ~~Line-level comments on a diff~~ | Done 2026-10-22 | [Evidence](validation/2026-10-22-review.md): anchored to a file, line, side and commit, and reported as outdated rather than moved |
+| Replies, threads and resolving a conversation | Implementation agent | A reviewer can reply under a line comment and mark the conversation settled, with a rule for who may settle it |
 | Markdig under NativeAOT | User + implementation agent | `tests/Graft.Git.Acceptance` passes against a published NativeAOT server built where the C++ workload exists |
 | Deployment TLS trust | Operator + implementation agent | Intended CA certificate, DNS/SAN, client trust and renewal rehearsal |
 | Required legacy host | Implementation agent + user | Integrated static-musl artifact inspected and run on Linux 3.10.108 with sanitized evidence |
 | DnaX distribution | User/DnaX maintainer | Clean checkout restores without a sibling source tree or locally prepared feed |
 
-Recommended next action: Owner: Implementation agent — take the "near, and small" section of [the backlog](backlog.md) as one batch. Tags, raw file download and archives are the three that together turn the browser into something a reader can fetch from rather than only look at, and each is bounded work against machinery that already exists. The two bugs recorded beside them are an afternoon: an empty repository's page reports a 404 as a permission problem, and `Commit.razor` resolves a project through the caller's own project list, so a commit link into a public project fails for a non-member. Line-level comments on a diff are the largest single thing that would change how review feels, and are a deliberate decision rather than a small task. The user-gated items are unchanged: the Android picker needs a device and NativeAOT needs the C++ build tools. Remaining release gates: deployment CA/DNS trust, DnaX distribution and the deferred Linux 3.10.108 MVP-08 run.
+Recommended next action: Owner: Implementation agent — take the "near, and small" section of [the backlog](backlog.md) as one batch. Replies and resolving a conversation is now the first thing a reviewer reaches for, since line comments exist and each one is standalone. Tags, raw file download and archives are the three that together turn the browser into something a reader can fetch from rather than only look at, and each is bounded work against machinery that already exists. The two bugs recorded beside them are an afternoon: an empty repository's page reports a 404 as a permission problem, and `Commit.razor` resolves a project through the caller's own project list, so a commit link into a public project fails for a non-member. The user-gated items are unchanged: the Android picker needs a device and NativeAOT needs the C++ build tools. Remaining release gates: deployment CA/DNS trust, DnaX distribution and the deferred Linux 3.10.108 MVP-08 run.

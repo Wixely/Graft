@@ -219,13 +219,17 @@ public sealed partial class GraftStore
         await RequireReaderAsync(db, null, identity, projectId, cancellationToken);
 
         CollaborationListParameters parameters = new(projectId, StateName(state), state is null ? 1 : 0, take, skip);
+        // No approvals here, for the same reason a listing does not decide mergeability: it would be a
+        // second query per row to answer a question the list does not ask.
         IEnumerable<MergeRow> rows = await db.QueryAsync<MergeRow>("""
             SELECT m.Id, m.ProjectId, m.Iid, m.AuthorUserId, a.Username AS AuthorUsername, m.Title, m.Description,
                    m.SourceBranch, m.TargetBranch, m.State, m.MergeCommitSha, g.Username AS MergedByUsername,
                    m.CreatedAtUtc, m.UpdatedAtUtc, m.ClosedAtUtc,
-                   (SELECT COUNT(*) FROM Comments c WHERE c.SubjectType = 'merge_request' AND c.SubjectId = m.Id) AS Comments
+                   (SELECT COUNT(*) FROM Comments c WHERE c.SubjectType = 'merge_request' AND c.SubjectId = m.Id) AS Comments,
+                   p.ApprovalsRequired
             FROM MergeRequests m
             JOIN Users a ON a.Id = m.AuthorUserId
+            JOIN Projects p ON p.Id = m.ProjectId
             LEFT JOIN Users g ON g.Id = m.MergedByUserId
             WHERE m.ProjectId = @ProjectId AND (@AnyState = 1 OR m.State = @State)
             ORDER BY m.Iid DESC
@@ -238,10 +242,17 @@ public sealed partial class GraftStore
         return new([.. rows.Select(ToProposal)], total);
     }
 
+    /// <summary>
+    /// Reads one proposal, with everyone who has approved it. <paramref name="sourceCommitSha"/> is the
+    /// branch tip the caller has just resolved; an approval recorded against that commit is current and
+    /// any other is stale. Passing null leaves every approval stale, which is the safe reading for a
+    /// caller that does not know where the branch is.
+    /// </summary>
     public async Task<MergeProposal?> FindMergeProposalAsync(
         AuthenticatedIdentity? identity,
         long projectId,
         long iid,
+        string? sourceCommitSha = null,
         CancellationToken cancellationToken = default)
     {
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
@@ -250,13 +261,31 @@ public sealed partial class GraftStore
             SELECT m.Id, m.ProjectId, m.Iid, m.AuthorUserId, a.Username AS AuthorUsername, m.Title, m.Description,
                    m.SourceBranch, m.TargetBranch, m.State, m.MergeCommitSha, g.Username AS MergedByUsername,
                    m.CreatedAtUtc, m.UpdatedAtUtc, m.ClosedAtUtc,
-                   (SELECT COUNT(*) FROM Comments c WHERE c.SubjectType = 'merge_request' AND c.SubjectId = m.Id) AS Comments
+                   (SELECT COUNT(*) FROM Comments c WHERE c.SubjectType = 'merge_request' AND c.SubjectId = m.Id) AS Comments,
+                   p.ApprovalsRequired
             FROM MergeRequests m
             JOIN Users a ON a.Id = m.AuthorUserId
+            JOIN Projects p ON p.Id = m.ProjectId
             LEFT JOIN Users g ON g.Id = m.MergedByUserId
             WHERE m.ProjectId = @ProjectId AND m.Iid = @Iid;
             """, new CollaborationItemParameters(projectId, iid));
-        return row is null ? null : ToProposal(row);
+        if (row is null) return null;
+
+        IEnumerable<ApprovalRow> approvals = await db.QueryAsync<ApprovalRow>("""
+            SELECT a.UserId, u.Username, a.SourceCommitSha, a.CreatedAtUtc
+            FROM MergeRequestApprovals a
+            JOIN Users u ON u.Id = a.UserId
+            WHERE a.MergeRequestId = @Id
+            ORDER BY a.CreatedAtUtc;
+            """, new IdParameters(row.Id));
+        return ToProposal(row) with
+        {
+            Approvals = [.. approvals.Select(approval => new Approval(approval.UserId, approval.Username,
+                approval.SourceCommitSha,
+                sourceCommitSha is not null && string.Equals(approval.SourceCommitSha, sourceCommitSha, StringComparison.Ordinal),
+                Instant(approval.CreatedAtUtc)))],
+            ApprovalsRequired = (int)row.ApprovalsRequired
+        };
     }
 
     /// <summary>
@@ -306,7 +335,7 @@ public sealed partial class GraftStore
                 nextState == "closed" ? "close-merge-request" : "reopen-merge-request", "merge_request",
                 Reference(projectId, iid), nextState == "closed" ? "Merge proposal closed." : "Merge proposal reopened.", now);
         await transaction.CommitAsync(cancellationToken);
-        return await FindMergeProposalAsync(actor, projectId, iid, cancellationToken)
+        return await FindMergeProposalAsync(actor, projectId, iid, null, cancellationToken)
             ?? throw new CollaborationNotFoundException("Merge proposal is unavailable.");
     }
 
@@ -348,8 +377,145 @@ public sealed partial class GraftStore
         await AuditAsync(db, transaction, actor.UserId, "merge-merge-request", "merge_request",
             Reference(projectId, iid), $"Merged as {mergeCommitSha}.", now);
         await transaction.CommitAsync(cancellationToken);
-        return await FindMergeProposalAsync(actor, projectId, iid, cancellationToken)
+        return await FindMergeProposalAsync(actor, projectId, iid, null, cancellationToken)
             ?? throw new CollaborationNotFoundException("Merge proposal is unavailable.");
+    }
+
+    /// <summary>
+    /// Adds a comment. The four anchor arguments are given together or not at all: all four present means
+    /// a comment on one line of one file as it looked at <paramref name="anchorCommitSha"/>, and all four
+    /// absent means a comment on the whole thing.
+    ///
+    /// <para>
+    /// The store does not check that the path or the line exists in that commit. It cannot: that is a
+    /// question for the Git engine, and the caller has just computed the diff the reader clicked on.
+    /// </para>
+    /// </summary>
+    /// <summary>
+    /// Records or withdraws one person's approval of a merge proposal.
+    ///
+    /// <para>
+    /// Approving needs the permission to push, not merely to comment. An approval is what permits a merge
+    /// where a project requires one, so it needs the same standing as merging; a Reporter can still say so
+    /// in a comment, which is an opinion rather than a gate.
+    /// </para>
+    ///
+    /// <para>
+    /// Nobody approves their own proposal. A gate the author can satisfy alone is not a gate, and the
+    /// refusal is worth making explicit rather than leaving as a convention.
+    /// </para>
+    /// </summary>
+    public async Task<MergeProposal> SetApprovalAsync(
+        AuthenticatedIdentity actor,
+        long projectId,
+        long iid,
+        bool approved,
+        string sourceCommitSha,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(actor);
+        if (approved && (sourceCommitSha.Length != 40 ||
+            !sourceCommitSha.All(character => character is >= '0' and <= '9' or >= 'a' and <= 'f')))
+            throw new ArgumentException("An approval records the commit it approved.", nameof(sourceCommitSha));
+
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
+        PermissionDecision permission = await DecideAsync(db, transaction, actor, projectId,
+            ProjectAction.PushRepository, cancellationToken);
+        if (!permission.Allowed) throw new UnauthorizedAccessException(permission.Explanation);
+        AuthenticatedIdentity reviewer = await RequireLiveIdentityAsync(db, transaction, actor, cancellationToken);
+
+        CollaborationOwnerRow? existing = await db.QuerySingleOrDefaultAsync<CollaborationOwnerRow>(
+            "SELECT Id, AuthorUserId, State FROM MergeRequests WHERE ProjectId = @ProjectId AND Iid = @Iid;",
+            new CollaborationItemParameters(projectId, iid), transaction);
+        if (existing is null) throw new CollaborationNotFoundException("Merge proposal is unavailable.");
+        if (existing.State != "opened")
+            throw new CollaborationConflictException("Only an open proposal can be approved.");
+        if (approved && existing.AuthorUserId == reviewer.UserId)
+            throw new CollaborationConflictException("An author cannot approve their own proposal.");
+
+        string now = Now();
+        if (approved)
+        {
+            await db.ExecuteAsync("""
+                INSERT INTO MergeRequestApprovals (MergeRequestId, UserId, SourceCommitSha, CreatedAtUtc)
+                VALUES (@MergeRequestId, @UserId, @SourceCommitSha, @CreatedAtUtc)
+                ON CONFLICT(MergeRequestId, UserId) DO UPDATE SET
+                    SourceCommitSha = excluded.SourceCommitSha, CreatedAtUtc = excluded.CreatedAtUtc;
+                """, new ApprovalParameters(existing.Id, reviewer.UserId, sourceCommitSha, now), transaction);
+        }
+        else
+        {
+            await db.ExecuteAsync("DELETE FROM MergeRequestApprovals WHERE MergeRequestId = @ProjectId AND UserId = @Iid;",
+                new CollaborationItemParameters(existing.Id, reviewer.UserId), transaction);
+        }
+        await AuditAsync(db, transaction, reviewer.UserId, approved ? "approve-merge-request" : "unapprove-merge-request",
+            "merge_request", Reference(projectId, iid),
+            approved ? $"Approved at {sourceCommitSha}." : "Approval withdrawn.", now);
+        await transaction.CommitAsync(cancellationToken);
+        return await FindMergeProposalAsync(actor, projectId, iid, sourceCommitSha, cancellationToken)
+            ?? throw new CollaborationNotFoundException("Merge proposal is unavailable.");
+    }
+
+    /// <summary>
+    /// How many more current approvals a proposal needs, or zero when it needs none. Read inside the merge
+    /// path so the gate cannot be bypassed by a client that simply does not ask.
+    /// </summary>
+    public async Task<int> ApprovalsOutstandingAsync(
+        long projectId,
+        long iid,
+        string sourceCommitSha,
+        CancellationToken cancellationToken = default)
+    {
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        ApprovalCountRow? row = await db.QuerySingleOrDefaultAsync<ApprovalCountRow>("""
+            SELECT p.ApprovalsRequired AS Required,
+                   (SELECT COUNT(*) FROM MergeRequestApprovals a
+                    WHERE a.MergeRequestId = m.Id AND a.SourceCommitSha = @Sha) AS Current
+            FROM MergeRequests m
+            JOIN Projects p ON p.Id = m.ProjectId
+            WHERE m.ProjectId = @ProjectId AND m.Iid = @Iid;
+            """, new ApprovalCountParameters(projectId, iid, sourceCommitSha));
+        return row is null ? 0 : (int)Math.Max(0, row.Required - row.Current);
+    }
+
+    /// <summary>
+    /// How many approvals this project requires. Takes no identity: it is a property of the project rather
+    /// than of a caller, and whoever is being shown it has already been authorized to see the project.
+    /// </summary>
+    public async Task<int> GetApprovalsRequiredAsync(long projectId, CancellationToken cancellationToken = default)
+    {
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        return (int)await db.QuerySingleAsync<long>(
+            "SELECT COALESCE((SELECT ApprovalsRequired FROM Projects WHERE Id = @Id), 0);",
+            new IdParameters(projectId));
+    }
+
+    /// <summary>
+    /// Sets how many current approvals this project requires before a merge. Zero removes the gate.
+    /// Maintainer-equivalent access, because it is a project rule rather than a review.
+    /// </summary>
+    public async Task SetApprovalsRequiredAsync(
+        AuthenticatedIdentity actor,
+        long projectId,
+        int required,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(actor);
+        if (required is < 0 or > 10) throw new ArgumentOutOfRangeException(nameof(required));
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
+        PermissionDecision permission = await DecideAsync(db, transaction, actor, projectId,
+            ProjectAction.ManageProject, cancellationToken);
+        if (!permission.Allowed) throw new UnauthorizedAccessException(permission.Explanation);
+
+        string now = Now();
+        await db.ExecuteAsync("UPDATE Projects SET ApprovalsRequired = @Value WHERE Id = @Id;",
+            new ProjectFlagParameters(projectId, required), transaction);
+        await AuditAsync(db, transaction, actor.UserId, "set-approvals-required", "project",
+            projectId.ToString(CultureInfo.InvariantCulture),
+            $"Merge proposals now require {required.ToString(CultureInfo.InvariantCulture)} approvals.", now);
+        await transaction.CommitAsync(cancellationToken);
     }
 
     public async Task<Comment> AddCommentAsync(
@@ -358,10 +524,26 @@ public sealed partial class GraftStore
         CommentSubject subject,
         long iid,
         string body,
+        string? path = null,
+        int? line = null,
+        DiffSide? side = null,
+        string? anchorCommitSha = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(actor);
         string cleanBody = RequireBody(body, nameof(body), allowEmpty: false);
+        bool anchored = path is not null || line is not null || side is not null || anchorCommitSha is not null;
+        if (anchored)
+        {
+            if (path is null || line is null || side is null || anchorCommitSha is null)
+                throw new ArgumentException("A comment on a line needs a path, a line, a side and the commit it was written against.", nameof(path));
+            if (path.Length is 0 or > 1024) throw new ArgumentException("The path is out of range.", nameof(path));
+            if (line is < 1 or > 10_000_000) throw new ArgumentException("The line is out of range.", nameof(line));
+            if (anchorCommitSha.Length != 40 || !anchorCommitSha.All(character => character is >= '0' and <= '9' or >= 'a' and <= 'f'))
+                throw new ArgumentException("The anchor is a lowercase hexadecimal object id.", nameof(anchorCommitSha));
+            if (subject != CommentSubject.MergeRequest)
+                throw new ArgumentException("Only a merge proposal has a diff to comment on.", nameof(subject));
+        }
 
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
         await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
@@ -370,10 +552,13 @@ public sealed partial class GraftStore
 
         string now = Now();
         long id = await db.QuerySingleAsync<long>("""
-            INSERT INTO Comments (ProjectId, SubjectType, SubjectId, AuthorUserId, Body, CreatedAtUtc)
-            VALUES (@ProjectId, @SubjectType, @SubjectId, @AuthorUserId, @Body, @CreatedAtUtc)
+            INSERT INTO Comments (ProjectId, SubjectType, SubjectId, AuthorUserId, Body, CreatedAtUtc,
+                                  Path, Line, Side, AnchorCommitSha)
+            VALUES (@ProjectId, @SubjectType, @SubjectId, @AuthorUserId, @Body, @CreatedAtUtc,
+                    @Path, @Line, @Side, @AnchorCommitSha)
             RETURNING Id;
-            """, new CommentInsertParameters(projectId, SubjectName(subject), subjectId, author.UserId, cleanBody, now),
+            """, new CommentInsertParameters(projectId, SubjectName(subject), subjectId, author.UserId, cleanBody, now,
+                path, line, side is null ? null : SideName(side.Value), anchorCommitSha),
             transaction);
         // The subject's own timestamp moves, so a list ordered by activity is possible later and a reader
         // can see that a closed issue is still being discussed.
@@ -382,7 +567,7 @@ public sealed partial class GraftStore
             : "UPDATE MergeRequests SET UpdatedAtUtc = @UpdatedAtUtc WHERE Id = @Id;",
             new TouchParameters(subjectId, now), transaction);
         await transaction.CommitAsync(cancellationToken);
-        return new(id, author.UserId, author.Username, cleanBody, Instant(now));
+        return new(id, author.UserId, author.Username, cleanBody, Instant(now), path, line, side, anchorCommitSha);
     }
 
     public async Task<IReadOnlyList<Comment>> ListCommentsAsync(
@@ -399,15 +584,15 @@ public sealed partial class GraftStore
         await RequireReaderAsync(db, null, identity, projectId, cancellationToken);
         long subjectId = await ResolveSubjectAsync(db, null, projectId, subject, iid);
         IEnumerable<CommentRow> rows = await db.QueryAsync<CommentRow>("""
-            SELECT c.Id, c.AuthorUserId, u.Username AS AuthorUsername, c.Body, c.CreatedAtUtc
+            SELECT c.Id, c.AuthorUserId, u.Username AS AuthorUsername, c.Body, c.CreatedAtUtc,
+                   c.Path, c.Line, c.Side, c.AnchorCommitSha
             FROM Comments c
             JOIN Users u ON u.Id = c.AuthorUserId
             WHERE c.SubjectType = @SubjectType AND c.SubjectId = @SubjectId
             ORDER BY c.Id
             LIMIT @Take OFFSET @Skip;
             """, new CommentListParameters(SubjectName(subject), subjectId, take, skip));
-        return [.. rows.Select(row => new Comment(row.Id, row.AuthorUserId, row.AuthorUsername, row.Body,
-            Instant(row.CreatedAtUtc)))];
+        return [.. rows.Select(ToComment)];
     }
 
     /// <summary>
@@ -548,6 +733,19 @@ public sealed partial class GraftStore
     private static string SubjectName(CommentSubject subject) =>
         subject == CommentSubject.Issue ? "issue" : "merge_request";
 
+    private static string SideName(DiffSide side) => side == DiffSide.Old ? "old" : "new";
+
+    private static DiffSide? ParseSide(string? value) => value switch
+    {
+        "old" => DiffSide.Old,
+        "new" => DiffSide.New,
+        _ => null
+    };
+
+    private static Comment ToComment(CommentRow row) => new(
+        row.Id, row.AuthorUserId, row.AuthorUsername, row.Body, Instant(row.CreatedAtUtc),
+        row.Path, row.Line is null ? null : (int)row.Line.Value, ParseSide(row.Side), row.AnchorCommitSha);
+
     private static string RequireTitle(string value)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(value);
@@ -616,7 +814,9 @@ internal sealed record MergeBranchParameters(long ProjectId, string Source, stri
 internal sealed record CollaborationItemParameters(long ProjectId, long Iid);
 internal sealed record CollaborationListParameters(long ProjectId, string? State, int AnyState, int Take, int Skip);
 internal sealed record CommentInsertParameters(long ProjectId, string SubjectType, long SubjectId, long AuthorUserId,
-    string Body, string CreatedAtUtc);
+    string Body, string CreatedAtUtc, string? Path, int? Line, string? Side, string? AnchorCommitSha);
+internal sealed record ApprovalParameters(long MergeRequestId, long UserId, string SourceCommitSha, string CreatedAtUtc);
+internal sealed record ApprovalCountParameters(long ProjectId, long Iid, string Sha);
 internal sealed record CommentListParameters(string SubjectType, long SubjectId, int Take, int Skip);
 internal sealed record CommentOwnerParameters(long Id, long ProjectId);
 internal sealed record TouchParameters(long Id, string UpdatedAtUtc);
@@ -672,6 +872,7 @@ internal sealed class MergeRow
     public string UpdatedAtUtc { get; set; } = "";
     public string? ClosedAtUtc { get; set; }
     public long Comments { get; set; }
+    public long ApprovalsRequired { get; set; }
 }
 
 internal sealed class CommentRow
@@ -681,6 +882,24 @@ internal sealed class CommentRow
     public string AuthorUsername { get; set; } = "";
     public string Body { get; set; } = "";
     public string CreatedAtUtc { get; set; } = "";
+    public string? Path { get; set; }
+    public long? Line { get; set; }
+    public string? Side { get; set; }
+    public string? AnchorCommitSha { get; set; }
+}
+
+internal sealed class ApprovalRow
+{
+    public long UserId { get; set; }
+    public string Username { get; set; } = "";
+    public string SourceCommitSha { get; set; } = "";
+    public string CreatedAtUtc { get; set; } = "";
+}
+
+internal sealed class ApprovalCountRow
+{
+    public long Required { get; set; }
+    public long Current { get; set; }
 }
 
 internal sealed class AuditEventRow

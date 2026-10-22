@@ -11,13 +11,26 @@ that review and the largest one were built immediately: project deletion and the
 
 Each entry says what is missing, why it matters, and roughly what it would take. Nothing here is scheduled.
 
+## Closed on 2026-10-22
+
+The merge request journey was walked end to end and the five gaps it found were built the same day. They
+are listed here because the backlog is also a record of what was decided, not only of what is left.
+
+- **The diff on the merge request page.** It listed files and showed no change. [ADR 0015](decisions/0015-review-journey.md).
+- **Line-level comments.** Anchored to a file, a line and the commit the diff came from, and reported as
+  outdated rather than moved when the branch changes. Same record.
+- **Webhooks.** Off by default behind `--webhooks`. [ADR 0016](decisions/0016-webhooks.md).
+- **Branch creation and deletion**, and removing the source branch with a merge. ADR 0015.
+- **Approvals.** A per-project count, superseded by a push, enforced at the merge. ADR 0015.
+
 ## Near, and small
 
-**Line-level comments on a diff.** Comments attach to an issue or a merge request as a whole. Anchoring one
-to a file and line is the single largest remaining difference between Graft's review and the review people
-expect, and it is what makes a merge request a conversation about code rather than about a change. Needs a
-comment to carry a path, a line and the blob it was written against, plus a rule for what happens to it
-when the branch moves underneath it. That last part is the real work.
+**Replies, threads and resolving a conversation.** A line comment is standalone: there is no reply, no
+thread, and no marking a conversation settled. With line comments in place this is the next thing a reviewer
+reaches for, and it is mostly a parent id on a comment plus a resolved flag with a rule about who may set it.
+
+**Editing a comment.** It can be deleted by its author or a Maintainer and that is all. An edit wants a
+record that it was edited, which is the part worth thinking about rather than the storage.
 
 **Tags and releases.** Pushed tags are stored and understood by the Git engine; nothing lists them. There is
 no tag in the API, none in the browser, and no concept of a release at all. Listing is nearly free, since
@@ -30,10 +43,6 @@ a tar or zip writer over the object model, which is bounded work but not trivial
 **Deleting a file through the API.** Files can be created and updated over the API; `DELETE` on the same
 route is not implemented, and the browser cannot delete either. The object writer gained a whole-tree
 writer for merges, which is most of what a deletion needs.
-
-**Creating and deleting branches over the API.** A branch appears by being pushed to, or by a file write
-that creates it. `POST` and `DELETE` on `/repository/branches` are absent. Small, and the permission rule is
-already the one a push obeys.
 
 **An empty repository's project page reads "Repository unavailable".** The browse endpoint answers 404 when
 there is no tree, and the page reports that as a permission problem. A project somebody has just created
@@ -65,9 +74,6 @@ description match. Issue search is the one people miss first.
 
 **SSH.** Smart HTTP only. SSH means a host key, an authorized-keys store, a key management interface and a
 second transport to keep correct. It is the most requested thing on this list and the most work.
-
-**Webhooks.** Nothing can be notified that anything happened. Needs outbound requests from the forge, which
-brings retries, a queue, timeouts and an egress policy an operator will want to bound.
 
 **Email, and anything that depends on it.** Graft holds no email addresses and sends nothing. Password
 reset is therefore administrator-driven with no self-service path, there are no notifications, and there is
@@ -106,6 +112,14 @@ These are recorded so nobody reopens them as oversights. Each has a decision rec
   worth revisiting. [Project pages](project-pages.md).
 - **Project sites need a second hostname.** No single-hostname fallback.
   [ADR 0006](decisions/0006-project-pages-and-public-browsing.md).
+- **A line comment ages rather than moves.** When the branch changes it is reported as outdated instead of
+  being re-anchored, which is the opposite of what other forges do.
+  [ADR 0015](decisions/0015-review-journey.md).
+- **An approval is superseded by a push.** It is shown and labelled rather than deleted, and does not count.
+  Same record.
+- **An agent cannot approve, or delete a branch.** Withheld from the agent surface. Same record.
+- **Webhook delivery is a notification, not a guarantee.** Bounded, in memory, lost on restart, oldest
+  dropped when full. [ADR 0016](decisions/0016-webhooks.md).
 
 ## Operational, still open from the MVP plan
 

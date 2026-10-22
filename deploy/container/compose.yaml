@@ -66,6 +66,11 @@ services:
       # database is not a leaked set of credentials; see docs/decisions/0012-recoverable-tokens.md.
       - --recoverable-tokens
       - ${GRAFT_RECOVERABLE_TOKENS:-false}
+      # Whether this server may make outbound HTTP requests on a project's behalf. On, a project Maintainer
+      # can make it call any address it can reach, including inside this network; that is the point on a
+      # self-hosted forge and is why it is the operator's switch. See docs/decisions/0016-webhooks.md.
+      - --webhooks
+      - ${GRAFT_WEBHOOKS:-false}
     ports:
       - "127.0.0.1:8443:8443"
     volumes:

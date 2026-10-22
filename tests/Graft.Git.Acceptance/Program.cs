@@ -29,6 +29,7 @@ int assertions = 0;
 // asked to change: the point of it is that it is decided before the process starts.
 bool publicBrowsing = false;
 bool pushToCreate = false;
+bool webhooksEnabled = false;
 Process? server = null;
 Task? outputReader = null;
 Task<string>? errorReader = null;
@@ -214,7 +215,9 @@ try
     await CheckProjectPages(address, aliceIdentity, source);
     await CheckCollaboration(address, aliceIdentity, bob.Username, "carol");
     await CheckProjectDeletion(address, aliceIdentity, administratorIdentity, bob.Username, alicePassword);
-    // After the deletions, so the trail it reads already contains them.
+    await CheckReview(address, aliceIdentity, bob.Username, "carol");
+    address = await CheckWebhooks(address, aliceIdentity);
+    // After everything that writes an audit row, so the trail it reads already contains them.
     await CheckAuditTrail(address, adminPassword, alicePassword);
 
     Console.WriteLine($"RESULT: PASS; assertions: {assertions}");
@@ -299,6 +302,10 @@ ProcessStartInfo ServerStart()
     // header without a second listener or a hosts-file entry.
     start.ArgumentList.Add("--pages-origin");
     start.ArgumentList.Add("https://pages.graft.test");
+    // Outbound notification is off unless a check asks for it, exactly as a deployment would have it, so
+    // every other assertion runs against a server that cannot call anything.
+    start.ArgumentList.Add("--webhooks");
+    start.ArgumentList.Add(webhooksEnabled ? "true" : "false");
     return start;
 }
 
@@ -3435,6 +3442,355 @@ async Task<long> CountRows(string table, long projectId)
     };
     command.Parameters.AddWithValue("$id", projectId);
     return Convert.ToInt64(await command.ExecuteScalarAsync(), System.Globalization.CultureInfo.InvariantCulture);
+}
+
+/// <summary>
+/// The rest of the review journey: branches managed without a Git client, comments that point at a line,
+/// approvals that stop counting when the branch moves, and removing the source branch with the merge.
+/// </summary>
+async Task CheckReview(string address, AuthenticatedIdentity alice, string bobUsername, string strangerUsername)
+{
+    long projectId;
+    string aliceApi;
+    string reviewerApi;
+    string strangerApi;
+    string readApi;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        ProjectInfo created = await store.CreateProjectWithRepositoryAsync(alice, "review", "Review",
+            (project, cancellation) => { cancellation.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, project.StorageId)); return Task.CompletedTask; });
+        projectId = created.Id;
+        UserAccount bob = Required(await store.FindActiveUserAsync(bobUsername), "bob account");
+        UserAccount stranger = Required(await store.FindActiveUserAsync(strangerUsername), "stranger account");
+        // A Developer, so they can push and therefore approve; approving is gated on pushing rather than
+        // on commenting, because an approval is what permits a merge.
+        await store.SetMembershipAsync(alice, projectId, bob.Id, ProjectRole.Developer);
+        // A Reporter, who may comment and must not be able to approve.
+        await store.SetMembershipAsync(alice, projectId, stranger.Id, ProjectRole.Reporter);
+        AuthenticatedIdentity bobIdentity = new(bob.Id, bob.Username, false, IdentityKind.BrowserSession);
+        AuthenticatedIdentity strangerIdentity = new(stranger.Id, stranger.Username, false, IdentityKind.BrowserSession);
+        aliceApi = (await store.CreateTokenAsync(alice, "review-api", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        readApi = (await store.CreateTokenAsync(alice, "review-read", TokenScope.ReadApi, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        reviewerApi = (await store.CreateTokenAsync(bobIdentity, "review-member", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        strangerApi = (await store.CreateTokenAsync(strangerIdentity, "review-reporter", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+    }
+    string prefix = "/api/v4/projects/" + projectId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    string clone = Path.Combine(root, "review-clone");
+    Directory.CreateDirectory(clone);
+    string pushUrl = AuthenticatedUrl(address, "alice", aliceApi, "alice/review.git");
+    await Git(clone, ["init", "--initial-branch=main"]);
+    File.WriteAllText(Path.Combine(clone, "lamp.txt"), "one\ntwo\nthree\n");
+    await Git(clone, ["add", "."]);
+    await Git(clone, ["commit", "-m", "Base"]);
+    await Git(clone, ["remote", "add", "origin", pushUrl]);
+    await Git(clone, ["push", "origin", "main"]);
+
+    // Branches, managed without a Git client at all.
+    using (HttpResponseMessage refused = await ApiPost(address, prefix + "/repository/branches", readApi,
+        new { branch = "from-read-token", @ref = "main" }))
+        Check(refused.StatusCode == HttpStatusCode.NotFound, "a read-only token cannot create a branch");
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/repository/branches", aliceApi,
+        new { branch = "wick", @ref = "main" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStreamAsync());
+        Check(created.StatusCode == HttpStatusCode.Created &&
+            json.RootElement.GetProperty("name").GetString() == "wick" &&
+            json.RootElement.GetProperty("commit").GetProperty("id").GetString()!.Length == 40,
+            "a branch is created from a named revision with no Git client");
+    }
+    using (HttpResponseMessage again = await ApiPost(address, prefix + "/repository/branches", aliceApi,
+        new { branch = "wick", @ref = "main" }))
+        Check(again.StatusCode == HttpStatusCode.Conflict, "creating a branch that already exists is refused rather than moving it");
+    using (HttpResponseMessage nowhere = await ApiPost(address, prefix + "/repository/branches", aliceApi,
+        new { branch = "nowhere", @ref = "no-such-revision" }))
+        Check(nowhere.StatusCode == HttpStatusCode.BadRequest, "a branch cannot start from a revision that does not resolve");
+    using (HttpResponseMessage spare = await ApiPost(address, prefix + "/repository/branches", aliceApi,
+        new { branch = "spare", @ref = "main" }))
+        Check(spare.StatusCode == HttpStatusCode.Created, "a second branch is created to be deleted");
+    using (HttpResponseMessage deleted = await ApiDelete(address, prefix + "/repository/branches/spare", aliceApi))
+        Check(deleted.StatusCode == HttpStatusCode.NoContent, "a branch is deleted");
+    using (HttpResponseMessage gone = await ApiDelete(address, prefix + "/repository/branches/spare", aliceApi))
+        Check(gone.StatusCode == HttpStatusCode.NotFound, "deleting a branch that is not there is a 404");
+    using (HttpResponseMessage theDefault = await ApiDelete(address, prefix + "/repository/branches/main", aliceApi))
+        Check(theDefault.StatusCode == HttpStatusCode.Conflict,
+            "the branch the project opens at cannot be deleted while it is the default");
+    // The commits behind a deleted branch are still there, which is what makes deleting one safe.
+    using (HttpResponseMessage branches = await ApiGet(address, prefix + "/repository/branches", aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await branches.Content.ReadAsStreamAsync());
+        Check(branches.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 2,
+            "the deleted branch is gone from the listing and the others remain");
+    }
+
+    // Work on the branch, so there is something to review.
+    await Git(clone, ["fetch", "origin"]);
+    await Git(clone, ["checkout", "-B", "wick", "origin/wick"]);
+    File.WriteAllText(Path.Combine(clone, "lamp.txt"), "one\ntwo changed\nthree\nfour\n");
+    await Git(clone, ["commit", "-am", "Change the wick"]);
+    await Git(clone, ["push", "origin", "wick"]);
+
+    long iid;
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/merge_requests", aliceApi,
+        new { source_branch = "wick", target_branch = "main", title = "Replace the wick" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStreamAsync());
+        iid = json.RootElement.GetProperty("iid").GetInt64();
+        Check(created.StatusCode == HttpStatusCode.Created &&
+            json.RootElement.GetProperty("approvals_required").GetInt32() == 0 &&
+            json.RootElement.GetProperty("approvals_left").GetInt32() == 0,
+            "a project requires no approvals until somebody asks for them");
+    }
+    string notes = prefix + "/merge_requests/" + iid + "/notes";
+
+    // A comment that points at a line.
+    using (HttpResponseMessage half = await ApiPost(address, notes, aliceApi, new { body = "Half a position", path = "lamp.txt" }))
+        Check(half.StatusCode == HttpStatusCode.BadRequest, "a comment on a line needs path, line and side together");
+    using (HttpResponseMessage sideways = await ApiPost(address, notes, aliceApi,
+        new { body = "Bad side", path = "lamp.txt", line = 2, side = "middle" }))
+        Check(sideways.StatusCode == HttpStatusCode.BadRequest, "side must be old or new");
+
+    string anchor;
+    using (HttpResponseMessage anchored = await ApiPost(address, notes, reviewerApi,
+        new { body = "Why four?", path = "lamp.txt", line = 4, side = "new" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await anchored.Content.ReadAsStreamAsync());
+        anchor = json.RootElement.GetProperty("anchor_commit_sha").GetString()!;
+        Check(anchored.StatusCode == HttpStatusCode.Created &&
+            json.RootElement.GetProperty("path").GetString() == "lamp.txt" &&
+            json.RootElement.GetProperty("line").GetInt32() == 4 &&
+            json.RootElement.GetProperty("side").GetString() == "new" &&
+            anchor.Length == 40 && !json.RootElement.GetProperty("outdated").GetBoolean(),
+            "a comment anchors to a line, a side and the commit the diff was computed from");
+    }
+    using (HttpResponseMessage reporter = await ApiPost(address, notes, strangerApi,
+        new { body = "A Reporter may comment on a line too.", path = "lamp.txt", line = 2, side = "new" }))
+        Check(reporter.StatusCode == HttpStatusCode.Created, "commenting on a line needs membership, not the ability to push");
+    using (HttpResponseMessage onIssue = await ApiPost(address, prefix + "/issues", aliceApi, new { title = "Nothing to diff" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await onIssue.Content.ReadAsStreamAsync());
+        long issue = json.RootElement.GetProperty("iid").GetInt64();
+        using HttpResponseMessage refused = await ApiPost(address, prefix + "/issues/" + issue + "/notes", aliceApi,
+            new { body = "On a line of what?", path = "lamp.txt", line = 1, side = "new" });
+        Check(refused.StatusCode == HttpStatusCode.BadRequest, "an issue has no diff, so a line comment on one is refused");
+    }
+
+    // Approvals.
+    using (HttpResponseMessage required = await ApiPut(address, prefix + "/approvals", aliceApi, new { approvals_before_merge = 1 }))
+        Check(required.StatusCode == HttpStatusCode.NoContent, "a Maintainer sets how many approvals a merge needs");
+    using (HttpResponseMessage refused = await ApiPut(address, prefix + "/approvals", reviewerApi, new { approvals_before_merge = 0 }))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden, "a Developer cannot change the approval rule");
+    using (HttpResponseMessage blocked = await ApiPut(address, prefix + "/merge_requests/" + iid + "/merge", aliceApi, new { }))
+    {
+        string body = await blocked.Content.ReadAsStringAsync();
+        Check(blocked.StatusCode == HttpStatusCode.Conflict && body.Contains("outstanding", StringComparison.Ordinal),
+            "a merge is refused while approvals are outstanding");
+    }
+    using (HttpResponseMessage own = await ApiPost(address, prefix + "/merge_requests/" + iid + "/approve", aliceApi, new { }))
+        Check(own.StatusCode == HttpStatusCode.Conflict, "an author cannot approve their own proposal");
+    using (HttpResponseMessage reporter = await ApiPost(address, prefix + "/merge_requests/" + iid + "/approve", strangerApi, new { }))
+        Check(reporter.StatusCode == HttpStatusCode.Forbidden,
+            "approving needs the permission to push, which a Reporter does not have");
+    using (HttpResponseMessage approved = await ApiPost(address, prefix + "/merge_requests/" + iid + "/approve", reviewerApi, new { }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await approved.Content.ReadAsStreamAsync());
+        Check(approved.IsSuccessStatusCode && json.RootElement.GetProperty("approvals_left").GetInt32() == 0 &&
+            json.RootElement.GetProperty("approved_by")[0].GetProperty("current").GetBoolean(),
+            "a reviewer approves, and the gate is satisfied");
+    }
+
+    // Pushing supersedes both the approval and the anchored comment, because neither was about this code.
+    File.WriteAllText(Path.Combine(clone, "lamp.txt"), "one\ntwo changed\nthree\nfour\nfive\n");
+    await Git(clone, ["commit", "-am", "And a fifth line"]);
+    await Git(clone, ["push", "origin", "wick"]);
+
+    using (HttpResponseMessage after = await ApiGet(address, prefix + "/merge_requests/" + iid, aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await after.Content.ReadAsStreamAsync());
+        Check(after.IsSuccessStatusCode && json.RootElement.GetProperty("approvals_left").GetInt32() == 1 &&
+            !json.RootElement.GetProperty("approved_by")[0].GetProperty("current").GetBoolean(),
+            "a push supersedes an approval, which is shown but no longer counts");
+    }
+    using (HttpResponseMessage blocked = await ApiPut(address, prefix + "/merge_requests/" + iid + "/merge", aliceApi, new { }))
+        Check(blocked.StatusCode == HttpStatusCode.Conflict, "and the merge is refused again");
+    using (HttpResponseMessage stale = await ApiGet(address, notes, aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await stale.Content.ReadAsStreamAsync());
+        Check(stale.IsSuccessStatusCode && json.RootElement.EnumerateArray()
+            .All(note => note.GetProperty("outdated").GetBoolean()),
+            "a comment written against an earlier commit is reported as outdated rather than moved");
+        Check(json.RootElement[0].GetProperty("anchor_commit_sha").GetString() == anchor,
+            "and still names the commit it was written against");
+    }
+
+    using (HttpResponseMessage approved = await ApiPost(address, prefix + "/merge_requests/" + iid + "/approve", reviewerApi, new { }))
+        Check(approved.IsSuccessStatusCode, "the reviewer approves the new work");
+    using (HttpResponseMessage withdrawn = await ApiPost(address, prefix + "/merge_requests/" + iid + "/unapprove", reviewerApi, new { }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await withdrawn.Content.ReadAsStreamAsync());
+        Check(withdrawn.IsSuccessStatusCode && json.RootElement.GetProperty("approved_by").GetArrayLength() == 0,
+            "an approval can be withdrawn");
+    }
+    using (HttpResponseMessage approved = await ApiPost(address, prefix + "/merge_requests/" + iid + "/approve", reviewerApi, new { }))
+        Check(approved.IsSuccessStatusCode, "and given again");
+
+    // Merging, taking the source branch with it.
+    using (HttpResponseMessage merged = await ApiPut(address, prefix + "/merge_requests/" + iid + "/merge", aliceApi,
+        new { should_remove_source_branch = true }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await merged.Content.ReadAsStreamAsync());
+        Check(merged.IsSuccessStatusCode && json.RootElement.GetProperty("source_branch_removed").GetBoolean(),
+            "a merge can take the source branch with it");
+    }
+    using (HttpResponseMessage branches = await ApiGet(address, prefix + "/repository/branches", aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await branches.Content.ReadAsStreamAsync());
+        Check(branches.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 1 &&
+            json.RootElement[0].GetProperty("name").GetString() == "main",
+            "and the branch is gone afterwards");
+    }
+    // The work survives the branch that carried it, which is the point of deleting one being safe.
+    await Git(clone, ["fetch", "origin", "--prune"]);
+    await Git(clone, ["checkout", "-B", "verify", "origin/main"]);
+    Check(File.ReadAllText(Path.Combine(clone, "lamp.txt")).Contains("five", StringComparison.Ordinal),
+        "the merged work is on the target branch after the source branch was removed");
+
+    using (HttpResponseMessage reset = await ApiPut(address, prefix + "/approvals", aliceApi, new { approvals_before_merge = 0 }))
+        Check(reset.StatusCode == HttpStatusCode.NoContent, "the approval rule can be removed again");
+}
+
+/// <summary>
+/// Webhooks, against a receiver this suite runs. Proves the delivery arrives, that it is signed with the
+/// hook's own secret, and that a server without the operator's switch has no hook routes at all.
+/// </summary>
+async Task<string> CheckWebhooks(string address, AuthenticatedIdentity alice)
+{
+    long projectId;
+    string apiToken;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        ProjectInfo created = await store.CreateProjectWithRepositoryAsync(alice, "notified", "Notified",
+            (project, cancellation) => { cancellation.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, project.StorageId)); return Task.CompletedTask; });
+        projectId = created.Id;
+        apiToken = (await store.CreateTokenAsync(alice, "hook-api", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+    }
+    string prefix = "/api/v4/projects/" + projectId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    // With the operator's switch off, which is how every other check in this suite runs.
+    using (HttpResponseMessage absent = await ApiGet(address, prefix + "/hooks", apiToken))
+        Check(absent.StatusCode == HttpStatusCode.NotFound,
+            "a server started without the switch has no webhook routes rather than refusing ones it has");
+
+    await StopServer();
+    webhooksEnabled = true;
+    address = await StartServer();
+    Check(serverLines.Any(line => line.StartsWith("WEBHOOKS: on", StringComparison.Ordinal)),
+        "a server with outbound notification says so at startup");
+
+    // A receiver of our own, so the delivery is observed arriving rather than assumed.
+    const string secret = "a-shared-signing-secret";
+    using HttpListener receiver = new();
+    int port = FreeLoopbackPort();
+    string hookUrl = "http://127.0.0.1:" + port.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/graft";
+    receiver.Prefixes.Add("http://127.0.0.1:" + port.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/");
+    receiver.Start();
+    TaskCompletionSource<(string Event, string Signature, string Body)> arrived =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    _ = Task.Run(async () =>
+    {
+        try
+        {
+            HttpListenerContext received = await receiver.GetContextAsync();
+            using StreamReader reader = new(received.Request.InputStream);
+            string body = await reader.ReadToEndAsync();
+            string eventName = received.Request.Headers["X-Graft-Event"] ?? "";
+            string signature = received.Request.Headers["X-Graft-Signature"] ?? "";
+            // Answered before the test is told, so the sender sees its 200 rather than a timeout caused by
+            // this listener being stopped while the assertions run.
+            received.Response.StatusCode = 200;
+            received.Response.Close();
+            arrived.TrySetResult((eventName, signature, body));
+        }
+        catch (Exception error) { arrived.TrySetException(error); }
+    });
+
+    using (HttpResponseMessage shortSecret = await ApiPost(address, prefix + "/hooks", apiToken,
+        new { url = hookUrl, secret = "tooshort", events = new[] { "issue" } }))
+        Check(shortSecret.StatusCode == HttpStatusCode.BadRequest, "a signing secret shorter than 16 characters is refused");
+    using (HttpResponseMessage scheme = await ApiPost(address, prefix + "/hooks", apiToken,
+        new { url = "file:///etc/passwd", secret, events = new[] { "issue" } }))
+        Check(scheme.StatusCode == HttpStatusCode.BadRequest, "a hook address must be http or https");
+    using (HttpResponseMessage unknown = await ApiPost(address, prefix + "/hooks", apiToken,
+        new { url = hookUrl, secret, events = new[] { "everything" } }))
+        Check(unknown.StatusCode == HttpStatusCode.BadRequest, "an event name nothing will ever send is refused when the hook is made");
+
+    long hookId;
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/hooks", apiToken,
+        new { url = hookUrl, secret, events = new[] { "issue", "push" } }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStreamAsync());
+        hookId = json.RootElement.GetProperty("id").GetInt64();
+        string payload = json.RootElement.ToString();
+        Check(created.StatusCode == HttpStatusCode.Created &&
+            json.RootElement.GetProperty("events").GetArrayLength() == 2 &&
+            !payload.Contains(secret, StringComparison.Ordinal),
+            "a hook is registered and its signing secret is never reported back");
+    }
+
+    using (HttpResponseMessage opened = await ApiPost(address, prefix + "/issues", apiToken, new { title = "Tell somebody" }))
+        Check(opened.StatusCode == HttpStatusCode.Created, "an issue is opened to trigger a delivery");
+
+    (string deliveredEvent, string signature, string deliveredBody) = await arrived.Task.WaitAsync(TimeSpan.FromSeconds(20));
+    Check(deliveredEvent == "issue", "the delivery names the event that caused it");
+    Check(signature == Signature(secret, deliveredBody),
+        "the delivery is signed with an HMAC of its exact body under the hook's own secret");
+    using (JsonDocument json = JsonDocument.Parse(deliveredBody))
+    {
+        Check(json.RootElement.GetProperty("action").GetString() == "opened" &&
+            json.RootElement.GetProperty("issue").GetProperty("title").GetString() == "Tell somebody" &&
+            json.RootElement.GetProperty("project").GetProperty("path").GetString() == "alice/notified",
+            "the payload says what happened, to what, and in which project");
+        Check(!deliveredBody.Contains(secret, StringComparison.Ordinal) &&
+            !deliveredBody.Contains(apiToken, StringComparison.Ordinal),
+            "and carries no credential of any kind");
+    }
+    // The outcome is recorded against the hook, so a failing receiver is visible without reading a log.
+    // Polled, because the sender records it after answering the request that caused it: the whole point of
+    // the queue is that nothing waits for the receiver.
+    int? recorded = null;
+    for (int attempt = 0; attempt < 40 && recorded is null; attempt++)
+    {
+        using HttpResponseMessage listed = await ApiGet(address, prefix + "/hooks", apiToken);
+        using JsonDocument json = JsonDocument.Parse(await listed.Content.ReadAsStreamAsync());
+        JsonElement status = json.RootElement[0].GetProperty("last_status");
+        if (status.ValueKind == JsonValueKind.Number) recorded = status.GetInt32();
+        else await Task.Delay(250);
+    }
+    Check(recorded == 200, "the last delivery's outcome is recorded on the hook");
+    receiver.Stop();
+    using (HttpResponseMessage removed = await ApiDelete(address, prefix + "/hooks/" + hookId, apiToken))
+        Check(removed.StatusCode == HttpStatusCode.NoContent, "a hook is removed");
+
+    // Back to the posture every other check runs under, and the caller takes the new address: a restart
+    // moves the port.
+    await StopServer();
+    webhooksEnabled = false;
+    return await StartServer();
+}
+
+/// <summary>The signature a receiver is expected to compute, written out here rather than shared with the
+/// server, so the assertion checks the format rather than agreeing with itself.</summary>
+static string Signature(string secret, string body) =>
+    "sha256=" + Convert.ToHexStringLower(System.Security.Cryptography.HMACSHA256.HashData(
+        Encoding.UTF8.GetBytes(secret), Encoding.UTF8.GetBytes(body)));
+
+static int FreeLoopbackPort()
+{
+    using System.Net.Sockets.TcpListener probe = new(IPAddress.Loopback, 0);
+    probe.Start();
+    int port = ((IPEndPoint)probe.LocalEndpoint).Port;
+    probe.Stop();
+    return port;
 }
 void Check(bool condition, string name)
 {

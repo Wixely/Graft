@@ -4,7 +4,7 @@ namespace Graft.Storage;
 
 public static class GraftSchema
 {
-    public static DnaXMigrationManifest Manifest { get; } = new(8,
+    public static DnaXMigrationManifest Manifest { get; } = new(10,
     [
         DnaXMigration.Sql(1, "initial-identity-project-schema", "Create identity and private project schema", """
             CREATE TABLE Users (
@@ -222,6 +222,71 @@ public static class GraftSchema
             CREATE INDEX IX_Issues_Project ON Issues(ProjectId, State);
             CREATE INDEX IX_MergeRequests_Project ON MergeRequests(ProjectId, State);
             CREATE INDEX IX_Comments_Subject ON Comments(SubjectType, SubjectId, Id);
+            """),
+        // Review, in the two forms it takes.
+        //
+        // An approval records the commit it was given against. An approval of code that has since changed
+        // is not an approval of what would be merged, so the stored sha is what lets a stale one be
+        // recognised rather than counted. Nothing deletes a stale approval; it stops counting and says so,
+        // because deleting it would hide that somebody had looked.
+        //
+        // ApprovalsRequired defaults to zero, so every project that existed before this migration merges
+        // exactly as it did. A gate is never the result of an upgrade.
+        //
+        // A comment gains an optional anchor: a path, a line, which side of the diff the line is on, and
+        // the commit the diff was computed from. All four are null together for a comment on the proposal
+        // as a whole, which is what every comment written before this migration was. The anchor is stored
+        // rather than recomputed because the branch moves underneath it, and a comment that silently
+        // re-anchored itself to whatever now occupies that line number would be worse than one that admits
+        // the code moved.
+        DnaXMigration.Sql(9, "review", "Record approvals, and let a comment point at a line", """
+            ALTER TABLE Projects ADD COLUMN ApprovalsRequired INTEGER NOT NULL DEFAULT 0
+                CHECK (ApprovalsRequired BETWEEN 0 AND 10);
+
+            CREATE TABLE MergeRequestApprovals (
+                MergeRequestId INTEGER NOT NULL REFERENCES MergeRequests(Id) ON DELETE CASCADE,
+                UserId INTEGER NOT NULL REFERENCES Users(Id) ON DELETE CASCADE,
+                SourceCommitSha TEXT NOT NULL,
+                CreatedAtUtc TEXT NOT NULL,
+                PRIMARY KEY (MergeRequestId, UserId)
+            );
+
+            ALTER TABLE Comments ADD COLUMN Path TEXT NULL;
+            ALTER TABLE Comments ADD COLUMN Line INTEGER NULL;
+            ALTER TABLE Comments ADD COLUMN Side TEXT NULL CHECK (Side IS NULL OR Side IN ('old', 'new'));
+            ALTER TABLE Comments ADD COLUMN AnchorCommitSha TEXT NULL;
+
+            CREATE INDEX IX_Comments_Anchor ON Comments(SubjectType, SubjectId, Path);
+            """),
+        // Where a project says it wants to be told that something happened.
+        //
+        // The secret is stored in the clear and never returned after creation. It is not a credential for
+        // Graft: it is the key the receiver uses to check the signature on a delivery, so the receiver must
+        // hold the same value and Graft must be able to sign with it. Encrypting it would protect nothing
+        // that the receiver's own copy does not already expose.
+        //
+        // Events are a comma-separated set from a fixed list rather than a table, because the set is small,
+        // closed, and only ever read whole.
+        //
+        // The last delivery's outcome is kept on the row so an operator can see a hook failing without
+        // reading a log. One row, overwritten: a delivery history would be a table that grows forever to
+        // answer a question nobody asks twice.
+        DnaXMigration.Sql(10, "webhooks", "Let a project ask to be told when something happens", """
+            CREATE TABLE Webhooks (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                Url TEXT NOT NULL,
+                Secret TEXT NOT NULL,
+                Events TEXT NOT NULL,
+                Active INTEGER NOT NULL DEFAULT 1 CHECK (Active IN (0, 1)),
+                CreatedByUserId INTEGER NOT NULL REFERENCES Users(Id),
+                CreatedAtUtc TEXT NOT NULL,
+                LastStatus INTEGER NULL,
+                LastError TEXT NULL,
+                LastDeliveredAtUtc TEXT NULL
+            );
+
+            CREATE INDEX IX_Webhooks_Project ON Webhooks(ProjectId, Active);
             """)
     ]);
 }

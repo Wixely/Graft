@@ -33,7 +33,7 @@ if (args.Length == 1 && args[0] == "--licences")
 
 if (!Arguments.TryParse(args, out Arguments? parsedSettings))
 {
-    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>] [--mcp true|false] [--pages-origin <https origin>] [--recoverable-tokens true|false].");
+    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>] [--mcp true|false] [--pages-origin <https origin>] [--recoverable-tokens true|false] [--webhooks true|false].");
     Console.Error.WriteLine("       Graft.Server --licences  prints the third-party notices this build redistributes.");
     return 2;
 }
@@ -170,6 +170,10 @@ await using WebApplication app = builder.Build();
 IDataProtector? tokenProtector = settings.RecoverableTokens
     ? app.Services.GetRequiredService<IDataProtectionProvider>().CreateProtector("graft.token.recovery.v1")
     : null;
+
+// Outbound notification, when the operator has allowed it. Null is not "off for now": with no sender,
+// nothing anywhere queues a delivery, and the routes that manage hooks are absent rather than refusing.
+await using WebhookSender? webhooks = settings.Webhooks ? new WebhookSender(store) : null;
 app.Use(async (context, next) =>
 {
     context.Response.Headers.CacheControl = "no-store";
@@ -222,7 +226,7 @@ app.MapGet("/api/session", async context =>
     if (!await OnlyQuery(context)) return;
     (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: false);
     SessionResponse response;
-    if (browser is null) response = new(false, null, false, "", 0, null, settings.PublicBrowsing, settings.Mcp);
+    if (browser is null) response = new(false, null, false, "", 0, null, settings.PublicBrowsing, settings.Mcp, settings.Webhooks);
     else
     {
         long userId = browser.Value.Identity.UserId;
@@ -230,7 +234,7 @@ app.MapGet("/api/session", async context =>
             ? AvatarUrl(context, AvatarOwner.User, userId)
             : null;
         response = new(true, browser.Value.Identity.Username, browser.Value.Identity.IsAdministrator,
-            Csrf(browser.Value.Secret), userId, avatarUrl, settings.PublicBrowsing, settings.Mcp);
+            Csrf(browser.Value.Secret), userId, avatarUrl, settings.PublicBrowsing, settings.Mcp, settings.Webhooks);
     }
     await context.Response.WriteAsJsonAsync(response, ApiJson.Default.SessionResponse, null, context.RequestAborted);
 });
@@ -1188,8 +1192,12 @@ Func<HttpContext, ProjectDetails?, Task> browseProject = async (context, details
         // open an issue without being able to push, so a page that gated its comment box on CanPush would
         // hide it from exactly the people it is for.
         PermissionDecision participate = await DecideFor(context, browser?.Identity, projectId, ProjectAction.WriteCollaboration);
+        // Only for somebody who can change it. A reader has no form to fill in, and the rule is of no
+        // interest to them until they open a proposal, where it is reported on the proposal itself.
+        int approvalsRequired = manage.Allowed ? await store.GetApprovalsRequiredAsync(projectId, context.RequestAborted) : 0;
         RepositoryPageResponse response = new(project, manage.Allowed, push.Allowed, branches, commits, entries,
-            fileResponse, readme, details.Project.PagePublished, settings.PublicBrowsing, participate.Allowed);
+            fileResponse, readme, details.Project.PagePublished, settings.PublicBrowsing, participate.Allowed,
+            approvalsRequired);
         await context.Response.WriteAsJsonAsync(response, ApiJson.Default.RepositoryPageResponse, null, context.RequestAborted);
     });
 };
@@ -1399,6 +1407,47 @@ app.MapPost("/api/v4/projects", async context =>
     ProjectCreateRequest? request = await ReadProjectCreateRequest(context);
     if (request is null) return;
     await CreateProject(context, identity, request);
+});
+
+// Creating and deleting a branch without a Git client. Both need the permission a push needs, because
+// both are what a push would otherwise have done.
+//
+// Neither writes an object: creating points a new reference at a commit the repository already holds, and
+// deleting removes a reference while the objects beneath it stay. That is Git's own behaviour, and it is
+// why deleting a branch cannot lose work another branch can still reach.
+app.MapPost("/api/v4/projects/{projectId}/repository/branches", async context =>
+{
+    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.PushRepository);
+    if (project is null) return;
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    BranchCreateRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.BranchCreateRequest, context.RequestAborted);
+    if (request?.Branch is not { Length: > 0 }) { await ApiError(context, 400, "branch is required"); return; }
+    await CreateBranch(context, project.Details, project.Identity, request.Branch, request.Ref);
+});
+
+app.MapDelete("/api/v4/projects/{projectId}/repository/branches/{**branch}", async context =>
+{
+    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.PushRepository);
+    if (project is null) return;
+    if (!await OnlyQuery(context)) return;
+    await DeleteBranch(context, project.Details, project.Identity, context.Request.RouteValues["branch"]?.ToString() ?? "");
+});
+
+app.MapPost("/api/projects/{projectId:long}/branches", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: true);
+    if (scope is null) return;
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    BranchCreateRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.BranchCreateRequest, context.RequestAborted);
+    if (request?.Branch is not { Length: > 0 }) { await ApiError(context, 400, "branch is required"); return; }
+    await CreateBranch(context, scope.Value.Details, scope.Value.Identity, request.Branch, request.Ref);
+});
+
+app.MapDelete("/api/projects/{projectId:long}/branches/{**branch}", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: true);
+    if (scope is null) return;
+    await DeleteBranch(context, scope.Value.Details, scope.Value.Identity, context.Request.RouteValues["branch"]?.ToString() ?? "");
 });
 
 app.MapGet("/api/v4/projects/{projectId}/repository/branches", async context =>
@@ -1904,12 +1953,27 @@ async Task<IssueResponse> IssueResponseFor(HttpContext context, ProjectDetails p
     ProjectWebUrl(context, project) + "/-/issues/" + issue.Iid.ToString(System.Globalization.CultureInfo.InvariantCulture),
     issue.Comments);
 
+/// <summary>
+/// Re-reads the proposal's approvals against the branch tip the analysis just resolved. The store cannot
+/// know that tip without walking the repository, so it loads every approval as stale and this decides
+/// which are current, with no second query and no second lock.
+/// </summary>
+static MergeProposal AgainstTip(MergeProposal proposal, string? tip) =>
+    proposal.Approvals is null ? proposal : proposal with
+    {
+        Approvals = [.. proposal.Approvals.Select(approval => approval with
+        {
+            Current = tip is not null && string.Equals(approval.SourceCommitSha, tip, StringComparison.Ordinal)
+        })]
+    };
+
 // `analysis` is null in a listing. Deciding whether a proposal merges means flattening three trees, and
 // doing that for every row of a page would make a list cost as much as the work it lists. GitLab answers
 // the same way, with a merge_status a client is expected to treat as not yet known.
 async Task<MergeRequestResponse> MergeResponseFor(HttpContext context, ProjectDetails project,
-    MergeProposal proposal, MergeAnalysis? analysis)
+    MergeProposal input, MergeAnalysis? analysis)
 {
+    MergeProposal proposal = analysis is null ? input : AgainstTip(input, analysis.SourceCommitId);
     string status = proposal.State switch
     {
         CollaborationState.Merged => "can_be_merged",
@@ -1925,18 +1989,43 @@ async Task<MergeRequestResponse> MergeResponseFor(HttpContext context, ProjectDe
         { Kind: MergeKind.AlreadyMerged } => "already_merged",
         _ => "unresolved"
     };
+    int current = proposal.Approvals?.Count(approval => approval.Current) ?? 0;
     return new(proposal.Id, proposal.Iid, proposal.ProjectId, proposal.Title, proposal.Description,
         StateText(proposal.State), proposal.SourceBranch, proposal.TargetBranch,
         await AuthorFor(context, proposal.AuthorUserId, proposal.AuthorUsername),
         proposal.CreatedAtUtc, proposal.UpdatedAtUtc, proposal.ClosedAtUtc,
         proposal.MergeCommitSha, proposal.MergedByUsername, status, analysis?.SourceCommitId,
         ProjectWebUrl(context, project) + "/-/merge-requests/" + proposal.Iid.ToString(System.Globalization.CultureInfo.InvariantCulture),
-        method, analysis?.Conflicts, proposal.Comments);
+        method, analysis?.Conflicts, proposal.Comments,
+        proposal.ApprovalsRequired, Math.Max(0, proposal.ApprovalsRequired - current),
+        proposal.Approvals is null ? null : [.. proposal.Approvals.Select(approval => new ApprovalResponse(
+            approval.UserId, approval.Username, approval.SourceCommitSha, approval.Current, approval.CreatedAtUtc))]);
 }
 
-async Task<NoteResponse> NoteResponseFor(HttpContext context, Comment comment) => new(
+// `tip` is the source branch as it stands now. A comment anchored to any other commit is outdated: the
+// line it names may no longer be the line it was about, so the page shows it beside the file rather than
+// inside the diff.
+async Task<NoteResponse> NoteResponseFor(HttpContext context, Comment comment, string? tip = null) => new(
     comment.Id, comment.Body, await AuthorFor(context, comment.AuthorUserId, comment.AuthorUsername),
-    comment.CreatedAtUtc);
+    comment.CreatedAtUtc, comment.Path, comment.Line,
+    comment.Side is null ? null : comment.Side == DiffSide.Old ? "old" : "new",
+    comment.AnchorCommitSha,
+    comment.AnchorCommitSha is not null && !string.Equals(comment.AnchorCommitSha, tip, StringComparison.Ordinal));
+
+/// <summary>
+/// Where a proposal's source branch points right now, or null when it no longer resolves. This is the
+/// value an approval is recorded against and an anchored comment is measured by, so it is read from the
+/// repository rather than taken from a caller.
+/// </summary>
+async Task<string?> SourceTip(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity, long iid)
+{
+    MergeProposal? proposal = await store.FindMergeProposalAsync(identity, project.Project.Id, iid, null, context.RequestAborted);
+    if (proposal is null) return null;
+    RepositoryEndpoint endpoint = EndpointFor(project.Project);
+    await endpoint.Gate.WaitAsync(context.RequestAborted);
+    try { return endpoint.Repository.Refs.GetValueOrDefault("refs/heads/" + proposal.SourceBranch); }
+    finally { endpoint.Gate.Release(); }
+}
 
 // Analyses a proposal against the repository as it stands now. Taken under the repository's gate like
 // every other read of it, because a merge analysis reads the whole object graph.
@@ -1976,6 +2065,17 @@ async Task CreateIssue(HttpContext context, ProjectDetails project, Authenticate
     {
         Issue issue = await store.CreateIssueAsync(identity, project.Project.Id, request.Title,
             request.Description ?? "", context.RequestAborted);
+        await Notify(context, project.Project, WebhookEvent.Issue, payload =>
+        {
+            payload["action"] = "opened";
+            payload["issue"] = new System.Text.Json.Nodes.JsonObject
+            {
+                ["iid"] = issue.Iid,
+                ["title"] = issue.Title,
+                ["state"] = "opened",
+                ["author"] = issue.AuthorUsername
+            };
+        });
         context.Response.StatusCode = StatusCodes.Status201Created;
         await context.Response.WriteAsJsonAsync(await IssueResponseFor(context, project, issue),
             ApiJson.Default.IssueResponse, null, context.RequestAborted);
@@ -2007,6 +2107,18 @@ async Task UpdateIssue(HttpContext context, ProjectDetails project, Authenticate
     {
         Issue issue = await store.UpdateIssueAsync(identity, project.Project.Id, Number(context),
             request.Title, request.Description, state, context.RequestAborted);
+        if (state is not null)
+            await Notify(context, project.Project, WebhookEvent.Issue, payload =>
+            {
+                payload["action"] = state == CollaborationState.Closed ? "closed" : "reopened";
+                payload["issue"] = new System.Text.Json.Nodes.JsonObject
+                {
+                    ["iid"] = issue.Iid,
+                    ["title"] = issue.Title,
+                    ["state"] = StateText(issue.State),
+                    ["author"] = issue.AuthorUsername
+                };
+            });
         await context.Response.WriteAsJsonAsync(await IssueResponseFor(context, project, issue),
             ApiJson.Default.IssueResponse, null, context.RequestAborted);
     }
@@ -2025,8 +2137,13 @@ async Task ListNotes(HttpContext context, ProjectDetails project, AuthenticatedI
     {
         IReadOnlyList<Comment> comments = await store.ListCommentsAsync(identity, project.Project.Id, subject,
             Number(context), (page - 1) * perPage, perPage, context.RequestAborted);
+        // Only a merge proposal has anchored comments, and only it needs the branch tip to tell a current
+        // anchor from an outdated one. An issue's comments never carry one, so the walk is skipped.
+        string? tip = subject == CommentSubject.MergeRequest && comments.Any(comment => comment.Path is not null)
+            ? await SourceTip(context, project, identity, Number(context))
+            : null;
         List<NoteResponse> response = [];
-        foreach (Comment comment in comments) response.Add(await NoteResponseFor(context, comment));
+        foreach (Comment comment in comments) response.Add(await NoteResponseFor(context, comment, tip));
         await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.NoteResponseArray, null, context.RequestAborted);
     }
     catch (CollaborationNotFoundException error) { await ApiError(context, 404, error.Message); }
@@ -2038,12 +2155,40 @@ async Task CreateNote(HttpContext context, ProjectDetails project, Authenticated
     if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
     NoteCreateRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.NoteCreateRequest, context.RequestAborted);
     if (request?.Body is not { Length: > 0 }) { await ApiError(context, 400, "body is required"); return; }
+
+    // A comment either names a line or it does not. Half a position is a client bug, and accepting it would
+    // store an anchor nothing could render.
+    bool anchored = request.Path is not null || request.Line is not null || request.Side is not null;
+    if (anchored && (request.Path is not { Length: > 0 } || request.Line is null || request.Side is null))
+    { await ApiError(context, 400, "a comment on a line needs path, line and side together"); return; }
+    if (anchored && request.Side is not ("old" or "new"))
+    { await ApiError(context, 400, "side must be old or new"); return; }
+    if (anchored && subject != CommentSubject.MergeRequest)
+    { await ApiError(context, 400, "only a merge request has a diff to comment on"); return; }
+
+    // The anchor is the branch tip as the server sees it now, not a value the client supplies. A client
+    // that sent its own could anchor a comment to a commit it never read.
+    string? anchor = anchored ? await SourceTip(context, project, identity, Number(context)) : null;
+    if (anchored && anchor is null)
+    { await ApiError(context, 409, "the source branch no longer resolves, so there is no diff to anchor to"); return; }
+
     try
     {
         Comment comment = await store.AddCommentAsync(identity, project.Project.Id, subject, Number(context),
-            request.Body, context.RequestAborted);
+            request.Body, request.Path, request.Line,
+            anchored ? request.Side == "old" ? DiffSide.Old : DiffSide.New : null,
+            anchor, context.RequestAborted);
+        await Notify(context, project.Project, WebhookEvent.Comment, payload =>
+        {
+            payload["action"] = "created";
+            payload["subject"] = subject == CommentSubject.Issue ? "issue" : "merge_request";
+            payload["iid"] = Number(context);
+            payload["author"] = comment.AuthorUsername;
+            payload["path"] = comment.Path;
+            payload["line"] = comment.Line;
+        });
         context.Response.StatusCode = StatusCodes.Status201Created;
-        await context.Response.WriteAsJsonAsync(await NoteResponseFor(context, comment),
+        await context.Response.WriteAsJsonAsync(await NoteResponseFor(context, comment, anchor),
             ApiJson.Default.NoteResponse, null, context.RequestAborted);
     }
     catch (CollaborationNotFoundException error) { await ApiError(context, 404, error.Message); }
@@ -2098,6 +2243,11 @@ async Task CreateMergeRequest(HttpContext context, ProjectDetails project, Authe
     {
         MergeProposal proposal = await store.CreateMergeProposalAsync(identity, project.Project.Id,
             request.SourceBranch, request.TargetBranch, request.Title, request.Description ?? "", context.RequestAborted);
+        await Notify(context, project.Project, WebhookEvent.MergeRequest, payload =>
+        {
+            payload["action"] = "opened";
+            payload["merge_request"] = MergeNode(proposal);
+        });
         context.Response.StatusCode = StatusCodes.Status201Created;
         await context.Response.WriteAsJsonAsync(
             await MergeResponseFor(context, project, proposal, await AnalyseProposal(context, project, proposal)),
@@ -2111,7 +2261,7 @@ async Task CreateMergeRequest(HttpContext context, ProjectDetails project, Authe
 async Task ReadMergeRequest(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
 {
     if (!await OnlyQuery(context)) return;
-    MergeProposal? proposal = await store.FindMergeProposalAsync(identity, project.Project.Id, Number(context), context.RequestAborted);
+    MergeProposal? proposal = await store.FindMergeProposalAsync(identity, project.Project.Id, Number(context), null, context.RequestAborted);
     if (proposal is null) { await ApiError(context, 404, "404 Merge Request Not Found"); return; }
     await context.Response.WriteAsJsonAsync(
         await MergeResponseFor(context, project, proposal, await AnalyseProposal(context, project, proposal)),
@@ -2145,7 +2295,7 @@ async Task UpdateMergeRequest(HttpContext context, ProjectDetails project, Authe
 async Task MergeRequestChanges(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
 {
     if (!await OnlyQuery(context)) return;
-    MergeProposal? proposal = await store.FindMergeProposalAsync(identity, project.Project.Id, Number(context), context.RequestAborted);
+    MergeProposal? proposal = await store.FindMergeProposalAsync(identity, project.Project.Id, Number(context), null, context.RequestAborted);
     if (proposal is null) { await ApiError(context, 404, "404 Merge Request Not Found"); return; }
 
     RepositoryEndpoint endpoint = EndpointFor(project.Project);
@@ -2191,10 +2341,35 @@ async Task AcceptMergeRequest(HttpContext context, ProjectDetails project, Authe
     PermissionDecision push = await DecideFor(context, identity, project.Project.Id, ProjectAction.PushRepository);
     if (!push.Allowed) { await ApiError(context, 403, push.Explanation); return; }
 
-    MergeProposal? proposal = await store.FindMergeProposalAsync(identity, project.Project.Id, Number(context), context.RequestAborted);
+    // The body is optional: GitLab's merge route takes none, and the only thing Graft reads from one is
+    // whether to remove the source branch afterwards.
+    bool removeSource = false;
+    if (context.Request.HasJsonContentType())
+    {
+        MergeAcceptRequest? body;
+        try { body = await context.Request.ReadFromJsonAsync(ApiJson.Default.MergeAcceptRequest, context.RequestAborted); }
+        catch (JsonException) { await ApiError(context, 400, "invalid JSON"); return; }
+        removeSource = body?.ShouldRemoveSourceBranch == true;
+    }
+
+    MergeProposal? proposal = await store.FindMergeProposalAsync(identity, project.Project.Id, Number(context),
+        null, context.RequestAborted);
     if (proposal is null) { await ApiError(context, 404, "404 Merge Request Not Found"); return; }
     if (proposal.State != CollaborationState.Opened)
     { await ApiError(context, 409, "the proposal is not open"); return; }
+
+    // The approval gate, checked here rather than only in the browser, so a client that simply does not
+    // ask cannot merge past it. Counted against the branch as it stands now, so an approval given before
+    // the latest push does not satisfy it.
+    string? currentTip = await SourceTip(context, project, identity, proposal.Iid);
+    int outstanding = await store.ApprovalsOutstandingAsync(project.Project.Id, proposal.Iid,
+        currentTip ?? "", context.RequestAborted);
+    if (outstanding > 0)
+    {
+        await ApiError(context, 409, $"this project requires {proposal.ApprovalsRequired} approvals of the " +
+            $"current branch and {outstanding} more are outstanding");
+        return;
+    }
 
     string message = $"Merge branch '{proposal.SourceBranch}' into '{proposal.TargetBranch}'\n\n{proposal.Title}";
     GitIdentity author = new(identity.Username, identity.Username + "@" + MergeAuthorHost, DateTimeOffset.UtcNow);
@@ -2202,6 +2377,7 @@ async Task AcceptMergeRequest(HttpContext context, ProjectDetails project, Authe
     RepositoryEndpoint endpoint = EndpointFor(project.Project);
     await endpoint.Gate.WaitAsync(context.RequestAborted);
     MergeOutcome outcome;
+    bool sourceRemoved = false;
     try
     {
         MergeAnalysis analysis = RepositoryMerge.Analyse(endpoint.Repository, proposal.SourceBranch,
@@ -2219,6 +2395,19 @@ async Task AcceptMergeRequest(HttpContext context, ProjectDetails project, Authe
         }
         outcome = RepositoryMerge.Merge(endpoint.Repository, proposal.SourceBranch, proposal.TargetBranch,
             author, message, context.RequestAborted);
+
+        // Inside the same lock as the merge, so nothing can push to the source branch between the two and
+        // have that push silently removed. Refused only when the source is the branch the project opens
+        // at, which is not an error worth failing a completed merge over.
+        if (removeSource)
+        {
+            try
+            {
+                endpoint.Repository.DeleteBranch(proposal.SourceBranch, context.RequestAborted);
+                sourceRemoved = true;
+            }
+            catch (GitInputException) { sourceRemoved = false; }
+        }
     }
     catch (GitInputException error) { await ApiError(context, 409, "merge refused: " + error.Message); return; }
     finally { endpoint.Gate.Release(); }
@@ -2228,11 +2417,232 @@ async Task AcceptMergeRequest(HttpContext context, ProjectDetails project, Authe
     // the proposal can be looked at.
     MergeProposal merged = await store.RecordMergeAsync(identity, project.Project.Id, proposal.Iid,
         outcome.CommitId, context.RequestAborted);
+    await Notify(context, project.Project, WebhookEvent.MergeRequest, payload =>
+    {
+        payload["action"] = "merged";
+        payload["merge_request"] = MergeNode(merged);
+        payload["merge_commit_sha"] = outcome.CommitId;
+        payload["source_branch_removed"] = sourceRemoved;
+    });
+    // A branch moved, which is the thing a build server is actually waiting for, so it is reported as a
+    // push as well. A receiver listening only for pushes would otherwise never hear about a merge.
+    await Notify(context, project.Project, WebhookEvent.Push, payload =>
+    {
+        payload["branch"] = merged.TargetBranch;
+        payload["commit"] = outcome.CommitId;
+        payload["by"] = identity.Username;
+        payload["via"] = "merge";
+    });
     await context.Response.WriteAsJsonAsync(new MergeResultResponse(
         await MergeResponseFor(context, project, merged, await AnalyseProposal(context, project, merged)),
-        outcome.Kind == MergeKind.FastForward ? "fast_forward" : "three_way", outcome.CommitId),
+        outcome.Kind == MergeKind.FastForward ? "fast_forward" : "three_way", outcome.CommitId, sourceRemoved),
         ApiJson.Default.MergeResultResponse, null, context.RequestAborted);
 }
+
+// The permission a push needs is re-checked here as well as at the route, because the browser family
+// authorizes reading and leaves writing to whatever the operation itself requires.
+async Task CreateBranch(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity,
+    string branch, string? revision)
+{
+    PermissionDecision push = await DecideFor(context, identity, project.Project.Id, ProjectAction.PushRepository);
+    if (!push.Allowed) { await ApiError(context, 403, push.Explanation); return; }
+
+    RepositoryEndpoint endpoint = EndpointFor(project.Project);
+    await WithRepository(endpoint, context, async repository =>
+    {
+        string from = string.IsNullOrWhiteSpace(revision) ? "HEAD" : revision.Trim();
+        try
+        {
+            string commitId = repository.CreateBranch(branch, from, context.RequestAborted);
+            context.Response.StatusCode = StatusCodes.Status201Created;
+            await context.Response.WriteAsJsonAsync(new BranchResponse(branch, false, false,
+                branch == repository.DefaultBranch, true, true, true,
+                ProjectWebUrl(context, project) + "/-/tree/" + Uri.EscapeDataString(branch),
+                CommitResponseFor(context, project, RepositoryView.ReadCommit(repository, commitId))),
+                ApiJson.Default.BranchResponse, null, context.RequestAborted);
+        }
+        catch (GitInputException error)
+        {
+            await ApiError(context, error.Message == "branch-exists" ? 409 : 400, error.Message switch
+            {
+                "branch-exists" => "a branch with this name already exists",
+                "branch-revision" => "the revision to branch from could not be resolved",
+                "ref-prefix-conflict" => "another branch's name is a prefix of this one, which Git cannot store",
+                _ => "the branch name is not valid"
+            });
+        }
+    });
+}
+
+async Task DeleteBranch(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity, string branch)
+{
+    PermissionDecision push = await DecideFor(context, identity, project.Project.Id, ProjectAction.PushRepository);
+    if (!push.Allowed) { await ApiError(context, 403, push.Explanation); return; }
+    try { branch = Uri.UnescapeDataString(branch); }
+    catch (UriFormatException) { await ApiError(context, 400, "branch"); return; }
+    if (branch.Length == 0) { await ApiError(context, 400, "branch is required"); return; }
+
+    RepositoryEndpoint endpoint = EndpointFor(project.Project);
+    await WithRepository(endpoint, context, async repository =>
+    {
+        try
+        {
+            repository.DeleteBranch(branch, context.RequestAborted);
+            context.Response.StatusCode = StatusCodes.Status204NoContent;
+        }
+        catch (GitInputException error)
+        {
+            await ApiError(context, error.Message == "branch-missing" ? 404 : 409, error.Message switch
+            {
+                "branch-missing" => "404 Branch Not Found",
+                "branch-is-default" => "this is the branch the project opens at; choose another default first",
+                _ => "the branch name is not valid"
+            });
+        }
+    });
+}
+
+// Approving records the commit approved, so the approval can be recognised as stale once the branch moves.
+// The commit comes from the repository rather than from the caller, for the same reason an anchor does.
+async Task SetApproval(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity, bool approved)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required to approve"); return; }
+    if (!await OnlyQuery(context)) return;
+    string? tip = await SourceTip(context, project, identity, Number(context));
+    if (approved && tip is null)
+    { await ApiError(context, 409, "the source branch no longer resolves, so there is nothing to approve"); return; }
+
+    try
+    {
+        MergeProposal proposal = await store.SetApprovalAsync(identity, project.Project.Id, Number(context),
+            approved, tip ?? "", context.RequestAborted);
+        await context.Response.WriteAsJsonAsync(
+            await MergeResponseFor(context, project, proposal, await AnalyseProposal(context, project, proposal)),
+            ApiJson.Default.MergeRequestResponse, null, context.RequestAborted);
+    }
+    catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Merge Request Not Found"); }
+    catch (CollaborationConflictException error) { await ApiError(context, 409, error.Message); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+}
+
+async Task SetApprovalsRequired(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    ApprovalsRequiredRequest? request = await context.Request.ReadFromJsonAsync(
+        ApiJson.Default.ApprovalsRequiredRequest, context.RequestAborted);
+    if (request is null) { await ApiError(context, 400, "approvals_before_merge is required"); return; }
+    if (request.ApprovalsBeforeMerge is < 0 or > 10)
+    { await ApiError(context, 400, "approvals_before_merge must be between 0 and 10"); return; }
+    try
+    {
+        await store.SetApprovalsRequiredAsync(identity, project.Project.Id, request.ApprovalsBeforeMerge, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+}
+
+// Hooks are managed only where the operator allowed outbound requests. Absent rather than refused on a
+// server without the switch: there is nothing for a hook to do there, and a 404 is the honest answer.
+async Task ListWebhooks(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    if (!await OnlyQuery(context)) return;
+    try
+    {
+        IReadOnlyList<Webhook> hooks = await store.ListWebhooksAsync(identity, project.Project.Id, context.RequestAborted);
+        await context.Response.WriteAsJsonAsync([.. hooks.Select(WebhookResponseFor)],
+            ApiJson.Default.WebhookResponseArray, null, context.RequestAborted);
+    }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+}
+
+async Task CreateWebhook(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    WebhookCreateRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.WebhookCreateRequest, context.RequestAborted);
+    if (request?.Url is not { Length: > 0 }) { await ApiError(context, 400, "url is required"); return; }
+    if (request.Secret is not { Length: > 0 }) { await ApiError(context, 400, "secret is required"); return; }
+    if (request.Events is not { Length: > 0 }) { await ApiError(context, 400, "at least one event is required"); return; }
+    if (!WebhookEvents.TryParse(string.Join(",", request.Events), out WebhookEvent events))
+    { await ApiError(context, 400, "events must be push, issue, merge_request or comment"); return; }
+    // An absolute http or https address and nothing else. A scheme this server could be talked into
+    // treating as a file or a socket is the one thing an address field must not accept.
+    if (!Uri.TryCreate(request.Url, UriKind.Absolute, out Uri? target) ||
+        (target.Scheme != Uri.UriSchemeHttp && target.Scheme != Uri.UriSchemeHttps) ||
+        !string.IsNullOrEmpty(target.UserInfo))
+    { await ApiError(context, 400, "url must be an absolute http or https address with no credentials in it"); return; }
+
+    try
+    {
+        Webhook hook = await store.CreateWebhookAsync(identity, project.Project.Id, request.Url,
+            request.Secret, events, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status201Created;
+        await context.Response.WriteAsJsonAsync(WebhookResponseFor(hook), ApiJson.Default.WebhookResponse, null, context.RequestAborted);
+    }
+    catch (CollaborationConflictException error) { await ApiError(context, 409, error.Message); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+}
+
+async Task DeleteWebhook(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    long hookId = Convert.ToInt64(context.Request.RouteValues["hookId"], System.Globalization.CultureInfo.InvariantCulture);
+    try
+    {
+        await store.DeleteWebhookAsync(identity, project.Project.Id, hookId, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Webhook Not Found"); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+}
+
+/// <summary>
+/// Queues an event for a project's hooks, if the operator allowed any. Returns as soon as it is queued;
+/// nothing a person does waits for somebody else's server to answer.
+///
+/// <para>
+/// The payload is built here as a JSON node tree rather than serialized from a type, for the same reason
+/// the agent tools are: reflection-based serialization is off, so a shape invented here would work under a
+/// debugger and fail in the published build.
+/// </para>
+/// </summary>
+async Task Notify(HttpContext context, ProjectInfo project, WebhookEvent single,
+    Action<System.Text.Json.Nodes.JsonObject> describe)
+{
+    if (webhooks is null) return;
+    System.Text.Json.Nodes.JsonObject payload = new()
+    {
+        ["event"] = WebhookEvents.Name(single),
+        ["project"] = new System.Text.Json.Nodes.JsonObject
+        {
+            ["id"] = project.Id,
+            ["path"] = project.Namespace + "/" + project.Slug,
+            ["web_url"] = ProjectUrlFor(context, project)
+        },
+        ["at"] = DateTimeOffset.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture)
+    };
+    describe(payload);
+    await webhooks.PublishAsync(project.Id, single, payload.ToJsonString(), context.RequestAborted);
+}
+
+static System.Text.Json.Nodes.JsonObject MergeNode(MergeProposal proposal) => new()
+{
+    ["iid"] = proposal.Iid,
+    ["title"] = proposal.Title,
+    ["state"] = StateText(proposal.State),
+    ["source_branch"] = proposal.SourceBranch,
+    ["target_branch"] = proposal.TargetBranch,
+    ["author"] = proposal.AuthorUsername
+};
+
+static WebhookResponse WebhookResponseFor(Webhook hook) => new(
+    hook.Id, hook.Url,
+    [.. WebhookEvents.All.Where(entry => hook.Events.HasFlag(entry.Value)).Select(entry => entry.Name)],
+    hook.Active, hook.CreatedByUsername, hook.CreatedAtUtc, hook.LastStatus, hook.LastError, hook.LastDeliveredAtUtc);
 
 async Task DeleteNote(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
 {
@@ -2382,6 +2792,72 @@ app.MapPost("/api/projects/{projectId:long}/merge-requests/{iid:long}/merge", as
     await AcceptMergeRequest(context, scope.Value.Details, scope.Value.Identity);
 });
 
+app.MapPost("/api/projects/{projectId:long}/merge-requests/{iid:long}/approve", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: true);
+    if (scope is null) return;
+    await SetApproval(context, scope.Value.Details, scope.Value.Identity, approved: true);
+});
+
+app.MapPost("/api/projects/{projectId:long}/merge-requests/{iid:long}/unapprove", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: true);
+    if (scope is null) return;
+    await SetApproval(context, scope.Value.Details, scope.Value.Identity, approved: false);
+});
+
+app.MapPost("/api/projects/{projectId:long}/approvals", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: true);
+    if (scope is null) return;
+    await SetApprovalsRequired(context, scope.Value.Details, scope.Value.Identity);
+});
+
+if (settings.Webhooks)
+{
+    app.MapGet("/api/projects/{projectId:long}/hooks", async context =>
+    {
+        var scope = await BrowserCollaboration(context, write: false);
+        if (scope is null) return;
+        await ListWebhooks(context, scope.Value.Details, scope.Value.Identity);
+    });
+
+    app.MapPost("/api/projects/{projectId:long}/hooks", async context =>
+    {
+        var scope = await BrowserCollaboration(context, write: true);
+        if (scope is null) return;
+        await CreateWebhook(context, scope.Value.Details, scope.Value.Identity);
+    });
+
+    app.MapDelete("/api/projects/{projectId:long}/hooks/{hookId:long}", async context =>
+    {
+        var scope = await BrowserCollaboration(context, write: true);
+        if (scope is null) return;
+        await DeleteWebhook(context, scope.Value.Details, scope.Value.Identity);
+    });
+
+    app.MapGet("/api/v4/projects/{projectId}/hooks", async context =>
+    {
+        var scope = await ApiCollaboration(context);
+        if (scope is null) return;
+        await ListWebhooks(context, scope.Value.Details, scope.Value.Identity);
+    });
+
+    app.MapPost("/api/v4/projects/{projectId}/hooks", async context =>
+    {
+        var scope = await ApiCollaboration(context);
+        if (scope is null) return;
+        await CreateWebhook(context, scope.Value.Details, scope.Value.Identity);
+    });
+
+    app.MapDelete("/api/v4/projects/{projectId}/hooks/{hookId:long}", async context =>
+    {
+        var scope = await ApiCollaboration(context);
+        if (scope is null) return;
+        await DeleteWebhook(context, scope.Value.Details, scope.Value.Identity);
+    });
+}
+
 app.MapDelete("/api/projects/{projectId:long}/comments/{commentId:long}", async context =>
 {
     var scope = await BrowserCollaboration(context, write: true);
@@ -2487,6 +2963,27 @@ app.MapMethods("/api/v4/projects/{projectId}/merge_requests/{iid:long}/merge", [
     await AcceptMergeRequest(context, scope.Value.Details, scope.Value.Identity);
 });
 
+app.MapPost("/api/v4/projects/{projectId}/merge_requests/{iid:long}/approve", async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    await SetApproval(context, scope.Value.Details, scope.Value.Identity, approved: true);
+});
+
+app.MapPost("/api/v4/projects/{projectId}/merge_requests/{iid:long}/unapprove", async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    await SetApproval(context, scope.Value.Details, scope.Value.Identity, approved: false);
+});
+
+app.MapMethods("/api/v4/projects/{projectId}/approvals", ["POST", "PUT"], async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    await SetApprovalsRequired(context, scope.Value.Details, scope.Value.Identity);
+});
+
 // GitLab answers this with 202 Accepted because its deletion is scheduled and happens later. Graft's is
 // immediate and complete when the response is written, so it answers 204: a client that polls for the
 // project to disappear would be polling for something that has already happened.
@@ -2537,6 +3034,7 @@ app.MapPost("/{projectNamespace}/{project}.git/{service}", async context =>
     };
     AuthorizedRepository? authorized = await Authorize(context, action);
     if (authorized is null) return;
+    List<(string Branch, string? From, string? To)> pushed = [];
     Limits.Require(context.Request.ContentType == "application/x-" + service + "-request", "content-type");
     Limits.Require(!context.Request.Headers.ContainsKey("Content-Encoding"), "content-encoding");
     if (!await authorized.Endpoint.Gate.WaitAsync(0, context.RequestAborted))
@@ -2571,13 +3069,35 @@ app.MapPost("/{projectNamespace}/{project}.git/{service}", async context =>
             return;
         }
 
+        // The refs before and after, so a push can report which branches moved. Taken inside the lock, so
+        // nothing else can move one between the two readings.
+        Dictionary<string, string>? before = service == "git-receive-pack" && webhooks is not null
+            ? new(authorized.Endpoint.Repository.Refs, StringComparer.Ordinal)
+            : null;
+
         byte[] data = service == "git-receive-pack"
             ? authorized.Endpoint.Repository.Receive(body, context.RequestAborted)
             : authorized.Endpoint.Repository.Upload(body, context.RequestAborted);
         context.Response.ContentType = "application/x-" + service + "-result";
         await context.Response.Body.WriteAsync(data, context.RequestAborted);
+
+        if (before is not null) pushed = Moved(before, authorized.Endpoint.Repository.Refs);
     }
     finally { authorized.Endpoint.Gate.Release(); }
+
+    // Queued after the lock is released and after the client has its answer, because a push is finished
+    // when the objects are durable and not when somebody else has been told about it.
+    foreach ((string branch, string? from, string? to) in pushed)
+    {
+        await Notify(context, authorized.Project, WebhookEvent.Push, payload =>
+        {
+            payload["branch"] = branch;
+            payload["before"] = from;
+            payload["commit"] = to;
+            payload["by"] = authorized.Identity?.Username;
+            payload["via"] = "push";
+        });
+    }
 });
 
 // The pages origin: a project's static site, served from a different hostname and nothing else.
@@ -2781,6 +3301,9 @@ Console.WriteLine("TOKENS: " + (settings.RecoverableTokens
     ? "secrets kept and readable by their owner with a password"
     : "secrets unrecoverable once issued"));
 Console.WriteLine(settings.PagesOrigin is null ? "PAGES: off" : "PAGES: " + settings.PagesOrigin + "/<project-slug>/");
+Console.WriteLine("WEBHOOKS: " + (settings.Webhooks
+    ? "on; a project Maintainer can make this server call an address of their choosing"
+    : "off"));
 Console.WriteLine("READY: " + address);
 await app.WaitForShutdownAsync();
 return 0;
@@ -3465,8 +3988,30 @@ static void NotifySystemd(string message)
     socket.SendTo(Encoding.UTF8.GetBytes(message), new UnixDomainSocketEndPoint(path));
 }
 
-static string ProjectWebUrl(HttpContext context, ProjectDetails project) =>
-    Origin(context) + "/" + Uri.EscapeDataString(project.Project.Namespace) + "/" + Uri.EscapeDataString(project.Project.Slug);
+static string ProjectWebUrl(HttpContext context, ProjectDetails project) => ProjectUrlFor(context, project.Project);
+
+// The same address from the lighter record. Local functions cannot be overloaded, hence the second name.
+static string ProjectUrlFor(HttpContext context, ProjectInfo project) =>
+    Origin(context) + "/" + Uri.EscapeDataString(project.Namespace) + "/" + Uri.EscapeDataString(project.Slug);
+
+/// <summary>
+/// Which branches a push moved, by comparing the references before and after. A branch that was created
+/// reports a null previous commit and one that was deleted reports a null new one, so a receiver can tell
+/// the three cases apart without guessing from the commit ids.
+/// </summary>
+static List<(string Branch, string? From, string? To)> Moved(
+    Dictionary<string, string> before, Dictionary<string, string> after)
+{
+    List<(string Branch, string? From, string? To)> moved = [];
+    foreach (string name in before.Keys.Union(after.Keys, StringComparer.Ordinal))
+    {
+        if (!name.StartsWith("refs/heads/", StringComparison.Ordinal)) continue;
+        before.TryGetValue(name, out string? from);
+        after.TryGetValue(name, out string? to);
+        if (!string.Equals(from, to, StringComparison.Ordinal)) moved.Add((name[11..], from, to));
+    }
+    return moved;
+}
 
 static X509Certificate2 LoadCertificate(Arguments settings)
 {
@@ -3587,12 +4132,12 @@ sealed record PendingSecret(long UserId, string Secret, DateTimeOffset ExpiresAt
 
 sealed record Arguments(string Database, string Repositories, IPAddress ListenAddress, int ListenPort, string? Origin,
     string? Certificate, string? CertificatePasswordFile, bool PublicBrowsing, bool PushToCreate, int SessionMinutes, bool Mcp,
-    string? PagesOrigin, bool RecoverableTokens)
+    string? PagesOrigin, bool RecoverableTokens, bool Webhooks)
 {
     public static bool TryParse(string[] values, out Arguments? result)
     {
         result = null;
-        if (values.Length is < 4 or > 24 || values.Length % 2 != 0) return false;
+        if (values.Length is < 4 or > 26 || values.Length % 2 != 0) return false;
         string? database = null;
         string? repositories = null;
         string? listen = null;
@@ -3605,6 +4150,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         string? mcp = null;
         string? pagesOrigin = null;
         string? recoverableTokens = null;
+        string? webhooks = null;
         HashSet<string> seen = new(StringComparer.Ordinal);
         for (int index = 0; index < values.Length; index += 2)
         {
@@ -3621,6 +4167,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             else if (values[index] == "--mcp") mcp = values[index + 1];
             else if (values[index] == "--pages-origin") pagesOrigin = values[index + 1];
             else if (values[index] == "--recoverable-tokens") recoverableTokens = values[index + 1];
+            else if (values[index] == "--webhooks") webhooks = values[index + 1];
             else return false;
         }
         if (string.IsNullOrWhiteSpace(database) || string.IsNullOrWhiteSpace(repositories)) return false;
@@ -3634,6 +4181,10 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         // Whether a token's secret stays readable after it is issued. Off by default, and off is the only
         // state in which losing a token is not also a way to read somebody else's: see ADR 0012.
         if (recoverableTokens is not null and not "true" and not "false") return false;
+        // Whether this server may make outbound HTTP requests on a project's behalf. Off by default, because
+        // turning it on lets a project Maintainer cause the server to issue a request to any address it can
+        // reach, which is an egress decision the operator owns rather than the project.
+        if (webhooks is not null and not "true" and not "false") return false;
         // Where project sites are served, on a hostname of their own. Repository-authored HTML cannot share
         // an origin with the session cookie and the API, so this names a second host or the feature stays
         // off. An https origin with no path, for the same reasons --origin takes one.
@@ -3679,7 +4230,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             origin is null ? null : origin.TrimEnd('/'), certificate is null ? null : Path.GetFullPath(certificate),
             certificatePasswordFile is null ? null : Path.GetFullPath(certificatePasswordFile),
             publicBrowsing == "true", pushToCreate == "true", window, mcp == "true",
-            pagesOrigin, recoverableTokens == "true");
+            pagesOrigin, recoverableTokens == "true", webhooks == "true");
         return true;
     }
 }

@@ -159,6 +159,18 @@ token, a repository-only token, a member, and an account with a perfectly good c
 the project. See [ADR 0014](decisions/0014-collaboration.md) and
 [the evidence](validation/2026-10-22-collaboration.md).
 
+Review is asserted from the parts that age. An approval is given, the branch is pushed to, and the suite
+asserts that the gate closed again without anybody withdrawing anything; a line comment is written, the same
+push happens, and the suite asserts that it reports itself outdated and still names the commit it was
+written against. Those two are the whole of what makes approvals and line comments trustworthy, so they are
+the assertions to keep if the rest were ever trimmed.
+
+Webhooks run against a receiver the suite starts on loopback, so a delivery is observed arriving rather
+than assumed. The signature is recomputed in the test from the secret and the received bytes rather than by
+calling the server's own signing code, so the assertion checks the format a receiver would implement rather
+than agreeing with itself. The suite also asserts that a server started without `--webhooks` has no hook
+routes at all, which is the state every other check in the file runs under.
+
 Deleting a project is asserted by what survives it. The row counts for issues, comments and membership are
 read with SQL rather than through an API, because nothing can ask an API about a project that no longer
 exists, and a row left behind would be keyed to an id some later project could be given.

@@ -346,6 +346,130 @@ else
         </div>
 
         <div class="panel">
+            <div class="panel-header"><Icon Name="branch" /><h2>Branches</h2><span class="spacer"></span><span class="label">@repo.Branches.Count</span></div>
+            <div class="panel-body">
+                <form class="form inline" @onsubmit="CreateBranch" @onsubmit:preventDefault>
+                    <label for="new-branch">New branch</label>
+                    <input id="new-branch" @bind="newBranch" maxlength="255" autocomplete="off" placeholder="name" />
+                    <label for="branch-from">from</label>
+                    <select id="branch-from" @bind="newBranchFrom">
+                        @foreach (BranchResponse option in repo.Branches) { <option value="@option.Name">@option.Name</option> }
+                    </select>
+                    <div class="form-actions">
+                        <button type="submit" disabled="@(busy || newBranch.Trim().Length == 0)">Create branch</button>
+                    </div>
+                </form>
+            </div>
+            <div class="list">
+                @foreach (BranchResponse option in repo.Branches)
+                {
+                    <div class="list-item">
+                        <Icon Name="branch" />
+                        <span class="list-item-main"><strong><code>@option.Name</code></strong></span>
+                        @if (option.Default)
+                        {
+                            <span class="label accent">default</span>
+                        }
+                        <span class="list-item-actions">
+                            @if (!option.Default)
+                            {
+                                <button type="button" class="@(pendingBranch == option.Name ? "danger" : "secondary")"
+                                        @onclick="() => DeleteBranch(option.Name)" disabled="@busy">
+                                    @(pendingBranch == option.Name ? "Confirm delete" : "Delete")
+                                </button>
+                            }
+                        </span>
+                    </div>
+                }
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="panel-header"><Icon Name="check" /><h2>Review</h2></div>
+            <div class="panel-body">
+                <p class="secondary-text">
+                    How many people must approve a merge request before it can be merged. An approval counts only
+                    while the branch it was given against is still the branch being merged, so pushing to a
+                    proposal supersedes the approvals of what came before. An author cannot approve their own.
+                </p>
+                <form class="form inline" @onsubmit="SaveApprovals" @onsubmit:preventDefault>
+                    <label for="approvals-required">Approvals required</label>
+                    <input id="approvals-required" type="number" min="0" max="10" @bind="approvalsRequired" />
+                    <div class="form-actions">
+                        <button type="submit" disabled="@busy">Save</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        @* Only where the operator allowed outbound requests. Elsewhere the routes are absent, so offering
+           the controls would be offering something that answers 404. *@
+        @if (Api.Session?.WebhooksAvailable == true)
+        {
+            <div class="panel">
+                <div class="panel-header"><Icon Name="upload" /><h2>Webhooks</h2><span class="spacer"></span><span class="label">@hooks.Length</span></div>
+                <div class="panel-body">
+                    <div class="banner info">
+                        <Icon Name="shield" />
+                        <span>
+                            Each delivery carries an <code>X-Graft-Signature</code> header: the text
+                            <code>sha256=</code> followed by an HMAC of the exact body under the secret below.
+                            Check it before trusting a delivery. The secret is stored but never shown again.
+                        </span>
+                    </div>
+                    <form class="form" @onsubmit="CreateHook" @onsubmit:preventDefault>
+                        <label for="hook-url">Address</label>
+                        <input id="hook-url" @bind="hookUrl" maxlength="2048" autocomplete="off" placeholder="https://build.example/graft" />
+                        <label for="hook-secret">Signing secret</label>
+                        <input id="hook-secret" type="password" @bind="hookSecret" minlength="16" maxlength="256" autocomplete="off" />
+                        <p class="field-hint">At least 16 characters. The receiver needs the same value.</p>
+                        <fieldset class="checkbox-group">
+                            <legend>Events</legend>
+                            @foreach (string name in HookEvents)
+                            {
+                                <label class="checkbox">
+                                    <input type="checkbox" checked="@hookEvents.Contains(name)"
+                                           @onchange="args => ToggleHookEvent(name, args)" />
+                                    @name
+                                </label>
+                            }
+                        </fieldset>
+                        <div class="form-actions">
+                            <button type="submit" disabled="@busy">Add webhook</button>
+                        </div>
+                    </form>
+                </div>
+                @if (hooks.Length > 0)
+                {
+                    <div class="list">
+                        @foreach (WebhookResponse hook in hooks)
+                        {
+                            <div class="list-item">
+                                <span class="list-item-main">
+                                    <strong><code>@hook.Url</code></strong>
+                                    <small>
+                                        @string.Join(", ", hook.Events) &middot; added by @hook.CreatedBy
+                                        @if (hook.LastDeliveredAt is not null)
+                                        {
+                                            <span>
+                                                &middot; last @(hook.LastStatus is not null
+                                                    ? "answered " + hook.LastStatus
+                                                    : "failed: " + hook.LastError)
+                                            </span>
+                                        }
+                                    </small>
+                                </span>
+                                <span class="list-item-actions">
+                                    <button type="button" class="secondary" @onclick="() => DeleteHook(hook)" disabled="@busy">Remove</button>
+                                </span>
+                            </div>
+                        }
+                    </div>
+                }
+            </div>
+        }
+
+        <div class="panel">
             <div class="panel-header"><Icon Name="repository" /><h2>Project avatar</h2></div>
             <div class="panel-body">
                 <p class="secondary-text">
@@ -460,6 +584,16 @@ else
     private string memberRole = "Developer";
     private string transferUsername = "";
     private string deleteConfirmation = "";
+    private string newBranch = "";
+    private string newBranchFrom = "";
+    private string? pendingBranch;
+    private int approvalsRequired;
+    private WebhookResponse[] hooks = [];
+    private string hookUrl = "";
+    private string hookSecret = "";
+    private readonly HashSet<string> hookEvents = new(StringComparer.Ordinal) { "push" };
+
+    private static readonly string[] HookEvents = ["push", "issue", "merge_request", "comment"];
     private bool loading = true;
     private bool busy;
 
@@ -574,8 +708,18 @@ else
         nameChoice = repo?.Project.Name ?? "";
         descriptionChoice = repo?.Project.Description ?? "";
         visibilityChoice = repo?.Project.Visibility ?? "private";
-        if (repo?.CanManage == true) await LoadMembers(repo.Project.Id);
+        if (newBranchFrom.Length == 0 || repo?.Branches.All(option => option.Name != newBranchFrom) == true)
+            newBranchFrom = repo?.Project.DefaultBranch ?? repo?.Branches.FirstOrDefault()?.Name ?? "";
+        approvalsRequired = repo?.ApprovalsRequired ?? 0;
+        if (repo?.CanManage == true)
+        {
+            await LoadMembers(repo.Project.Id);
+            await LoadHooks();
+        }
     }
+
+    /// <summary>Reloads just the repository view, after something that changed its branches.</summary>
+    private Task LoadRepository() => Load();
 
     /// <summary>Switches branch, dropping the current path because it may not exist on the new one.</summary>
     private async Task SwitchBranch(ChangeEventArgs args)
@@ -716,6 +860,114 @@ else
         string.Equals(repo.Project.Namespace.Path, Api.Username, StringComparison.OrdinalIgnoreCase));
 
     private string ProjectPath => repo is null ? "" : repo.Project.Namespace.Path + "/" + repo.Project.Path;
+
+    private async Task CreateBranch()
+    {
+        if (busy || repo is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            string from = newBranchFrom.Length > 0 ? newBranchFrom : Branch;
+            ApiResult result = await Api.PostAsync($"api/projects/{repo.Project.Id}/branches",
+                new BranchCreateRequest(newBranch.Trim(), from), ApiJson.Default.BranchCreateRequest,
+                $"{newBranch.Trim()} created from {from}.");
+            Report(result);
+            if (!result.Ok) return;
+            newBranch = "";
+            await LoadRepository();
+        }
+        finally { busy = false; }
+    }
+
+    /// <summary>Deleting a branch needs a second click: the first arms it, so a stray click cannot remove
+    /// a branch somebody is working on.</summary>
+    private async Task DeleteBranch(string branch)
+    {
+        if (busy || repo is null) return;
+        if (pendingBranch != branch)
+        {
+            pendingBranch = branch;
+            Report(ApiResult.Refused($"Select Confirm delete to remove {branch}. Its commits stay in the repository."));
+            return;
+        }
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.DeleteAsync(
+                $"api/projects/{repo.Project.Id}/branches/{Uri.EscapeDataString(branch)}", $"{branch} deleted.");
+            Report(result);
+            pendingBranch = null;
+            if (result.Ok) await LoadRepository();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task SaveApprovals()
+    {
+        if (busy || repo is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/projects/{repo.Project.Id}/approvals",
+                new ApprovalsRequiredRequest(approvalsRequired), ApiJson.Default.ApprovalsRequiredRequest,
+                approvalsRequired == 0
+                    ? "Merge requests no longer need approval."
+                    : $"Merge requests now need {approvalsRequired} approvals.");
+            Report(result);
+        }
+        finally { busy = false; }
+    }
+
+    private void ToggleHookEvent(string name, ChangeEventArgs args)
+    {
+        if (args.Value is true) hookEvents.Add(name);
+        else hookEvents.Remove(name);
+    }
+
+    private async Task LoadHooks()
+    {
+        if (repo is null || Api.Session?.WebhooksAvailable != true || !repo.CanManage) return;
+        hooks = await Api.GetAsync($"api/projects/{repo.Project.Id}/hooks", ApiJson.Default.WebhookResponseArray) ?? [];
+    }
+
+    private async Task CreateHook()
+    {
+        if (busy || repo is null) return;
+        if (hookEvents.Count == 0) { Report(ApiResult.Refused("Choose at least one event.")); return; }
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/projects/{repo.Project.Id}/hooks",
+                new WebhookCreateRequest(hookUrl.Trim(), hookSecret, [.. hookEvents]),
+                ApiJson.Default.WebhookCreateRequest, "Webhook added.");
+            // Cleared whatever the outcome: a secret that stayed in the form after a refusal would sit in
+            // the page until the reader navigated away.
+            hookSecret = "";
+            Report(result);
+            if (!result.Ok) return;
+            hookUrl = "";
+            await LoadHooks();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task DeleteHook(WebhookResponse hook)
+    {
+        if (busy || repo is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.DeleteAsync($"api/projects/{repo.Project.Id}/hooks/{hook.Id}", "Webhook removed.");
+            Report(result);
+            if (result.Ok) await LoadHooks();
+        }
+        finally { busy = false; }
+    }
 
     private async Task DeleteProject()
     {

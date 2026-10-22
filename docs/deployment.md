@@ -137,6 +137,41 @@ TOKENS: secrets unrecoverable once issued
 
 See [ADR 0012](decisions/0012-recoverable-tokens.md).
 
+### Optional webhooks
+
+A project can ask to be told when something happens: a push, an issue, a merge request, a comment. The
+forge sends nothing until an operator allows it to:
+
+```sh
+GRAFT_WEBHOOKS=true
+```
+
+or `--webhooks true`.
+
+**Know what this costs before turning it on.** With it on, a project Maintainer can cause this server to
+issue an HTTP request to any address it can reach, including addresses inside your network that nothing
+outside it could otherwise ask for. That is the point of the feature on a self-hosted forge, where the
+address a hook wants is usually an internal build server, and it is why the switch belongs to the operator
+rather than to the project. Graft refuses only what no address field should accept: a hook URL must be an
+absolute `http` or `https` address with no credentials embedded in it.
+
+Each delivery carries `X-Graft-Event` and `X-Graft-Signature`, the latter being `sha256=` followed by an
+HMAC-SHA256 of the exact body under the hook's own secret. A receiver should check it and reject anything
+that does not match; the secret itself is never sent.
+
+Deliveries are queued and sent on a worker, so nothing a person does in Graft waits for a receiver to
+answer. The queue is bounded, held in memory, lost on restart, and drops its oldest entry when full, with
+three attempts a few seconds apart. **This is a notification mechanism, not a guarantee of delivery.** A
+receiver that must not miss an event should reconcile against the API rather than trust that it heard.
+
+The forge prints which it is doing at startup:
+
+```text
+WEBHOOKS: off
+```
+
+See [ADR 0016](decisions/0016-webhooks.md).
+
 ### Optional project sites
 
 A project page can serve a static site from a folder in its repository. That is repository-authored HTML,

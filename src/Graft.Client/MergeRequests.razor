@@ -147,13 +147,65 @@ else
                     @foreach (string path in proposal.Conflicts) { <li><code>@path</code></li> }
                 </ul>
             }
-            @if (canPush && proposal.State == "opened" && proposal.MergeStatus == "can_be_merged")
+            @if (proposal.ApprovalsRequired > 0 || proposal.ApprovedBy is { Count: > 0 })
             {
-                <div class="form-actions">
+                <div class="banner @(proposal.ApprovalsLeft > 0 ? "warning" : "success")">
+                    <Icon Name="@(proposal.ApprovalsLeft > 0 ? "alert" : "check")" />
+                    <span>@ApprovalExplanation</span>
+                </div>
+            }
+            @if (proposal.ApprovedBy is { Count: > 0 })
+            {
+                <div class="list">
+                    @foreach (ApprovalResponse approval in proposal.ApprovedBy)
+                    {
+                        <div class="list-item">
+                            <span class="avatar avatar-small" aria-hidden="true">@Initial(approval.Username)</span>
+                            <span class="list-item-main">
+                                <strong>@approval.Username</strong>
+                                <small>
+                                    approved @approval.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")
+                                    at <code>@Short(approval.SourceCommitSha)</code>
+                                </small>
+                            </span>
+                            <span class="label @(approval.Current ? "success" : "")">
+                                @(approval.Current ? "current" : "superseded")
+                            </span>
+                        </div>
+                    }
+                </div>
+            }
+            <div class="form-actions">
+                @if (canPush && proposal.State == "opened" && proposal.MergeStatus == "can_be_merged" && proposal.ApprovalsLeft == 0)
+                {
                     <button type="button" @onclick="Merge" disabled="@busy">
                         @(busy ? "Merging…" : proposal.MergeMethod == "fast_forward" ? "Fast-forward" : "Merge")
                     </button>
-                </div>
+                }
+                @if (canPush && proposal.State == "opened" && !IsAuthor)
+                {
+                    <button type="button" class="secondary" @onclick="() => SetApproval(!HasApproved)" disabled="@busy">
+                        @(HasApproved ? "Withdraw approval" : "Approve")
+                    </button>
+                }
+                @if (canPush && proposal.State == "merged" && branches.Contains(proposal.SourceBranch) &&
+                     proposal.SourceBranch != project.DefaultBranch)
+                {
+                    <button type="button" class="secondary" @onclick="RemoveSourceBranch" disabled="@busy">
+                        Delete <code>@proposal.SourceBranch</code>
+                    </button>
+                }
+            </div>
+            @if (canPush && proposal.State == "opened" && proposal.MergeStatus == "can_be_merged" && proposal.ApprovalsLeft == 0)
+            {
+                <label class="checkbox">
+                    <input type="checkbox" @bind="removeSourceOnMerge" />
+                    Delete <code>@proposal.SourceBranch</code> after merging
+                </label>
+            }
+            @if (canPush && proposal.State == "opened" && IsAuthor && proposal.ApprovalsRequired > 0)
+            {
+                <p class="field-hint">You cannot approve your own proposal.</p>
             }
         </div>
     </div>
@@ -168,6 +220,13 @@ else
             <Icon Name="file" /><h2>Changes</h2>
             <span class="spacer"></span>
             <span class="label">@files.Length @(files.Length == 1 ? "file" : "files")</span>
+            @if (files.Length > 0)
+            {
+                <span class="diff-total">
+                    <span class="diff-added">+@files.Sum(file => file.Added)</span>
+                    <span class="diff-removed">&minus;@files.Sum(file => file.Removed)</span>
+                </span>
+            }
         </div>
         @if (files.Length == 0)
         {
@@ -179,27 +238,182 @@ else
                 @foreach (DiffFileResponse file in files)
                 {
                     <div class="list-item">
-                        <span class="list-item-main"><strong><code>@file.Path</code></strong></span>
+                        <span class="list-item-main"><strong><a href="#@Anchor(file.Path)"><code>@file.Path</code></a></strong></span>
                         <span class="label @StatusClass(file.Status)">@file.Status</span>
-                        <span class="list-item-meta">
-                            <small>+@file.Added &minus;@file.Removed</small>
-                        </span>
+                        <span class="list-item-meta"><small>+@file.Added &minus;@file.Removed</small></span>
                     </div>
                 }
             </div>
         }
+        @if (truncated)
+        {
+            <div class="panel-footer">
+                <span class="secondary-text">
+                    This comparison was cut short, so files are missing from it. Compare locally to see the whole change.
+                </span>
+            </div>
+        }
     </div>
 
+    @* The change itself, file by file, the same rendering the commit page uses. Every cell binds repository
+       content as text, so it is escaped by the renderer and never interpreted as markup. *@
+    @foreach (DiffFileResponse file in files)
+    {
+        <div class="panel diff-file" id="@Anchor(file.Path)">
+            <div class="panel-header">
+                <Icon Name="file" />
+                <strong class="mono">@file.Path</strong>
+                <span class="label @StatusClass(file.Status)">@file.Status</span>
+                @if (!file.IsBinary && !file.TooLarge)
+                {
+                    <span class="diff-total">
+                        <span class="diff-added">+@file.Added</span>
+                        <span class="diff-removed">&minus;@file.Removed</span>
+                    </span>
+                }
+            </div>
+
+            @if (file.IsBinary)
+            {
+                <p class="panel-empty">Binary file; no line comparison is shown.</p>
+            }
+            else if (file.TooLarge)
+            {
+                <p class="panel-empty">This file is too large to compare line by line.</p>
+            }
+            else if (file.Hunks.Count == 0)
+            {
+                <p class="panel-empty">
+                    @if (file.OldMode is not null && file.NewMode is not null && file.OldMode != file.NewMode)
+                    {
+                        @($"Mode changed from {file.OldMode} to {file.NewMode}; the content is unchanged.")
+                    }
+                    else
+                    {
+                        @("No content changes.")
+                    }
+                </p>
+            }
+            else
+            {
+                <table class="diff">
+                    <tbody>
+                        @foreach (DiffHunkResponse hunk in file.Hunks)
+                        {
+                            <tr class="diff-hunk">
+                                <td class="diff-number" colspan="3"></td>
+                                <td class="diff-text">@hunk.Header</td>
+                            </tr>
+                            @foreach (DiffLineResponse line in hunk.Lines)
+                            {
+                                string side = line.Kind == "-" ? "old" : "new";
+                                int? number = line.Kind == "-" ? line.OldLine : line.NewLine;
+                                <tr class="@LineClass(line.Kind)">
+                                    <td class="diff-gutter">
+                                        @if (canParticipate && number is not null)
+                                        {
+                                            <button type="button" class="line-comment"
+                                                    title="Comment on this line"
+                                                    @onclick="() => StartLineComment(file.Path, number.Value, side)">+</button>
+                                        }
+                                    </td>
+                                    <td class="diff-number">@(line.OldLine?.ToString() ?? "")</td>
+                                    <td class="diff-number">@(line.NewLine?.ToString() ?? "")</td>
+                                    <td class="diff-text"><span class="diff-sign">@line.Kind</span>@line.Text</td>
+                                </tr>
+                                @if (line.NoNewline)
+                                {
+                                    <tr class="diff-note">
+                                        <td class="diff-number" colspan="3"></td>
+                                        <td class="diff-text">\ No newline at end of file</td>
+                                    </tr>
+                                }
+                                @foreach (NoteResponse note in AnchoredAt(file.Path, number, side))
+                                {
+                                    <tr class="diff-comment">
+                                        <td colspan="4">
+                                            <div class="list-item comment">
+                                                <span class="avatar avatar-small" aria-hidden="true">@Initial(note.Author.Username)</span>
+                                                <span class="list-item-main">
+                                                    <small><strong>@note.Author.Username</strong> &middot; @note.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")</small>
+                                                    <pre class="commit-message">@note.Body</pre>
+                                                </span>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                }
+                                @if (IsCommentingAt(file.Path, number, side))
+                                {
+                                    <tr class="diff-comment">
+                                        <td colspan="4">
+                                            <form class="form" @onsubmit="AddLineComment" @onsubmit:preventDefault>
+                                                <label for="line-comment">Comment on line @number</label>
+                                                <textarea id="line-comment" @bind="lineCommentBody" rows="3" maxlength="50000" required></textarea>
+                                                <div class="form-actions">
+                                                    <button type="submit" disabled="@busy">@(busy ? "Posting…" : "Comment")</button>
+                                                    <button type="button" class="secondary" @onclick="CancelLineComment" disabled="@busy">Cancel</button>
+                                                </div>
+                                            </form>
+                                        </td>
+                                    </tr>
+                                }
+                            }
+                        }
+                    </tbody>
+                </table>
+            }
+
+            @* Comments written against an earlier version of this file. They are kept and shown, because
+               somebody said them, but not placed on a line: the line they named may now be a different
+               line. *@
+            @{ NoteResponse[] stale = OutdatedFor(file.Path); }
+            @if (stale.Length > 0)
+            {
+                <div class="panel-body">
+                    <div class="banner info">
+                        <Icon Name="alert" />
+                        <span>
+                            @stale.Length @(stale.Length == 1 ? "comment was" : "comments were") written against an
+                            earlier version of this file, so @(stale.Length == 1 ? "it is" : "they are") shown here
+                            rather than on a line.
+                        </span>
+                    </div>
+                    <div class="list">
+                        @foreach (NoteResponse note in stale)
+                        {
+                            <div class="list-item comment">
+                                <span class="avatar avatar-small" aria-hidden="true">@Initial(note.Author.Username)</span>
+                                <span class="list-item-main">
+                                    <small>
+                                        <strong>@note.Author.Username</strong> on line @note.Line
+                                        at <code>@Short(note.AnchorCommitSha)</code>
+                                    </small>
+                                    <pre class="commit-message">@note.Body</pre>
+                                </span>
+                            </div>
+                        }
+                    </div>
+                </div>
+            }
+        </div>
+    }
+
     <div class="panel">
-        <div class="panel-header"><h2>Comments</h2><span class="spacer"></span><span class="label">@comments.Length</span></div>
-        @if (comments.Length == 0)
+        <div class="panel-header">
+            <h2>Comments</h2>
+            <span class="spacer"></span>
+            <span class="label">@comments.Length</span>
+        </div>
+        @if (GeneralComments.Length == 0)
         {
-            <div class="panel-empty">Nothing said yet.</div>
+            <div class="panel-empty">
+                @(comments.Length == 0 ? "Nothing said yet." : "Everything said so far is on a line of the diff above.")
+            </div>
         }
         else
         {
             <div class="list">
-                @foreach (NoteResponse note in comments)
+                @foreach (NoteResponse note in GeneralComments)
                 {
                     <div class="list-item comment">
                         <span class="avatar avatar-small" aria-hidden="true">@Initial(note.Author.Username)</span>
@@ -248,6 +462,12 @@ else
     private DiffFileResponse[] files = [];
     private NoteResponse[] comments = [];
     private long total;
+    private bool truncated;
+    private bool removeSourceOnMerge;
+    private string? commentingPath;
+    private int? commentingLine;
+    private string? commentingSide;
+    private string lineCommentBody = "";
     private string state = "opened";
     private string draftSource = "";
     private string draftTarget = "";
@@ -270,6 +490,49 @@ else
 
     private bool CanChangeState => proposal is not null && canParticipate && proposal.State != "merged" &&
         (canManage || string.Equals(proposal.Author.Username, Api.Username, StringComparison.Ordinal));
+
+    private bool IsAuthor => proposal is not null &&
+        string.Equals(proposal.Author.Username, Api.Username, StringComparison.Ordinal);
+
+    private bool HasApproved => proposal?.ApprovedBy?.Any(approval =>
+        string.Equals(approval.Username, Api.Username, StringComparison.Ordinal)) == true;
+
+    /// <summary>
+    /// What the approval gate means right now, in a sentence rather than a pair of numbers. The superseded
+    /// case is the one worth spelling out: an approval that no longer counts is not an approval that was
+    /// withdrawn, and the difference is not obvious from a count alone.
+    /// </summary>
+    private string ApprovalExplanation
+    {
+        get
+        {
+            int current = proposal!.ApprovedBy?.Count(approval => approval.Current) ?? 0;
+            int superseded = (proposal.ApprovedBy?.Count ?? 0) - current;
+            if (proposal.ApprovalsRequired == 0)
+                return $"{current} {(current == 1 ? "person has" : "people have")} approved. This project requires none.";
+            string stale = superseded == 0
+                ? ""
+                : $" {superseded} earlier {(superseded == 1 ? "approval was" : "approvals were")} superseded by a later push.";
+            return proposal.ApprovalsLeft > 0
+                ? $"{current} of {proposal.ApprovalsRequired} approvals of the current branch.{stale}"
+                : $"Approved by {current} of the {proposal.ApprovalsRequired} required.{stale}";
+        }
+    }
+
+    /// <summary>Comments that belong in the conversation rather than on a line.</summary>
+    private NoteResponse[] GeneralComments => [.. comments.Where(note => note.Path is null)];
+
+    /// <summary>Comments sitting on one line of one file, as that file looks now.</summary>
+    private NoteResponse[] AnchoredAt(string path, int? line, string side) => line is null
+        ? []
+        : [.. comments.Where(note => !note.Outdated && note.Path == path && note.Line == line && note.Side == side)];
+
+    /// <summary>Comments on this file written against a commit that is no longer the branch tip.</summary>
+    private NoteResponse[] OutdatedFor(string path) =>
+        [.. comments.Where(note => note.Outdated && note.Path == path)];
+
+    private bool IsCommentingAt(string path, int? line, string side) =>
+        line is not null && commentingPath == path && commentingLine == line && commentingSide == side;
 
     /// <summary>
     /// What this proposal's state actually means for somebody deciding whether to merge it. Graft's answer
@@ -311,6 +574,22 @@ else
         "deleted" => "danger",
         _ => ""
     };
+
+    private static string LineClass(string kind) => kind switch
+    {
+        "+" => "diff-line diff-line-added",
+        "-" => "diff-line diff-line-removed",
+        _ => "diff-line"
+    };
+
+    /// <summary>
+    /// A fragment id for a file, so the summary at the top links to the file below it. Built from the path
+    /// with everything but letters, numbers and hyphens replaced, because a repository path may contain
+    /// characters a fragment may not.
+    /// </summary>
+    private static string Anchor(string path) =>
+        "file-" + new string([.. path.Select(character =>
+            char.IsAsciiLetterOrDigit(character) ? char.ToLowerInvariant(character) : '-')]);
 
     private static string Initial(string name) => name.Length == 0 ? "?" : name[..1].ToUpperInvariant();
 
@@ -383,6 +662,7 @@ else
         }
         proposal = changes.MergeRequest;
         files = [.. changes.Files];
+        truncated = changes.Truncated;
         comments = await Api.GetAsync($"api/projects/{projectId}/merge-requests/{Number}/comments",
             ApiJson.Default.NoteResponseArray) ?? [];
     }
@@ -449,9 +729,80 @@ else
         try
         {
             ApiResult result = await Api.PostAsync(
-                $"api/projects/{projectId}/merge-requests/{proposal.Iid}/merge", "Merged.");
+                $"api/projects/{projectId}/merge-requests/{proposal.Iid}/merge",
+                new MergeAcceptRequest(removeSourceOnMerge), ApiJson.Default.MergeAcceptRequest, "Merged.");
+            Report(result.Ok, result.Message);
+            if (!result.Ok) return;
+            await ResolveProject();
+            await LoadOne();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task SetApproval(bool approve)
+    {
+        if (busy || proposal is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync(
+                $"api/projects/{projectId}/merge-requests/{proposal.Iid}/{(approve ? "approve" : "unapprove")}",
+                approve ? "Approved." : "Approval withdrawn.");
             Report(result.Ok, result.Message);
             if (result.Ok) await LoadOne();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task RemoveSourceBranch()
+    {
+        if (busy || proposal is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.DeleteAsync(
+                $"api/projects/{projectId}/branches/{Uri.EscapeDataString(proposal.SourceBranch)}",
+                $"{proposal.SourceBranch} deleted.");
+            Report(result.Ok, result.Message);
+            if (!result.Ok) return;
+            await ResolveProject();
+            await LoadOne();
+        }
+        finally { busy = false; }
+    }
+
+    private void StartLineComment(string path, int line, string side)
+    {
+        commentingPath = path;
+        commentingLine = line;
+        commentingSide = side;
+        lineCommentBody = "";
+    }
+
+    private void CancelLineComment()
+    {
+        commentingPath = null;
+        commentingLine = null;
+        commentingSide = null;
+        lineCommentBody = "";
+    }
+
+    private async Task AddLineComment()
+    {
+        if (busy || proposal is null || commentingPath is null || commentingLine is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/projects/{projectId}/merge-requests/{proposal.Iid}/comments",
+                new NoteCreateRequest(lineCommentBody, commentingPath, commentingLine, commentingSide),
+                ApiJson.Default.NoteCreateRequest, "Comment added.");
+            Report(result.Ok, result.Message);
+            if (!result.Ok) return;
+            CancelLineComment();
+            await LoadOne();
         }
         finally { busy = false; }
     }
