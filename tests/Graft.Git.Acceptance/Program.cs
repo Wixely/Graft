@@ -48,12 +48,14 @@ try
     ProjectInfo project;
     UserAccount bob;
     AuthenticatedIdentity aliceIdentity;
+    AuthenticatedIdentity administratorIdentity;
 
     await using (GraftStore fixture = await GraftStore.OpenAsync(databasePath))
     {
         await fixture.BootstrapAdministratorAsync("admin", adminPassword);
         SessionGrant adminSession = Required(await fixture.LoginAsync("admin", adminPassword), "admin login");
         AuthenticatedIdentity admin = Required(await fixture.ResolveSessionAsync(adminSession.Secret), "admin identity");
+        administratorIdentity = admin;
         UserAccount alice = await fixture.CreateUserAsync(admin, "alice", alicePassword);
         bob = await fixture.CreateUserAsync(admin, "bob", bobPassword);
         UserAccount carol = await fixture.CreateUserAsync(admin, "carol", carolPassword);
@@ -210,6 +212,10 @@ try
     // Last, because writing a file creates a branch and several checks above count branches.
     await CheckApiFileWrites(address, aliceIdentity, project.Id);
     await CheckProjectPages(address, aliceIdentity, source);
+    await CheckCollaboration(address, aliceIdentity, bob.Username, "carol");
+    await CheckProjectDeletion(address, aliceIdentity, administratorIdentity, bob.Username, alicePassword);
+    // After the deletions, so the trail it reads already contains them.
+    await CheckAuditTrail(address, adminPassword, alicePassword);
 
     Console.WriteLine($"RESULT: PASS; assertions: {assertions}");
     Console.WriteLine("BOUNDARY: loopback HTTPS with an ephemeral untrusted certificate; one writer process and bounded repositories.");
@@ -2887,6 +2893,549 @@ static string ApplyHunks(string oldText, IReadOnlyList<DiffHunk> hunks)
     return string.Join("\n", result) + (endsWithNewline ? "\n" : "");
 }
 
+
+/// <summary>
+/// Issues, merge proposals and comments, over the GitLab-compatible routes.
+///
+/// <para>
+/// The project is its own, with branches of its own, because a merge moves a branch and several checks
+/// elsewhere in this suite count the branches of the shared project.
+/// </para>
+/// </summary>
+async Task CheckCollaboration(string address, AuthenticatedIdentity alice, string bobUsername, string strangerUsername)
+{
+    // Fresh credentials, like every other check this late in the suite: account administration above
+    // revokes tokens, so nothing threaded in from the fixture can be assumed to still work.
+    long projectId;
+    string aliceApi;
+    string aliceReadApi;
+    string repositoryOnly;
+    string bobApi;
+    string strangerApi;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        ProjectInfo created = await store.CreateProjectWithRepositoryAsync(alice, "talk", "Collaboration",
+            (project, cancellation) => { cancellation.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, project.StorageId)); return Task.CompletedTask; });
+        projectId = created.Id;
+        UserAccount bob = Required(await store.FindActiveUserAsync(bobUsername), "bob account");
+        UserAccount stranger = Required(await store.FindActiveUserAsync(strangerUsername), "stranger account");
+        await store.SetMembershipAsync(alice, projectId, bob.Id, ProjectRole.Developer);
+        AuthenticatedIdentity bobIdentity = new(bob.Id, bob.Username, false, IdentityKind.BrowserSession);
+        AuthenticatedIdentity strangerIdentity = new(stranger.Id, stranger.Username, false, IdentityKind.BrowserSession);
+        aliceApi = (await store.CreateTokenAsync(alice, "talk-api", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        aliceReadApi = (await store.CreateTokenAsync(alice, "talk-read-api", TokenScope.ReadApi, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        repositoryOnly = (await store.CreateTokenAsync(alice, "talk-repository", TokenScope.ReadRepository | TokenScope.WriteRepository, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        bobApi = (await store.CreateTokenAsync(bobIdentity, "talk-member-api", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        strangerApi = (await store.CreateTokenAsync(strangerIdentity, "talk-stranger-api", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+    }
+    string prefix = "/api/v4/projects/" + projectId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    // Branches to propose between, pushed as real Git content so the merge runs against a repository a
+    // client built rather than one this suite assembled.
+    string clone = Path.Combine(root, "talk-clone");
+    string writeUrl = AuthenticatedUrl(address, "alice", aliceApi, "alice/talk.git");
+    Directory.CreateDirectory(clone);
+    await Git(clone, ["init", "--initial-branch=main"]);
+    File.WriteAllText(Path.Combine(clone, "shared.txt"), "one\n");
+    File.WriteAllText(Path.Combine(clone, "base.txt"), "base\n");
+    await Git(clone, ["add", "."]);
+    await Git(clone, ["commit", "-m", "Base"]);
+    await Git(clone, ["remote", "add", "origin", writeUrl]);
+    await Git(clone, ["push", "origin", "main"]);
+
+    // A branch that only adds a file, so it merges three ways against a main that has also moved.
+    await Git(clone, ["checkout", "-b", "feature"]);
+    File.WriteAllText(Path.Combine(clone, "feature.txt"), "feature work\n");
+    await Git(clone, ["add", "."]);
+    await Git(clone, ["commit", "-m", "Add feature"]);
+    await Git(clone, ["push", "origin", "feature"]);
+    // A target that never moves, so a proposal into it is a fast-forward rather than a merge: the whole
+    // distinction is whether the target gained anything the source does not already have.
+    await Git(clone, ["branch", "trunk", "main"]);
+    await Git(clone, ["push", "origin", "trunk"]);
+    await Git(clone, ["checkout", "-b", "forward", "main"]);
+    File.WriteAllText(Path.Combine(clone, "forward.txt"), "ahead\n");
+    await Git(clone, ["add", "."]);
+    await Git(clone, ["commit", "-m", "Move ahead"]);
+    await Git(clone, ["push", "origin", "forward"]);
+    // Two branches that change the same file differently, which is the case Graft refuses.
+    await Git(clone, ["checkout", "-b", "mine", "main"]);
+    File.WriteAllText(Path.Combine(clone, "shared.txt"), "mine\n");
+    await Git(clone, ["commit", "-am", "Change shared from one side"]);
+    await Git(clone, ["push", "origin", "mine"]);
+    await Git(clone, ["checkout", "-b", "theirs", "main"]);
+    File.WriteAllText(Path.Combine(clone, "shared.txt"), "theirs\n");
+    await Git(clone, ["commit", "-am", "Change shared from the other side"]);
+    await Git(clone, ["push", "origin", "theirs"]);
+    // main moves too, so the feature proposal is a genuine three-way rather than a fast-forward.
+    await Git(clone, ["checkout", "main"]);
+    File.WriteAllText(Path.Combine(clone, "base.txt"), "base moved\n");
+    await Git(clone, ["commit", "-am", "Move main"]);
+    await Git(clone, ["push", "origin", "main"]);
+
+    long issueNumber;
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/issues", aliceApi,
+        new { title = "The lantern flickers", description = "It dims every few seconds." }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStreamAsync());
+        issueNumber = json.RootElement.GetProperty("iid").GetInt64();
+        Check(created.StatusCode == HttpStatusCode.Created && issueNumber == 1 &&
+            json.RootElement.GetProperty("state").GetString() == "opened" &&
+            json.RootElement.GetProperty("author").GetProperty("username").GetString() == "alice",
+            "an issue is opened and numbered from one within its project");
+    }
+    using (HttpResponseMessage second = await ApiPost(address, prefix + "/issues", bobApi, new { title = "A developer files one too" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await second.Content.ReadAsStreamAsync());
+        Check(second.StatusCode == HttpStatusCode.Created && json.RootElement.GetProperty("iid").GetInt64() == 2,
+            "a second issue takes the next number");
+    }
+
+    using (HttpResponseMessage listing = await ApiGet(address, prefix + "/issues", aliceReadApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await listing.Content.ReadAsStreamAsync());
+        Check(listing.IsSuccessStatusCode && json.RootElement.GetProperty("total").GetInt64() == 2 &&
+            json.RootElement.GetProperty("issues")[0].GetProperty("iid").GetInt64() == 2,
+            "a read_api token lists issues, newest first");
+    }
+    using (HttpResponseMessage refused = await ApiPost(address, prefix + "/issues", aliceReadApi, new { title = "Not with this token" }))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden, "a read_api token cannot open an issue");
+    using (HttpResponseMessage refused = await ApiGet(address, prefix + "/issues", repositoryOnly))
+        Check(refused.StatusCode == HttpStatusCode.NotFound, "a repository-only token cannot read issues");
+    using (HttpResponseMessage refused = await ApiGet(address, prefix + "/issues", null))
+        Check(refused.StatusCode == HttpStatusCode.NotFound, "a private project's issues are concealed from a stranger");
+
+    using (HttpResponseMessage comment = await ApiPost(address,
+        prefix + "/issues/" + issueNumber + "/notes", bobApi, new { body = "I see it too." }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await comment.Content.ReadAsStreamAsync());
+        Check(comment.StatusCode == HttpStatusCode.Created &&
+            json.RootElement.GetProperty("author").GetProperty("username").GetString() == bobUsername,
+            "a member comments on somebody else's issue");
+    }
+    using (HttpResponseMessage notes = await ApiGet(address, prefix + "/issues/" + issueNumber + "/notes", aliceReadApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await notes.Content.ReadAsStreamAsync());
+        Check(notes.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 1, "comments are listed in order");
+    }
+    using (HttpResponseMessage read = await ApiGet(address, prefix + "/issues/" + issueNumber, aliceReadApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await read.Content.ReadAsStreamAsync());
+        Check(read.IsSuccessStatusCode && json.RootElement.GetProperty("user_notes_count").GetInt64() == 1,
+            "an issue reports how many comments it has");
+    }
+
+    using (HttpResponseMessage refused = await ApiPut(address, prefix + "/issues/" + issueNumber, bobApi,
+        new { title = "Rewriting somebody else's words" }))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden, "a Developer cannot rewrite another author's issue");
+    using (HttpResponseMessage refused = await ApiPut(address, prefix + "/issues/" + issueNumber, bobApi, new { state_event = "close" }))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden, "a Developer cannot close another author's issue");
+    using (HttpResponseMessage closed = await ApiPut(address, prefix + "/issues/" + issueNumber, aliceApi, new { state_event = "close" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await closed.Content.ReadAsStreamAsync());
+        Check(closed.IsSuccessStatusCode && json.RootElement.GetProperty("state").GetString() == "closed" &&
+            json.RootElement.GetProperty("closed_at").ValueKind != JsonValueKind.Null,
+            "the author closes their own issue, and the time it closed is recorded");
+    }
+    using (HttpResponseMessage closed = await ApiPut(address, prefix + "/issues/2", aliceApi, new { state_event = "close" }))
+        Check(closed.IsSuccessStatusCode, "a Maintainer closes somebody else's issue");
+    using (HttpResponseMessage reopened = await ApiPut(address, prefix + "/issues/2", aliceApi, new { state_event = "reopen" }))
+        Check(reopened.IsSuccessStatusCode, "and can reopen it");
+    using (HttpResponseMessage reopened = await ApiPut(address, prefix + "/issues/" + issueNumber, aliceApi, new { state_event = "reopen" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await reopened.Content.ReadAsStreamAsync());
+        Check(reopened.IsSuccessStatusCode && json.RootElement.GetProperty("state").GetString() == "opened" &&
+            json.RootElement.GetProperty("closed_at").ValueKind == JsonValueKind.Null,
+            "reopening an issue clears the time it closed");
+    }
+    using (HttpResponseMessage refused = await ApiPut(address, prefix + "/issues/" + issueNumber, aliceApi, new { state_event = "resolve" }))
+        Check(refused.StatusCode == HttpStatusCode.BadRequest, "state_event takes only close or reopen");
+    using (HttpResponseMessage missing = await ApiGet(address, prefix + "/issues/99", aliceApi))
+        Check(missing.StatusCode == HttpStatusCode.NotFound, "an issue number that names nothing is a 404");
+    using (HttpResponseMessage refused = await ApiPost(address, prefix + "/issues", aliceApi, new { description = "no title" }))
+        Check(refused.StatusCode == HttpStatusCode.BadRequest, "an issue needs a title");
+
+    long forward;
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/merge_requests", aliceApi,
+        new { source_branch = "forward", target_branch = "nothing", title = "Into a branch that is not there" }))
+        Check(created.StatusCode == HttpStatusCode.BadRequest, "a proposal cannot name a branch that does not exist");
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/merge_requests", aliceApi,
+        new { source_branch = "forward", target_branch = "forward", title = "Into itself" }))
+        Check(created.StatusCode == HttpStatusCode.BadRequest, "a proposal needs two different branches");
+
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/merge_requests", aliceApi,
+        new { source_branch = "forward", target_branch = "trunk", title = "Move trunk ahead" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStreamAsync());
+        forward = json.RootElement.GetProperty("iid").GetInt64();
+        Check(created.StatusCode == HttpStatusCode.Created && forward == 1 &&
+            json.RootElement.GetProperty("source_branch").GetString() == "forward",
+            "a merge proposal is created and numbered separately from issues");
+    }
+    using (HttpResponseMessage duplicate = await ApiPost(address, prefix + "/merge_requests", aliceApi,
+        new { source_branch = "forward", target_branch = "trunk", title = "The same pair again" }))
+        Check(duplicate.StatusCode == HttpStatusCode.Conflict, "a second open proposal for the same branches is refused");
+
+    using (HttpResponseMessage listing = await ApiGet(address, prefix + "/merge_requests", aliceReadApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await listing.Content.ReadAsStreamAsync());
+        Check(listing.IsSuccessStatusCode &&
+            json.RootElement.GetProperty("merge_requests")[0].GetProperty("merge_status").GetString() == "unchecked",
+            "a listing does not decide whether each proposal merges");
+    }
+
+    long conflicting;
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/merge_requests", aliceApi,
+        new { source_branch = "theirs", target_branch = "mine", title = "Both sides changed one file" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStreamAsync());
+        conflicting = json.RootElement.GetProperty("iid").GetInt64();
+        Check(created.StatusCode == HttpStatusCode.Created &&
+            json.RootElement.GetProperty("merge_method").GetString() == "conflict" &&
+            json.RootElement.GetProperty("merge_status").GetString() == "cannot_be_merged" &&
+            json.RootElement.GetProperty("conflicts")[0].GetString() == "shared.txt",
+            "a proposal whose branches changed one file reports the conflict and names the file");
+    }
+    using (HttpResponseMessage refused = await ApiPut(address,
+        prefix + "/merge_requests/" + conflicting + "/merge", aliceApi, new { }))
+    {
+        string body = await refused.Content.ReadAsStringAsync();
+        Check(refused.StatusCode == HttpStatusCode.Conflict && body.Contains("shared.txt", StringComparison.Ordinal),
+            "merging a conflicting proposal is refused and says which file");
+    }
+
+    long feature;
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/merge_requests", aliceApi,
+        new { source_branch = "feature", target_branch = "main", title = "Add the feature", description = "Only adds files." }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStreamAsync());
+        feature = json.RootElement.GetProperty("iid").GetInt64();
+        Check(created.StatusCode == HttpStatusCode.Created &&
+            json.RootElement.GetProperty("merge_method").GetString() == "three_way" &&
+            json.RootElement.GetProperty("merge_status").GetString() == "can_be_merged",
+            "a proposal over disjoint files reports that it merges three ways");
+    }
+    using (HttpResponseMessage changes = await ApiGet(address, prefix + "/merge_requests/" + feature + "/changes", aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await changes.Content.ReadAsStreamAsync());
+        JsonElement files = json.RootElement.GetProperty("files");
+        // Measured from the merge base, so the file main gained afterwards is not attributed to this branch.
+        Check(changes.IsSuccessStatusCode && files.GetArrayLength() == 1 &&
+            files[0].GetProperty("path").GetString() == "feature.txt" &&
+            files[0].GetProperty("status").GetString() == "added" &&
+            json.RootElement.GetProperty("base_sha").GetString()!.Length == 40,
+            "a proposal's changes are measured from where the branches last agreed");
+    }
+
+    using (HttpResponseMessage refused = await ApiPut(address, prefix + "/merge_requests/" + feature + "/merge", aliceReadApi, new { }))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden, "merging needs the permission a push needs");
+
+    using (HttpResponseMessage merged = await ApiPut(address, prefix + "/merge_requests/" + forward + "/merge", aliceApi, new { }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await merged.Content.ReadAsStreamAsync());
+        Check(merged.IsSuccessStatusCode && json.RootElement.GetProperty("method").GetString() == "fast_forward" &&
+            json.RootElement.GetProperty("merge_request").GetProperty("state").GetString() == "merged",
+            "a proposal whose target is an ancestor of its source fast-forwards");
+    }
+    using (HttpResponseMessage merged = await ApiPut(address, prefix + "/merge_requests/" + feature + "/merge", aliceApi, new { }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await merged.Content.ReadAsStreamAsync());
+        Check(merged.IsSuccessStatusCode && json.RootElement.GetProperty("method").GetString() == "three_way" &&
+            json.RootElement.GetProperty("merge_commit_sha").GetString()!.Length == 40,
+            "a proposal over disjoint files merges with a merge commit");
+    }
+    using (HttpResponseMessage again = await ApiPut(address, prefix + "/merge_requests/" + feature + "/merge", aliceApi, new { }))
+        Check(again.StatusCode == HttpStatusCode.Conflict, "a merged proposal cannot be merged twice");
+    using (HttpResponseMessage reopen = await ApiPut(address, prefix + "/merge_requests/" + feature, aliceApi, new { state_event = "reopen" }))
+        Check(reopen.StatusCode == HttpStatusCode.Conflict, "a merged proposal cannot be reopened");
+
+    // The merge is a real Git commit: a client fetches it, sees two parents, and finds both sides' files.
+    await Git(clone, ["fetch", "origin"]);
+    string mergeCommit = (await Git(clone, ["rev-parse", "origin/main"])).Trim();
+    string parents = (await Git(clone, ["rev-list", "--parents", "-n", "1", mergeCommit])).Trim();
+    Check(parents.Split(' ').Length == 3, "the merge commit real Git fetches has two parents");
+    await Git(clone, ["checkout", "-B", "verify", "origin/main"]);
+    Check(File.Exists(Path.Combine(clone, "feature.txt")) &&
+        File.ReadAllText(Path.Combine(clone, "base.txt")).Trim() == "base moved",
+        "the merged tree carries both sides' changes");
+    Check((await RunGit(clone, ["fsck", "--strict", "--no-progress"])).ExitCode == 0, "the merged objects pass git fsck");
+
+    using (HttpResponseMessage closed = await ApiPut(address, prefix + "/merge_requests/" + conflicting, aliceApi, new { state_event = "close" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await closed.Content.ReadAsStreamAsync());
+        Check(closed.IsSuccessStatusCode && json.RootElement.GetProperty("state").GetString() == "closed",
+            "a proposal nobody will merge can be closed");
+    }
+
+    // A public project's conversation is readable by a stranger; writing on it still is not.
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+        await store.SetProjectVisibilityAsync(alice, projectId, ProjectVisibility.Public);
+    using (HttpResponseMessage anonymous = await ApiGet(address, prefix + "/issues", null))
+    {
+        using JsonDocument json = JsonDocument.Parse(await anonymous.Content.ReadAsStreamAsync());
+        Check(anonymous.IsSuccessStatusCode && json.RootElement.GetProperty("total").GetInt64() == 2,
+            "a public project's issues are readable with no credential");
+    }
+    using (HttpResponseMessage refused = await ApiPost(address, prefix + "/issues", null, new { title = "From nobody" }))
+        Check(refused.StatusCode == HttpStatusCode.Unauthorized, "an anonymous caller cannot open an issue on a public project");
+    using (HttpResponseMessage refused = await ApiPost(address, prefix + "/issues", strangerApi, new { title = "From a stranger with an account" }))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden,
+            "reading a public project does not make a stranger able to write on it");
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+        await store.SetProjectVisibilityAsync(alice, projectId, ProjectVisibility.Private);
+}
+
+/// <summary>
+/// Deleting a project: who may, what it removes, and what the browser demands before it happens.
+/// </summary>
+async Task CheckProjectDeletion(string address, AuthenticatedIdentity alice, AuthenticatedIdentity administrator,
+    string bobUsername, string alicePassword)
+{
+    long projectId;
+    string storageId;
+    string aliceApi;
+    string bobApi;
+    string administratorApi;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        aliceApi = (await store.CreateTokenAsync(alice, "delete-api", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        administratorApi = (await store.CreateTokenAsync(administrator, "delete-admin-api", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        ProjectInfo created = await store.CreateProjectWithRepositoryAsync(alice, "doomed", "Doomed",
+            (project, cancellation) => { cancellation.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, project.StorageId)); return Task.CompletedTask; });
+        projectId = created.Id;
+        storageId = created.StorageId;
+        UserAccount bob = Required(await store.FindActiveUserAsync(bobUsername), "bob account");
+        await store.SetMembershipAsync(alice, projectId, bob.Id, ProjectRole.Maintainer);
+        bobApi = (await store.CreateTokenAsync(new(bob.Id, bob.Username, false, IdentityKind.BrowserSession),
+            "delete-member-api", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        Issue issue = await store.CreateIssueAsync(alice, projectId, "Something to leave behind");
+        await store.AddCommentAsync(alice, projectId, CommentSubject.Issue, issue.Iid, "A comment too.");
+    }
+    string directory = Path.Combine(repositoriesRoot, storageId);
+    Check(Directory.Exists(directory), "the project to be deleted has a repository on disk");
+
+    string path = "/api/v4/projects/" + projectId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    using (HttpResponseMessage refused = await ApiDelete(address, path, bobApi))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden,
+            "a Maintainer who does not own the project cannot delete it");
+    using (HttpResponseMessage refused = await ApiDelete(address, path, null))
+        Check(refused.StatusCode == HttpStatusCode.NotFound, "an anonymous caller cannot delete a project");
+
+    // The browser asks for the path to be typed back, so a misclick cannot end a repository.
+    CookieContainer cookies = new();
+    using HttpClientHandler handler = new()
+    {
+        CookieContainer = cookies,
+        ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
+        UseProxy = false
+    };
+    using HttpClient browser = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
+    using (HttpRequestMessage login = new(HttpMethod.Post, "/api/login"))
+    {
+        login.Headers.Add("Origin", address);
+        login.Content = JsonContent.Create(new { username = "alice", password = alicePassword });
+        using HttpResponseMessage response = await browser.SendAsync(login);
+        Check(response.IsSuccessStatusCode, "the owner signs in to delete a project");
+    }
+    string csrf;
+    using (HttpResponseMessage session = await browser.GetAsync("/api/session"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await session.Content.ReadAsStreamAsync());
+        csrf = json.RootElement.GetProperty("csrf").GetString()!;
+    }
+    string browserPath = "/api/projects/" + projectId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    using (HttpRequestMessage wrong = new(HttpMethod.Delete, browserPath))
+    {
+        wrong.Headers.Add("Origin", address);
+        wrong.Headers.Add("X-Graft-CSRF", csrf);
+        wrong.Content = JsonContent.Create(new { path = "alice/not-this-one" });
+        using HttpResponseMessage response = await browser.SendAsync(wrong);
+        Check(response.StatusCode == HttpStatusCode.BadRequest, "the browser refuses a deletion whose confirmation does not match");
+    }
+    using (HttpRequestMessage noCsrf = new(HttpMethod.Delete, browserPath))
+    {
+        noCsrf.Headers.Add("Origin", address);
+        noCsrf.Content = JsonContent.Create(new { path = "alice/doomed" });
+        using HttpResponseMessage response = await browser.SendAsync(noCsrf);
+        Check(response.StatusCode == HttpStatusCode.Forbidden, "a deletion without the CSRF header is refused");
+    }
+    Check(Directory.Exists(directory), "no refused deletion removed anything");
+
+    using (HttpRequestMessage confirmed = new(HttpMethod.Delete, browserPath))
+    {
+        confirmed.Headers.Add("Origin", address);
+        confirmed.Headers.Add("X-Graft-CSRF", csrf);
+        confirmed.Content = JsonContent.Create(new { path = "alice/doomed" });
+        using HttpResponseMessage response = await browser.SendAsync(confirmed);
+        Check(response.StatusCode == HttpStatusCode.NoContent, "a confirmed deletion answers 204 because it is already done");
+    }
+    Check(!Directory.Exists(directory), "deleting a project removes its repository from disk");
+    using (HttpResponseMessage gone = await ApiGet(address, path, aliceApi))
+        Check(gone.StatusCode == HttpStatusCode.NotFound, "a deleted project is no longer served");
+    // The Git transport authenticates with Basic rather than a token header, so a refusal here arrives as
+    // the challenge a client would be prompted by. What matters is that no advertisement comes back.
+    using (HttpResponseMessage clone = await ApiGet(address, "/alice/doomed.git/info/refs?service=git-upload-pack", aliceApi))
+        Check(!clone.IsSuccessStatusCode, "a deleted project no longer answers the Git transport");
+
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        Check(await store.FindReadyProjectAsync("alice", "doomed") is null, "the deleted project's row is gone");
+        // The path is free again, which is the test that nothing was left holding it: both the namespace
+        // pair and the instance-wide slug were released.
+        ProjectInfo again = await store.CreateProjectWithRepositoryAsync(alice, "doomed", "Doomed again",
+            (project, cancellation) => { cancellation.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, project.StorageId)); return Task.CompletedTask; });
+        Check(again.Id != projectId && again.GlobalSlug == "doomed",
+            "the deleted project's path and instance-wide slug are free again");
+    }
+
+    // Read straight from the database, because nothing can ask an API about a project that no longer
+    // exists. A row left behind would be keyed to an id some later project could be given.
+    Check(await CountRows("Issues", projectId) == 0 && await CountRows("Comments", projectId) == 0,
+        "the deleted project's issues and comments went with it");
+    Check(await CountRows("ProjectMemberships", projectId) == 0,
+        "the deleted project's membership went with it, so nothing can inherit it");
+
+    // An administrator may delete somebody else's project, over the API, with no confirmation: the caller
+    // is a program that already named the project in the URL.
+    long adminTarget;
+    string adminStorage;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        ProjectInfo created = await store.CreateProjectWithRepositoryAsync(alice, "admin-removes", "Administrator removes this",
+            (project, cancellation) => { cancellation.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, project.StorageId)); return Task.CompletedTask; });
+        adminTarget = created.Id;
+        adminStorage = created.StorageId;
+    }
+    using (HttpResponseMessage deleted = await ApiDelete(address,
+        "/api/v4/projects/" + adminTarget.ToString(System.Globalization.CultureInfo.InvariantCulture), administratorApi))
+        Check(deleted.StatusCode == HttpStatusCode.NoContent, "an administrator deletes a project over the API without a confirmation");
+    Check(!Directory.Exists(Path.Combine(repositoriesRoot, adminStorage)), "the administrator's deletion removed the repository too");
+}
+
+/// <summary>
+/// The audit trail, which until now was written on every sensitive act and readable by nobody.
+/// </summary>
+async Task CheckAuditTrail(string address, string adminPassword, string alicePassword)
+{
+    CookieContainer cookies = new();
+    using HttpClientHandler handler = new()
+    {
+        CookieContainer = cookies,
+        ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
+        UseProxy = false
+    };
+    using HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
+
+    using (HttpResponseMessage anonymous = await client.GetAsync("/api/graft/admin/audit"))
+        Check(anonymous.StatusCode == HttpStatusCode.Unauthorized, "the audit trail needs a session");
+
+    using (HttpRequestMessage login = new(HttpMethod.Post, "/api/login"))
+    {
+        login.Headers.Add("Origin", address);
+        login.Content = JsonContent.Create(new { username = "alice", password = alicePassword });
+        using HttpResponseMessage response = await client.SendAsync(login);
+        Check(response.IsSuccessStatusCode, "an ordinary account signs in");
+    }
+    using (HttpResponseMessage refused = await client.GetAsync("/api/graft/admin/audit"))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden, "an ordinary account cannot read the audit trail");
+
+    // A second browser rather than signing the first one out, so the two sessions are independent and the
+    // ordinary account's refusal above cannot be explained by anything this one does.
+    CookieContainer adminCookies = new();
+    using HttpClientHandler adminHandler = new()
+    {
+        CookieContainer = adminCookies,
+        ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
+        UseProxy = false
+    };
+    using HttpClient administrator = new(adminHandler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
+    using (HttpRequestMessage login = new(HttpMethod.Post, "/api/login"))
+    {
+        login.Headers.Add("Origin", address);
+        login.Content = JsonContent.Create(new { username = "admin", password = adminPassword });
+        using HttpResponseMessage response = await administrator.SendAsync(login);
+        Check(response.IsSuccessStatusCode, "the administrator signs in");
+    }
+
+    long total;
+    using (HttpResponseMessage page = await administrator.GetAsync("/api/graft/admin/audit?per_page=20"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await page.Content.ReadAsStreamAsync());
+        JsonElement entries = json.RootElement.GetProperty("entries");
+        total = json.RootElement.GetProperty("total").GetInt64();
+        Check(page.IsSuccessStatusCode && total > 20 && entries.GetArrayLength() == 20,
+            "an administrator reads the audit trail, a page at a time");
+        Check(page.Headers.Contains("X-Total") && page.Headers.Contains("X-Page"), "the audit trail paginates like the rest of the API");
+        // Newest first, which is the only ordering that makes the first page the useful one.
+        long first = entries[0].GetProperty("id").GetInt64();
+        long next = entries[1].GetProperty("id").GetInt64();
+        Check(first > next, "the audit trail reads newest first");
+        Check(entries[0].GetProperty("actor_username").GetString() is not null &&
+            entries[0].GetProperty("created_at").GetString()!.Length > 0 &&
+            entries[0].GetProperty("detail").GetString()!.Length > 0,
+            "an entry names who did it, when, and what happened");
+    }
+    using (HttpResponseMessage filtered = await administrator.GetAsync("/api/graft/admin/audit?action=delete-project"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await filtered.Content.ReadAsStreamAsync());
+        JsonElement entries = json.RootElement.GetProperty("entries");
+        Check(filtered.IsSuccessStatusCode && entries.GetArrayLength() >= 2 &&
+            entries.EnumerateArray().All(entry => entry.GetProperty("action").GetString() == "delete-project"),
+            "the trail filters by action, and the deletions above are in it");
+        Check(entries.EnumerateArray().Any(entry =>
+            entry.GetProperty("detail").GetString()!.Contains("repository storage", StringComparison.Ordinal)),
+            "a deletion's entry names the repository directory, which nothing else records afterwards");
+    }
+    using (HttpResponseMessage filtered = await administrator.GetAsync("/api/graft/admin/audit?target_type=issue"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await filtered.Content.ReadAsStreamAsync());
+        Check(filtered.IsSuccessStatusCode && json.RootElement.GetProperty("entries").EnumerateArray()
+            .All(entry => entry.GetProperty("target_type").GetString() == "issue"),
+            "the trail filters by what was acted on");
+    }
+    using (HttpResponseMessage filtered = await administrator.GetAsync("/api/graft/admin/audit?action=nothing-does-this"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await filtered.Content.ReadAsStreamAsync());
+        Check(filtered.IsSuccessStatusCode && json.RootElement.GetProperty("total").GetInt64() == 0,
+            "a filter that matches nothing is an empty page rather than an error");
+    }
+    using (HttpResponseMessage refused = await administrator.GetAsync("/api/graft/admin/audit?sort=detail"))
+        Check(refused.StatusCode == HttpStatusCode.BadRequest, "the audit trail refuses a query it does not implement");
+
+    // The trail records that things happened and never what they were. A token's secret passing through it
+    // would be the one place a credential outlived its creation, so every entry is searched for one.
+    using (HttpResponseMessage everything = await administrator.GetAsync("/api/graft/admin/audit?per_page=100"))
+    {
+        string body = await everything.Content.ReadAsStringAsync();
+        Check(everything.IsSuccessStatusCode && !body.Contains("graft_pat_", StringComparison.Ordinal) &&
+            !body.Contains(adminPassword, StringComparison.Ordinal) && !body.Contains(alicePassword, StringComparison.Ordinal),
+            "no audit entry carries a token, a password or any other secret");
+    }
+}
+
+/// <summary>
+/// Counts rows in one table for one project. Used only to prove that a deleted project left none: the
+/// table name comes from a literal at each call site and never from input.
+/// </summary>
+async Task<long> CountRows(string table, long projectId)
+{
+    await using Microsoft.Data.Sqlite.SqliteConnection db = new(new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder
+    {
+        DataSource = databasePath,
+        Pooling = false
+    }.ToString());
+    await db.OpenAsync();
+    await using Microsoft.Data.Sqlite.SqliteCommand command = db.CreateCommand();
+    command.CommandText = table switch
+    {
+        "Issues" => "SELECT COUNT(*) FROM Issues WHERE ProjectId = $id;",
+        "Comments" => "SELECT COUNT(*) FROM Comments WHERE ProjectId = $id;",
+        "ProjectMemberships" => "SELECT COUNT(*) FROM ProjectMemberships WHERE ProjectId = $id;",
+        _ => throw new ArgumentOutOfRangeException(nameof(table))
+    };
+    command.Parameters.AddWithValue("$id", projectId);
+    return Convert.ToInt64(await command.ExecuteScalarAsync(), System.Globalization.CultureInfo.InvariantCulture);
+}
 void Check(bool condition, string name)
 {
     if (!condition) throw new InvalidOperationException("Assertion failed: " + name);

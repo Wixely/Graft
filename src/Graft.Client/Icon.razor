@@ -22,6 +22,19 @@
             <circle cx="8" cy="8" r="2.5" />
             <path d="M0.75 8h4.75M10.5 8h4.75" />
             break;
+        @* One circle rather than a ring. The stylesheet fills closed shapes, so a second circle inside this
+           one would be covered by it rather than reading as a hole. *@
+        case "issue":
+            <circle cx="8" cy="8" r="5.25" />
+            break;
+        @* A branch meeting a trunk: the same vocabulary as the branch icon, which is what a reader already
+           associates with refs here. *@
+        case "merge":
+            <circle cx="4.25" cy="3.25" r="1.75" />
+            <circle cx="4.25" cy="12.75" r="1.75" />
+            <circle cx="11.75" cy="8" r="1.75" />
+            <path d="M4.25 5v6M4.25 8h5.75" />
+            break;
         case "upload":
             <path d="M8 10.75V2.25M4.75 5.5 8 2.25l3.25 3.25" />
             <path d="M1.75 10.25v3a.5.5 0 0 0 .5.5h11.5a.5.5 0 0 0 .5-.5v-3" />

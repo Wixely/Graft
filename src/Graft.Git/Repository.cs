@@ -255,6 +255,57 @@ public static class Graph
         return false;
     }
 
+    /// <summary>
+    /// The best common ancestor of two commits, or null when they share none.
+    ///
+    /// <para>
+    /// Walks back from the first commit collecting everything reachable, then walks back from the second
+    /// and returns the first commit it meets that the first could also reach. "First it meets" is by
+    /// breadth, so the answer is the nearest common ancestor along the second commit's history rather than
+    /// an arbitrary one. Where the graph has several equally near ancestors, Git would recursively merge
+    /// them into a virtual base and this returns one of them instead; the difference can only show up in a
+    /// criss-cross history, and the result is still an ancestor of both.
+    /// </para>
+    /// </summary>
+    public static string? MergeBase(IReadOnlyDictionary<string, GitObject> objects, string first, string second,
+        CancellationToken cancellationToken = default)
+    {
+        HashSet<string> reachable = Ancestors(objects, first, cancellationToken);
+        HashSet<string> seen = new(StringComparer.Ordinal);
+        Queue<string> pending = new();
+        pending.Enqueue(second);
+        while (pending.TryDequeue(out string? id))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!seen.Add(id)) continue;
+            Limits.Require(seen.Count <= Limits.ObjectCount, "merge-base-budget");
+            if (reachable.Contains(id)) return id;
+            if (!objects.TryGetValue(id, out GitObject? commit) || commit.Type != 1) continue;
+            foreach ((string parent, int type) in Links(commit))
+                if (type == 1) pending.Enqueue(parent);
+        }
+        return null;
+    }
+
+    /// <summary>A commit and every commit it can reach, following parents only.</summary>
+    public static HashSet<string> Ancestors(IReadOnlyDictionary<string, GitObject> objects, string commitId,
+        CancellationToken cancellationToken = default)
+    {
+        HashSet<string> seen = new(StringComparer.Ordinal);
+        Stack<string> pending = new();
+        pending.Push(commitId);
+        while (pending.TryPop(out string? id))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!seen.Add(id)) continue;
+            Limits.Require(seen.Count <= Limits.ObjectCount, "ancestry-budget");
+            if (!objects.TryGetValue(id, out GitObject? commit) || commit.Type != 1) continue;
+            foreach ((string parent, int type) in Links(commit))
+                if (type == 1) pending.Push(parent);
+        }
+        return seen;
+    }
+
     public static List<(string Id, int Type)> Links(GitObject obj)
     {
         var links = new List<(string, int)>();

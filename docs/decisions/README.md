@@ -14,5 +14,7 @@ Preserve this history; supersede a decision explicitly instead of silently chang
 - [0010: Instance-wide project slugs](0010-project-slugs.md) — accepted and implemented; a second address for every project, with no owner in the URL
 - [0011: Bringing agent access to parity with the API](0011-agent-parity.md) — accepted and implemented; six capabilities opened to tokens, four deliberately withheld
 - [0012: Recoverable token secrets](0012-recoverable-tokens.md) — accepted and implemented; off by default, and what it costs when it is on
+- [0013: Deleting a project, and reading the audit trail](0013-project-deletion-and-audit.md) — accepted and implemented; the owner or an administrator, irreversible, and withheld from agents
+- [0014: Issues, merge requests, and a merge that says what it cannot do](0014-collaboration.md) — accepted and implemented; reading follows the repository, writing needs membership, and conflicts are named rather than guessed at
 
 Open architecture choices are in [architecture.md](../architecture.md); they are not accepted decisions.

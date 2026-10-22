@@ -1,0 +1,191 @@
+@page "/-/admin/audit"
+@inject GraftApi Api
+@inject NavigationManager Navigation
+
+<PageTitle>Audit trail &middot; Graft</PageTitle>
+
+@if (loading)
+{
+    <p role="status" class="secondary-text">Loading…</p>
+}
+else if (!Api.IsAdministrator)
+{
+    <div class="page-header"><div><h1>Administration</h1><p class="subtitle">This page requires an administrator account.</p></div></div>
+}
+else
+{
+    <div class="page-header">
+        <div>
+            <h1>Audit trail</h1>
+            <p class="subtitle">What has been done on this instance, newest first.</p>
+        </div>
+    </div>
+
+    <Banner Message="@message" Kind="error" />
+
+    <div class="panel">
+        <div class="panel-body">
+            <div class="banner info">
+                <Icon Name="shield" />
+                <span>
+                    Every entry records that something happened and never what it was. No password, token or
+                    other secret appears here.
+                </span>
+            </div>
+            <form class="form inline" @onsubmit="Apply" @onsubmit:preventDefault>
+                <label for="audit-action">Action</label>
+                <select id="audit-action" @bind="action">
+                    <option value="">Any action</option>
+                    @foreach (string known in KnownActions) { <option value="@known">@known</option> }
+                </select>
+                <label for="audit-target">Subject</label>
+                <select id="audit-target" @bind="targetType">
+                    <option value="">Anything</option>
+                    @foreach (string known in KnownTargets) { <option value="@known">@known</option> }
+                </select>
+                <div class="form-actions">
+                    <button type="submit" disabled="@busy">@(busy ? "Reading…" : "Apply")</button>
+                    @if (action.Length > 0 || targetType.Length > 0)
+                    {
+                        <button type="button" class="secondary" @onclick="Clear" disabled="@busy">Clear</button>
+                    }
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <div class="panel">
+        <div class="panel-header">
+            <h2>Entries</h2>
+            <span class="spacer"></span>
+            <span class="label">@total total</span>
+        </div>
+        @if (entries.Length == 0)
+        {
+            <div class="panel-body"><p class="secondary-text">Nothing matches.</p></div>
+        }
+        else
+        {
+            <div class="list">
+                @foreach (AuditEntryResponse entry in entries)
+                {
+                    <div class="list-item">
+                        <span class="list-item-main">
+                            <strong>@entry.Action</strong>
+                            <small>@entry.Detail</small>
+                        </span>
+                        <span class="label">@entry.TargetType@(entry.TargetId is null ? "" : " " + entry.TargetId)</span>
+                        <span class="list-item-meta">
+                            <small>@(entry.ActorUsername ?? "the system")</small>
+                            <small title="@entry.CreatedAt.ToString("O")">@entry.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")</small>
+                        </span>
+                    </div>
+                }
+            </div>
+        }
+        @if (total > PerPage)
+        {
+            <div class="panel-footer">
+                <button type="button" class="secondary" @onclick="() => Go(page - 1)" disabled="@(busy || page <= 1)">
+                    <Icon Name="chevron-left" />Newer
+                </button>
+                <span class="spacer"></span>
+                <span class="secondary-text">Page @(page) of @Pages</span>
+                <span class="spacer"></span>
+                <button type="button" class="secondary" @onclick="() => Go(page + 1)" disabled="@(busy || page >= Pages)">
+                    Older<Icon Name="chevron-right" />
+                </button>
+            </div>
+        }
+    </div>
+}
+
+@code {
+    private const int PerPage = 50;
+
+    /// <summary>
+    /// The actions and subjects the server writes, offered as a list rather than a text box. The filter is
+    /// an exact match on a stored value, so a free-text box would mostly produce empty pages and leave the
+    /// reader unsure whether they had mistyped or found nothing.
+    /// </summary>
+    private static readonly string[] KnownActions =
+    [
+        "bootstrap-admin", "create-user", "disable-user", "enable-user", "change-password", "reset-password",
+        "create-token", "revoke-token", "reveal-token",
+        "create-project", "begin-create-project", "delete-project", "transfer-ownership",
+        "set-visibility", "set-page-published", "set-project-details", "set-default-branch",
+        "set-membership", "revoke-membership", "mcp-settings",
+        "open-issue", "close-issue", "reopen-issue",
+        "open-merge-request", "close-merge-request", "reopen-merge-request", "merge-merge-request",
+        "delete-comment"
+    ];
+
+    private static readonly string[] KnownTargets = ["user", "token", "project", "issue", "merge_request", "comment", "server"];
+
+    private AuditEntryResponse[] entries = [];
+    private long total;
+    private int page = 1;
+    private string action = "";
+    private string targetType = "";
+    private string message = "";
+    private bool loading = true;
+    private bool busy;
+
+    private int Pages => (int)Math.Max(1, (total + PerPage - 1) / PerPage);
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            if (!await Api.EnsureSessionAsync())
+            {
+                if (Api.Reachable) Navigation.NavigateTo("/-/login", replace: true);
+                return;
+            }
+            if (Api.IsAdministrator) await Load();
+        }
+        finally { loading = false; }
+    }
+
+    private async Task Apply()
+    {
+        page = 1;
+        await Load();
+    }
+
+    private async Task Clear()
+    {
+        action = "";
+        targetType = "";
+        page = 1;
+        await Load();
+    }
+
+    private async Task Go(int target)
+    {
+        page = Math.Clamp(target, 1, Pages);
+        await Load();
+    }
+
+    private async Task Load()
+    {
+        if (busy) return;
+        busy = true;
+        message = "";
+        try
+        {
+            string query = $"api/graft/admin/audit?page={page}&per_page={PerPage}";
+            if (action.Length > 0) query += "&action=" + Uri.EscapeDataString(action);
+            if (targetType.Length > 0) query += "&target_type=" + Uri.EscapeDataString(targetType);
+            AuditPageResponse? result = await Api.GetAsync(query, ApiJson.Default.AuditPageResponse);
+            if (result is null)
+            {
+                message = "The audit trail could not be read.";
+                return;
+            }
+            entries = [.. result.Entries];
+            total = result.Total;
+        }
+        finally { busy = false; }
+    }
+}

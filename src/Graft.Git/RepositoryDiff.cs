@@ -96,9 +96,28 @@ public static class RepositoryDiff
         GitCommit commit = RepositoryView.ReadCommit(repository, commitId);
         string? parentId = parentIndex >= 0 && parentIndex < commit.ParentIds.Count ? commit.ParentIds[parentIndex] : null;
         string? parentTree = parentId is null ? null : RepositoryView.ReadCommit(repository, parentId).TreeId;
+        (IReadOnlyList<DiffFile> files, bool truncated) = BetweenTrees(repository, parentTree, commit.TreeId);
+        return new(commit, parentId, files, truncated);
+    }
 
-        Dictionary<string, (string Id, string Mode)> before = parentTree is null ? [] : Flatten(repository, parentTree, "");
-        Dictionary<string, (string Id, string Mode)> after = Flatten(repository, commit.TreeId, "");
+    /// <summary>
+    /// Compares two commits directly, which is the question a merge proposal asks: not "what did this
+    /// commit change" but "what does this branch contain that that one does not". A null
+    /// <paramref name="beforeCommitId"/> compares against nothing, so every file reads as added.
+    /// </summary>
+    public static (IReadOnlyList<DiffFile> Files, bool Truncated) BetweenCommits(
+        Repository repository, string? beforeCommitId, string afterCommitId)
+    {
+        ArgumentNullException.ThrowIfNull(repository);
+        string? beforeTree = beforeCommitId is null ? null : RepositoryView.ReadCommit(repository, beforeCommitId).TreeId;
+        return BetweenTrees(repository, beforeTree, RepositoryView.ReadCommit(repository, afterCommitId).TreeId);
+    }
+
+    private static (IReadOnlyList<DiffFile> Files, bool Truncated) BetweenTrees(
+        Repository repository, string? beforeTreeId, string afterTreeId)
+    {
+        Dictionary<string, (string Id, string Mode)> before = beforeTreeId is null ? [] : Flatten(repository, beforeTreeId, "");
+        Dictionary<string, (string Id, string Mode)> after = Flatten(repository, afterTreeId, "");
 
         List<string> paths = before.Keys.Union(after.Keys, StringComparer.Ordinal).ToList();
         paths.Sort(StringComparer.Ordinal);
@@ -116,7 +135,7 @@ public static class RepositoryDiff
             files.Add(Compare(repository, path, status, inBefore ? old : null, inAfter ? current : null));
         }
 
-        return new(commit, parentId, files, truncated);
+        return (files, truncated);
     }
 
     /// <summary>Diffs one path between two trees, or reports why it could not be shown as text.</summary>
@@ -147,7 +166,7 @@ public static class RepositoryDiff
     /// tree comparison into a set comparison, and because an unchanged directory keeps its object id, the
     /// walk could be pruned later without changing the result.
     /// </summary>
-    private static Dictionary<string, (string Id, string Mode)> Flatten(Repository repository, string treeId, string parent)
+    internal static Dictionary<string, (string Id, string Mode)> Flatten(Repository repository, string treeId, string parent)
     {
         Dictionary<string, (string Id, string Mode)> entries = new(StringComparer.Ordinal);
         foreach (GitTreeEntry entry in RepositoryView.ReadTree(repository, treeId, parent))

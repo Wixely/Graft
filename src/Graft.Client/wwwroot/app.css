@@ -279,6 +279,12 @@ footer a:hover { color: var(--text-secondary); text-decoration: underline; }
 .panel-body { padding: var(--space-4); }
 .panel-body > * + * { margin-top: var(--space-3); }
 .panel-empty { padding: var(--space-5) var(--space-4); text-align: center; color: var(--text-muted); font-size: 13px; }
+.panel-footer {
+    display: flex; align-items: center; gap: var(--space-3);
+    padding: var(--space-2) var(--space-4); min-height: 38px;
+    background: var(--sunken); border-top: 1px solid var(--border);
+}
+.panel-footer button { width: auto; }
 
 /* Buttons */
 
@@ -338,6 +344,12 @@ legend { padding: 0 4px; font-size: 13px; font-weight: 600; }
 .form-actions { display: flex; gap: var(--space-2); margin-top: var(--space-4); }
 .form-actions button { width: auto; }
 
+/* A filter bar rather than a stack of fields: label and control sit on one line and wrap together. */
+.form.inline { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-3); }
+.form.inline label { margin: 0; }
+.form.inline select, .form.inline input { width: auto; min-width: 160px; }
+.form.inline .form-actions { margin-top: 0; }
+
 /* Banners and labels */
 
 .banner {
@@ -377,6 +389,9 @@ a.list-item:hover, button.list-item:hover { background: var(--sunken); text-deco
 .list-item-main { min-width: 0; flex: 1 1 auto; }
 .list-item-main strong { display: block; font-weight: 600; }
 .list-item-main small { display: block; margin-top: 1px; color: var(--text-secondary); font-size: 12px; }
+/* Who and when, at the trailing edge of a row. Right-aligned so a column of them lines up down the list. */
+.list-item-meta { display: grid; justify-items: end; flex: none; text-align: right; }
+.list-item-meta small { color: var(--text-secondary); font-size: 12px; }
 .list-item-actions { display: flex; align-items: center; gap: var(--space-2); flex: none; }
 .list-item-actions .checkbox { margin: 0; }
 
@@ -716,3 +731,12 @@ nav[aria-label="Path"] .link:last-of-type { color: var(--text); font-weight: 600
     border: 1px solid var(--border); border-radius: var(--radius); background: var(--raised);
     color-scheme: light dark;
 }
+
+/* The one panel whose border says "read this before clicking". The tint is the only visual difference, so
+   it reads as part of the page rather than as an error that has already happened. */
+.panel.danger-zone { border-color: var(--danger); }
+.panel.danger-zone > .panel-header { background: var(--danger-subtle); border-bottom-color: var(--danger); }
+
+/* A list with no markers, for a short run of file paths inside a panel. */
+ul.plain { margin: 0; padding: 0; list-style: none; }
+ul.plain li + li { margin-top: var(--space-1); }

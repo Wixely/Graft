@@ -1,6 +1,47 @@
 # Next-agent handoff
 
-Updated: 2026-10-21. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
+Updated: 2026-10-22. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
+
+## Added on 2026-10-22, the forge gained a conversation
+
+**Graft can now be asked what it does not do, and the answer is written down.**
+[The backlog](backlog.md) is new, and it is the first place to look before proposing work. It came from a
+review on 2026-10-22; the three things that review found most worth doing were done immediately and the
+rest is in that file with reasoning and rough size.
+
+**A project can be deleted.** The owner or an administrator, never a Maintainer, because managing a project
+and ending it are different acts. The browser asks for the path to be typed back and the API does not, on
+the grounds that a confirmation a script fills in automatically confirms nothing. The database row goes
+first and the repository directory second, so a failure leaves an unreferenced directory the audit row
+names rather than a project whose repository has gone. Deliberately absent from the agent surface, joining
+the four capabilities ADR 0011 withheld. See [ADR 0013](decisions/0013-project-deletion-and-audit.md).
+
+**The audit trail can be read.** It had been written on every sensitive act since the first migration and
+readable by nobody without the SQLite file. Administrators only, newest first, filtered by exact action or
+subject rather than searched, because a loose search lets somebody believe they have seen everything that
+matched. A project-scoped view for a Maintainer is in the backlog and is not this.
+
+**Issues, merge requests and comments exist.** Reading them follows the repository, so a public project's
+conversation is readable by a stranger; writing needs membership, because a public project that accepted
+anonymous writing would be a spam target and there is no moderation to fall back on. Both are numbered from
+one per project. See [ADR 0014](decisions/0014-collaboration.md).
+
+**Merging is narrower than other forges and says so.** It fast-forwards where the target is an ancestor of
+the source, writes a two-parent merge commit where both branches moved but touched different files, and
+refuses where both changed the same file, naming those files. It does not merge file contents and will not
+pretend to; the full reasoning is in ADR 0014 and the short version is that a silently wrong merge is worse
+than a refusal. `merge_method` reports which case a proposal is in before anything is merged, and a listing
+deliberately declines to decide because deciding costs three tree walks a row.
+
+**The merge commit is an ordinary Git commit.** Real Git fetches it, finds two parents, finds both sides'
+changes in the tree, and passes `git fsck --strict`. That is asserted in the suite rather than assumed.
+
+Nine new agent tools take the Model Context Protocol surface from 19 to 28. `graft_merge` is offered
+because it cannot destroy anything; project deletion is not.
+
+Migration 8 adds `Issues`, `MergeRequests` and `Comments`. Manifest version 8.
+
+Suites: Git 483 -> 556, accounts and core 162 -> 168, agents 101, operations 41.
 
 ## Added on 2026-10-21, copying a token without putting it in the page
 
@@ -509,11 +550,13 @@ This repository is published at github.com/Wixely/Graft and the GitHub repositor
 
 ## Next work
 
-Build the `.graft` config and the file allowlist, which is the half of the project-page request that is
-designed and not yet written. Keep the recorded static-musl server/admin pair available for the deferred
-Linux 3.10.108 run. Validate the intended CA-issued certificate, DNS, client trust and renewal path before
-non-loopback deployment, which now matters more than it did: a public listing is only reachable by strangers
-on a non-loopback address.
+Read [the backlog](backlog.md) first. It is the maintained list of what Graft does not do, with reasoning
+and rough size, and it replaces the habit of rediscovering gaps one at a time. The `.graft` config and file
+allowlist that this section used to ask for were built on 2026-10-20.
+
+Keep the recorded static-musl server/admin pair available for the deferred Linux 3.10.108 run. Validate the
+intended CA-issued certificate, DNS, client trust and renewal path before non-loopback deployment, which
+now matters more than it did: a public listing is only reachable by strangers on a non-loopback address.
 
 Continue to use the ignored reproducible DnaX feed until the user or DnaX maintainer selects an approved durable package source. Do not substitute a server-side Git executable or native Git library.
 
@@ -522,12 +565,13 @@ Continue to use the ignored reproducible DnaX feed until the user or DnaX mainta
 | Work | Owner | Acceptance |
 | --- | --- | --- |
 | ~~Project ownership continuity~~ | Done 2026-10-04 | [Evidence](validation/2026-10-04-project-ownership.md): transfer is owner-or-administrator only, and an account owning projects cannot be disabled |
+| ~~`.graft` config and file allowlist~~ | Done 2026-10-20 | [Evidence](validation/2026-10-20-project-pages.md) |
+| ~~Custom static site on a pages origin~~ | Done 2026-10-20 | [Evidence](validation/2026-10-20-project-pages.md) |
 | Git's indent heuristic in the diff | Implementation agent | `tests/Graft.Diff.Fuzz` agrees with `git diff` at its default settings as closely as it already does with the heuristic turned off |
-| `.graft` config and file allowlist | Implementation agent | A page serves exactly the paths its config names and 404s every other path, proved by a corpus where most files must not be reachable |
-| Custom static site on a pages origin | Operator + implementation agent | A site serves only from the configured second hostname, only from under `site.root`, and the main origin serves no repository-authored HTML |
+| Line-level comments on a diff | Implementation agent | A comment anchors to a file and line on a merge request, and survives the branch moving underneath it in a way somebody can predict |
 | Markdig under NativeAOT | User + implementation agent | `tests/Graft.Git.Acceptance` passes against a published NativeAOT server built where the C++ workload exists |
 | Deployment TLS trust | Operator + implementation agent | Intended CA certificate, DNS/SAN, client trust and renewal rehearsal |
 | Required legacy host | Implementation agent + user | Integrated static-musl artifact inspected and run on Linux 3.10.108 with sanitized evidence |
 | DnaX distribution | User/DnaX maintainer | Clean checkout restores without a sibling source tree or locally prepared feed |
 
-Recommended next action: Owner: Implementation agent — build `.graft/project.json` and the file allowlist, which is the remaining half of the project-page request and the only queued item that is fully buildable here. Worth pairing with a look at the Git transport for other requests Git makes that Graft has never been sent, since the chunked-push probe was one of those and went unnoticed for the life of the project. The user-gated items are unchanged: the Android picker needs a device and NativeAOT needs the C++ build tools. Remaining release gates: deployment CA/DNS trust, DnaX distribution and the deferred Linux 3.10.108 MVP-08 run.
+Recommended next action: Owner: Implementation agent — take the "near, and small" section of [the backlog](backlog.md) as one batch. Tags, raw file download and archives are the three that together turn the browser into something a reader can fetch from rather than only look at, and each is bounded work against machinery that already exists. The two bugs recorded beside them are an afternoon: an empty repository's page reports a 404 as a permission problem, and `Commit.razor` resolves a project through the caller's own project list, so a commit link into a public project fails for a non-member. Line-level comments on a diff are the largest single thing that would change how review feels, and are a deliberate decision rather than a small task. The user-gated items are unchanged: the Android picker needs a device and NativeAOT needs the C++ build tools. Remaining release gates: deployment CA/DNS trust, DnaX distribution and the deferred Linux 3.10.108 MVP-08 run.

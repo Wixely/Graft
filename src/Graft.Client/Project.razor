@@ -32,9 +32,13 @@ else
 
     <Banner Message="@message" Kind="@messageKind" />
 
+    @* Issues and merge requests are pages rather than tabs, because each one of them needs an address of
+       its own: a link to an issue is the commonest thing anybody shares about a project. *@
     <div class="tabs">
         <button type="button" class="@(tab == "code" ? "active" : "")" @onclick='() => tab = "code"'>Code</button>
         <button type="button" class="@(tab == "commits" ? "active" : "")" @onclick='() => tab = "commits"'>Commits</button>
+        <a href="@(ProjectBase + "/-/issues")">Issues</a>
+        <a href="@(ProjectBase + "/-/merge-requests")">Merge requests</a>
         @if (repo.CanPush)
         {
             <button type="button" class="@(tab == "upload" ? "active" : "")" @onclick='() => tab = "upload"'>Add files</button>
@@ -392,6 +396,36 @@ else
                 </div>
             }
         </div>
+
+        @* Only the owner and an administrator, matching what the server will accept. A Maintainer sees no
+           button rather than one that answers 403: offering an action nobody can take is worse than not
+           offering it. *@
+        @if (CanDelete)
+        {
+            <div class="panel danger-zone">
+                <div class="panel-header"><Icon Name="alert" /><h2>Delete this project</h2></div>
+                <div class="panel-body">
+                    <div class="banner error">
+                        <Icon Name="alert" />
+                        <span>
+                            This removes the repository, its history, its issues and its merge requests, and
+                            it cannot be undone. Every clone URL and shared link stops working, and the path
+                            becomes available for a new project.
+                        </span>
+                    </div>
+                    <form class="form" @onsubmit="DeleteProject" @onsubmit:preventDefault>
+                        <label for="delete-confirm">Type <strong>@ProjectPath</strong> to confirm</label>
+                        <input id="delete-confirm" @bind="deleteConfirmation" @bind:event="oninput"
+                               autocomplete="off" spellcheck="false" />
+                        <div class="form-actions">
+                            <button type="submit" class="danger" disabled="@(busy || deleteConfirmation.Trim() != ProjectPath)">
+                                @(busy ? "Deleting…" : "Delete this project")
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        }
     }
 }
 
@@ -425,6 +459,7 @@ else
     private string memberUsername = "";
     private string memberRole = "Developer";
     private string transferUsername = "";
+    private string deleteConfirmation = "";
     private bool loading = true;
     private bool busy;
 
@@ -667,6 +702,44 @@ else
     /// Hands the project to another account. On success the project has moved, so this navigates to the new
     /// path rather than reloading: the page the browser is on no longer resolves.
     /// </summary>
+    /// <summary>
+    /// Deleting needs the owner or an administrator, which is stricter than managing the project. The
+    /// server decides; this only decides whether to show a control.
+    ///
+    /// <para>
+    /// The owner is recognised by the namespace matching the signed-in account, because the repository
+    /// payload reports the owning namespace and not an owner id. That holds for every project reachable
+    /// here: a project's namespace is its owner's account name.
+    /// </para>
+    /// </summary>
+    private bool CanDelete => repo is not null && (Api.IsAdministrator ||
+        string.Equals(repo.Project.Namespace.Path, Api.Username, StringComparison.OrdinalIgnoreCase));
+
+    private string ProjectPath => repo is null ? "" : repo.Project.Namespace.Path + "/" + repo.Project.Path;
+
+    private async Task DeleteProject()
+    {
+        if (busy || repo is null) return;
+        if (deleteConfirmation.Trim() != ProjectPath)
+        {
+            Report(ApiResult.Refused($"Type {ProjectPath} to confirm."));
+            return;
+        }
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.SendAsync(HttpMethod.Delete, $"api/projects/{repo.Project.Id}",
+                JsonContent.Create(new ProjectDeleteRequest(ProjectPath), ApiJson.Default.ProjectDeleteRequest),
+                "Project deleted.");
+            Report(result);
+            // Away from a page whose project no longer exists. Replacing the history entry, so Back does
+            // not return to a repository view that can only fail now.
+            if (result.Ok) Navigation.NavigateTo("/", replace: true);
+        }
+        finally { busy = false; }
+    }
+
     private async Task TransferOwnership()
     {
         if (busy || repo is null) return;
