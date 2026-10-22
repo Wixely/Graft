@@ -12,7 +12,7 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace Graft.Storage;
 
-public sealed class GraftStore : IAsyncDisposable
+public sealed partial class GraftStore : IAsyncDisposable
 {
     private const TokenScope AllTokenScopes = TokenScope.ReadApi | TokenScope.Api |
         TokenScope.ReadRepository | TokenScope.WriteRepository;
@@ -771,6 +771,63 @@ public sealed class GraftStore : IAsyncDisposable
     }
 
     /// <summary>
+    /// Deletes a project, its membership, its avatar and its collaboration, and reports where its
+    /// repository was stored so the caller can remove that too.
+    ///
+    /// <para>
+    /// The owner or an administrator, and nobody else. Every other project operation tops out at
+    /// <see cref="ProjectAction.ManageProject"/>, which a Maintainer holds; this one does not use it,
+    /// because managing a project and ending it are different acts and a Maintainer was trusted with the
+    /// first. Ownership transfer draws the line in the same place for the same reason.
+    /// </para>
+    ///
+    /// <para>
+    /// The audit row outlives the project and names the storage directory. Nothing else will afterwards: the
+    /// row is gone, so an operator looking for a repository whose removal failed has only this.
+    /// </para>
+    /// </summary>
+    public async Task<DeletedProject> DeleteProjectAsync(
+        AuthenticatedIdentity actor,
+        long projectId,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(actor);
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
+        AuthenticatedIdentity liveActor = await RequireLiveIdentityAsync(db, transaction, actor, cancellationToken);
+
+        ProjectPathRow? project = await db.QuerySingleOrDefaultAsync<ProjectPathRow>("""
+            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.StorageId, p.DefaultBranch,
+                   p.Visibility, p.PagePublished, p.GlobalSlug
+            FROM Projects p
+            JOIN Users u ON u.Id = p.OwnerUserId
+            WHERE p.Id = @Id AND p.State = 'ready';
+            """, new IdParameters(projectId), transaction);
+        if (project is null) throw new UnauthorizedAccessException("Project is unavailable.");
+        if (!liveActor.IsAdministrator && liveActor.UserId != project.OwnerUserId)
+            throw new UnauthorizedAccessException("Only the project owner or an administrator can delete a project.");
+
+        string now = Now();
+        // Written before the rows go, because it names them. Every dependent row is removed explicitly
+        // rather than left to ON DELETE CASCADE: whether SQLite enforces foreign keys depends on a pragma
+        // the provider sets, and a project that half-disappeared because that pragma changed would leave
+        // membership rows granting access to an id a later project could be given.
+        await AuditAsync(db, transaction, actor.UserId, "delete-project", "project",
+            projectId.ToString(CultureInfo.InvariantCulture),
+            $"Project {project.Namespace}/{project.Slug} deleted; repository storage {project.StorageId}.", now);
+        await db.ExecuteAsync("DELETE FROM ProjectMemberships WHERE ProjectId = @Id;", new IdParameters(projectId), transaction);
+        await db.ExecuteAsync("DELETE FROM Avatars WHERE OwnerType = 'project' AND OwnerId = @Id;",
+            new IdParameters(projectId), transaction);
+        await db.ExecuteAsync("DELETE FROM Comments WHERE ProjectId = @Id;", new IdParameters(projectId), transaction);
+        await db.ExecuteAsync("DELETE FROM Issues WHERE ProjectId = @Id;", new IdParameters(projectId), transaction);
+        await db.ExecuteAsync("DELETE FROM MergeRequests WHERE ProjectId = @Id;", new IdParameters(projectId), transaction);
+        int changed = await db.ExecuteAsync("DELETE FROM Projects WHERE Id = @Id;", new IdParameters(projectId), transaction);
+        if (changed != 1) throw new InvalidOperationException("Project could not be deleted.");
+        await transaction.CommitAsync(cancellationToken);
+        return new(projectId, project.Namespace, project.Slug, project.StorageId);
+    }
+
+    /// <summary>
     /// Records which branch a project treats as its default. Pass null to clear the preference and let the
     /// repository fall back to convention. The caller validates that the branch exists: storage keeps a name,
     /// not a guarantee, because the branch can be deleted afterwards.
@@ -1207,6 +1264,59 @@ public sealed class GraftStore : IAsyncDisposable
         return await db.QuerySingleAsync<long>("SELECT COUNT(*) FROM AuditEvents;");
     }
 
+    /// <summary>
+    /// Reads the audit trail, newest first. Administrators only.
+    ///
+    /// <para>
+    /// Every sensitive act has written a row here since the first migration and nothing could read one back
+    /// without opening the database, which made the trail write-only in practice. It is a whole-instance
+    /// record covering accounts, tokens and projects together, so it is not divisible by project and the
+    /// only honest audience for it is an administrator.
+    /// </para>
+    ///
+    /// <para>
+    /// <paramref name="action"/> and <paramref name="targetType"/> filter on exact stored values when given.
+    /// Neither is a search: there is no pattern matching here, because a trail an administrator can query
+    /// loosely is a trail they can accidentally believe they have read all of.
+    /// </para>
+    /// </summary>
+    public async Task<AuditPage> ListAuditEventsAsync(
+        AuthenticatedIdentity actor,
+        int skip,
+        int take,
+        string? action = null,
+        string? targetType = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(actor);
+        if (skip < 0 || take is < 1 or > 100) throw new ArgumentOutOfRangeException(nameof(take));
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        AuthenticatedIdentity live = await RequireLiveIdentityAsync(db, null, actor, cancellationToken);
+        if (!live.IsAdministrator) throw new UnauthorizedAccessException("Administrator access is required.");
+
+        AuditQueryParameters parameters = new(
+            action, action is null ? 1 : 0,
+            targetType, targetType is null ? 1 : 0,
+            take, skip);
+        IEnumerable<AuditEventRow> rows = await db.QueryAsync<AuditEventRow>("""
+            SELECT e.Id, e.ActorUserId, u.Username AS ActorUsername, e.Action, e.TargetType, e.TargetId,
+                   e.Detail, e.CreatedAtUtc
+            FROM AuditEvents e
+            LEFT JOIN Users u ON u.Id = e.ActorUserId
+            WHERE (@AnyAction = 1 OR e.Action = @Action)
+              AND (@AnyTargetType = 1 OR e.TargetType = @TargetType)
+            ORDER BY e.Id DESC
+            LIMIT @Take OFFSET @Skip;
+            """, parameters);
+        long total = await db.QuerySingleAsync<long>("""
+            SELECT COUNT(*) FROM AuditEvents e
+            WHERE (@AnyAction = 1 OR e.Action = @Action)
+              AND (@AnyTargetType = 1 OR e.TargetType = @TargetType);
+            """, parameters);
+        return new([.. rows.Select(row => new AuditEntry(row.Id, row.ActorUserId, row.ActorUsername,
+            row.Action, row.TargetType, row.TargetId, row.Detail, Instant(row.CreatedAtUtc)))], total);
+    }
+
     private static async Task<PermissionDecision> DecideAsync(
         SqliteConnection db,
         SqliteTransaction? transaction,
@@ -1394,6 +1504,10 @@ public sealed class GraftStore : IAsyncDisposable
         secret.AsSpan(prefix.Length).ToString().All(character => character is >= '0' and <= '9' or >= 'a' and <= 'f');
     private static string Digest(string secret) => Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(secret)));
     private static string Now() => DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture);
+
+    /// <summary>Reads a stored timestamp back. Every one of them was written by <see cref="Now"/>.</summary>
+    private static DateTimeOffset Instant(string value) =>
+        DateTimeOffset.Parse(value, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
 
     private static ProjectDetails ToDetails(ProjectDetailsRow row) => new(
         ToInfo(row),

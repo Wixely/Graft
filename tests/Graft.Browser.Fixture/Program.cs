@@ -131,6 +131,31 @@ try
     await Git(sample, ["commit", "-m", "A site in the pages folder, and a page config"]);
     await Git(sample, ["push", AuthenticatedUrl(address, username, token.Secret, username + "/page-only.git"), "main"]);
 
+    // A second branch to propose, so the merge request below is a real proposal over real commits rather
+    // than a row describing branches that do not exist.
+    await Git(source, ["checkout", "-b", "lantern"]);
+    File.WriteAllText(Path.Combine(source, "lantern.txt"), "A lantern, added on a branch.\n");
+    await Git(source, ["add", "."]);
+    await Git(source, ["commit", "-m", "Add a lantern on a branch"]);
+    await Git(source, ["push", "origin", "lantern"]);
+
+    // Conversation to look at. Seeded through the store rather than the API because the fixture already
+    // holds an identity and this needs no HTTP.
+    await using (GraftStore fixture = await GraftStore.OpenAsync(databasePath))
+    {
+        SessionGrant session = (await fixture.LoginAsync(username, password))!;
+        AuthenticatedIdentity identity = (await fixture.ResolveSessionAsync(session.Secret))!;
+        ProjectInfo seeded = (await fixture.FindReadyProjectAsync(username, "seeded"))!;
+        Issue first = await fixture.CreateIssueAsync(identity, seeded.Id, "The lantern flickers",
+            "It dims every few seconds, and only after the room has been dark for a while.\n\nSteps:\n1. Turn it on.\n2. Wait.");
+        await fixture.AddCommentAsync(identity, seeded.Id, CommentSubject.Issue, first.Iid,
+            "Reproduced. It looks like the wick, not the oil.");
+        Issue second = await fixture.CreateIssueAsync(identity, seeded.Id, "Document the oil ratio");
+        await fixture.UpdateIssueAsync(identity, seeded.Id, second.Iid, null, null, CollaborationState.Closed);
+        await fixture.CreateMergeProposalAsync(identity, seeded.Id, "lantern", "main",
+            "Add a lantern", "Adds one file and changes nothing else, so it should merge cleanly.");
+    }
+
     // Echo the credentials only when they are the throwaway defaults, so a supplied password is never logged.
     Console.WriteLine(password == DefaultPassword
         ? $"FIXTURE: username={username}; password={password}; project={username}/seeded"
@@ -140,6 +165,8 @@ try
     // browser treats as a different origin.
     Console.WriteLine("PAGE: " + address + "/-/p/page-only");
     Console.WriteLine("SITE: " + pagesOrigin + "/page-only/");
+    Console.WriteLine("ISSUES: " + address + "/" + username + "/seeded/-/issues");
+    Console.WriteLine("MERGE: " + address + "/" + username + "/seeded/-/merge-requests");
     Console.WriteLine("READY: " + address + "/projects");
     Console.WriteLine("Press Enter to stop and remove the disposable fixture.");
     await Console.In.ReadLineAsync();

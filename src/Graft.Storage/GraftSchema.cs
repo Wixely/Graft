@@ -4,7 +4,7 @@ namespace Graft.Storage;
 
 public static class GraftSchema
 {
-    public static DnaXMigrationManifest Manifest { get; } = new(7,
+    public static DnaXMigrationManifest Manifest { get; } = new(8,
     [
         DnaXMigration.Sql(1, "initial-identity-project-schema", "Create identity and private project schema", """
             CREATE TABLE Users (
@@ -155,6 +155,73 @@ public static class GraftSchema
         // recoverable secret in the clear and holds no key.
         DnaXMigration.Sql(7, "token-secret-cipher", "Let an operator keep token secrets recoverable", """
             ALTER TABLE AccessTokens ADD COLUMN SecretCipher TEXT NULL;
+            """),
+        // Where the conversation about a project lives. Until this migration Graft hosted code and said
+        // nothing about changing it: no issues, no proposals, no comments.
+        //
+        // Issues and merge requests are separate tables rather than one table with a kind, because they
+        // differ in more than a label: a merge request names two branches, can be merged, and carries a
+        // merge commit. A shared table would be half-empty for every issue and its CHECK constraints could
+        // not say which columns belong to which kind.
+        //
+        // Comments are shared, because a comment is the same thing on either: an author, a body and a time.
+        // SubjectId holds the row id rather than the public number, so a comment cannot be orphaned by
+        // renumbering and the join needs no project in it. SQLite cannot express a foreign key whose target
+        // table depends on another column, so the two parents are deleted by hand wherever comments are.
+        //
+        // Iid is the number people use: per project and per kind, counted from one, the way GitLab numbers
+        // them. The database holds no counter. A new row takes MAX(Iid) + 1 inside the immediate
+        // transaction, which is the same transaction that inserts it, so two concurrent authors cannot be
+        // handed the same number. The UNIQUE constraint is the backstop if that reasoning is ever wrong.
+        //
+        // State is spelled GitLab's way, 'opened' rather than 'open', so the API can report the stored
+        // value without translating it and a client comparing strings sees what it expects.
+        DnaXMigration.Sql(8, "collaboration", "Give a project issues, merge requests and comments", """
+            CREATE TABLE Issues (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                Iid INTEGER NOT NULL,
+                AuthorUserId INTEGER NOT NULL REFERENCES Users(Id),
+                Title TEXT NOT NULL,
+                Description TEXT NOT NULL DEFAULT '',
+                State TEXT NOT NULL CHECK (State IN ('opened', 'closed')),
+                CreatedAtUtc TEXT NOT NULL,
+                UpdatedAtUtc TEXT NOT NULL,
+                ClosedAtUtc TEXT NULL,
+                UNIQUE (ProjectId, Iid)
+            );
+
+            CREATE TABLE MergeRequests (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                Iid INTEGER NOT NULL,
+                AuthorUserId INTEGER NOT NULL REFERENCES Users(Id),
+                Title TEXT NOT NULL,
+                Description TEXT NOT NULL DEFAULT '',
+                SourceBranch TEXT NOT NULL,
+                TargetBranch TEXT NOT NULL,
+                State TEXT NOT NULL CHECK (State IN ('opened', 'merged', 'closed')),
+                MergeCommitSha TEXT NULL,
+                MergedByUserId INTEGER NULL REFERENCES Users(Id),
+                CreatedAtUtc TEXT NOT NULL,
+                UpdatedAtUtc TEXT NOT NULL,
+                ClosedAtUtc TEXT NULL,
+                UNIQUE (ProjectId, Iid)
+            );
+
+            CREATE TABLE Comments (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                SubjectType TEXT NOT NULL CHECK (SubjectType IN ('issue', 'merge_request')),
+                SubjectId INTEGER NOT NULL,
+                AuthorUserId INTEGER NOT NULL REFERENCES Users(Id),
+                Body TEXT NOT NULL,
+                CreatedAtUtc TEXT NOT NULL
+            );
+
+            CREATE INDEX IX_Issues_Project ON Issues(ProjectId, State);
+            CREATE INDEX IX_MergeRequests_Project ON MergeRequests(ProjectId, State);
+            CREATE INDEX IX_Comments_Subject ON Comments(SubjectType, SubjectId, Id);
             """)
     ]);
 }

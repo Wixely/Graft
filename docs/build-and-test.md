@@ -149,6 +149,20 @@ by a Maintainer. Its optional static site is served from a second hostname named
 by default. The suite covers the matcher, the parser and both surfaces; see
 [project pages](project-pages.md) and [page evidence](validation/2026-10-20-project-pages.md).
 
+Collaboration is exercised on a project of its own, with branches pushed by real Git so the merge runs
+against a repository a client built. The branches are arranged so each of the three merge outcomes occurs:
+one target that never moves, for a fast-forward; a branch adding a file while the target moves elsewhere,
+for a three-way merge; and two branches changing one file differently, for the refusal. After the merge,
+Git itself fetches the result, counts the parents, checks the tree carries both sides' changes and runs
+`git fsck --strict`. The permission boundary is asserted from four vantage points at once: a `read_api`
+token, a repository-only token, a member, and an account with a perfectly good credential and no role on
+the project. See [ADR 0014](decisions/0014-collaboration.md) and
+[the evidence](validation/2026-10-22-collaboration.md).
+
+Deleting a project is asserted by what survives it. The row counts for issues, comments and membership are
+read with SQL rather than through an API, because nothing can ask an API about a project that no longer
+exists, and a row left behind would be keyed to an id some later project could be given.
+
 A browser session is an idle window, renewed by use, set by `--session-minutes` and defaulting to 12 hours
 with an absolute ceiling of 30 days from sign-in. It used to be a fifteen-minute countdown from sign-in that
 no amount of activity moved, which is what it looked like from a chair: being logged out mid-sentence. See

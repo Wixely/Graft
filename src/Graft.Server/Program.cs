@@ -80,6 +80,11 @@ McpEndpoint mcpEndpoint = new();
 // and "/api/v4/projects/:id/uploads", so squatting either would block later compatibility work. Unmatched
 // paths beneath "/api/" already return 404 rather than the SPA shell.
 const string UploadPrefix = "/api/graft/uploads";
+
+// The email domain a server-authored merge commit is attributed to. Graft holds no email addresses, and a
+// commit needs one, so this says plainly where the identity came from rather than inventing a plausible
+// address that would bounce. A `.invalid` domain is reserved for exactly this by RFC 2606.
+const string MergeAuthorHost = "graft.invalid";
 string stateDirectory = Path.GetDirectoryName(Path.GetFullPath(settings.Database))!;
 string uploadRoot = Path.Combine(stateDirectory, "uploads");
 string keyRingDirectory = Path.Combine(stateDirectory, "data-protection-keys");
@@ -512,6 +517,39 @@ app.MapPost("/api/graft/admin/mcp", async context =>
     await context.Response.WriteAsJsonAsync(McpResponse(updated), ApiJson.Default.McpSettingsResponse, null, context.RequestAborted);
 });
 
+// The audit trail. Every sensitive act has written a row since the first migration; until now nothing could
+// read one back without opening the database, which made a trail nobody could consult. Administrators only,
+// because it spans accounts, tokens and every project at once and cannot be divided by project.
+app.MapGet("/api/graft/admin/audit", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!browser.Value.Identity.IsAdministrator) { await ApiError(context, 403, "administrator"); return; }
+    if (!await OnlyQuery(context, "page", "per_page", "action", "target_type")) return;
+    (int Page, int PerPage)? pagination = await Pagination(context);
+    if (pagination is null) return;
+    (int page, int perPage) = pagination.Value;
+    string? action = context.Request.Query["action"].ToString();
+    string? targetType = context.Request.Query["target_type"].ToString();
+    if (action.Length == 0) action = null;
+    if (targetType.Length == 0) targetType = null;
+    if (action?.Length > 64 || targetType?.Length > 64) { await ApiError(context, 400, "filter is too long"); return; }
+
+    AuditPage entries;
+    try
+    {
+        entries = await store.ListAuditEventsAsync(browser.Value.Identity, (page - 1) * perPage, perPage,
+            action, targetType, context.RequestAborted);
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 403, "administrator"); return; }
+    AuditEntryResponse[] response = [.. entries.Entries.Select(entry => new AuditEntryResponse(
+        entry.Id, entry.ActorUserId, entry.ActorUsername, entry.Action, entry.TargetType, entry.TargetId,
+        entry.Detail, entry.CreatedAtUtc))];
+    SetPagination(context, page, perPage, entries.Total);
+    await context.Response.WriteAsJsonAsync(new AuditPageResponse(response, entries.Total, page, perPage),
+        ApiJson.Default.AuditPageResponse, null, context.RequestAborted);
+});
+
 app.MapGet("/api/tokens", async context =>
 {
     (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
@@ -849,6 +887,31 @@ app.MapPost("/api/projects/{projectId:long}/page", async context =>
 // The public browser. Anonymous by design, and it answers identically for everyone: a signed-in caller sees
 // exactly what a stranger sees, so this listing can never become a way to discover a project that is not
 // published. Unlisted projects are absent, which is the whole of what makes them unlisted.
+// Deleting a project. Irreversible, and the one project operation a Maintainer cannot do: the store
+// requires the owner or an administrator.
+//
+// The browser asks for the path to be typed back. The API does not, because there the caller is a program
+// that already had to name the project in the URL, and a confirmation a script fills in automatically is
+// not a confirmation. See ADR 0013.
+app.MapDelete("/api/projects/{projectId:long}", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    ProjectDeleteRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.ProjectDeleteRequest, context.RequestAborted);
+
+    long projectId = Convert.ToInt64(context.Request.RouteValues["projectId"], System.Globalization.CultureInfo.InvariantCulture);
+    ProjectDetails? details = await store.GetReadyProjectAsync(projectId, context.RequestAborted);
+    if (details is null) { await ApiError(context, 404, "project"); return; }
+    string expected = details.Project.Namespace + "/" + details.Project.Slug;
+    if (!string.Equals(request?.Path?.Trim(), expected, StringComparison.Ordinal))
+    { await ApiError(context, 400, "type " + expected + " to confirm"); return; }
+    await DeleteProject(context, browser.Value.Identity, projectId);
+});
+
 app.MapGet("/api/browse", async context =>
 {
     if (!await OnlyQuery(context, "search", "page")) return;
@@ -1121,8 +1184,12 @@ Func<HttpContext, ProjectDetails?, Task> browseProject = async (context, details
         // The README is rendered for the root of the branch being viewed, so switching branch shows that
         // branch's README. Only the root is considered; a README deeper in the tree is an ordinary file.
         ReadmeResponse? readme = path.Length == 0 ? ReadmeFor(context, details, repository, revision) : null;
+        // Reported separately from pushing because it is a weaker permission: a Reporter may comment and
+        // open an issue without being able to push, so a page that gated its comment box on CanPush would
+        // hide it from exactly the people it is for.
+        PermissionDecision participate = await DecideFor(context, browser?.Identity, projectId, ProjectAction.WriteCollaboration);
         RepositoryPageResponse response = new(project, manage.Allowed, push.Allowed, branches, commits, entries,
-            fileResponse, readme, details.Project.PagePublished, settings.PublicBrowsing);
+            fileResponse, readme, details.Project.PagePublished, settings.PublicBrowsing, participate.Allowed);
         await context.Response.WriteAsJsonAsync(response, ApiJson.Default.RepositoryPageResponse, null, context.RequestAborted);
     });
 };
@@ -1779,6 +1846,659 @@ app.MapGet("/api/graft/projects/{projectId}/page", async context =>
         ApiJson.Default.PageStateResponse, null, context.RequestAborted);
 });
 
+// ---------------------------------------------------------------------------------------------------
+// Collaboration: issues, merge proposals and the comments on both.
+//
+// Every operation below exists twice, as a GitLab-compatible route under /api/v4 answering to a token and
+// as a Graft route under /api/projects answering to a browser session. The two differ only in how the
+// caller is identified and in the CSRF and Origin checks a cookie makes necessary; the body of each is one
+// shared function, so a rule cannot hold on one surface and not the other.
+// ---------------------------------------------------------------------------------------------------
+
+// Reading is allowed wherever the repository can be read, including anonymously on a public project. A
+// refusal is a 404 like every other project refusal, because distinguishing "no" from "does not exist"
+// would make the existence of a private project readable.
+async Task<(ProjectDetails Details, AuthenticatedIdentity? Identity)?> BrowserCollaboration(
+    HttpContext context, bool write)
+{
+    if (write && context.Request.Headers.Origin.ToString() != serverOrigin)
+    { await ApiError(context, 403, "origin"); return null; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: write);
+    if (write && browser is null) return null;
+    if (write && !VerifyCsrf(browser!.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return null; }
+
+    long projectId = Convert.ToInt64(context.Request.RouteValues["projectId"], System.Globalization.CultureInfo.InvariantCulture);
+    ProjectDetails? details = await store.GetReadyProjectAsync(projectId, context.RequestAborted);
+    AuthenticatedIdentity? identity = browser?.Identity;
+    if (details is null) { await ApiError(context, 404, "project"); return null; }
+    PermissionDecision permission = await DecideFor(context, identity, projectId, ProjectAction.ReadCollaboration);
+    if (!permission.Allowed) { await ApiError(context, 404, "project"); return null; }
+    return (details, identity);
+}
+
+// The same for a token caller. Reading is checked here; writing is checked by the store, so a caller who
+// can read but not write is told so with a 403 rather than being hidden from.
+async Task<(ProjectDetails Details, AuthenticatedIdentity? Identity)?> ApiCollaboration(HttpContext context)
+{
+    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.ReadCollaboration);
+    return project is null ? null : (project.Details, project.Identity);
+}
+
+long Number(HttpContext context) =>
+    Convert.ToInt64(context.Request.RouteValues["iid"], System.Globalization.CultureInfo.InvariantCulture);
+
+async Task<UserResponse> AuthorFor(HttpContext context, long userId, string username)
+{
+    string? avatarUrl = await store.HasAvatarAsync(AvatarOwner.User, userId, context.RequestAborted)
+        ? AvatarUrl(context, AvatarOwner.User, userId)
+        : null;
+    return new(userId, username, username, "active", false,
+        Origin(context) + "/" + Uri.EscapeDataString(username), avatarUrl);
+}
+
+async Task<IssueResponse> IssueResponseFor(HttpContext context, ProjectDetails project, Issue issue) => new(
+    issue.Id, issue.Iid, issue.ProjectId, issue.Title, issue.Description, StateText(issue.State),
+    await AuthorFor(context, issue.AuthorUserId, issue.AuthorUsername),
+    issue.CreatedAtUtc, issue.UpdatedAtUtc, issue.ClosedAtUtc,
+    ProjectWebUrl(context, project) + "/-/issues/" + issue.Iid.ToString(System.Globalization.CultureInfo.InvariantCulture),
+    issue.Comments);
+
+// `analysis` is null in a listing. Deciding whether a proposal merges means flattening three trees, and
+// doing that for every row of a page would make a list cost as much as the work it lists. GitLab answers
+// the same way, with a merge_status a client is expected to treat as not yet known.
+async Task<MergeRequestResponse> MergeResponseFor(HttpContext context, ProjectDetails project,
+    MergeProposal proposal, MergeAnalysis? analysis)
+{
+    string status = proposal.State switch
+    {
+        CollaborationState.Merged => "can_be_merged",
+        CollaborationState.Closed => "cannot_be_merged",
+        _ => analysis is null ? "unchecked" : analysis.CanMerge ? "can_be_merged" : "cannot_be_merged"
+    };
+    string method = proposal.State == CollaborationState.Merged ? "already_merged" : analysis switch
+    {
+        null => "unresolved",
+        { Kind: MergeKind.FastForward } => "fast_forward",
+        { Kind: MergeKind.ThreeWay } => "three_way",
+        { Kind: MergeKind.Conflict } => "conflict",
+        { Kind: MergeKind.AlreadyMerged } => "already_merged",
+        _ => "unresolved"
+    };
+    return new(proposal.Id, proposal.Iid, proposal.ProjectId, proposal.Title, proposal.Description,
+        StateText(proposal.State), proposal.SourceBranch, proposal.TargetBranch,
+        await AuthorFor(context, proposal.AuthorUserId, proposal.AuthorUsername),
+        proposal.CreatedAtUtc, proposal.UpdatedAtUtc, proposal.ClosedAtUtc,
+        proposal.MergeCommitSha, proposal.MergedByUsername, status, analysis?.SourceCommitId,
+        ProjectWebUrl(context, project) + "/-/merge-requests/" + proposal.Iid.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        method, analysis?.Conflicts, proposal.Comments);
+}
+
+async Task<NoteResponse> NoteResponseFor(HttpContext context, Comment comment) => new(
+    comment.Id, comment.Body, await AuthorFor(context, comment.AuthorUserId, comment.AuthorUsername),
+    comment.CreatedAtUtc);
+
+// Analyses a proposal against the repository as it stands now. Taken under the repository's gate like
+// every other read of it, because a merge analysis reads the whole object graph.
+async Task<MergeAnalysis> AnalyseProposal(HttpContext context, ProjectDetails project, MergeProposal proposal)
+{
+    RepositoryEndpoint endpoint = EndpointFor(project.Project);
+    await endpoint.Gate.WaitAsync(context.RequestAborted);
+    try { return RepositoryMerge.Analyse(endpoint.Repository, proposal.SourceBranch, proposal.TargetBranch, context.RequestAborted); }
+    finally { endpoint.Gate.Release(); }
+}
+
+async Task ListIssues(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (!await OnlyQuery(context, "state", "page", "per_page")) return;
+    if (!TryReadState(context.Request.Query["state"].ToString(), out CollaborationState? state, merged: false))
+    { await ApiError(context, 400, "state must be opened, closed or all"); return; }
+    (int Page, int PerPage)? pagination = await Pagination(context);
+    if (pagination is null) return;
+    (int page, int perPage) = pagination.Value;
+
+    IssuePage issues = await store.ListIssuesAsync(identity, project.Project.Id, state,
+        (page - 1) * perPage, perPage, context.RequestAborted);
+    List<IssueResponse> response = [];
+    foreach (Issue issue in issues.Issues) response.Add(await IssueResponseFor(context, project, issue));
+    SetPagination(context, page, perPage, issues.Total);
+    await context.Response.WriteAsJsonAsync(new IssuePageResponse(response, issues.Total, page, perPage),
+        ApiJson.Default.IssuePageResponse, null, context.RequestAborted);
+}
+
+async Task CreateIssue(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required to open an issue"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    IssueCreateRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.IssueCreateRequest, context.RequestAborted);
+    if (request?.Title is not { Length: > 0 }) { await ApiError(context, 400, "title is required"); return; }
+    try
+    {
+        Issue issue = await store.CreateIssueAsync(identity, project.Project.Id, request.Title,
+            request.Description ?? "", context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status201Created;
+        await context.Response.WriteAsJsonAsync(await IssueResponseFor(context, project, issue),
+            ApiJson.Default.IssueResponse, null, context.RequestAborted);
+    }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+}
+
+async Task ReadIssue(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (!await OnlyQuery(context)) return;
+    Issue? issue = await store.FindIssueAsync(identity, project.Project.Id, Number(context), context.RequestAborted);
+    if (issue is null) { await ApiError(context, 404, "404 Issue Not Found"); return; }
+    await context.Response.WriteAsJsonAsync(await IssueResponseFor(context, project, issue),
+        ApiJson.Default.IssueResponse, null, context.RequestAborted);
+}
+
+async Task UpdateIssue(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    IssueUpdateRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.IssueUpdateRequest, context.RequestAborted);
+    if (request is null) { await ApiError(context, 400, "issue"); return; }
+    if (!TryReadStateEvent(request.StateEvent, out CollaborationState? state))
+    { await ApiError(context, 400, "state_event must be close or reopen"); return; }
+    if (request.Title is null && request.Description is null && state is null)
+    { await ApiError(context, 400, "nothing to change"); return; }
+    try
+    {
+        Issue issue = await store.UpdateIssueAsync(identity, project.Project.Id, Number(context),
+            request.Title, request.Description, state, context.RequestAborted);
+        await context.Response.WriteAsJsonAsync(await IssueResponseFor(context, project, issue),
+            ApiJson.Default.IssueResponse, null, context.RequestAborted);
+    }
+    catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Issue Not Found"); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+}
+
+async Task ListNotes(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity, CommentSubject subject)
+{
+    if (!await OnlyQuery(context, "page", "per_page")) return;
+    (int Page, int PerPage)? pagination = await Pagination(context);
+    if (pagination is null) return;
+    (int page, int perPage) = pagination.Value;
+    try
+    {
+        IReadOnlyList<Comment> comments = await store.ListCommentsAsync(identity, project.Project.Id, subject,
+            Number(context), (page - 1) * perPage, perPage, context.RequestAborted);
+        List<NoteResponse> response = [];
+        foreach (Comment comment in comments) response.Add(await NoteResponseFor(context, comment));
+        await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.NoteResponseArray, null, context.RequestAborted);
+    }
+    catch (CollaborationNotFoundException error) { await ApiError(context, 404, error.Message); }
+}
+
+async Task CreateNote(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity, CommentSubject subject)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required to comment"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    NoteCreateRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.NoteCreateRequest, context.RequestAborted);
+    if (request?.Body is not { Length: > 0 }) { await ApiError(context, 400, "body is required"); return; }
+    try
+    {
+        Comment comment = await store.AddCommentAsync(identity, project.Project.Id, subject, Number(context),
+            request.Body, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status201Created;
+        await context.Response.WriteAsJsonAsync(await NoteResponseFor(context, comment),
+            ApiJson.Default.NoteResponse, null, context.RequestAborted);
+    }
+    catch (CollaborationNotFoundException error) { await ApiError(context, 404, error.Message); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+}
+
+async Task ListMergeRequests(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (!await OnlyQuery(context, "state", "page", "per_page")) return;
+    if (!TryReadState(context.Request.Query["state"].ToString(), out CollaborationState? state, merged: true))
+    { await ApiError(context, 400, "state must be opened, closed, merged or all"); return; }
+    (int Page, int PerPage)? pagination = await Pagination(context);
+    if (pagination is null) return;
+    (int page, int perPage) = pagination.Value;
+
+    MergeProposalPage proposals = await store.ListMergeProposalsAsync(identity, project.Project.Id, state,
+        (page - 1) * perPage, perPage, context.RequestAborted);
+    List<MergeRequestResponse> response = [];
+    foreach (MergeProposal proposal in proposals.Proposals)
+        response.Add(await MergeResponseFor(context, project, proposal, null));
+    SetPagination(context, page, perPage, proposals.Total);
+    await context.Response.WriteAsJsonAsync(new MergeRequestPageResponse(response, proposals.Total, page, perPage),
+        ApiJson.Default.MergeRequestPageResponse, null, context.RequestAborted);
+}
+
+async Task CreateMergeRequest(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required to propose a merge"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    MergeRequestCreateRequest? request = await context.Request.ReadFromJsonAsync(
+        ApiJson.Default.MergeRequestCreateRequest, context.RequestAborted);
+    if (request?.SourceBranch is not { Length: > 0 } || request.TargetBranch is not { Length: > 0 })
+    { await ApiError(context, 400, "source_branch and target_branch are required"); return; }
+    if (request.Title is not { Length: > 0 }) { await ApiError(context, 400, "title is required"); return; }
+
+    // Both branches must exist before the proposal does. A proposal naming a branch that was never there
+    // is a typo rather than a plan, and catching it here is the difference between an error at the moment
+    // of the mistake and a proposal that can never be merged for reasons nobody can see.
+    RepositoryEndpoint endpoint = EndpointFor(project.Project);
+    await endpoint.Gate.WaitAsync(context.RequestAborted);
+    try
+    {
+        if (!endpoint.Repository.Refs.ContainsKey("refs/heads/" + request.SourceBranch))
+        { await ApiError(context, 400, "source_branch does not exist"); return; }
+        if (!endpoint.Repository.Refs.ContainsKey("refs/heads/" + request.TargetBranch))
+        { await ApiError(context, 400, "target_branch does not exist"); return; }
+    }
+    finally { endpoint.Gate.Release(); }
+
+    try
+    {
+        MergeProposal proposal = await store.CreateMergeProposalAsync(identity, project.Project.Id,
+            request.SourceBranch, request.TargetBranch, request.Title, request.Description ?? "", context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status201Created;
+        await context.Response.WriteAsJsonAsync(
+            await MergeResponseFor(context, project, proposal, await AnalyseProposal(context, project, proposal)),
+            ApiJson.Default.MergeRequestResponse, null, context.RequestAborted);
+    }
+    catch (CollaborationConflictException error) { await ApiError(context, 409, error.Message); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+}
+
+async Task ReadMergeRequest(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (!await OnlyQuery(context)) return;
+    MergeProposal? proposal = await store.FindMergeProposalAsync(identity, project.Project.Id, Number(context), context.RequestAborted);
+    if (proposal is null) { await ApiError(context, 404, "404 Merge Request Not Found"); return; }
+    await context.Response.WriteAsJsonAsync(
+        await MergeResponseFor(context, project, proposal, await AnalyseProposal(context, project, proposal)),
+        ApiJson.Default.MergeRequestResponse, null, context.RequestAborted);
+}
+
+async Task UpdateMergeRequest(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    IssueUpdateRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.IssueUpdateRequest, context.RequestAborted);
+    if (request is null) { await ApiError(context, 400, "merge request"); return; }
+    if (!TryReadStateEvent(request.StateEvent, out CollaborationState? state))
+    { await ApiError(context, 400, "state_event must be close or reopen"); return; }
+    if (request.Title is null && request.Description is null && state is null)
+    { await ApiError(context, 400, "nothing to change"); return; }
+    try
+    {
+        MergeProposal proposal = await store.UpdateMergeProposalAsync(identity, project.Project.Id, Number(context),
+            request.Title, request.Description, state, context.RequestAborted);
+        await context.Response.WriteAsJsonAsync(
+            await MergeResponseFor(context, project, proposal, await AnalyseProposal(context, project, proposal)),
+            ApiJson.Default.MergeRequestResponse, null, context.RequestAborted);
+    }
+    catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Merge Request Not Found"); }
+    catch (CollaborationConflictException error) { await ApiError(context, 409, error.Message); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+}
+
+async Task MergeRequestChanges(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (!await OnlyQuery(context)) return;
+    MergeProposal? proposal = await store.FindMergeProposalAsync(identity, project.Project.Id, Number(context), context.RequestAborted);
+    if (proposal is null) { await ApiError(context, 404, "404 Merge Request Not Found"); return; }
+
+    RepositoryEndpoint endpoint = EndpointFor(project.Project);
+    await endpoint.Gate.WaitAsync(context.RequestAborted);
+    MergeAnalysis analysis;
+    IReadOnlyList<DiffFile> files = [];
+    bool truncated = false;
+    try
+    {
+        analysis = RepositoryMerge.Analyse(endpoint.Repository, proposal.SourceBranch, proposal.TargetBranch, context.RequestAborted);
+        // Measured from where the branches last agreed, which is what review wants: the source's own
+        // changes, not everything the target has gained since. For a merged proposal the branches have
+        // converged and the base is the source itself, so this correctly shows nothing.
+        if (analysis.SourceCommitId is not null)
+        {
+            try
+            {
+                (files, truncated) = RepositoryDiff.BetweenCommits(endpoint.Repository,
+                    analysis.BaseCommitId, analysis.SourceCommitId);
+            }
+            catch (GitInputException) { files = []; truncated = true; }
+        }
+    }
+    finally { endpoint.Gate.Release(); }
+
+    DiffFileResponse[] response = [.. files.Select(file => new DiffFileResponse(file.Path, file.Status,
+        file.OldMode, file.NewMode, file.IsBinary, file.TooLarge, file.Added, file.Removed,
+        [.. file.Hunks.Select(hunk => new DiffHunkResponse(HunkHeader(hunk),
+            [.. hunk.Lines.Select(line => new DiffLineResponse(line.Kind.ToString(), line.Text, line.OldLine, line.NewLine, line.NoNewline))]))]))];
+    await context.Response.WriteAsJsonAsync(new MergeRequestChangesResponse(
+        await MergeResponseFor(context, project, proposal, analysis),
+        analysis.BaseCommitId, analysis.SourceCommitId, analysis.TargetCommitId,
+        response, truncated, response.Sum(file => file.Added), response.Sum(file => file.Removed)),
+        ApiJson.Default.MergeRequestChangesResponse, null, context.RequestAborted);
+}
+
+// Merging writes to the target branch, so it needs exactly what a push to that branch needs. The store
+// re-checks that; this checks it first so a caller who may read but not push is refused before the Git
+// engine does any work.
+async Task AcceptMergeRequest(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required to merge"); return; }
+    PermissionDecision push = await DecideFor(context, identity, project.Project.Id, ProjectAction.PushRepository);
+    if (!push.Allowed) { await ApiError(context, 403, push.Explanation); return; }
+
+    MergeProposal? proposal = await store.FindMergeProposalAsync(identity, project.Project.Id, Number(context), context.RequestAborted);
+    if (proposal is null) { await ApiError(context, 404, "404 Merge Request Not Found"); return; }
+    if (proposal.State != CollaborationState.Opened)
+    { await ApiError(context, 409, "the proposal is not open"); return; }
+
+    string message = $"Merge branch '{proposal.SourceBranch}' into '{proposal.TargetBranch}'\n\n{proposal.Title}";
+    GitIdentity author = new(identity.Username, identity.Username + "@" + MergeAuthorHost, DateTimeOffset.UtcNow);
+
+    RepositoryEndpoint endpoint = EndpointFor(project.Project);
+    await endpoint.Gate.WaitAsync(context.RequestAborted);
+    MergeOutcome outcome;
+    try
+    {
+        MergeAnalysis analysis = RepositoryMerge.Analyse(endpoint.Repository, proposal.SourceBranch,
+            proposal.TargetBranch, context.RequestAborted);
+        if (!analysis.CanMerge)
+        {
+            string reason = analysis.Kind switch
+            {
+                MergeKind.AlreadyMerged => "the target branch already contains the source",
+                MergeKind.Conflict => "both branches changed: " + string.Join(", ", analysis.Conflicts),
+                _ => "a branch this proposal names no longer exists"
+            };
+            await ApiError(context, 409, reason);
+            return;
+        }
+        outcome = RepositoryMerge.Merge(endpoint.Repository, proposal.SourceBranch, proposal.TargetBranch,
+            author, message, context.RequestAborted);
+    }
+    catch (GitInputException error) { await ApiError(context, 409, "merge refused: " + error.Message); return; }
+    finally { endpoint.Gate.Release(); }
+
+    // The branch has moved. Recording it cannot be undone from here, so a failure after this point leaves a
+    // merged branch and an open proposal, which is the safe direction to fail in: the work is not lost and
+    // the proposal can be looked at.
+    MergeProposal merged = await store.RecordMergeAsync(identity, project.Project.Id, proposal.Iid,
+        outcome.CommitId, context.RequestAborted);
+    await context.Response.WriteAsJsonAsync(new MergeResultResponse(
+        await MergeResponseFor(context, project, merged, await AnalyseProposal(context, project, merged)),
+        outcome.Kind == MergeKind.FastForward ? "fast_forward" : "three_way", outcome.CommitId),
+        ApiJson.Default.MergeResultResponse, null, context.RequestAborted);
+}
+
+async Task DeleteNote(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    long commentId = Convert.ToInt64(context.Request.RouteValues["commentId"], System.Globalization.CultureInfo.InvariantCulture);
+    try
+    {
+        await store.DeleteCommentAsync(identity, project.Project.Id, commentId, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (CollaborationNotFoundException error) { await ApiError(context, 404, error.Message); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+}
+
+static string StateText(CollaborationState state) => state switch
+{
+    CollaborationState.Closed => "closed",
+    CollaborationState.Merged => "merged",
+    _ => "opened"
+};
+
+// An absent state means every state, which is what a browser's first request wants. GitLab defaults the
+// same way.
+static bool TryReadState(string? value, out CollaborationState? state, bool merged)
+{
+    state = null;
+    if (string.IsNullOrEmpty(value) || value == "all") return true;
+    switch (value)
+    {
+        case "opened": state = CollaborationState.Opened; return true;
+        case "closed": state = CollaborationState.Closed; return true;
+        case "merged" when merged: state = CollaborationState.Merged; return true;
+        default: return false;
+    }
+}
+
+// GitLab names the act rather than the result, and so does this: `close` and `reopen` rather than a state
+// to assert. A caller asserting a state would have to be told that the state they asked for is the one
+// they were already in, which is not an error worth having.
+static bool TryReadStateEvent(string? value, out CollaborationState? state)
+{
+    state = null;
+    if (string.IsNullOrEmpty(value)) return true;
+    switch (value)
+    {
+        case "close": state = CollaborationState.Closed; return true;
+        case "reopen": state = CollaborationState.Opened; return true;
+        default: return false;
+    }
+}
+
+app.MapGet("/api/projects/{projectId:long}/issues", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: false);
+    if (scope is null) return;
+    await ListIssues(context, scope.Value.Details, scope.Value.Identity);
+});
+
+app.MapPost("/api/projects/{projectId:long}/issues", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: true);
+    if (scope is null) return;
+    await CreateIssue(context, scope.Value.Details, scope.Value.Identity);
+});
+
+app.MapGet("/api/projects/{projectId:long}/issues/{iid:long}", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: false);
+    if (scope is null) return;
+    await ReadIssue(context, scope.Value.Details, scope.Value.Identity);
+});
+
+app.MapPost("/api/projects/{projectId:long}/issues/{iid:long}", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: true);
+    if (scope is null) return;
+    await UpdateIssue(context, scope.Value.Details, scope.Value.Identity);
+});
+
+app.MapGet("/api/projects/{projectId:long}/issues/{iid:long}/comments", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: false);
+    if (scope is null) return;
+    await ListNotes(context, scope.Value.Details, scope.Value.Identity, CommentSubject.Issue);
+});
+
+app.MapPost("/api/projects/{projectId:long}/issues/{iid:long}/comments", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: true);
+    if (scope is null) return;
+    await CreateNote(context, scope.Value.Details, scope.Value.Identity, CommentSubject.Issue);
+});
+
+app.MapGet("/api/projects/{projectId:long}/merge-requests", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: false);
+    if (scope is null) return;
+    await ListMergeRequests(context, scope.Value.Details, scope.Value.Identity);
+});
+
+app.MapPost("/api/projects/{projectId:long}/merge-requests", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: true);
+    if (scope is null) return;
+    await CreateMergeRequest(context, scope.Value.Details, scope.Value.Identity);
+});
+
+app.MapGet("/api/projects/{projectId:long}/merge-requests/{iid:long}", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: false);
+    if (scope is null) return;
+    await ReadMergeRequest(context, scope.Value.Details, scope.Value.Identity);
+});
+
+app.MapPost("/api/projects/{projectId:long}/merge-requests/{iid:long}", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: true);
+    if (scope is null) return;
+    await UpdateMergeRequest(context, scope.Value.Details, scope.Value.Identity);
+});
+
+app.MapGet("/api/projects/{projectId:long}/merge-requests/{iid:long}/changes", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: false);
+    if (scope is null) return;
+    await MergeRequestChanges(context, scope.Value.Details, scope.Value.Identity);
+});
+
+app.MapGet("/api/projects/{projectId:long}/merge-requests/{iid:long}/comments", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: false);
+    if (scope is null) return;
+    await ListNotes(context, scope.Value.Details, scope.Value.Identity, CommentSubject.MergeRequest);
+});
+
+app.MapPost("/api/projects/{projectId:long}/merge-requests/{iid:long}/comments", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: true);
+    if (scope is null) return;
+    await CreateNote(context, scope.Value.Details, scope.Value.Identity, CommentSubject.MergeRequest);
+});
+
+app.MapPost("/api/projects/{projectId:long}/merge-requests/{iid:long}/merge", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: true);
+    if (scope is null) return;
+    await AcceptMergeRequest(context, scope.Value.Details, scope.Value.Identity);
+});
+
+app.MapDelete("/api/projects/{projectId:long}/comments/{commentId:long}", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: true);
+    if (scope is null) return;
+    await DeleteNote(context, scope.Value.Details, scope.Value.Identity);
+});
+
+app.MapGet("/api/v4/projects/{projectId}/issues", async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    await ListIssues(context, scope.Value.Details, scope.Value.Identity);
+});
+
+app.MapPost("/api/v4/projects/{projectId}/issues", async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    await CreateIssue(context, scope.Value.Details, scope.Value.Identity);
+});
+
+app.MapGet("/api/v4/projects/{projectId}/issues/{iid:long}", async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    await ReadIssue(context, scope.Value.Details, scope.Value.Identity);
+});
+
+app.MapMethods("/api/v4/projects/{projectId}/issues/{iid:long}", ["PUT"], async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    await UpdateIssue(context, scope.Value.Details, scope.Value.Identity);
+});
+
+app.MapGet("/api/v4/projects/{projectId}/issues/{iid:long}/notes", async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    await ListNotes(context, scope.Value.Details, scope.Value.Identity, CommentSubject.Issue);
+});
+
+app.MapPost("/api/v4/projects/{projectId}/issues/{iid:long}/notes", async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    await CreateNote(context, scope.Value.Details, scope.Value.Identity, CommentSubject.Issue);
+});
+
+app.MapGet("/api/v4/projects/{projectId}/merge_requests", async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    await ListMergeRequests(context, scope.Value.Details, scope.Value.Identity);
+});
+
+app.MapPost("/api/v4/projects/{projectId}/merge_requests", async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    await CreateMergeRequest(context, scope.Value.Details, scope.Value.Identity);
+});
+
+app.MapGet("/api/v4/projects/{projectId}/merge_requests/{iid:long}", async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    await ReadMergeRequest(context, scope.Value.Details, scope.Value.Identity);
+});
+
+app.MapMethods("/api/v4/projects/{projectId}/merge_requests/{iid:long}", ["PUT"], async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    await UpdateMergeRequest(context, scope.Value.Details, scope.Value.Identity);
+});
+
+app.MapGet("/api/v4/projects/{projectId}/merge_requests/{iid:long}/changes", async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    await MergeRequestChanges(context, scope.Value.Details, scope.Value.Identity);
+});
+
+app.MapGet("/api/v4/projects/{projectId}/merge_requests/{iid:long}/notes", async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    await ListNotes(context, scope.Value.Details, scope.Value.Identity, CommentSubject.MergeRequest);
+});
+
+app.MapPost("/api/v4/projects/{projectId}/merge_requests/{iid:long}/notes", async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    await CreateNote(context, scope.Value.Details, scope.Value.Identity, CommentSubject.MergeRequest);
+});
+
+app.MapMethods("/api/v4/projects/{projectId}/merge_requests/{iid:long}/merge", ["PUT"], async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    await AcceptMergeRequest(context, scope.Value.Details, scope.Value.Identity);
+});
+
+// GitLab answers this with 202 Accepted because its deletion is scheduled and happens later. Graft's is
+// immediate and complete when the response is written, so it answers 204: a client that polls for the
+// project to disappear would be polling for something that has already happened.
+app.MapDelete("/api/v4/projects/{**projectId}", async context =>
+{
+    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.ManageProject);
+    if (project is null) return;
+    if (project.Identity is null) { await ApiError(context, 401, "401 Unauthorized"); return; }
+    if (!await OnlyQuery(context)) return;
+    await DeleteProject(context, project.Identity, project.Details.Project.Id);
+});
+
 app.Map("/api/v4/{**path}", context => ApiError(context, 404, "404 API endpoint not found"));
 
 app.MapGet("/{projectNamespace}/{project}.git/info/refs", async context =>
@@ -2406,6 +3126,50 @@ async Task<ApiProject?> AuthorizeApiProject(HttpContext context, ProjectAction a
         return null;
     }
     return new(details, identity, EndpointFor(details.Project));
+}
+
+/// <summary>
+/// Removes a project and then its repository, in that order.
+///
+/// <para>
+/// The database first, because that is what makes the project inaccessible, and the directory afterwards.
+/// If the directory removal fails the instance is left with an unreferenced directory whose name is a
+/// random identifier that will never be issued again, which is harmless and is named in the audit row the
+/// deletion wrote. The other order could leave a project whose repository had already gone.
+/// </para>
+///
+/// <para>
+/// The cached repository is evicted and its gate taken first, so a request already inside the Git engine
+/// finishes before the files under it are removed. A caller that will not yield within the wait keeps its
+/// directory: the row is gone either way, so nothing can reach it.
+/// </para>
+/// </summary>
+async Task DeleteProject(HttpContext context, AuthenticatedIdentity identity, long projectId)
+{
+    DeletedProject deleted;
+    try { deleted = await store.DeleteProjectAsync(identity, projectId, context.RequestAborted); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); return; }
+    catch (InvalidOperationException error) { await ApiError(context, 409, error.Message); return; }
+
+    if (repositories.TryRemove(deleted.StorageId, out Lazy<RepositoryEndpoint>? cached) && cached.IsValueCreated)
+    {
+        if (await cached.Value.Gate.WaitAsync(TimeSpan.FromSeconds(30), CancellationToken.None))
+            cached.Value.Gate.Release();
+        else
+        {
+            Console.Error.WriteLine($"DELETE PROJECT: repository {deleted.StorageId} was busy; its directory remains.");
+            context.Response.StatusCode = StatusCodes.Status204NoContent;
+            return;
+        }
+    }
+
+    string directory = Path.Combine(settings.Repositories, deleted.StorageId);
+    try { if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true); }
+    catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+    {
+        Console.Error.WriteLine($"DELETE PROJECT: repository {deleted.StorageId} could not be removed: {error.Message}");
+    }
+    context.Response.StatusCode = StatusCodes.Status204NoContent;
 }
 
 RepositoryEndpoint EndpointFor(ProjectInfo project)

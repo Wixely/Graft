@@ -47,7 +47,14 @@ public static class GraftGuide
         intend to discard what is there. It creates the branch if it does not exist, which makes a branch of
         your own the safe default.
 
-        Ask graft_help for detail on: addressing, permissions, visibility, pages, writing, limits.
+        Collaboration. A project has issues and merge requests, numbered from one within that project, and
+        comments on both. Reading them needs whatever reading the repository needs, so a public project's
+        issues are readable anonymously; writing on any of them needs membership, which reading a public
+        project does not give you. graft_merge fast-forwards where it can and otherwise writes a merge
+        commit, and refuses when both branches changed the same file rather than guessing.
+
+        Ask graft_help for detail on: addressing, permissions, visibility, pages, writing, collaboration,
+        limits.
         """;
 
     /// <summary>The longer documents <c>graft_help</c> serves, keyed by topic.</summary>
@@ -166,7 +173,39 @@ public static class GraftGuide
             `graft_set_visibility` and `graft_set_page_published` change who can see a project. Both widen
             access to strangers, so prefer to propose them rather than perform them unprompted.
 
-            There is no tool that deletes or renames a project, because the product has neither.
+            There is no tool that deletes a project, and that is a decision rather than an omission. The
+            product can delete one, from the browser or over the API with a person's own credential, and it
+            is irreversible. An agent holding a token should not be one keystroke from ending a repository,
+            so the capability stops at this boundary. Renaming a project does not exist at all yet.
+            """,
+
+        ["collaboration"] = """
+            # Issues, merge requests and comments
+
+            Both are numbered from one within their project, so `#1` means two different things in two
+            projects and a number alone is never an address. The tools take the project and the number.
+
+            Reading follows the repository: wherever the code can be read the conversation can be read,
+            including anonymously on a public project. Writing does not follow it. Opening an issue,
+            commenting, or proposing a merge all need membership of the project, so being able to read a
+            public project is not being able to write on it. That is deliberate and it is why a read that
+            succeeds can be followed by a write that is refused with a 403 rather than a 404.
+
+            Editing somebody else's words needs Maintainer; closing and reopening needs the author or a
+            Maintainer. A merged merge request is final and cannot be reopened, because reopening it would
+            propose work the target branch already contains.
+
+            `graft_merge` is where Graft is narrower than other forges, and the narrowness is visible rather
+            than hidden. It merges in two ways. If the target branch is an ancestor of the source it
+            fast-forwards, moving the branch with no new commit. Otherwise it writes a merge commit with two
+            parents, taking each side's changes, which it can do as long as no single file was changed on
+            both sides. When one was, it refuses and names those files, because resolving that case means
+            merging text inside a file and a forge that guessed at it would sometimes be confidently wrong.
+            The answer then is to merge locally, where the conflict can be seen and resolved, and push.
+
+            `graft_read_merge_request` reports `merge_method` before anything is merged, so you can tell
+            which of those three a proposal is in without attempting it. A listing does not: deciding costs
+            three tree walks per proposal, so a list reports `unchecked` and you read one to find out.
             """,
 
         ["limits"] = """

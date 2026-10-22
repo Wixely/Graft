@@ -8,6 +8,30 @@ Graft is a planned locally hosted GitLab alternative in C#/.NET 10. It targets G
 
 Status as of **2026-09-20**: [MVP-08 packaging and resource validation](docs/validation/2026-09-19-mvp08-packaging-resources.md) conditionally passes. Windows NativeAOT interactive and Windows Service, Linux static-musl interactive/systemd, and rootless Podman paths are implemented and tested; the recorded Linux static binaries retain all 76 Git/API/project-creation and 36 recovery assertions. That Windows Git/API/browser workflow passed **135 assertions** under the runtime and NativeAOT at the time, including [administrator user creation and project membership](docs/validation/2026-09-19-user-membership.md), [personal access-token lifecycle](docs/validation/2026-09-19-personal-access-tokens.md), and [account credential lifecycle](docs/validation/2026-09-20-account-credentials.md). The GitLab 18.0.0 source fixture passes against Graft and a [live reference](docs/validation/2026-09-19-gitlab-18-live-reference.md), while pinned `glab` 1.58.0 passes against both. The rendered Blazor workflow and one-use [operator bootstrap](docs/validation/2026-09-19-operator-bootstrap.md) pass. The Linux 3.10.108 run is deferred. DnaX distribution and a real CA/DNS trust environment remain gates. Remote hosting and the project licence are undecided. The repository itself is public at github.com/Wixely/Graft.
 
+Status as of **2026-10-22**: Graft hosts the conversation about the code, not just the code. A project now
+has issues, merge requests and comments on both, numbered from one within that project. Reading them
+follows the repository, so a public project's issues are readable by a stranger; writing on them needs
+membership, because a public project that accepted anonymous writing would be a spam target and there is no
+moderation to fall back on.
+
+Merging is narrower than other forges and says so rather than guessing. It fast-forwards where the target
+branch is an ancestor of the source, writes a two-parent merge commit where both branches moved but touched
+different files, and refuses where both changed the same file, naming those files so the author can merge
+locally. It does not merge file contents, because a forge that produced a silently wrong merge would be
+worse than one that admits the limit. Each proposal reports which of those three it is in before anything
+is merged. Real Git fetches the result, finds two parents and passes `git fsck --strict`.
+
+Two smaller absences closed with it. A project can be deleted, by its owner or an administrator, with the
+path typed back in the browser and irreversibly; and the audit trail, written on every sensitive act since
+the first migration, can finally be read by an administrator. Nine new agent tools bring the Model Context
+Protocol surface to 28; deleting a project is deliberately not one of them. See
+[ADR 0013](docs/decisions/0013-project-deletion-and-audit.md),
+[ADR 0014](docs/decisions/0014-collaboration.md) and
+[the evidence](docs/validation/2026-10-22-collaboration.md).
+
+What Graft still does not do is now written down in one place rather than discovered: see
+[the backlog](docs/backlog.md).
+
 Status as of **2026-10-21**: a personal access token's secret never enters the page. Creating one returns a
 single-use handle rather than the secret; pressing Copy claims it with one request and writes it straight
 to the clipboard. A token nobody copies therefore never reaches the browser, and a copied one is never in

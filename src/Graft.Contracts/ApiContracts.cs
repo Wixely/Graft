@@ -257,7 +257,11 @@ public sealed record RepositoryPageResponse(
     bool PagePublished,
     /// <summary>Whether this server's operator permits publishing at all. False hides the controls rather
     /// than offering a choice the server would refuse.</summary>
-    bool PublishingAllowed);
+    bool PublishingAllowed,
+    /// <summary>Whether this caller may open an issue, propose a merge or comment. Weaker than
+    /// <see cref="CanPush"/>: a Reporter holds this and cannot push, so the two are reported separately
+    /// rather than one standing in for the other.</summary>
+    bool CanParticipate = false);
 
 public sealed record VisibilityRequest(string? Visibility);
 public sealed record PagePublishRequest(bool Published);
@@ -324,6 +328,132 @@ public sealed record McpSettingsRequest(
     bool AllowWrites,
     bool AllowAnonymous);
 
+/// <summary>
+/// Confirms a project deletion by naming the project. The browser requires it; the API does not, because
+/// there the caller is a program that already had to choose the path it sent.
+/// </summary>
+public sealed record ProjectDeleteRequest(string? Path);
+
+/// <summary>One recorded act, as an administrator reads it. No field here can hold a credential.</summary>
+public sealed record AuditEntryResponse(
+    long Id,
+    [property: JsonPropertyName("actor_user_id")] long? ActorUserId,
+    [property: JsonPropertyName("actor_username")] string? ActorUsername,
+    string Action,
+    [property: JsonPropertyName("target_type")] string TargetType,
+    [property: JsonPropertyName("target_id")] string? TargetId,
+    string Detail,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt);
+
+public sealed record AuditPageResponse(
+    IReadOnlyList<AuditEntryResponse> Entries,
+    long Total,
+    int Page,
+    int PerPage);
+
+/// <summary>
+/// An issue, in GitLab's shape. <c>iid</c> is the number people use and <c>id</c> is the row; GitLab
+/// carries both and so does this, because a client that addresses issues by the wrong one of the two
+/// silently works until two projects have issues.
+/// </summary>
+public sealed record IssueResponse(
+    long Id,
+    long Iid,
+    [property: JsonPropertyName("project_id")] long ProjectId,
+    string Title,
+    string Description,
+    string State,
+    UserResponse Author,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt,
+    [property: JsonPropertyName("updated_at")] DateTimeOffset UpdatedAt,
+    [property: JsonPropertyName("closed_at")] DateTimeOffset? ClosedAt,
+    [property: JsonPropertyName("web_url")] string WebUrl,
+    /// <summary>How many comments it has. Graft's own field, so a listing can show it without a second
+    /// request for every row.</summary>
+    [property: JsonPropertyName("user_notes_count")] long UserNotesCount = 0);
+
+/// <summary>
+/// A merge proposal. GitLab calls this a merge request and so does the API surface; the Graft code calls
+/// it a proposal, because that is what it is until somebody merges it.
+/// </summary>
+public sealed record MergeRequestResponse(
+    long Id,
+    long Iid,
+    [property: JsonPropertyName("project_id")] long ProjectId,
+    string Title,
+    string Description,
+    string State,
+    [property: JsonPropertyName("source_branch")] string SourceBranch,
+    [property: JsonPropertyName("target_branch")] string TargetBranch,
+    UserResponse Author,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt,
+    [property: JsonPropertyName("updated_at")] DateTimeOffset UpdatedAt,
+    [property: JsonPropertyName("closed_at")] DateTimeOffset? ClosedAt,
+    [property: JsonPropertyName("merge_commit_sha")] string? MergeCommitSha,
+    [property: JsonPropertyName("merged_by_username")] string? MergedByUsername,
+    /// <summary>GitLab's own vocabulary: <c>can_be_merged</c>, <c>cannot_be_merged</c>, or
+    /// <c>unchecked</c> when a branch the proposal names no longer resolves.</summary>
+    [property: JsonPropertyName("merge_status")] string MergeStatus,
+    /// <summary>The source branch tip, or null when the branch is gone.</summary>
+    string? Sha,
+    [property: JsonPropertyName("web_url")] string WebUrl,
+    /// <summary>
+    /// How this would be merged, if it can be. Graft's own field, because Graft's answer is narrower than
+    /// GitLab's and saying so is more useful than a bare <c>cannot_be_merged</c>: <c>already_merged</c>,
+    /// <c>fast_forward</c>, <c>three_way</c>, <c>conflict</c>, or <c>unresolved</c>.
+    /// </summary>
+    [property: JsonPropertyName("merge_method")] string MergeMethod = "unresolved",
+    /// <summary>The paths both branches changed, which is the whole reason a merge is refused when it is.</summary>
+    IReadOnlyList<string>? Conflicts = null,
+    [property: JsonPropertyName("user_notes_count")] long UserNotesCount = 0);
+
+public sealed record IssuePageResponse(IReadOnlyList<IssueResponse> Issues, long Total, int Page, int PerPage);
+public sealed record MergeRequestPageResponse(IReadOnlyList<MergeRequestResponse> MergeRequests, long Total, int Page, int PerPage);
+
+/// <summary>A comment. GitLab calls these notes and the API path says so.</summary>
+public sealed record NoteResponse(
+    long Id,
+    string Body,
+    UserResponse Author,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt);
+
+public sealed record IssueCreateRequest(string? Title, string? Description);
+
+/// <summary>
+/// Edits an issue or a proposal. <c>state_event</c> is GitLab's spelling and takes <c>close</c> or
+/// <c>reopen</c>, so a state is changed by naming the act rather than by asserting the result.
+/// </summary>
+public sealed record IssueUpdateRequest(
+    string? Title,
+    string? Description,
+    [property: JsonPropertyName("state_event")] string? StateEvent);
+
+public sealed record NoteCreateRequest(string? Body);
+
+public sealed record MergeRequestCreateRequest(
+    [property: JsonPropertyName("source_branch")] string? SourceBranch,
+    [property: JsonPropertyName("target_branch")] string? TargetBranch,
+    string? Title,
+    string? Description);
+
+/// <summary>What a merge produced, or why it could not happen.</summary>
+public sealed record MergeResultResponse(
+    MergeRequestResponse MergeRequest,
+    /// <summary><c>fast_forward</c> or <c>three_way</c>: how the target branch actually moved.</summary>
+    string Method,
+    [property: JsonPropertyName("merge_commit_sha")] string? MergeCommitSha);
+
+/// <summary>A proposal and what it would change, measured from the point the two branches last agreed.</summary>
+public sealed record MergeRequestChangesResponse(
+    [property: JsonPropertyName("merge_request")] MergeRequestResponse MergeRequest,
+    [property: JsonPropertyName("base_sha")] string? BaseSha,
+    [property: JsonPropertyName("source_sha")] string? SourceSha,
+    [property: JsonPropertyName("target_sha")] string? TargetSha,
+    IReadOnlyList<DiffFileResponse> Files,
+    bool Truncated,
+    int Added,
+    int Removed);
+
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower)]
 [JsonSerializable(typeof(UserResponse))]
 [JsonSerializable(typeof(ProjectResponse))]
@@ -369,4 +499,20 @@ public sealed record McpSettingsRequest(
 [JsonSerializable(typeof(BrowseResponse))]
 [JsonSerializable(typeof(McpSettingsResponse))]
 [JsonSerializable(typeof(McpSettingsRequest))]
+[JsonSerializable(typeof(ProjectDeleteRequest))]
+[JsonSerializable(typeof(AuditPageResponse))]
+[JsonSerializable(typeof(IssueResponse))]
+[JsonSerializable(typeof(IssueResponse[]))]
+[JsonSerializable(typeof(IssuePageResponse))]
+[JsonSerializable(typeof(MergeRequestResponse))]
+[JsonSerializable(typeof(MergeRequestResponse[]))]
+[JsonSerializable(typeof(MergeRequestPageResponse))]
+[JsonSerializable(typeof(MergeRequestChangesResponse))]
+[JsonSerializable(typeof(MergeResultResponse))]
+[JsonSerializable(typeof(NoteResponse))]
+[JsonSerializable(typeof(NoteResponse[]))]
+[JsonSerializable(typeof(IssueCreateRequest))]
+[JsonSerializable(typeof(IssueUpdateRequest))]
+[JsonSerializable(typeof(NoteCreateRequest))]
+[JsonSerializable(typeof(MergeRequestCreateRequest))]
 public partial class ApiJson : JsonSerializerContext;

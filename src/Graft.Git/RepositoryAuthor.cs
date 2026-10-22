@@ -107,6 +107,67 @@ public static class RepositoryAuthor
     }
 
     /// <summary>
+    /// Writes a whole tree from a flat map of path to blob, and returns its id.
+    ///
+    /// <para>
+    /// <see cref="CommitFiles"/> starts from an existing tree and overwrites paths within it, which cannot
+    /// express a deletion. A merge can delete, so it computes the resulting file set itself and hands the
+    /// whole thing here. Every directory is therefore re-serialized rather than re-used by id, which costs
+    /// nothing at these sizes and is what makes the result depend only on the map.
+    /// </para>
+    /// </summary>
+    internal static string WriteTree(
+        IReadOnlyDictionary<string, (string Mode, string Id)> files,
+        Dictionary<string, GitObject> written,
+        CancellationToken cancellationToken)
+    {
+        Node root = new();
+        foreach ((string path, (string mode, string id)) in files.OrderBy(entry => entry.Key, StringComparer.Ordinal))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            string[] segments = ValidatePath(path).Split('/');
+            Node node = root;
+            for (int depth = 0; depth < segments.Length - 1; depth++)
+            {
+                string name = segments[depth];
+                Limits.Require(!node.Leaves.ContainsKey(name), "path-is-file");
+                if (!node.Subtrees.TryGetValue(name, out Node? child))
+                {
+                    child = new Node();
+                    node.Subtrees[name] = child;
+                }
+                node = child;
+            }
+            string leaf = segments[^1];
+            Limits.Require(!node.Subtrees.ContainsKey(leaf), "path-is-directory");
+            Limits.Require(mode is RegularFileMode or ExecutableFileMode or "120000", "file-mode");
+            node.Leaves[leaf] = (mode, id);
+        }
+        return Serialize(root, written, cancellationToken);
+    }
+
+    /// <summary>
+    /// Builds a commit with any number of parents, which is what distinguishes a merge from every other
+    /// commit this file writes. Parent order is meaningful and preserved: the first is the branch being
+    /// advanced, so <c>diff HEAD^</c> shows what the merge brought in.
+    /// </summary>
+    internal static GitObject BuildCommit(string treeId, IReadOnlyList<string> parents, GitIdentity author, string message)
+    {
+        string identity = FormatIdentity(author);
+        StringBuilder headers = new();
+        headers.Append("tree ").Append(treeId).Append('\n');
+        foreach (string parent in parents)
+        {
+            Limits.Require(Limits.IsId(parent), "commit-parent");
+            headers.Append("parent ").Append(parent).Append('\n');
+        }
+        headers.Append("author ").Append(identity).Append('\n');
+        headers.Append("committer ").Append(identity).Append('\n');
+        headers.Append('\n').Append(NormalizeMessage(message));
+        return new(1, Encoding.UTF8.GetBytes(headers.ToString()));
+    }
+
+    /// <summary>
     /// A directory being rewritten. Subtrees the commit does not touch stay unloaded and are re-emitted by
     /// their existing id, so untouched directories keep their exact bytes and are never re-serialized.
     /// </summary>

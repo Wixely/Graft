@@ -1,7 +1,9 @@
 using System.ComponentModel;
 using System.Globalization;
 using System.Text;
+using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.Json.Serialization.Metadata;
 using Graft.Contracts;
 using ModelContextProtocol.Server;
 
@@ -470,7 +472,7 @@ public sealed class GraftTools
     [McpServerTool(Name = "graft_help")]
     [Description("Explains how this forge works: addressing a project, what bounds an agent, visibility, project pages, changing things, and limits. Call it with no topic for the list.")]
     public static string Help(
-        [Description("One of: addressing, permissions, visibility, pages, writing, limits. Empty returns the overview and the list of topics.")] string topic)
+        [Description("One of: addressing, permissions, visibility, pages, writing, collaboration, limits. Empty returns the overview and the list of topics.")] string topic)
     {
         string name = (topic ?? "").Trim();
         if (name.Length == 0)
@@ -527,6 +529,307 @@ public sealed class GraftTools
             ? new JsonObject { ["project"] = project, ["page_published"] = published }.ToJsonString()
             : Failure(GraftClient.Describe(status, response));
     }
+
+    [McpServerTool(Name = "graft_list_issues")]
+    [Description("Lists a project's issues, newest first. State may be opened, closed, or all.")]
+    public static async Task<string> ListIssues(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("One of opened, closed or all. Empty means all.")] string state,
+        CancellationToken cancellationToken)
+    {
+        if (!TryState(state, merged: false, out string? query)) return Failure("state must be opened, closed or all.");
+        (IssuePageResponse? page, string? error) = await graft.GetAsync(
+            "api/v4/projects/" + Encode(project) + "/issues" + query, ApiJson.Default.IssuePageResponse, cancellationToken);
+        if (error is not null) return Failure(error);
+
+        return new JsonObject
+        {
+            ["total"] = page!.Total,
+            ["issues"] = Array(page.Issues, issue => new JsonObject
+            {
+                ["number"] = issue.Iid,
+                ["title"] = issue.Title,
+                ["state"] = issue.State,
+                ["author"] = issue.Author.Username,
+                ["comments"] = issue.UserNotesCount,
+                ["updated_at"] = issue.UpdatedAt.ToString("O", CultureInfo.InvariantCulture),
+                ["web_url"] = issue.WebUrl
+            })
+        }.ToJsonString();
+    }
+
+    [McpServerTool(Name = "graft_read_issue")]
+    [Description("Reads one issue by its number, with its description and every comment on it.")]
+    public static async Task<string> ReadIssue(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("The issue number as shown in the project, counted from one.")] long number,
+        CancellationToken cancellationToken)
+    {
+        string prefix = "api/v4/projects/" + Encode(project) + "/issues/" + Number(number);
+        (IssueResponse? issue, string? error) = await graft.GetAsync(prefix, ApiJson.Default.IssueResponse, cancellationToken);
+        if (error is not null) return Failure(error);
+        (NoteResponse[]? notes, string? notesError) =
+            await graft.GetAsync(prefix + "/notes", ApiJson.Default.NoteResponseArray, cancellationToken);
+
+        return new JsonObject
+        {
+            ["number"] = issue!.Iid,
+            ["title"] = issue.Title,
+            ["state"] = issue.State,
+            ["author"] = issue.Author.Username,
+            ["created_at"] = issue.CreatedAt.ToString("O", CultureInfo.InvariantCulture),
+            ["description"] = issue.Description,
+            ["web_url"] = issue.WebUrl,
+            ["comments"] = notesError is not null || notes is null
+                ? null
+                : Array(notes, note => new JsonObject
+                {
+                    ["author"] = note.Author.Username,
+                    ["created_at"] = note.CreatedAt.ToString("O", CultureInfo.InvariantCulture),
+                    ["body"] = note.Body
+                })
+        }.ToJsonString();
+    }
+
+    [McpServerTool(Name = "graft_open_issue")]
+    [Description("Opens an issue on a project. Needs membership: reading a public project is not enough to write on it. Refused unless writes are allowed on this server.")]
+    public static async Task<string> OpenIssue(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("One line saying what the issue is.")] string title,
+        [Description("The detail. May be empty. Markdown is shown as written; it is not rendered here.")] string description,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowWrites) return Refused(graft, "opening an issue");
+        if (string.IsNullOrWhiteSpace(title)) return Failure("title is required.");
+
+        JsonObject body = new() { ["title"] = title.Trim() };
+        if (!string.IsNullOrWhiteSpace(description)) body["description"] = description;
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Post,
+            "api/v4/projects/" + Encode(project) + "/issues", body, cancellationToken);
+        if (!ok) return Failure(GraftClient.Describe(status, response));
+        return Created(response, ApiJson.Default.IssueResponse, issue => new JsonObject
+        {
+            ["opened"] = true,
+            ["number"] = issue.Iid,
+            ["web_url"] = issue.WebUrl
+        });
+    }
+
+    [McpServerTool(Name = "graft_close_issue")]
+    [Description("Closes or reopens an issue. The author or a Maintainer may do either. Refused unless writes are allowed on this server.")]
+    public static async Task<string> CloseIssue(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("The issue number as shown in the project.")] long number,
+        [Description("Either close or reopen.")] string action,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowWrites) return Refused(graft, "closing or reopening an issue");
+        if (action is not ("close" or "reopen")) return Failure("action must be close or reopen.");
+
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Put,
+            "api/v4/projects/" + Encode(project) + "/issues/" + Number(number),
+            new JsonObject { ["state_event"] = action }, cancellationToken);
+        return ok
+            ? new JsonObject { ["number"] = number, ["state"] = action == "close" ? "closed" : "opened" }.ToJsonString()
+            : Failure(GraftClient.Describe(status, response));
+    }
+
+    [McpServerTool(Name = "graft_comment")]
+    [Description("Adds a comment to an issue or a merge request. Needs membership. Refused unless writes are allowed on this server.")]
+    public static async Task<string> Comment(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("Either issue or merge_request.")] string subject,
+        [Description("The number of the issue or merge request, as shown in the project.")] long number,
+        [Description("What to say.")] string body,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowWrites) return Refused(graft, "commenting");
+        if (subject is not ("issue" or "merge_request")) return Failure("subject must be issue or merge_request.");
+        if (string.IsNullOrWhiteSpace(body)) return Failure("body is required.");
+
+        string path = "api/v4/projects/" + Encode(project) +
+            (subject == "issue" ? "/issues/" : "/merge_requests/") + Number(number) + "/notes";
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Post, path,
+            new JsonObject { ["body"] = body }, cancellationToken);
+        return ok
+            ? new JsonObject { ["commented"] = true, ["subject"] = subject, ["number"] = number }.ToJsonString()
+            : Failure(GraftClient.Describe(status, response));
+    }
+
+    [McpServerTool(Name = "graft_list_merge_requests")]
+    [Description("Lists a project's merge requests. State may be opened, closed, merged, or all. Whether each one can be merged is not reported here; read one to find out.")]
+    public static async Task<string> ListMergeRequests(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("One of opened, closed, merged or all. Empty means all.")] string state,
+        CancellationToken cancellationToken)
+    {
+        if (!TryState(state, merged: true, out string? query))
+            return Failure("state must be opened, closed, merged or all.");
+        (MergeRequestPageResponse? page, string? error) = await graft.GetAsync(
+            "api/v4/projects/" + Encode(project) + "/merge_requests" + query,
+            ApiJson.Default.MergeRequestPageResponse, cancellationToken);
+        if (error is not null) return Failure(error);
+
+        return new JsonObject
+        {
+            ["total"] = page!.Total,
+            ["merge_requests"] = Array(page.MergeRequests, request => new JsonObject
+            {
+                ["number"] = request.Iid,
+                ["title"] = request.Title,
+                ["state"] = request.State,
+                ["source_branch"] = request.SourceBranch,
+                ["target_branch"] = request.TargetBranch,
+                ["author"] = request.Author.Username,
+                ["comments"] = request.UserNotesCount,
+                ["web_url"] = request.WebUrl
+            })
+        }.ToJsonString();
+    }
+
+    [McpServerTool(Name = "graft_read_merge_request")]
+    [Description("Reads one merge request: its description, whether it can be merged and how, any conflicting paths, the files it changes, and every comment on it.")]
+    public static async Task<string> ReadMergeRequest(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("The merge request number as shown in the project.")] long number,
+        CancellationToken cancellationToken)
+    {
+        string prefix = "api/v4/projects/" + Encode(project) + "/merge_requests/" + Number(number);
+        (MergeRequestChangesResponse? changes, string? error) =
+            await graft.GetAsync(prefix + "/changes", ApiJson.Default.MergeRequestChangesResponse, cancellationToken);
+        if (error is not null) return Failure(error);
+        (NoteResponse[]? notes, string? notesError) =
+            await graft.GetAsync(prefix + "/notes", ApiJson.Default.NoteResponseArray, cancellationToken);
+
+        MergeRequestResponse request = changes!.MergeRequest;
+        return new JsonObject
+        {
+            ["number"] = request.Iid,
+            ["title"] = request.Title,
+            ["state"] = request.State,
+            ["author"] = request.Author.Username,
+            ["description"] = request.Description,
+            ["source_branch"] = request.SourceBranch,
+            ["target_branch"] = request.TargetBranch,
+            ["can_be_merged"] = request.MergeStatus == "can_be_merged",
+            ["merge_method"] = request.MergeMethod,
+            ["conflicts"] = request.Conflicts is null ? null : Texts(request.Conflicts),
+            ["changed_files"] = Array(changes.Files, file => new JsonObject
+            {
+                ["path"] = file.Path,
+                ["status"] = file.Status,
+                ["added"] = file.Added,
+                ["removed"] = file.Removed
+            }),
+            ["web_url"] = request.WebUrl,
+            ["comments"] = notesError is not null || notes is null
+                ? null
+                : Array(notes, note => new JsonObject
+                {
+                    ["author"] = note.Author.Username,
+                    ["body"] = note.Body
+                })
+        }.ToJsonString();
+    }
+
+    [McpServerTool(Name = "graft_open_merge_request")]
+    [Description("Proposes merging one existing branch into another. Both branches must already exist; this does not create or push a branch. Refused unless writes are allowed on this server.")]
+    public static async Task<string> OpenMergeRequest(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("The branch holding the work.")] string sourceBranch,
+        [Description("The branch it should go into.")] string targetBranch,
+        [Description("One line saying what the change does.")] string title,
+        [Description("The detail. May be empty.")] string description,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowWrites) return Refused(graft, "proposing a merge");
+        if (string.IsNullOrWhiteSpace(sourceBranch) || string.IsNullOrWhiteSpace(targetBranch))
+            return Failure("source and target branches are required.");
+        if (string.IsNullOrWhiteSpace(title)) return Failure("title is required.");
+
+        JsonObject body = new()
+        {
+            ["source_branch"] = sourceBranch.Trim(),
+            ["target_branch"] = targetBranch.Trim(),
+            ["title"] = title.Trim()
+        };
+        if (!string.IsNullOrWhiteSpace(description)) body["description"] = description;
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Post,
+            "api/v4/projects/" + Encode(project) + "/merge_requests", body, cancellationToken);
+        if (!ok) return Failure(GraftClient.Describe(status, response));
+        return Created(response, ApiJson.Default.MergeRequestResponse, request => new JsonObject
+        {
+            ["opened"] = true,
+            ["number"] = request.Iid,
+            ["merge_method"] = request.MergeMethod,
+            ["web_url"] = request.WebUrl
+        });
+    }
+
+    [McpServerTool(Name = "graft_merge")]
+    [Description("Merges an open merge request into its target branch. Needs the same permission as pushing. Fast-forwards where it can, otherwise writes a merge commit; refuses when both branches changed the same file, and names those files. Refused unless writes are allowed on this server.")]
+    public static async Task<string> Merge(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("The merge request number as shown in the project.")] long number,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowWrites) return Refused(graft, "merging");
+
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Put,
+            "api/v4/projects/" + Encode(project) + "/merge_requests/" + Number(number) + "/merge", null, cancellationToken);
+        if (!ok) return Failure(GraftClient.Describe(status, response));
+        return Created(response, ApiJson.Default.MergeResultResponse, result => new JsonObject
+        {
+            ["merged"] = true,
+            ["method"] = result.Method,
+            ["commit"] = result.MergeCommitSha,
+            ["target_branch"] = result.MergeRequest.TargetBranch
+        });
+    }
+
+    /// <summary>
+    /// Re-reads a successful write's own response so the tool can report what was created. A failure to
+    /// parse it is reported as success without the detail rather than as an error: the write happened, and
+    /// telling an agent it failed would invite it to do the thing twice.
+    /// </summary>
+    private static string Created<T>(string response, JsonTypeInfo<T> type, Func<T, JsonObject> describe)
+    {
+        try
+        {
+            T? value = JsonSerializer.Deserialize(response, type);
+            if (value is not null) return describe(value).ToJsonString();
+        }
+        catch (JsonException) { }
+        return new JsonObject { ["done"] = true }.ToJsonString();
+    }
+
+    private static bool TryState(string? value, bool merged, out string? query)
+    {
+        query = null;
+        string state = (value ?? "").Trim();
+        if (state.Length == 0 || state == "all") { query = ""; return true; }
+        if (state is not ("opened" or "closed") && !(merged && state == "merged")) return false;
+        query = "?state=" + state;
+        return true;
+    }
+
+    private static JsonArray Texts(IReadOnlyList<string> values)
+    {
+        JsonArray array = [];
+        foreach (string value in values) array.Add((JsonNode)JsonValue.Create(value));
+        return array;
+    }
+
+    private static string Number(long value) => value.ToString(CultureInfo.InvariantCulture);
 
     /// <summary>
     /// A refusal that names what would permit the action. An agent told only "not allowed"

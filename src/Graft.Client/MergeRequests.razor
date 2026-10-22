@@ -1,0 +1,464 @@
+@page "/{Namespace}/{Slug}/-/merge-requests"
+@page "/{Namespace}/{Slug}/-/merge-requests/{Number:long}"
+@* The same pages under the project's instance-wide slug, for a link shared without an account name. *@
+@page "/projects/{Slug}/-/merge-requests"
+@page "/projects/{Slug}/-/merge-requests/{Number:long}"
+@inject GraftApi Api
+@inject NavigationManager Navigation
+
+<PageTitle>@(Number is null ? "Merge requests" : "Merge request !" + Number) &middot; Graft</PageTitle>
+
+@if (loading)
+{
+    <p role="status" class="secondary-text">Loading…</p>
+}
+else if (project is null)
+{
+    <div class="page-header"><div><h1>Unavailable</h1><p class="subtitle">@message</p></div></div>
+    <a class="button secondary" href="/"><Icon Name="chevron-left" />Back to projects</a>
+}
+else if (Number is null)
+{
+    <div class="page-header">
+        <div>
+            <h1>Merge requests</h1>
+            <p class="subtitle"><a href="@ProjectUrl">@project.Namespace.Name / @project.Name</a></p>
+        </div>
+        <div class="page-header-actions">
+            <a class="button secondary" href="@IssuesUrl"><Icon Name="issue" />Issues</a>
+            @if (canParticipate && branches.Length > 1)
+            {
+                <button type="button" class="@(composing ? "secondary" : "")" @onclick="StartComposing">
+                    <Icon Name="plus" />New merge request
+                </button>
+            }
+        </div>
+    </div>
+
+    <Banner Message="@message" Kind="@messageKind" />
+
+    @if (canParticipate && branches.Length < 2)
+    {
+        <div class="banner info">
+            <Icon Name="branch" />
+            <span>A merge request needs two branches. This repository has @(branches.Length == 1 ? "one" : "none").</span>
+        </div>
+    }
+
+    @if (composing)
+    {
+        <div class="panel">
+            <div class="panel-header"><h2>Propose a merge</h2></div>
+            <div class="panel-body">
+                <form class="form" @onsubmit="Create" @onsubmit:preventDefault>
+                    <label for="mr-source">From branch</label>
+                    <select id="mr-source" @bind="draftSource">
+                        @foreach (string branch in branches) { <option value="@branch">@branch</option> }
+                    </select>
+                    <label for="mr-target">Into branch</label>
+                    <select id="mr-target" @bind="draftTarget">
+                        @foreach (string branch in branches) { <option value="@branch">@branch</option> }
+                    </select>
+                    <label for="mr-title">Title</label>
+                    <input id="mr-title" @bind="draftTitle" required maxlength="255" autocomplete="off" />
+                    <label for="mr-body">Description</label>
+                    <textarea id="mr-body" @bind="draftBody" rows="5" maxlength="50000"></textarea>
+                    <div class="form-actions">
+                        <button type="submit" disabled="@busy">@(busy ? "Proposing…" : "Propose merge")</button>
+                        <button type="button" class="secondary" @onclick="() => composing = false" disabled="@busy">Cancel</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    }
+
+    <div class="tabs">
+        <button type="button" class="@(state == "opened" ? "active" : "")" @onclick='() => Filter("opened")'>Open</button>
+        <button type="button" class="@(state == "merged" ? "active" : "")" @onclick='() => Filter("merged")'>Merged</button>
+        <button type="button" class="@(state == "closed" ? "active" : "")" @onclick='() => Filter("closed")'>Closed</button>
+        <button type="button" class="@(state == "all" ? "active" : "")" @onclick='() => Filter("all")'>All</button>
+    </div>
+
+    <div class="panel">
+        <div class="panel-header">
+            <Icon Name="merge" /><h2>Proposals</h2>
+            <span class="spacer"></span>
+            <span class="label">@total</span>
+        </div>
+        @if (proposals.Length == 0)
+        {
+            <div class="panel-empty">Nothing here.</div>
+        }
+        else
+        {
+            <div class="list">
+                @foreach (MergeRequestResponse proposal in proposals)
+                {
+                    <div class="list-item">
+                        <Icon Name="merge" Class="@(proposal.State == "opened" ? "icon" : "icon muted")" />
+                        <span class="list-item-main">
+                            <strong><a href="@MergeRequestUrl(proposal.Iid)">@proposal.Title</a></strong>
+                            <small>
+                                !@proposal.Iid &middot; <code>@proposal.SourceBranch</code> into
+                                <code>@proposal.TargetBranch</code> &middot; by @proposal.Author.Username
+                            </small>
+                        </span>
+                        <span class="label @StateClass(proposal.State)">@proposal.State</span>
+                    </div>
+                }
+            </div>
+        }
+    </div>
+}
+else if (proposal is null)
+{
+    <div class="page-header"><div><h1>Merge request unavailable</h1><p class="subtitle">@message</p></div></div>
+    <a class="button secondary" href="@MergeRequestsUrl"><Icon Name="chevron-left" />Back</a>
+}
+else
+{
+    <div class="page-header">
+        <div>
+            <h1>@proposal.Title</h1>
+            <p class="subtitle">
+                !@proposal.Iid in <a href="@ProjectUrl">@project.Namespace.Name / @project.Name</a> &middot;
+                <code>@proposal.SourceBranch</code> into <code>@proposal.TargetBranch</code> &middot;
+                by @proposal.Author.Username
+            </p>
+        </div>
+        <span class="label @StateClass(proposal.State)">@proposal.State</span>
+        <div class="page-header-actions">
+            <a class="button secondary" href="@MergeRequestsUrl"><Icon Name="chevron-left" />Merge requests</a>
+        </div>
+    </div>
+
+    <Banner Message="@message" Kind="@messageKind" />
+
+    <div class="panel">
+        <div class="panel-header"><Icon Name="merge" /><h2>Mergeability</h2></div>
+        <div class="panel-body">
+            <div class="banner @MergeBannerKind">
+                <Icon Name="@(proposal.MergeMethod == "conflict" ? "alert" : "check")" />
+                <span>@MergeExplanation</span>
+            </div>
+            @if (proposal.Conflicts is { Count: > 0 })
+            {
+                <ul class="plain">
+                    @foreach (string path in proposal.Conflicts) { <li><code>@path</code></li> }
+                </ul>
+            }
+            @if (canPush && proposal.State == "opened" && proposal.MergeStatus == "can_be_merged")
+            {
+                <div class="form-actions">
+                    <button type="button" @onclick="Merge" disabled="@busy">
+                        @(busy ? "Merging…" : proposal.MergeMethod == "fast_forward" ? "Fast-forward" : "Merge")
+                    </button>
+                </div>
+            }
+        </div>
+    </div>
+
+    @if (proposal.Description.Length > 0)
+    {
+        <div class="panel"><div class="panel-body"><pre class="commit-message">@proposal.Description</pre></div></div>
+    }
+
+    <div class="panel">
+        <div class="panel-header">
+            <Icon Name="file" /><h2>Changes</h2>
+            <span class="spacer"></span>
+            <span class="label">@files.Length @(files.Length == 1 ? "file" : "files")</span>
+        </div>
+        @if (files.Length == 0)
+        {
+            <div class="panel-empty">Nothing differs from where the branches last agreed.</div>
+        }
+        else
+        {
+            <div class="list">
+                @foreach (DiffFileResponse file in files)
+                {
+                    <div class="list-item">
+                        <span class="list-item-main"><strong><code>@file.Path</code></strong></span>
+                        <span class="label @StatusClass(file.Status)">@file.Status</span>
+                        <span class="list-item-meta">
+                            <small>+@file.Added &minus;@file.Removed</small>
+                        </span>
+                    </div>
+                }
+            </div>
+        }
+    </div>
+
+    <div class="panel">
+        <div class="panel-header"><h2>Comments</h2><span class="spacer"></span><span class="label">@comments.Length</span></div>
+        @if (comments.Length == 0)
+        {
+            <div class="panel-empty">Nothing said yet.</div>
+        }
+        else
+        {
+            <div class="list">
+                @foreach (NoteResponse note in comments)
+                {
+                    <div class="list-item comment">
+                        <span class="avatar avatar-small" aria-hidden="true">@Initial(note.Author.Username)</span>
+                        <span class="list-item-main">
+                            <small><strong>@note.Author.Username</strong> &middot; @note.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")</small>
+                            <pre class="commit-message">@note.Body</pre>
+                        </span>
+                    </div>
+                }
+            </div>
+        }
+        @if (canParticipate)
+        {
+            <div class="panel-body">
+                <form class="form" @onsubmit="AddComment" @onsubmit:preventDefault>
+                    <label for="mr-comment">Add a comment</label>
+                    <textarea id="mr-comment" @bind="commentBody" rows="4" maxlength="50000" required></textarea>
+                    <div class="form-actions">
+                        <button type="submit" disabled="@busy">@(busy ? "Posting…" : "Comment")</button>
+                        @if (CanChangeState)
+                        {
+                            <button type="button" class="secondary" @onclick="ToggleState" disabled="@busy">
+                                @(proposal.State == "closed" ? "Reopen" : "Close")
+                            </button>
+                        }
+                    </div>
+                </form>
+            </div>
+        }
+    </div>
+}
+
+@code {
+    [Parameter] public string Namespace { get; set; } = "";
+    [Parameter] public string Slug { get; set; } = "";
+    [Parameter] public long? Number { get; set; }
+
+    private ProjectResponse? project;
+    private long projectId;
+    private bool canParticipate;
+    private bool canManage;
+    private bool canPush;
+    private string[] branches = [];
+    private MergeRequestResponse[] proposals = [];
+    private MergeRequestResponse? proposal;
+    private DiffFileResponse[] files = [];
+    private NoteResponse[] comments = [];
+    private long total;
+    private string state = "opened";
+    private string draftSource = "";
+    private string draftTarget = "";
+    private string draftTitle = "";
+    private string draftBody = "";
+    private string commentBody = "";
+    private string message = "";
+    private string messageKind = "info";
+    private bool composing;
+    private bool loading = true;
+    private bool busy;
+
+    private bool ViaSlug => Namespace.Length == 0;
+    private string ProjectUrl => ViaSlug
+        ? $"/projects/{Uri.EscapeDataString(Slug)}"
+        : $"/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
+    private string IssuesUrl => ProjectUrl + "/-/issues";
+    private string MergeRequestsUrl => ProjectUrl + "/-/merge-requests";
+    private string MergeRequestUrl(long number) => $"{MergeRequestsUrl}/{number}";
+
+    private bool CanChangeState => proposal is not null && canParticipate && proposal.State != "merged" &&
+        (canManage || string.Equals(proposal.Author.Username, Api.Username, StringComparison.Ordinal));
+
+    /// <summary>
+    /// What this proposal's state actually means for somebody deciding whether to merge it. Graft's answer
+    /// is narrower than other forges', so it is spelled out rather than left as a status word.
+    /// </summary>
+    private string MergeExplanation => proposal!.MergeMethod switch
+    {
+        "already_merged" when proposal.State == "merged" =>
+            $"Merged into {proposal.TargetBranch} as {Short(proposal.MergeCommitSha)}.",
+        "already_merged" => $"{proposal.TargetBranch} already contains this work. There is nothing to merge.",
+        "fast_forward" =>
+            $"{proposal.TargetBranch} has gained nothing since this branch left it, so merging moves it forward with no merge commit.",
+        "three_way" =>
+            "Both branches have moved, and no file was changed on both sides. Merging writes a merge commit that takes each side's changes.",
+        "conflict" =>
+            "Both branches changed the same file. Graft does not merge file contents, so this has to be merged locally and pushed. The files are below.",
+        _ => "A branch this proposal names no longer exists, so there is nothing to compare."
+    };
+
+    private string MergeBannerKind => proposal!.MergeMethod switch
+    {
+        "conflict" => "warning",
+        "fast_forward" or "three_way" => "success",
+        _ => "info"
+    };
+
+    private static string Short(string? sha) => sha is null || sha.Length < 8 ? sha ?? "" : sha[..8];
+
+    private static string StateClass(string state) => state switch
+    {
+        "merged" => "accent",
+        "opened" => "success",
+        _ => ""
+    };
+
+    private static string StatusClass(string status) => status switch
+    {
+        "added" => "accent",
+        "deleted" => "danger",
+        _ => ""
+    };
+
+    private static string Initial(string name) => name.Length == 0 ? "?" : name[..1].ToUpperInvariant();
+
+    protected override async Task OnParametersSetAsync()
+    {
+        loading = true;
+        message = "";
+        try
+        {
+            await Api.EnsureSessionAsync();
+            if (!await ResolveProject()) return;
+            if (Number is null) await LoadList();
+            else await LoadOne();
+        }
+        finally { loading = false; }
+    }
+
+    private async Task<bool> ResolveProject()
+    {
+        string path = ViaSlug
+            ? $"api/graft/slugs/{Uri.EscapeDataString(Slug)}"
+            : $"api/browser/projects/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
+        (bool reached, RepositoryPageResponse? page) = await Api.GetOptionalAsync(path, ApiJson.Default.RepositoryPageResponse);
+        if (!reached) { message = "Graft could not be reached."; return false; }
+        if (page is null) { message = "That repository could not be found."; return false; }
+        project = page.Project;
+        projectId = page.Project.Id;
+        canParticipate = page.CanParticipate;
+        canManage = page.CanManage;
+        canPush = page.CanPush;
+        branches = [.. page.Branches.Select(branch => branch.Name)];
+        return true;
+    }
+
+    private void StartComposing()
+    {
+        composing = !composing;
+        if (!composing) return;
+        // The default branch as the target and anything else as the source, which is the proposal somebody
+        // is nearly always about to make.
+        draftTarget = project?.DefaultBranch is { Length: > 0 } preferred && branches.Contains(preferred)
+            ? preferred
+            : branches.FirstOrDefault() ?? "";
+        draftSource = branches.FirstOrDefault(branch => branch != draftTarget) ?? "";
+    }
+
+    private async Task Filter(string next)
+    {
+        state = next;
+        await LoadList();
+    }
+
+    private async Task LoadList()
+    {
+        MergeRequestPageResponse? page = await Api.GetAsync(
+            $"api/projects/{projectId}/merge-requests?state={state}&per_page=100", ApiJson.Default.MergeRequestPageResponse);
+        proposals = page is null ? [] : [.. page.MergeRequests];
+        total = page?.Total ?? 0;
+    }
+
+    private async Task LoadOne()
+    {
+        MergeRequestChangesResponse? changes = await Api.GetAsync(
+            $"api/projects/{projectId}/merge-requests/{Number}/changes", ApiJson.Default.MergeRequestChangesResponse);
+        if (changes is null)
+        {
+            proposal = null;
+            message = "That merge request could not be found.";
+            return;
+        }
+        proposal = changes.MergeRequest;
+        files = [.. changes.Files];
+        comments = await Api.GetAsync($"api/projects/{projectId}/merge-requests/{Number}/comments",
+            ApiJson.Default.NoteResponseArray) ?? [];
+    }
+
+    private async Task Create()
+    {
+        if (busy) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult<MergeRequestResponse> result = await Api.SendAsync<MergeRequestCreateRequest, MergeRequestResponse>(
+                HttpMethod.Post, $"api/projects/{projectId}/merge-requests",
+                new MergeRequestCreateRequest(draftSource, draftTarget, draftTitle, draftBody),
+                ApiJson.Default.MergeRequestCreateRequest, ApiJson.Default.MergeRequestResponse, "Merge proposed.");
+            if (!result.Ok || result.Value is null) { Report(result.Ok, result.Message); return; }
+            draftTitle = "";
+            draftBody = "";
+            composing = false;
+            Navigation.NavigateTo(MergeRequestUrl(result.Value.Iid));
+        }
+        finally { busy = false; }
+    }
+
+    private async Task AddComment()
+    {
+        if (busy || proposal is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/projects/{projectId}/merge-requests/{proposal.Iid}/comments",
+                new NoteCreateRequest(commentBody), ApiJson.Default.NoteCreateRequest, "Comment added.");
+            Report(result.Ok, result.Message);
+            if (!result.Ok) return;
+            commentBody = "";
+            await LoadOne();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task ToggleState()
+    {
+        if (busy || proposal is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            string stateEvent = proposal.State == "closed" ? "reopen" : "close";
+            ApiResult result = await Api.PostAsync($"api/projects/{projectId}/merge-requests/{proposal.Iid}",
+                new IssueUpdateRequest(null, null, stateEvent), ApiJson.Default.IssueUpdateRequest,
+                stateEvent == "close" ? "Closed." : "Reopened.");
+            Report(result.Ok, result.Message);
+            if (result.Ok) await LoadOne();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task Merge()
+    {
+        if (busy || proposal is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync(
+                $"api/projects/{projectId}/merge-requests/{proposal.Iid}/merge", "Merged.");
+            Report(result.Ok, result.Message);
+            if (result.Ok) await LoadOne();
+        }
+        finally { busy = false; }
+    }
+
+    private void Report(bool ok, string text)
+    {
+        message = text;
+        messageKind = ok ? "success" : "error";
+    }
+}

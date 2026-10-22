@@ -16,7 +16,15 @@ public enum ProjectAction
     ManageProject,
     /// <summary>Read the published project page: the curated surface, not the repository. This is the only
     /// action a <see cref="AccessGrant.Page"/> grant can satisfy.</summary>
-    ReadPage
+    ReadPage,
+    /// <summary>Read the project's issues, merge requests and comments. Granted wherever the repository
+    /// itself can be read, including anonymously on a public project: a forge whose conversation is private
+    /// while its code is public has the two the wrong way round.</summary>
+    ReadCollaboration,
+    /// <summary>Open an issue or a merge request, comment on one, or change its state. Members only, and
+    /// deliberately not granted by visibility: a public project that accepted anonymous writing would be a
+    /// spam target, and Graft has no moderation for it to fall back on.</summary>
+    WriteCollaboration
 }
 
 /// <summary>
@@ -118,7 +126,7 @@ public static class ProjectAuthorization
         // credential. A token's scopes limit what that token may reach; they cannot subtract from what the
         // whole world can already read without one, and pretending otherwise would mean a request with a
         // narrow token saw less of a public project than the same request with no token at all.
-        if (project.Visibility is ProjectVisibility.Public or ProjectVisibility.Unlisted && IsRepositoryRead(action))
+        if (project.Visibility is ProjectVisibility.Public or ProjectVisibility.Unlisted && VisibilityGrants(action))
             return new(true, ProjectRole.Reporter, "Visibility",
                 $"Project visibility {project.Visibility} grants anonymous {action}.", AccessGrant.Repository);
 
@@ -176,14 +184,15 @@ public static class ProjectAuthorization
     }
 
     /// <summary>
-    /// Whether an action reads the repository itself, as opposed to managing it or reading a curated page.
-    /// Visibility grants exactly this set and no more: anonymous callers never write, and never manage.
+    /// What a public or unlisted project grants a caller holding no role, which is every reading action and
+    /// nothing else. Anonymous callers never write, never manage, and never participate.
     /// </summary>
-    private static bool IsRepositoryRead(ProjectAction action) => action
+    private static bool VisibilityGrants(ProjectAction action) => action
         is ProjectAction.ReadRest
         or ProjectAction.BrowseRepository
         or ProjectAction.FetchRepository
-        or ProjectAction.ReadPage;
+        or ProjectAction.ReadPage
+        or ProjectAction.ReadCollaboration;
 
     private static bool ScopeAllows(TokenScope scopes, ProjectAction action) => action switch
     {
@@ -196,6 +205,12 @@ public static class ProjectAuthorization
         ProjectAction.PushRepository =>
             scopes.HasFlag(TokenScope.Api) || scopes.HasFlag(TokenScope.WriteRepository),
         ProjectAction.ManageProject => scopes.HasFlag(TokenScope.Api),
+        // Collaboration is an API surface, so the repository scopes do not reach it in either direction. A
+        // token minted to clone is not a token to read somebody's issues, and writing one needs the full
+        // api scope because read_api is the read half by name.
+        ProjectAction.ReadCollaboration =>
+            scopes.HasFlag(TokenScope.Api) || scopes.HasFlag(TokenScope.ReadApi),
+        ProjectAction.WriteCollaboration => scopes.HasFlag(TokenScope.Api),
         _ => false
     };
 
@@ -203,6 +218,29 @@ public static class ProjectAuthorization
 }
 
 public sealed record UserAccount(long Id, string Username, bool IsAdministrator, bool Disabled);
+
+/// <summary>
+/// One recorded act. The actor is nullable because the first administrator is created before any account
+/// exists to have done it, and the username is nullable for the same reason rather than because accounts
+/// can vanish: nothing deletes a user row.
+///
+/// <para>
+/// An audit entry is a statement that something happened, and never a copy of what it happened to. No
+/// field here holds a secret, a password or a token, and that is a property the writers maintain rather
+/// than one this shape can enforce.
+/// </para>
+/// </summary>
+public sealed record AuditEntry(
+    long Id,
+    long? ActorUserId,
+    string? ActorUsername,
+    string Action,
+    string TargetType,
+    string? TargetId,
+    string Detail,
+    DateTimeOffset CreatedAtUtc);
+
+public sealed record AuditPage(IReadOnlyList<AuditEntry> Entries, long Total);
 public sealed record ProjectMember(long UserId, string Username, ProjectRole Role);
 public sealed record ProjectInfo(long Id, long OwnerUserId, string Namespace, string Slug, string Name, string StorageId,
     string? DefaultBranch = null,
@@ -211,6 +249,11 @@ public sealed record ProjectInfo(long Id, long OwnerUserId, string Namespace, st
     /// <summary>The instance-wide name this project can also be reached by, without its owner in the path.
     /// Every stored project has one; it is empty only on a value built before the row was written.</summary>
     string GlobalSlug = "");
+/// <summary>
+/// A project that has just been deleted. Carries its storage directory because nothing else does any more:
+/// the row naming it is gone, so a caller that still has to remove the repository on disk has only this.
+/// </summary>
+public sealed record DeletedProject(long Id, string Namespace, string Slug, string StorageId);
 /// <summary>A project and its stored settings. DefaultBranch is a preference and may be null, or may name
 /// a branch that no longer exists; the Git engine resolves the effective branch.</summary>
 public sealed record ProjectDetails(ProjectInfo Project, string Description, DateTimeOffset CreatedAtUtc, string? DefaultBranch);

@@ -1,0 +1,338 @@
+@page "/{Namespace}/{Slug}/-/issues"
+@page "/{Namespace}/{Slug}/-/issues/{Number:long}"
+@* The same pages under the project's instance-wide slug, so a link shared from a page does not put the
+   owner's account name back in the address. *@
+@page "/projects/{Slug}/-/issues"
+@page "/projects/{Slug}/-/issues/{Number:long}"
+@inject GraftApi Api
+@inject NavigationManager Navigation
+
+<PageTitle>@(Number is null ? "Issues" : "Issue #" + Number) &middot; Graft</PageTitle>
+
+@if (loading)
+{
+    <p role="status" class="secondary-text">Loading…</p>
+}
+else if (project is null)
+{
+    <div class="page-header"><div><h1>Unavailable</h1><p class="subtitle">@message</p></div></div>
+    <a class="button secondary" href="/"><Icon Name="chevron-left" />Back to projects</a>
+}
+else if (Number is null)
+{
+    <div class="page-header">
+        <div>
+            <h1>Issues</h1>
+            <p class="subtitle"><a href="@ProjectUrl">@project.Namespace.Name / @project.Name</a></p>
+        </div>
+        <div class="page-header-actions">
+            <a class="button secondary" href="@MergeRequestsUrl"><Icon Name="merge" />Merge requests</a>
+            @if (canParticipate)
+            {
+                <button type="button" class="@(composing ? "secondary" : "")" @onclick="() => composing = !composing">
+                    <Icon Name="plus" />New issue
+                </button>
+            }
+        </div>
+    </div>
+
+    <Banner Message="@message" Kind="@messageKind" />
+
+    @if (composing)
+    {
+        <div class="panel">
+            <div class="panel-header"><h2>Open an issue</h2></div>
+            <div class="panel-body">
+                <form class="form" @onsubmit="Create" @onsubmit:preventDefault>
+                    <label for="issue-title">Title</label>
+                    <input id="issue-title" @bind="draftTitle" required maxlength="255" autocomplete="off" />
+                    <label for="issue-body">Description</label>
+                    <textarea id="issue-body" @bind="draftBody" rows="6" maxlength="50000"></textarea>
+                    <p class="field-hint">Shown as written. Markdown is not rendered here.</p>
+                    <div class="form-actions">
+                        <button type="submit" disabled="@busy">@(busy ? "Opening…" : "Open issue")</button>
+                        <button type="button" class="secondary" @onclick="() => composing = false" disabled="@busy">Cancel</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    }
+
+    <div class="tabs">
+        <button type="button" class="@(state == "opened" ? "active" : "")" @onclick='() => Filter("opened")'>Open</button>
+        <button type="button" class="@(state == "closed" ? "active" : "")" @onclick='() => Filter("closed")'>Closed</button>
+        <button type="button" class="@(state == "all" ? "active" : "")" @onclick='() => Filter("all")'>All</button>
+    </div>
+
+    <div class="panel">
+        <div class="panel-header">
+            <Icon Name="issue" /><h2>@(state == "closed" ? "Closed" : state == "all" ? "Every issue" : "Open")</h2>
+            <span class="spacer"></span>
+            <span class="label">@total</span>
+        </div>
+        @if (issues.Length == 0)
+        {
+            <div class="panel-empty">
+                @(state == "opened" ? "Nothing is open." : state == "closed" ? "Nothing has been closed." : "No issues yet.")
+            </div>
+        }
+        else
+        {
+            <div class="list">
+                @foreach (IssueResponse issue in issues)
+                {
+                    <div class="list-item">
+                        <Icon Name="issue" Class="@(issue.State == "closed" ? "icon muted" : "icon")" />
+                        <span class="list-item-main">
+                            <strong><a href="@IssueUrl(issue.Iid)">@issue.Title</a></strong>
+                            <small>
+                                #@issue.Iid opened by @issue.Author.Username
+                                @if (issue.UserNotesCount > 0)
+                                {
+                                    <span> &middot; @issue.UserNotesCount @(issue.UserNotesCount == 1 ? "comment" : "comments")</span>
+                                }
+                            </small>
+                        </span>
+                        <span class="label @(issue.State == "closed" ? "" : "success")">@issue.State</span>
+                    </div>
+                }
+            </div>
+        }
+    </div>
+}
+else if (issue is null)
+{
+    <div class="page-header"><div><h1>Issue unavailable</h1><p class="subtitle">@message</p></div></div>
+    <a class="button secondary" href="@IssuesUrl"><Icon Name="chevron-left" />Back to issues</a>
+}
+else
+{
+    <div class="page-header">
+        <div>
+            <h1>@issue.Title</h1>
+            <p class="subtitle">
+                #@issue.Iid in <a href="@ProjectUrl">@project.Namespace.Name / @project.Name</a>,
+                opened by @issue.Author.Username on @issue.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd")
+            </p>
+        </div>
+        <span class="label @(issue.State == "closed" ? "" : "success")">@issue.State</span>
+        <div class="page-header-actions">
+            <a class="button secondary" href="@IssuesUrl"><Icon Name="chevron-left" />Issues</a>
+        </div>
+    </div>
+
+    <Banner Message="@message" Kind="@messageKind" />
+
+    @if (issue.Description.Length > 0)
+    {
+        @* Repository and user content, bound as text and never as markup. *@
+        <div class="panel"><div class="panel-body"><pre class="commit-message">@issue.Description</pre></div></div>
+    }
+
+    <div class="panel">
+        <div class="panel-header"><h2>Comments</h2><span class="spacer"></span><span class="label">@comments.Length</span></div>
+        @if (comments.Length == 0)
+        {
+            <div class="panel-empty">Nothing said yet.</div>
+        }
+        else
+        {
+            <div class="list">
+                @foreach (NoteResponse note in comments)
+                {
+                    <div class="list-item comment">
+                        <span class="avatar avatar-small" aria-hidden="true">@Initial(note.Author.Username)</span>
+                        <span class="list-item-main">
+                            <small><strong>@note.Author.Username</strong> &middot; @note.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")</small>
+                            <pre class="commit-message">@note.Body</pre>
+                        </span>
+                    </div>
+                }
+            </div>
+        }
+        @if (canParticipate)
+        {
+            <div class="panel-body">
+                <form class="form" @onsubmit="AddComment" @onsubmit:preventDefault>
+                    <label for="comment-body">Add a comment</label>
+                    <textarea id="comment-body" @bind="commentBody" rows="4" maxlength="50000" required></textarea>
+                    <div class="form-actions">
+                        <button type="submit" disabled="@busy">@(busy ? "Posting…" : "Comment")</button>
+                        @if (CanChangeState)
+                        {
+                            <button type="button" class="secondary" @onclick="ToggleState" disabled="@busy">
+                                @(issue.State == "closed" ? "Reopen issue" : "Close issue")
+                            </button>
+                        }
+                    </div>
+                </form>
+            </div>
+        }
+        else if (CanChangeState)
+        {
+            <div class="panel-footer">
+                <button type="button" class="secondary" @onclick="ToggleState" disabled="@busy">
+                    @(issue.State == "closed" ? "Reopen issue" : "Close issue")
+                </button>
+            </div>
+        }
+    </div>
+}
+
+@code {
+    [Parameter] public string Namespace { get; set; } = "";
+    [Parameter] public string Slug { get; set; } = "";
+    [Parameter] public long? Number { get; set; }
+
+    private ProjectResponse? project;
+    private long projectId;
+    private bool canParticipate;
+    private bool canManage;
+    private IssueResponse[] issues = [];
+    private IssueResponse? issue;
+    private NoteResponse[] comments = [];
+    private long total;
+    private string state = "opened";
+    private string draftTitle = "";
+    private string draftBody = "";
+    private string commentBody = "";
+    private string message = "";
+    private string messageKind = "info";
+    private bool composing;
+    private bool loading = true;
+    private bool busy;
+
+    private bool ViaSlug => Namespace.Length == 0;
+    private string ProjectUrl => ViaSlug
+        ? $"/projects/{Uri.EscapeDataString(Slug)}"
+        : $"/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
+    private string IssuesUrl => ProjectUrl + "/-/issues";
+    private string MergeRequestsUrl => ProjectUrl + "/-/merge-requests";
+    private string IssueUrl(long number) => $"{IssuesUrl}/{number}";
+
+    /// <summary>The author may close and reopen their own; a Maintainer may close anyone's. The server
+    /// decides, and this only decides whether to offer the button.</summary>
+    private bool CanChangeState => issue is not null && canParticipate &&
+        (canManage || string.Equals(issue.Author.Username, Api.Username, StringComparison.Ordinal));
+
+    private static string Initial(string name) => name.Length == 0 ? "?" : name[..1].ToUpperInvariant();
+
+    protected override async Task OnParametersSetAsync()
+    {
+        loading = true;
+        message = "";
+        try
+        {
+            // Not required to read: a public project's issues answer an anonymous caller. Awaited so the
+            // session and its CSRF secret are in hand before anything is written, and so the page knows
+            // whose name to compare against an issue's author.
+            await Api.EnsureSessionAsync();
+            if (!await ResolveProject()) return;
+            if (Number is null) await LoadList();
+            else await LoadOne();
+        }
+        finally { loading = false; }
+    }
+
+    /// <summary>
+    /// Resolves the project through the browser repository endpoint, which answers for any reader the
+    /// project is visible to rather than only for its members. That is what lets a stranger read a public
+    /// project's issues, which is the whole point of them being readable.
+    /// </summary>
+    private async Task<bool> ResolveProject()
+    {
+        string path = ViaSlug
+            ? $"api/graft/slugs/{Uri.EscapeDataString(Slug)}"
+            : $"api/browser/projects/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
+        (bool reached, RepositoryPageResponse? page) = await Api.GetOptionalAsync(path, ApiJson.Default.RepositoryPageResponse);
+        if (!reached) { message = "Graft could not be reached."; return false; }
+        if (page is null) { message = "That repository could not be found."; return false; }
+        project = page.Project;
+        projectId = page.Project.Id;
+        canParticipate = page.CanParticipate;
+        canManage = page.CanManage;
+        return true;
+    }
+
+    private async Task Filter(string next)
+    {
+        state = next;
+        await LoadList();
+    }
+
+    private async Task LoadList()
+    {
+        IssuePageResponse? page = await Api.GetAsync(
+            $"api/projects/{projectId}/issues?state={state}&per_page=100", ApiJson.Default.IssuePageResponse);
+        issues = page is null ? [] : [.. page.Issues];
+        total = page?.Total ?? 0;
+    }
+
+    private async Task LoadOne()
+    {
+        issue = await Api.GetAsync($"api/projects/{projectId}/issues/{Number}", ApiJson.Default.IssueResponse);
+        if (issue is null) { message = "That issue could not be found."; return; }
+        comments = await Api.GetAsync($"api/projects/{projectId}/issues/{Number}/comments",
+            ApiJson.Default.NoteResponseArray) ?? [];
+    }
+
+    private async Task Create()
+    {
+        if (busy) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult<IssueResponse> result = await Api.SendAsync<IssueCreateRequest, IssueResponse>(
+                HttpMethod.Post, $"api/projects/{projectId}/issues",
+                new IssueCreateRequest(draftTitle, draftBody), ApiJson.Default.IssueCreateRequest,
+                ApiJson.Default.IssueResponse, "Issue opened.");
+            if (!result.Ok || result.Value is null) { Report(result.Ok, result.Message); return; }
+            draftTitle = "";
+            draftBody = "";
+            composing = false;
+            Navigation.NavigateTo(IssueUrl(result.Value.Iid));
+        }
+        finally { busy = false; }
+    }
+
+    private async Task AddComment()
+    {
+        if (busy || issue is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/projects/{projectId}/issues/{issue.Iid}/comments",
+                new NoteCreateRequest(commentBody), ApiJson.Default.NoteCreateRequest, "Comment added.");
+            Report(result.Ok, result.Message);
+            if (!result.Ok) return;
+            commentBody = "";
+            await LoadOne();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task ToggleState()
+    {
+        if (busy || issue is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            string stateEvent = issue.State == "closed" ? "reopen" : "close";
+            ApiResult result = await Api.PostAsync($"api/projects/{projectId}/issues/{issue.Iid}",
+                new IssueUpdateRequest(null, null, stateEvent), ApiJson.Default.IssueUpdateRequest,
+                stateEvent == "close" ? "Issue closed." : "Issue reopened.");
+            Report(result.Ok, result.Message);
+            if (result.Ok) await LoadOne();
+        }
+        finally { busy = false; }
+    }
+
+    private void Report(bool ok, string text)
+    {
+        message = text;
+        messageKind = ok ? "success" : "error";
+    }
+}
