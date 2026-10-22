@@ -216,6 +216,8 @@ try
     await CheckCollaboration(address, aliceIdentity, bob.Username, "carol");
     await CheckProjectDeletion(address, aliceIdentity, administratorIdentity, bob.Username, alicePassword);
     await CheckReview(address, aliceIdentity, bob.Username, "carol");
+    await CheckFetching(address, aliceIdentity, "carol");
+    await CheckEmptyRepository(address, aliceIdentity, alicePassword);
     address = await CheckWebhooks(address, aliceIdentity);
     // After everything that writes an audit row, so the trail it reads already contains them.
     await CheckAuditTrail(address, adminPassword, alicePassword);
@@ -3791,6 +3793,268 @@ static int FreeLoopbackPort()
     int port = ((IPEndPoint)probe.LocalEndpoint).Port;
     probe.Stop();
     return port;
+}
+
+/// <summary>
+/// Getting things out of Graft without cloning: tags, one file as bytes, and the whole tree as an archive.
+/// Also the two defects this batch fixed, which were both about a page reporting the wrong thing.
+/// </summary>
+async Task CheckFetching(string address, AuthenticatedIdentity alice, string strangerUsername)
+{
+    long projectId;
+    string apiToken;
+    string readApi;
+    string strangerApi;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        ProjectInfo created = await store.CreateProjectWithRepositoryAsync(alice, "fetchable", "Fetchable",
+            (project, cancellation) => { cancellation.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, project.StorageId)); return Task.CompletedTask; });
+        projectId = created.Id;
+        UserAccount stranger = Required(await store.FindActiveUserAsync(strangerUsername), "stranger account");
+        apiToken = (await store.CreateTokenAsync(alice, "fetch-api", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        readApi = (await store.CreateTokenAsync(alice, "fetch-read", TokenScope.ReadApi, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        strangerApi = (await store.CreateTokenAsync(new(stranger.Id, stranger.Username, false, IdentityKind.BrowserSession),
+            "fetch-stranger", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+    }
+    string prefix = "/api/v4/projects/" + projectId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    // An empty repository is a state, not a refusal. This was the defect: the browse endpoint answered 404
+    // when there was no tree, and the page reported that as a permission problem, so a project somebody had
+    // just created looked like one they could not see.
+    using (HttpResponseMessage empty = await ApiGet(address, "/api/browser/projects/alice/fetchable", null))
+        Check(empty.StatusCode == HttpStatusCode.NotFound, "an empty private repository is still concealed from a stranger");
+
+    string clone = Path.Combine(root, "fetch-clone");
+    Directory.CreateDirectory(clone);
+    await Git(clone, ["init", "--initial-branch=main"]);
+    File.WriteAllText(Path.Combine(clone, "notes.txt"), "first line\nsecond line\n");
+    Directory.CreateDirectory(Path.Combine(clone, "bin"));
+    File.WriteAllBytes(Path.Combine(clone, "bin", "blob.dat"), [0, 1, 2, 0, 255, 7]);
+    File.WriteAllText(Path.Combine(clone, "run.sh"), "#!/bin/sh\necho hello\n");
+    await Git(clone, ["add", "."]);
+    await Git(clone, ["update-index", "--chmod=+x", "run.sh"]);
+    await Git(clone, ["commit", "-m", "Something to fetch"]);
+    await Git(clone, ["remote", "add", "origin", AuthenticatedUrl(address, "alice", apiToken, "alice/fetchable.git")]);
+    await Git(clone, ["push", "origin", "main"]);
+    string head = (await Git(clone, ["rev-parse", "HEAD"])).Trim();
+
+    // Tags.
+    using (HttpResponseMessage none = await ApiGet(address, prefix + "/repository/tags", readApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await none.Content.ReadAsStreamAsync());
+        Check(none.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 0, "a repository with no tags lists none");
+    }
+    using (HttpResponseMessage refused = await ApiPost(address, prefix + "/repository/tags", readApi,
+        new { tag_name = "v0", @ref = "main" }))
+        Check(refused.StatusCode == HttpStatusCode.NotFound, "a read-only token cannot create a tag");
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/repository/tags", apiToken,
+        new { tag_name = "v1.0.0", @ref = "main" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStreamAsync());
+        Check(created.StatusCode == HttpStatusCode.Created &&
+            json.RootElement.GetProperty("name").GetString() == "v1.0.0" &&
+            json.RootElement.GetProperty("commit").GetProperty("id").GetString() == head,
+            "a tag is created at a named revision and names the commit it resolves to");
+    }
+    using (HttpResponseMessage again = await ApiPost(address, prefix + "/repository/tags", apiToken,
+        new { tag_name = "v1.0.0", @ref = "main" }))
+        Check(again.StatusCode == HttpStatusCode.Conflict, "creating a tag that already exists is refused");
+    using (HttpResponseMessage nowhere = await ApiPost(address, prefix + "/repository/tags", apiToken,
+        new { tag_name = "v9", @ref = "no-such-thing" }))
+        Check(nowhere.StatusCode == HttpStatusCode.BadRequest, "a tag cannot name a revision that does not resolve");
+
+    // A tag pushed by a client, including an annotated one, appears in the same listing.
+    await Git(clone, ["tag", "-a", "v1.1.0", "-m", "Annotated by a client"]);
+    await Git(clone, ["push", "origin", "v1.1.0"]);
+    using (HttpResponseMessage listed = await ApiGet(address, prefix + "/repository/tags", readApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await listed.Content.ReadAsStreamAsync());
+        JsonElement annotated = json.RootElement.EnumerateArray().Single(tag => tag.GetProperty("name").GetString() == "v1.1.0");
+        Check(listed.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 2,
+            "a tag pushed by a client is listed beside one created through the API");
+        // The reference points at the tag object and the commit is what it resolves to, which is the whole
+        // reason both are reported rather than one.
+        Check(annotated.GetProperty("target").GetString() != annotated.GetProperty("commit").GetProperty("id").GetString() &&
+            annotated.GetProperty("commit").GetProperty("id").GetString() == head,
+            "an annotated tag reports the tag object it points at and the commit that resolves to");
+    }
+    using (HttpResponseMessage deleted = await ApiDelete(address, prefix + "/repository/tags/v1.0.0", apiToken))
+        Check(deleted.StatusCode == HttpStatusCode.NoContent, "a tag is deleted");
+    using (HttpResponseMessage gone = await ApiDelete(address, prefix + "/repository/tags/v1.0.0", apiToken))
+        Check(gone.StatusCode == HttpStatusCode.NotFound, "deleting a tag that is not there is a 404");
+
+    // One file, as bytes.
+    using (HttpResponseMessage raw = await ApiGet(address, prefix + "/repository/files/notes.txt/raw?ref=main", readApi))
+    {
+        byte[] body = await raw.Content.ReadAsByteArrayAsync();
+        Check(raw.IsSuccessStatusCode && Encoding.UTF8.GetString(body) == "first line\nsecond line\n",
+            "a file is served as its exact bytes");
+        // The point of this route's content type: repository bytes must never reach this origin as a
+        // document, because this origin holds the session cookie and the API.
+        Check(raw.Content.Headers.ContentType?.MediaType == "application/octet-stream",
+            "a raw file is always an unknown type, never the type its content looks like");
+        Check(raw.Content.Headers.ContentDisposition?.DispositionType == "attachment",
+            "and is always an attachment, so a browser saves it rather than rendering it");
+        Check(raw.Headers.TryGetValues("X-Content-Type-Options", out IEnumerable<string>? sniff) &&
+            sniff.Contains("nosniff"), "and the browser is told not to decide otherwise from the content");
+    }
+    using (HttpResponseMessage binary = await ApiGet(address,
+        prefix + "/repository/files/" + Uri.EscapeDataString("bin/blob.dat") + "/raw?ref=main", readApi))
+    {
+        byte[] body = await binary.Content.ReadAsByteArrayAsync();
+        Check(binary.IsSuccessStatusCode && body.SequenceEqual<byte>([0, 1, 2, 0, 255, 7]),
+            "a binary file comes back byte for byte, which nothing else in the API could do");
+    }
+    using (HttpResponseMessage missing = await ApiGet(address, prefix + "/repository/files/absent.txt/raw?ref=main", readApi))
+        Check(missing.StatusCode == HttpStatusCode.NotFound, "a file that is not there is a 404");
+    // The browser's own route, because the GitLab-shaped one answers a token and would refuse a session.
+    // A page that offered a download which then refused the reader would be worse than no download.
+    using (HttpResponseMessage browserRaw = await ApiGet(address,
+        "/api/projects/" + projectId.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+        "/raw/bin/blob.dat?ref=main", null))
+        Check(browserRaw.StatusCode == HttpStatusCode.NotFound,
+            "the browser's own raw route conceals a private project from a stranger too");
+    using (HttpResponseMessage refused = await ApiGet(address, prefix + "/repository/files/notes.txt/raw?ref=main", null))
+        Check(refused.StatusCode == HttpStatusCode.NotFound, "a private project's files are concealed from a stranger");
+
+    // The whole tree, as one file.
+    byte[] zip;
+    using (HttpResponseMessage archive = await ApiGet(address, prefix + "/repository/archive.zip?sha=main", readApi))
+    {
+        zip = await archive.Content.ReadAsByteArrayAsync();
+        Check(archive.IsSuccessStatusCode && archive.Content.Headers.ContentType?.MediaType == "application/octet-stream" &&
+            archive.Content.Headers.ContentDisposition?.DispositionType == "attachment",
+            "an archive is served as an attachment of unknown type too");
+    }
+    using (MemoryStream reading = new(zip))
+    using (System.IO.Compression.ZipArchive opened = new(reading, System.IO.Compression.ZipArchiveMode.Read))
+    {
+        string[] names = [.. opened.Entries.Select(entry => entry.FullName).OrderBy(name => name, StringComparer.Ordinal)];
+        string expectedPrefix = "fetchable-" + head[..8] + "/";
+        Check(names.Length == 3 && names.All(name => name.StartsWith(expectedPrefix, StringComparison.Ordinal)),
+            "the zip holds every file under one directory named for the project and the commit");
+        System.IO.Compression.ZipArchiveEntry notes = opened.Entries.Single(entry => entry.FullName.EndsWith("notes.txt", StringComparison.Ordinal));
+        using StreamReader reader = new(notes.Open());
+        Check(await reader.ReadToEndAsync() == "first line\nsecond line\n", "and its contents are the file's exact bytes");
+    }
+
+    byte[] tarball;
+    using (HttpResponseMessage archive = await ApiGet(address, prefix + "/repository/archive.tar.gz?sha=main", readApi))
+        tarball = await archive.Content.ReadAsByteArrayAsync();
+    using (MemoryStream reading = new(tarball))
+    using (System.IO.Compression.GZipStream decompressed = new(reading, System.IO.Compression.CompressionMode.Decompress))
+    using (System.Formats.Tar.TarReader tar = new(decompressed))
+    {
+        int entries = 0;
+        bool executable = false;
+        while (await tar.GetNextEntryAsync() is System.Formats.Tar.TarEntry entry)
+        {
+            entries++;
+            if (entry.Name.EndsWith("run.sh", StringComparison.Ordinal))
+                executable = entry.Mode.HasFlag(UnixFileMode.UserExecute);
+        }
+        Check(entries == 3, "the tarball holds the same three files");
+        // The one permission bit Git keeps. A script that unpacked without it would not run.
+        Check(executable, "and an executable file unpacks executable");
+    }
+    using (HttpResponseMessage nowhere = await ApiGet(address, prefix + "/repository/archive.zip?sha=no-such-revision", readApi))
+        Check(nowhere.StatusCode == HttpStatusCode.NotFound, "an archive of a revision that does not resolve is a 404");
+    using (HttpResponseMessage refused = await ApiGet(address, prefix + "/repository/archive.zip?sha=main", strangerApi))
+        Check(refused.StatusCode == HttpStatusCode.NotFound, "an archive of a private project is concealed from a stranger");
+    // The default extension is the tarball, so a caller that names no format still gets a real archive.
+    using (HttpResponseMessage plain = await ApiGet(address, prefix + "/repository/archive?sha=main", readApi))
+        Check(plain.IsSuccessStatusCode && (await plain.Content.ReadAsByteArrayAsync()).Length > 0,
+            "the archive route with no extension answers with a tarball");
+
+    // A tag is a revision like any other, which is what makes it useful to download by.
+    using (HttpResponseMessage byTag = await ApiGet(address, prefix + "/repository/archive.zip?sha=v1.1.0", readApi))
+        Check(byTag.IsSuccessStatusCode, "an archive can be taken at a tag");
+
+    // The premise the commit page's fix rests on. It used to resolve a project through the caller's own
+    // listing, which returns only what they own or belong to, so a commit link into a public project failed
+    // for everybody else even though the commit was readable. The browser repository endpoint answers for
+    // any reader the project is visible to, and these two assertions are the difference between them.
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+        await store.SetProjectVisibilityAsync(alice, projectId, ProjectVisibility.Public);
+    using (HttpResponseMessage listing = await ApiGet(address, "/api/v4/projects", strangerApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await listing.Content.ReadAsStreamAsync());
+        Check(listing.IsSuccessStatusCode && json.RootElement.EnumerateArray()
+            .All(item => item.GetProperty("id").GetInt64() != projectId),
+            "a public project a reader does not belong to is absent from their own project listing");
+    }
+    using (HttpResponseMessage resolved = await ApiGet(address, "/api/browser/projects/alice/fetchable", null))
+    {
+        using JsonDocument json = JsonDocument.Parse(await resolved.Content.ReadAsStreamAsync());
+        Check(resolved.IsSuccessStatusCode && json.RootElement.GetProperty("project").GetProperty("id").GetInt64() == projectId,
+            "and is still resolvable by path through the endpoint every page now uses");
+    }
+    using (HttpResponseMessage anonymous = await ApiGet(address, prefix + "/repository/files/notes.txt/raw?ref=main", null))
+        Check(anonymous.IsSuccessStatusCode, "a public project's files can be downloaded with no credential");
+    using (HttpResponseMessage viaBrowser = await ApiGet(address,
+        "/api/projects/" + projectId.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+        "/raw/notes.txt?ref=main", null))
+    {
+        byte[] body = await viaBrowser.Content.ReadAsByteArrayAsync();
+        Check(viaBrowser.IsSuccessStatusCode && Encoding.UTF8.GetString(body) == "first line\nsecond line\n",
+            "and through the route the page's download button actually uses");
+    }
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+        await store.SetProjectVisibilityAsync(alice, projectId, ProjectVisibility.Private);
+}
+
+/// <summary>
+/// The empty-repository page, which used to report a 404 from the browse endpoint and which the browser
+/// then described as a permission problem.
+/// </summary>
+async Task CheckEmptyRepository(string address, AuthenticatedIdentity alice, string ownerPassword)
+{
+    long projectId;
+    string apiToken;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        ProjectInfo created = await store.CreateProjectWithRepositoryAsync(alice, "brand-new", "Brand new",
+            (project, cancellation) => { cancellation.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, project.StorageId)); return Task.CompletedTask; });
+        projectId = created.Id;
+        apiToken = (await store.CreateTokenAsync(alice, "empty-api", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+    }
+
+    CookieContainer cookies = new();
+    using HttpClientHandler handler = new()
+    {
+        CookieContainer = cookies,
+        ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
+        UseProxy = false
+    };
+    using HttpClient browser = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
+    using (HttpRequestMessage login = new(HttpMethod.Post, "/api/login"))
+    {
+        login.Headers.Add("Origin", address);
+        login.Content = JsonContent.Create(new { username = "alice", password = ownerPassword });
+        using HttpResponseMessage response = await browser.SendAsync(login);
+        Check(response.IsSuccessStatusCode, "the owner signs in to look at an empty repository");
+    }
+
+    using (HttpResponseMessage page = await browser.GetAsync("/api/browser/projects/alice/brand-new"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await page.Content.ReadAsStreamAsync());
+        Check(page.IsSuccessStatusCode, "an empty repository answers with a page rather than a 404");
+        Check(json.RootElement.GetProperty("branches").GetArrayLength() == 0 &&
+            json.RootElement.GetProperty("commits").GetArrayLength() == 0 &&
+            json.RootElement.GetProperty("tree").GetArrayLength() == 0 &&
+            json.RootElement.GetProperty("readme").ValueKind == JsonValueKind.Null,
+            "and reports itself empty rather than describing a tree it does not have");
+        Check(json.RootElement.GetProperty("can_push").GetBoolean() &&
+            json.RootElement.GetProperty("project").GetProperty("http_url_to_repo").GetString()!.EndsWith(".git", StringComparison.Ordinal),
+            "and still carries what somebody needs to push the first commit");
+    }
+    // Still concealed from everyone it should be. Being empty is not a reason to be visible.
+    using (HttpResponseMessage stranger = await ApiGet(address, "/api/browser/projects/alice/brand-new", null))
+        Check(stranger.StatusCode == HttpStatusCode.NotFound, "an empty private repository is still a 404 for a stranger");
+    using (HttpResponseMessage archive = await ApiGet(address,
+        "/api/v4/projects/" + projectId.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+        "/repository/archive.zip", apiToken))
+        Check(archive.StatusCode == HttpStatusCode.NotFound, "an empty repository has no archive to take");
 }
 void Check(bool condition, string name)
 {

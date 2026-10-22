@@ -2,6 +2,35 @@
 
 Updated: 2026-10-22. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
 
+## Added on 2026-10-22, a way out and two defects
+
+**Nothing could be got out of Graft except by cloning it.** A file can now be downloaded as bytes, the
+whole tree as a gzipped tar or a zip, and tags are listed, created and deleted. See
+[ADR 0017](decisions/0017-getting-things-out.md).
+
+**Repository bytes are always an attachment of unknown type**, never a content type derived from the file,
+with `nosniff`. This is the decision the feature rests on: this origin holds the session cookie and the API,
+which is exactly why project sites were given a hostname of their own, and a raw route that guessed a type
+would undo that in one line. The cost is that a browser cannot preview a raw file, which is the right trade.
+
+**An archive is built in memory**, which is sound only because the Git engine bounds a repository at a few
+tens of megabytes. If that bound is ever raised, this has to stream before the bound moves.
+
+**A tag listing reports both what the reference points at and what that resolves to**, because an annotated
+tag points at a tag object rather than a commit and reporting one would be wrong about the repository.
+
+Two defects went with it. An empty repository reported a 404 that the page described as a permission
+problem, so a project somebody had just created looked like one they could not see; it is now a state the
+page renders with the commands that end it. And the commit page resolved a project through the caller's own
+project listing, so a commit link into a public project failed for every non-member; it now uses the
+endpoint that answers for any reader, as the collaboration pages already did.
+
+**A third thing was found by pressing the button rather than reading the code.** The download control first
+pointed at the GitLab-shaped raw route, which answers a token and would have refused every reader of a
+private project. The browser has its own raw and archive routes now.
+
+Git suite 603 to 641. The other three are unchanged.
+
 ## Added on 2026-10-22, the review journey end to end
 
 Walking the merge request journey the same day it was built found five gaps, and all five are closed. See
@@ -609,4 +638,6 @@ Continue to use the ignored reproducible DnaX feed until the user or DnaX mainta
 | Required legacy host | Implementation agent + user | Integrated static-musl artifact inspected and run on Linux 3.10.108 with sanitized evidence |
 | DnaX distribution | User/DnaX maintainer | Clean checkout restores without a sibling source tree or locally prepared feed |
 
-Recommended next action: Owner: Implementation agent — take the "near, and small" section of [the backlog](backlog.md) as one batch. Replies and resolving a conversation is now the first thing a reviewer reaches for, since line comments exist and each one is standalone. Tags, raw file download and archives are the three that together turn the browser into something a reader can fetch from rather than only look at, and each is bounded work against machinery that already exists. The two bugs recorded beside them are an afternoon: an empty repository's page reports a 404 as a permission problem, and `Commit.razor` resolves a project through the caller's own project list, so a commit link into a public project fails for a non-member. The user-gated items are unchanged: the Android picker needs a device and NativeAOT needs the C++ build tools. Remaining release gates: deployment CA/DNS trust, DnaX distribution and the deferred Linux 3.10.108 MVP-08 run.
+Recommended next action: Owner: Implementation agent — replies, threads and resolving a conversation, which is now the first entry in [the backlog](backlog.md). Line comments exist and each one is standalone, so a reviewer can say something and nobody can answer it or mark it settled; the work is a parent id and a resolved flag, and the thinking is who may resolve and whether an edit leaves a record. After that the near list is small and independent: releases on top of the tags that now exist, deleting a file through the API, token rotation.
+
+The release gates matter more than any of that and have not moved since the MVP plan: the DnaX packages have no durable source so a clean external checkout cannot restore, deployment certificate and DNS trust are unproven outside loopback, and the Linux 3.10.108 acceptance run has never happened. Two of the three need the user rather than an implementation agent. The other user-gated items are unchanged: the Android picker needs a device and NativeAOT needs the C++ build tools.

@@ -1170,6 +1170,24 @@ Func<HttpContext, ProjectDetails?, Task> browseProject = async (context, details
     RepositoryEndpoint endpoint = EndpointFor(details.Project);
     await WithRepository(endpoint, context, async repository =>
     {
+        // A repository with no branches is not a missing tree, and answering 404 made a project somebody
+        // had just created look like one they could not see: the browser reports a refusal as a permission
+        // problem, because for every other 404 on this route that is what it is. An empty repository is a
+        // state the page can render, so it is reported as one.
+        if (repository.Refs.Count == 0)
+        {
+            ProjectResponse bare = await ProjectResponseForLocked(context, details, repository);
+            PermissionDecision bareManage = await DecideFor(context, browser?.Identity, projectId, ProjectAction.ManageProject);
+            PermissionDecision barePush = await DecideFor(context, browser?.Identity, projectId, ProjectAction.PushRepository);
+            PermissionDecision bareParticipate = await DecideFor(context, browser?.Identity, projectId, ProjectAction.WriteCollaboration);
+            await context.Response.WriteAsJsonAsync(new RepositoryPageResponse(bare, bareManage.Allowed,
+                barePush.Allowed, [], [], [], null, null, details.Project.PagePublished, settings.PublicBrowsing,
+                bareParticipate.Allowed,
+                bareManage.Allowed ? await store.GetApprovalsRequiredAsync(projectId, context.RequestAborted) : 0),
+                ApiJson.Default.RepositoryPageResponse, null, context.RequestAborted);
+            return;
+        }
+
         IReadOnlyList<GitTreeEntry>? tree = RepositoryView.Tree(repository, revision, path);
         if (tree is null) { await ApiError(context, 404, "tree"); return; }
         GitFile? file = filePath.Length == 0 ? null : RepositoryView.File(repository, revision, filePath);
@@ -1448,6 +1466,160 @@ app.MapDelete("/api/projects/{projectId:long}/branches/{**branch}", async contex
     var scope = await BrowserCollaboration(context, write: true);
     if (scope is null) return;
     await DeleteBranch(context, scope.Value.Details, scope.Value.Identity, context.Request.RouteValues["branch"]?.ToString() ?? "");
+});
+
+// One file, as bytes.
+//
+// Always served as an attachment of unknown type, never as the type the file looks like. Repository content
+// is somebody else's HTML and script, and this origin holds the session cookie and the API; that is the
+// whole reason project sites live on a hostname of their own. A raw route that guessed a content type would
+// undo that in one line. The browser therefore downloads it and never renders it, and a command-line client
+// still prints it to the terminal exactly as before.
+// The path is one URL-encoded segment here, not a catch-all, because a catch-all cannot be followed by
+// anything and `/raw` has to come after it. That is GitLab's own documented form for this route.
+app.MapGet("/api/v4/projects/{projectId}/repository/files/{filePath}/raw", async context =>
+{
+    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.BrowseRepository);
+    if (project is null) return;
+    if (!await OnlyQuery(context, "ref")) return;
+    string revision = context.Request.Query["ref"].ToString();
+    if (revision.Length == 0) revision = "HEAD";
+    string filePath;
+    try { filePath = Uri.UnescapeDataString(context.Request.RouteValues["filePath"]?.ToString() ?? ""); }
+    catch (UriFormatException) { await ApiError(context, 400, "file path"); return; }
+
+    await WithRepository(project.Endpoint, context, async repository =>
+    {
+        GitFile? file = RepositoryView.File(repository, revision, filePath);
+        if (file is null) { await ApiError(context, 404, "404 File Not Found"); return; }
+        await WriteDownload(context, file.Content, Path.GetFileName(file.Path), "application/octet-stream");
+    });
+});
+
+// The whole tree at a revision, as one file. Two formats: a gzipped tar and a zip, chosen by the extension
+// on the route, because a client that asked for one and received the other would have no way to tell until
+// it failed to open it.
+// The same file, for a browser. The GitLab-shaped route above answers a token and nothing else, so a
+// signed-in reader could not use it. Here the path is the catch-all because nothing follows it.
+app.MapGet("/api/projects/{projectId:long}/raw/{**filePath}", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: false);
+    if (scope is null) return;
+    PermissionDecision browse = await DecideFor(context, scope.Value.Identity, scope.Value.Details.Project.Id,
+        ProjectAction.BrowseRepository);
+    if (!browse.Allowed) { await ApiError(context, 404, "project"); return; }
+    if (!await OnlyQuery(context, "ref")) return;
+    string revision = context.Request.Query["ref"].ToString();
+    if (revision.Length == 0) revision = "HEAD";
+    string filePath;
+    try { filePath = Uri.UnescapeDataString(context.Request.RouteValues["filePath"]?.ToString() ?? ""); }
+    catch (UriFormatException) { await ApiError(context, 400, "file path"); return; }
+
+    await WithRepository(EndpointFor(scope.Value.Details.Project), context, async repository =>
+    {
+        GitFile? file = RepositoryView.File(repository, revision, filePath);
+        if (file is null) { await ApiError(context, 404, "404 File Not Found"); return; }
+        await WriteDownload(context, file.Content, Path.GetFileName(file.Path), "application/octet-stream");
+    });
+});
+
+// One route per extension rather than one with the extension as a parameter. A parameter inside a segment
+// matches by backtracking over a literal, which is exactly the kind of route that works in testing and
+// surprises somebody later; three literals cannot.
+foreach ((string suffix, string archiveFormat) in new[] { ("", "tar.gz"), (".tar.gz", "tar.gz"), (".zip", "zip") })
+{
+    string chosen = archiveFormat;
+    app.MapGet("/api/v4/projects/{projectId}/repository/archive" + suffix, async context =>
+    {
+        ApiProject? project = await AuthorizeApiProject(context, ProjectAction.BrowseRepository);
+        if (project is null) return;
+        if (!await OnlyQuery(context, "sha")) return;
+        string revision = context.Request.Query["sha"].ToString();
+        if (revision.Length == 0) revision = "HEAD";
+        await WriteArchive(context, project.Details, project.Endpoint, revision, chosen);
+    });
+
+    app.MapGet("/api/projects/{projectId:long}/archive" + suffix, async context =>
+    {
+        var scope = await BrowserCollaboration(context, write: false);
+        if (scope is null) return;
+        PermissionDecision browse = await DecideFor(context, scope.Value.Identity, scope.Value.Details.Project.Id,
+            ProjectAction.BrowseRepository);
+        if (!browse.Allowed) { await ApiError(context, 404, "project"); return; }
+        string revision = context.Request.Query["sha"].ToString();
+        if (revision.Length == 0) revision = "HEAD";
+        await WriteArchive(context, scope.Value.Details, EndpointFor(scope.Value.Details.Project), revision, chosen);
+    });
+}
+
+app.MapGet("/api/v4/projects/{projectId}/repository/tags", async context =>
+{
+    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.BrowseRepository);
+    if (project is null) return;
+    if (!await OnlyQuery(context, "page", "per_page")) return;
+    (int Page, int PerPage)? pagination = await Pagination(context);
+    if (pagination is null) return;
+    (int page, int perPage) = pagination.Value;
+    await WithRepository(project.Endpoint, context, async repository =>
+    {
+        (string Name, string Id)[] tags = RepositoryView.Tags(repository).ToArray();
+        List<TagResponse> result = [];
+        foreach ((string name, string target) in tags.Skip((page - 1) * perPage).Take(perPage))
+        {
+            // The reference may point at an annotated tag object rather than at the commit, so the commit
+            // is resolved through the name. A tag whose target has gone is skipped rather than failing the
+            // listing: one unreadable tag should not hide the rest.
+            string? commitId = RepositoryView.ResolveCommit(repository, name);
+            if (commitId is null) continue;
+            result.Add(new(name, target,
+                ProjectWebUrl(context, project.Details) + "/-/tree/" + Uri.EscapeDataString(name),
+                CommitResponseFor(context, project.Details, RepositoryView.ReadCommit(repository, commitId))));
+        }
+        SetPagination(context, page, perPage, tags.Length);
+        await context.Response.WriteAsJsonAsync(result.ToArray(), ApiJson.Default.TagResponseArray, null, context.RequestAborted);
+    });
+});
+
+app.MapPost("/api/v4/projects/{projectId}/repository/tags", async context =>
+{
+    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.PushRepository);
+    if (project is null) return;
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    TagCreateRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.TagCreateRequest, context.RequestAborted);
+    if (request?.TagName is not { Length: > 0 }) { await ApiError(context, 400, "tag_name is required"); return; }
+    await CreateTag(context, project.Details, project.Identity, request.TagName, request.Ref);
+});
+
+app.MapDelete("/api/v4/projects/{projectId}/repository/tags/{**tag}", async context =>
+{
+    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.PushRepository);
+    if (project is null) return;
+    if (!await OnlyQuery(context)) return;
+    await DeleteTag(context, project.Details, project.Identity, context.Request.RouteValues["tag"]?.ToString() ?? "");
+});
+
+app.MapGet("/api/projects/{projectId:long}/tags", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: false);
+    if (scope is null) return;
+    await BrowserTags(context, scope.Value.Details, scope.Value.Identity);
+});
+
+app.MapPost("/api/projects/{projectId:long}/tags", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: true);
+    if (scope is null) return;
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    TagCreateRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.TagCreateRequest, context.RequestAborted);
+    if (request?.TagName is not { Length: > 0 }) { await ApiError(context, 400, "tag_name is required"); return; }
+    await CreateTag(context, scope.Value.Details, scope.Value.Identity, request.TagName, request.Ref);
+});
+
+app.MapDelete("/api/projects/{projectId:long}/tags/{**tag}", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: true);
+    if (scope is null) return;
+    await DeleteTag(context, scope.Value.Details, scope.Value.Identity, context.Request.RouteValues["tag"]?.ToString() ?? "");
 });
 
 app.MapGet("/api/v4/projects/{projectId}/repository/branches", async context =>
@@ -2470,6 +2642,187 @@ async Task CreateBranch(HttpContext context, ProjectDetails project, Authenticat
                 "ref-prefix-conflict" => "another branch's name is a prefix of this one, which Git cannot store",
                 _ => "the branch name is not valid"
             });
+        }
+    });
+}
+
+/// <summary>
+/// Writes bytes the caller is meant to save rather than look at.
+///
+/// <para>
+/// The type is always one the browser will not render and the disposition is always an attachment, with
+/// <c>nosniff</c> so the browser does not decide otherwise from the content. Repository bytes reaching this
+/// origin as a document would be script running where the session cookie lives.
+/// </para>
+/// </summary>
+static async Task WriteDownload(HttpContext context, byte[] content, string fileName, string contentType)
+{
+    context.Response.ContentType = contentType;
+    context.Response.Headers.XContentTypeOptions = "nosniff";
+    // Only the characters a header can carry without quoting, so a repository path cannot inject one. A
+    // name that loses everything is replaced rather than sent empty.
+    string safe = new([.. fileName.Where(character =>
+        char.IsAsciiLetterOrDigit(character) || character is '.' or '-' or '_')]);
+    if (safe.Length is 0 or > 100) safe = "download";
+    context.Response.Headers.ContentDisposition = "attachment; filename=\"" + safe + "\"";
+    context.Response.ContentLength = content.Length;
+    await context.Response.Body.WriteAsync(content, context.RequestAborted);
+}
+
+/// <summary>
+/// Writes the whole tree at a revision as a gzipped tar or a zip.
+///
+/// <para>
+/// Built in memory, which is sound here and would not be in general: a repository is bounded at a few tens
+/// of megabytes by the Git engine's own limits, so an archive is bounded with it. Building it under the
+/// repository's lock and writing afterwards keeps a slow client from holding the repository while it reads.
+/// </para>
+/// </summary>
+async Task WriteArchive(HttpContext context, ProjectDetails project, RepositoryEndpoint endpoint,
+    string revision, string format)
+{
+    byte[]? archive = null;
+    string? commitId = null;
+    await WithRepository(endpoint, context, async repository =>
+    {
+        commitId = RepositoryView.ResolveCommit(repository, revision);
+        if (commitId is null) { await ApiError(context, 404, "404 Revision Not Found"); return; }
+        IReadOnlyList<GitTreeEntry> files = RepositoryView.FlatTree(repository, commitId)!;
+        // Git's own convention: everything sits under one directory named for the project and the commit,
+        // so unpacking two archives in one place cannot merge them.
+        string prefix = project.Project.Slug + "-" + commitId[..8] + "/";
+        archive = format == "zip"
+            ? BuildZip(repository, files, prefix)
+            : BuildTarGz(repository, files, prefix, project.CreatedAtUtc);
+    });
+    if (archive is null || commitId is null) return;
+    await WriteDownload(context, archive, project.Project.Slug + "-" + commitId[..8] +
+        (format == "zip" ? ".zip" : ".tar.gz"), "application/octet-stream");
+}
+
+static byte[] BuildZip(Repository repository, IReadOnlyList<GitTreeEntry> files, string prefix)
+{
+    using MemoryStream output = new();
+    using (System.IO.Compression.ZipArchive zip = new(output, System.IO.Compression.ZipArchiveMode.Create, true))
+    {
+        foreach (GitTreeEntry file in files)
+        {
+            System.IO.Compression.ZipArchiveEntry entry = zip.CreateEntry(prefix + file.Path,
+                System.IO.Compression.CompressionLevel.Optimal);
+            using Stream writing = entry.Open();
+            writing.Write(BlobBytes(repository, file.Id));
+        }
+    }
+    return output.ToArray();
+}
+
+static byte[] BuildTarGz(Repository repository, IReadOnlyList<GitTreeEntry> files, string prefix, DateTimeOffset when)
+{
+    using MemoryStream output = new();
+    using (System.IO.Compression.GZipStream compressed =
+        new(output, System.IO.Compression.CompressionLevel.Optimal, true))
+    using (System.Formats.Tar.TarWriter writer = new(compressed, System.Formats.Tar.TarEntryFormat.Pax, true))
+    {
+        foreach (GitTreeEntry file in files)
+        {
+            byte[] content = BlobBytes(repository, file.Id);
+            System.Formats.Tar.PaxTarEntry entry = new(System.Formats.Tar.TarEntryType.RegularFile, prefix + file.Path)
+            {
+                // Git stores one bit of permission that matters, and this carries it: an executable file
+                // unpacks executable. Everything else is the ordinary mode rather than whatever the host
+                // running the server happens to use.
+                Mode = file.Mode == "100755"
+                    ? UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+                      UnixFileMode.GroupRead | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherExecute
+                    : UnixFileMode.UserRead | UnixFileMode.UserWrite |
+                      UnixFileMode.GroupRead | UnixFileMode.OtherRead,
+                ModificationTime = when,
+                DataStream = new MemoryStream(content)
+            };
+            writer.WriteEntry(entry);
+        }
+    }
+    return output.ToArray();
+}
+
+static byte[] BlobBytes(Repository repository, string blobId)
+{
+    Limits.Require(repository.Objects.TryGetValue(blobId, out GitObject? blob) && blob.Type == 3, "blob");
+    return blob!.Data;
+}
+
+async Task BrowserTags(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    PermissionDecision browse = await DecideFor(context, identity, project.Project.Id, ProjectAction.BrowseRepository);
+    if (!browse.Allowed) { await ApiError(context, 404, "project"); return; }
+    RepositoryEndpoint endpoint = EndpointFor(project.Project);
+    await WithRepository(endpoint, context, async repository =>
+    {
+        List<TagResponse> result = [];
+        foreach ((string name, string target) in RepositoryView.Tags(repository))
+        {
+            string? commitId = RepositoryView.ResolveCommit(repository, name);
+            if (commitId is null) continue;
+            result.Add(new(name, target,
+                ProjectWebUrl(context, project) + "/-/tree/" + Uri.EscapeDataString(name),
+                CommitResponseFor(context, project, RepositoryView.ReadCommit(repository, commitId))));
+        }
+        await context.Response.WriteAsJsonAsync(result.ToArray(), ApiJson.Default.TagResponseArray, null, context.RequestAborted);
+    });
+}
+
+async Task CreateTag(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity,
+    string tag, string? revision)
+{
+    PermissionDecision push = await DecideFor(context, identity, project.Project.Id, ProjectAction.PushRepository);
+    if (!push.Allowed) { await ApiError(context, 403, push.Explanation); return; }
+
+    RepositoryEndpoint endpoint = EndpointFor(project.Project);
+    await WithRepository(endpoint, context, async repository =>
+    {
+        string from = string.IsNullOrWhiteSpace(revision) ? "HEAD" : revision.Trim();
+        try
+        {
+            string commitId = repository.CreateTag(tag, from, context.RequestAborted);
+            context.Response.StatusCode = StatusCodes.Status201Created;
+            await context.Response.WriteAsJsonAsync(new TagResponse(tag, commitId,
+                ProjectWebUrl(context, project) + "/-/tree/" + Uri.EscapeDataString(tag),
+                CommitResponseFor(context, project, RepositoryView.ReadCommit(repository, commitId))),
+                ApiJson.Default.TagResponse, null, context.RequestAborted);
+        }
+        catch (GitInputException error)
+        {
+            await ApiError(context, error.Message == "tag-exists" ? 409 : 400, error.Message switch
+            {
+                "tag-exists" => "a tag with this name already exists",
+                "tag-revision" => "the revision to tag could not be resolved",
+                "ref-prefix-conflict" => "another tag's name is a prefix of this one, which Git cannot store",
+                _ => "the tag name is not valid"
+            });
+        }
+    });
+}
+
+async Task DeleteTag(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity, string tag)
+{
+    PermissionDecision push = await DecideFor(context, identity, project.Project.Id, ProjectAction.PushRepository);
+    if (!push.Allowed) { await ApiError(context, 403, push.Explanation); return; }
+    try { tag = Uri.UnescapeDataString(tag); }
+    catch (UriFormatException) { await ApiError(context, 400, "tag"); return; }
+    if (tag.Length == 0) { await ApiError(context, 400, "tag is required"); return; }
+
+    RepositoryEndpoint endpoint = EndpointFor(project.Project);
+    await WithRepository(endpoint, context, async repository =>
+    {
+        try
+        {
+            repository.DeleteTag(tag, context.RequestAborted);
+            context.Response.StatusCode = StatusCodes.Status204NoContent;
+        }
+        catch (GitInputException error)
+        {
+            await ApiError(context, error.Message == "tag-missing" ? 404 : 400,
+                error.Message == "tag-missing" ? "404 Tag Not Found" : "the tag name is not valid");
         }
     });
 }

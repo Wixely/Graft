@@ -49,7 +49,29 @@ else
         }
     </div>
 
-    @if (tab == "code")
+    @* A repository nobody has pushed to yet. Shown as a state of its own rather than as an error, and it
+       carries the commands that end it, because "empty" is only useful alongside what to do about it. *@
+    @if (tab == "code" && repo.Branches.Count == 0)
+    {
+        <div class="panel">
+            <div class="panel-header"><Icon Name="repository" /><h2>This repository is empty</h2></div>
+            <div class="panel-body">
+                <p class="secondary-text">
+                    Nothing has been pushed yet. Push an existing repository, or start one here.
+                    @if (repo.CanPush)
+                    {
+                        <span>You can also add files from the Add files tab, which creates the first branch for you.</span>
+                    }
+                </p>
+                <pre class="commit-message">git remote add origin @CloneAddress
+git push -u origin main</pre>
+                <p class="field-hint">
+                    Pushing needs a personal access token as the password. Create one under Profile and tokens.
+                </p>
+            </div>
+        </div>
+    }
+    else if (tab == "code")
     {
         <div class="panel overflowing">
             <div class="panel-header">
@@ -66,7 +88,16 @@ else
                 {
                     <span class="label accent">default</span>
                 }
+                @if (tags.Length > 0)
+                {
+                    <span class="label">@tags.Length @(tags.Length == 1 ? "tag" : "tags")</span>
+                }
                 <span class="spacer"></span>
+                @* Served as an attachment of unknown type, so the browser saves it rather than rendering
+                   somebody's repository on this origin. *@
+                <a class="button secondary" href="@ArchiveUrl(".zip")" download>
+                    <Icon Name="download" />Download
+                </a>
                 @* Arrive by the slug and the clone URL offered first is the slug's, so a reader who was
                    given an ownerless link is never handed back one with an account name in it. *@
                 <CloneMenu Url="@(ViaSlug && repo.Project.GlobalWebUrl.Length > 0 ? repo.Project.GlobalWebUrl + ".git" : repo.Project.HttpUrlToRepo)"
@@ -129,6 +160,11 @@ else
                     <strong class="mono">@repo.File.FilePath</strong>
                     <span class="spacer"></span>
                     <span class="label">@repo.File.Size bytes</span>
+                    @* The only way to get a binary file out of Graft short of cloning, and the only way to
+                       get an exact copy of a text one. *@
+                    <a class="button secondary" href="@RawUrl(repo.File.FilePath)" download>
+                        <Icon Name="download" />Download
+                    </a>
                 </div>
                 @if (fileText is null)
                 {
@@ -385,6 +421,51 @@ else
         </div>
 
         <div class="panel">
+            <div class="panel-header"><Icon Name="archive" /><h2>Tags</h2><span class="spacer"></span><span class="label">@tags.Length</span></div>
+            <div class="panel-body">
+                <form class="form inline" @onsubmit="CreateTag" @onsubmit:preventDefault>
+                    <label for="new-tag">New tag</label>
+                    <input id="new-tag" @bind="newTag" maxlength="255" autocomplete="off" placeholder="v1.0.0" />
+                    <label for="tag-from">at</label>
+                    <select id="tag-from" @bind="newTagFrom">
+                        @foreach (BranchResponse option in repo.Branches) { <option value="@option.Name">@option.Name</option> }
+                    </select>
+                    <div class="form-actions">
+                        <button type="submit" disabled="@(busy || newTag.Trim().Length == 0 || repo.Branches.Count == 0)">Create tag</button>
+                    </div>
+                </form>
+            </div>
+            @if (tags.Length == 0)
+            {
+                <div class="panel-empty">No tags. A tag pushed by a client appears here too.</div>
+            }
+            else
+            {
+                <div class="list">
+                    @foreach (TagResponse tag in tags)
+                    {
+                        <div class="list-item">
+                            <Icon Name="archive" />
+                            <span class="list-item-main">
+                                <strong><code>@tag.Name</code></strong>
+                                <small>@tag.Commit.Title</small>
+                            </span>
+                            <span class="list-item-actions">
+                                <a class="button secondary" href="@ArchiveUrl(".zip", tag.Name)" download>
+                                    <Icon Name="download" />Download
+                                </a>
+                                <button type="button" class="@(pendingTag == tag.Name ? "danger" : "secondary")"
+                                        @onclick="() => DeleteTag(tag.Name)" disabled="@busy">
+                                    @(pendingTag == tag.Name ? "Confirm delete" : "Delete")
+                                </button>
+                            </span>
+                        </div>
+                    }
+                </div>
+            }
+        </div>
+
+        <div class="panel">
             <div class="panel-header"><Icon Name="check" /><h2>Review</h2></div>
             <div class="panel-body">
                 <p class="secondary-text">
@@ -567,6 +648,14 @@ else
         ? $"/projects/{Uri.EscapeDataString(Slug)}"
         : $"/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
 
+    /// <summary>The clone address to offer, matching the route the reader arrived by so a link shared
+    /// without an account name does not hand one back.</summary>
+    private string CloneAddress => repo is null
+        ? ""
+        : ViaSlug && repo.Project.GlobalWebUrl.Length > 0
+            ? repo.Project.GlobalWebUrl + ".git"
+            : repo.Project.HttpUrlToRepo;
+
     private RepositoryPageResponse? repo;
     private ProjectMemberResponse[] members = [];
     private string tab = "code";
@@ -587,6 +676,10 @@ else
     private string newBranch = "";
     private string newBranchFrom = "";
     private string? pendingBranch;
+    private TagResponse[] tags = [];
+    private string newTag = "";
+    private string newTagFrom = "";
+    private string? pendingTag;
     private int approvalsRequired;
     private WebhookResponse[] hooks = [];
     private string hookUrl = "";
@@ -711,6 +804,9 @@ else
         if (newBranchFrom.Length == 0 || repo?.Branches.All(option => option.Name != newBranchFrom) == true)
             newBranchFrom = repo?.Project.DefaultBranch ?? repo?.Branches.FirstOrDefault()?.Name ?? "";
         approvalsRequired = repo?.ApprovalsRequired ?? 0;
+        if (newTagFrom.Length == 0 || repo?.Branches.All(option => option.Name != newTagFrom) == true)
+            newTagFrom = newBranchFrom;
+        if (repo is not null) await LoadTags();
         if (repo?.CanManage == true)
         {
             await LoadMembers(repo.Project.Id);
@@ -860,6 +956,69 @@ else
         string.Equals(repo.Project.Namespace.Path, Api.Username, StringComparison.OrdinalIgnoreCase));
 
     private string ProjectPath => repo is null ? "" : repo.Project.Namespace.Path + "/" + repo.Project.Path;
+
+    /// <summary>
+    /// The archive and raw addresses are built as plain links rather than fetched, so the browser's own
+    /// download handling applies and a large archive never passes through this page's memory.
+    /// </summary>
+    private string ArchiveUrl(string format, string? revision = null) => repo is null
+        ? ""
+        : $"/api/projects/{repo.Project.Id}/archive{format}?sha=" + Uri.EscapeDataString(revision ?? Branch);
+
+    // Graft's own route rather than the GitLab-shaped one, which answers a token and would refuse this
+    // page's session.
+    private string RawUrl(string filePath) => repo is null
+        ? ""
+        : $"/api/projects/{repo.Project.Id}/raw/{filePath}?ref=" + Uri.EscapeDataString(Branch);
+
+    private async Task LoadTags()
+    {
+        if (repo is null) return;
+        tags = await Api.GetAsync($"api/projects/{repo.Project.Id}/tags", ApiJson.Default.TagResponseArray) ?? [];
+    }
+
+    private async Task CreateTag()
+    {
+        if (busy || repo is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            string at = newTagFrom.Length > 0 ? newTagFrom : Branch;
+            ApiResult result = await Api.PostAsync($"api/projects/{repo.Project.Id}/tags",
+                new TagCreateRequest(newTag.Trim(), at), ApiJson.Default.TagCreateRequest,
+                $"{newTag.Trim()} tagged at {at}.");
+            Report(result);
+            if (!result.Ok) return;
+            newTag = "";
+            await LoadTags();
+        }
+        finally { busy = false; }
+    }
+
+    /// <summary>Deleting a tag needs a second click, like deleting a branch: a tag is how a release is
+    /// identified, and removing one silently would strand whatever referred to it.</summary>
+    private async Task DeleteTag(string tag)
+    {
+        if (busy || repo is null) return;
+        if (pendingTag != tag)
+        {
+            pendingTag = tag;
+            Report(ApiResult.Refused($"Select Confirm delete to remove the tag {tag}. Its commits stay in the repository."));
+            return;
+        }
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.DeleteAsync(
+                $"api/projects/{repo.Project.Id}/tags/{Uri.EscapeDataString(tag)}", $"Tag {tag} deleted.");
+            Report(result);
+            pendingTag = null;
+            if (result.Ok) await LoadTags();
+        }
+        finally { busy = false; }
+    }
 
     private async Task CreateBranch()
     {

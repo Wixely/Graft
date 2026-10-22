@@ -98,10 +98,10 @@ public sealed record SessionResponse(
     /// <summary>Whether this server's operator permits publishing and serves a public listing. A property of
     /// the server, not of the caller, so it is reported to an anonymous caller as well.</summary>
     bool PublicBrowsing = false,
-    /// <summary>Whether this server.s operator started it with the Model Context Protocol endpoint available.
+    /// <summary>Whether this server's operator started it with the Model Context Protocol endpoint available.
     /// Also a property of the server; the administrator settings behind it are read separately.</summary>
     bool McpAvailable = false,
-    /// <summary>Whether this server.s operator allowed it to make outbound requests on a project.s behalf.
+    /// <summary>Whether this server's operator allowed it to make outbound requests on a project's behalf.
     /// False hides the hook controls rather than offering a setting the server would refuse.</summary>
     bool WebhooksAvailable = false);
 public sealed record LoginRequest(string Username, string Password);
@@ -517,6 +517,19 @@ public sealed record MergeRequestCreateRequest(
 /// </summary>
 public sealed record BranchCreateRequest(string? Branch, string? Ref);
 
+/// <summary>
+/// A tag. <c>Target</c> is what the reference points at, which for an annotated tag is a tag object rather
+/// than a commit; <c>Commit</c> is what that resolves to, and is what a reader usually means.
+/// </summary>
+public sealed record TagResponse(
+    string Name,
+    string Target,
+    [property: JsonPropertyName("web_url")] string WebUrl,
+    CommitResponse Commit);
+
+/// <summary>Names a new tag and what it should point at. <c>Ref</c> takes a branch, a tag or a commit id.</summary>
+public sealed record TagCreateRequest([property: JsonPropertyName("tag_name")] string? TagName, string? Ref);
+
 /// <summary>Asks for a merge, and optionally for the source branch to go with it.</summary>
 public sealed record MergeAcceptRequest(
     [property: JsonPropertyName("should_remove_source_branch")] bool ShouldRemoveSourceBranch = false);
@@ -604,6 +617,9 @@ public sealed record MergeRequestChangesResponse(
 [JsonSerializable(typeof(NoteCreateRequest))]
 [JsonSerializable(typeof(MergeRequestCreateRequest))]
 [JsonSerializable(typeof(BranchCreateRequest))]
+[JsonSerializable(typeof(TagCreateRequest))]
+[JsonSerializable(typeof(TagResponse))]
+[JsonSerializable(typeof(TagResponse[]))]
 [JsonSerializable(typeof(ApprovalsRequiredRequest))]
 [JsonSerializable(typeof(WebhookCreateRequest))]
 [JsonSerializable(typeof(WebhookResponse))]

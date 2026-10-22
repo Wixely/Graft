@@ -8,6 +8,16 @@ Graft is a planned locally hosted GitLab alternative in C#/.NET 10. It targets G
 
 Status as of **2026-09-20**: [MVP-08 packaging and resource validation](docs/validation/2026-09-19-mvp08-packaging-resources.md) conditionally passes. Windows NativeAOT interactive and Windows Service, Linux static-musl interactive/systemd, and rootless Podman paths are implemented and tested; the recorded Linux static binaries retain all 76 Git/API/project-creation and 36 recovery assertions. That Windows Git/API/browser workflow passed **135 assertions** under the runtime and NativeAOT at the time, including [administrator user creation and project membership](docs/validation/2026-09-19-user-membership.md), [personal access-token lifecycle](docs/validation/2026-09-19-personal-access-tokens.md), and [account credential lifecycle](docs/validation/2026-09-20-account-credentials.md). The GitLab 18.0.0 source fixture passes against Graft and a [live reference](docs/validation/2026-09-19-gitlab-18-live-reference.md), while pinned `glab` 1.58.0 passes against both. The rendered Blazor workflow and one-use [operator bootstrap](docs/validation/2026-09-19-operator-bootstrap.md) pass. The Linux 3.10.108 run is deferred. DnaX distribution and a real CA/DNS trust environment remain gates. Remote hosting and the project licence are undecided. The repository itself is public at github.com/Wixely/Graft.
 
+Status as of **2026-10-22**, last of the day: things can be got out of Graft without cloning it. A file
+downloads as its exact bytes, the whole tree downloads as a gzipped tar or a zip, and tags are listed,
+created and deleted, with an annotated tag pushed by a client described correctly beside one made here.
+Repository bytes are always served as an attachment of unknown type, never as the type the content looks
+like, because this origin holds the session cookie and the API and that is the same reason project sites
+have a hostname of their own. Two defects went with it: an empty repository used to report a permission
+problem, and a commit link into a public project used to fail for anyone who was not a member. See
+[ADR 0017](docs/decisions/0017-getting-things-out.md) and
+[the evidence](docs/validation/2026-10-22-fetching.md).
+
 Status as of **2026-10-22**, later the same day: the review journey works end to end. The merge request
 page renders the diff rather than only listing which files changed. A comment can sit on a line, and when
 the branch is pushed to afterwards it is reported as written against an earlier version rather than
