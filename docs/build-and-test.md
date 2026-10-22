@@ -159,6 +159,15 @@ token, a repository-only token, a member, and an account with a perfectly good c
 the project. See [ADR 0014](decisions/0014-collaboration.md) and
 [the evidence](validation/2026-10-22-collaboration.md).
 
+Archives are opened rather than measured. The suite reads the zip back with the framework's zip reader and
+the tarball with its tar reader, checks the entry names, reads one file's contents and checks that an
+executable file unpacks executable. "It produced an archive" is not the same claim as "a reader could open
+it", and only the second is worth asserting.
+
+The raw route's three headers are asserted individually: the content type, the disposition and the nosniff
+header. They are the whole of what keeps repository bytes from running as script on the origin that holds
+the session cookie, so a change that relaxed any one of them should fail here.
+
 Review is asserted from the parts that age. An approval is given, the branch is pushed to, and the suite
 asserts that the gate closed again without anybody withdrawing anything; a line comment is written, the same
 push happens, and the suite asserts that it reports itself outdated and still names the commit it was

@@ -69,6 +69,52 @@ public static class RepositoryBranches
         repository.Apply(new(repository.Objects, StringComparer.Ordinal), staged, cancellationToken);
     }
 
+    /// <summary>
+    /// Points a tag at a commit. Lightweight only: the reference names the commit directly rather than an
+    /// annotated tag object, because an annotated tag carries a message and a tagger and those belong to a
+    /// release, which this is not. A tag pushed by a client keeps whatever form the client gave it.
+    /// </summary>
+    public static string CreateTag(
+        this Repository repository,
+        string name,
+        string revision,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(repository);
+        string reference = "refs/tags/" + name;
+        Limits.Require(Limits.IsRef(reference), "tag");
+        Limits.Require(!repository.Refs.ContainsKey(reference), "tag-exists");
+
+        string? commitId = RepositoryView.ResolveCommit(repository, revision);
+        Limits.Require(commitId is not null, "tag-revision");
+
+        Dictionary<string, string> staged = new(repository.Refs, StringComparer.Ordinal) { [reference] = commitId! };
+        Limits.Require(staged.Count <= Limits.RefCount, "ref-count");
+        RequireNoPrefixConflict(staged);
+
+        repository.Apply(new(repository.Objects, StringComparer.Ordinal), staged, cancellationToken);
+        return commitId!;
+    }
+
+    /// <summary>
+    /// Removes a tag. Unlike a branch there is no default to protect, so this refuses only a name that is
+    /// not there.
+    /// </summary>
+    public static void DeleteTag(
+        this Repository repository,
+        string name,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(repository);
+        string reference = "refs/tags/" + name;
+        Limits.Require(Limits.IsRef(reference), "tag");
+        Limits.Require(repository.Refs.ContainsKey(reference), "tag-missing");
+
+        Dictionary<string, string> staged = new(repository.Refs, StringComparer.Ordinal);
+        staged.Remove(reference);
+        repository.Apply(new(repository.Objects, StringComparer.Ordinal), staged, cancellationToken);
+    }
+
     private static void RequireNoPrefixConflict(Dictionary<string, string> refs)
     {
         foreach (string name in refs.Keys)

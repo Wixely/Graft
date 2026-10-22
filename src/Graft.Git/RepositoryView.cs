@@ -46,6 +46,53 @@ public static class RepositoryView
         .OrderBy(pair => pair.Item1, StringComparer.Ordinal)
         .ToArray();
 
+    /// <summary>
+    /// The repository's tags, by name, with the object each points at.
+    ///
+    /// <para>
+    /// That object is not always a commit: an annotated tag points at a tag object which points at the
+    /// commit, so a caller that wants the commit resolves the name through
+    /// <see cref="ResolveCommit"/>, which follows the chain. Both forms are listed here, because both are
+    /// tags and a listing that quietly dropped one would be wrong about the repository.
+    /// </para>
+    /// </summary>
+    public static IReadOnlyList<(string Name, string Id)> Tags(Repository repository) => repository.Refs
+        .Where(pair => pair.Key.StartsWith("refs/tags/", StringComparison.Ordinal))
+        .Select(pair => (pair.Key[10..], pair.Value))
+        .OrderBy(pair => pair.Item1, StringComparer.Ordinal)
+        .ToArray();
+
+    /// <summary>
+    /// Every blob reachable from a revision, by full path, in path order. This is what an archive is: the
+    /// whole tree flattened, with the mode each file should be written with.
+    ///
+    /// <para>
+    /// Null when the revision does not resolve. A submodule is a commit reference rather than content this
+    /// engine holds, so it simply does not appear.
+    /// </para>
+    /// </summary>
+    public static IReadOnlyList<GitTreeEntry>? FlatTree(Repository repository, string revision)
+    {
+        string? commitId = ResolveCommit(repository, revision);
+        if (commitId is null) return null;
+        List<GitTreeEntry> files = [];
+        Collect(repository, ReadCommit(repository, commitId).TreeId, "", files, 0);
+        files.Sort((left, right) => string.CompareOrdinal(left.Path, right.Path));
+        return files;
+    }
+
+    private static void Collect(Repository repository, string treeId, string parent, List<GitTreeEntry> files, int depth)
+    {
+        // The same ceiling the tree reader uses. A repository is bounded well below this; the limit is here
+        // so a malformed object graph cannot recurse without end.
+        Limits.Require(depth <= 64, "tree-depth");
+        foreach (GitTreeEntry entry in ReadTree(repository, treeId, parent))
+        {
+            if (entry.Type == "tree") Collect(repository, entry.Id, entry.Path, files, depth + 1);
+            else if (entry.Type == "blob") files.Add(entry);
+        }
+    }
+
     public static GitCommit ReadCommit(Repository repository, string id)
     {
         Limits.Require(repository.Objects.TryGetValue(id, out GitObject? value) && value.Type == 1, "commit");

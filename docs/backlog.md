@@ -23,6 +23,15 @@ are listed here because the backlog is also a record of what was decided, not on
 - **Branch creation and deletion**, and removing the source branch with a merge. ADR 0015.
 - **Approvals.** A per-project count, superseded by a push, enforced at the merge. ADR 0015.
 
+And then, the same day, the two recorded defects and the batch that gets things out of Graft without
+cloning. [ADR 0017](decisions/0017-getting-things-out.md).
+
+- **The empty-repository page**, which reported a 404 as a permission problem.
+- **The commit page's project resolution**, which failed for any reader who was not a member.
+- **Tags**, listed, created and deleted, with annotated tags from a client listed alongside.
+- **Raw file download**, always as an attachment of unknown type.
+- **Archives**, as a gzipped tar or a zip.
+
 ## Near, and small
 
 **Replies, threads and resolving a conversation.** A line comment is standalone: there is no reply, no
@@ -32,26 +41,12 @@ reaches for, and it is mostly a parent id on a comment plus a resolved flag with
 **Editing a comment.** It can be deleted by its author or a Maintainer and that is all. An edit wants a
 record that it was edited, which is the part worth thinking about rather than the storage.
 
-**Tags and releases.** Pushed tags are stored and understood by the Git engine; nothing lists them. There is
-no tag in the API, none in the browser, and no concept of a release at all. Listing is nearly free, since
-the refs are already there. A release with notes and attachments is a feature of its own.
-
-**Raw file download and archives.** There is no way to fetch one file or a snapshot without cloning. GitLab
-serves `/repository/files/:path/raw` and `/repository/archive.tar.gz`. The first is small. The second needs
-a tar or zip writer over the object model, which is bounded work but not trivial.
+**Releases.** Tags exist; a release does not. No notes, no attachments, no marking a tag as a release, and
+no listing of them. The tag machinery is in place, so this is the notes-and-files half.
 
 **Deleting a file through the API.** Files can be created and updated over the API; `DELETE` on the same
 route is not implemented, and the browser cannot delete either. The object writer gained a whole-tree
 writer for merges, which is most of what a deletion needs.
-
-**An empty repository's project page reads "Repository unavailable".** The browse endpoint answers 404 when
-there is no tree, and the page reports that as a permission problem. A project somebody has just created
-therefore looks broken. Found on 2026-10-22 while checking other work.
-
-**`Commit.razor` resolves a project through the caller's own project list.** That means a commit link into
-a public project fails for a reader who is not a member, even though the commit is readable. The newer
-collaboration pages resolve through the browser repository endpoint instead, which answers for any reader;
-this page should do the same.
 
 **Token rotation.** Regenerating a token in place, keeping its name, scopes and expiry while issuing a new
 secret. Offered when recoverable secrets were chosen instead in
@@ -120,6 +115,11 @@ These are recorded so nobody reopens them as oversights. Each has a decision rec
 - **An agent cannot approve, or delete a branch.** Withheld from the agent surface. Same record.
 - **Webhook delivery is a notification, not a guarantee.** Bounded, in memory, lost on restart, oldest
   dropped when full. [ADR 0016](decisions/0016-webhooks.md).
+- **Repository bytes are never served with a guessed content type.** Raw files and archives are always an
+  attachment of unknown type, so a browser cannot preview them.
+  [ADR 0017](decisions/0017-getting-things-out.md).
+- **An archive is built in memory**, which is sound only because the Git engine bounds a repository. Raising
+  that bound means making this stream first. Same record.
 
 ## Operational, still open from the MVP plan
 
