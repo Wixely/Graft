@@ -1,5 +1,10 @@
 # Graft
 
+Repository capacity as of **2026-10-24**: 4 GiB of uncompressed object history, with
+64 MiB individual objects. Git transfers and archives use temporary files, and stored
+objects load on demand. See [limits and operational requirements](docs/decisions/0018-repository-capacity.md)
+and [validation](docs/validation/2026-10-24-repository-capacity.md).
+
 <p align="center">
   <img src="docs/assets/graft-readme-blue.png" alt="Graft" width="600" />
 </p>

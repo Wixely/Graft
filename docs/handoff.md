@@ -1,6 +1,20 @@
 # Next-agent handoff
 
-Updated: 2026-10-22. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
+Updated: 2026-10-24. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
+
+## Added on 2026-10-24: repository capacity
+
+The repository budget is now 4 GiB of uncompressed object history, with 64 MiB objects,
+5 GiB Git requests, one million objects and 4,096 refs. Objects load from durable files
+on demand; Git transfers and archives spool to temporary files instead of whole-buffer
+allocations. Git/archive deadlines are two hours. Existing object storage is compatible.
+See [ADR 0018](decisions/0018-repository-capacity.md) and
+[validation](validation/2026-10-24-repository-capacity.md): 645 integrated assertions,
+42 protocol checks, and an exact 4 GiB receive/restart/fetch with real Git validation.
+
+Remaining work: published NativeAOT/Linux and deployment resource validation. Next action —
+Operator + implementation agent: rebuild and test a representative repository on the intended
+host, including temporary disk capacity and proxy limits, before deployment.
 
 ## Added on 2026-10-22, a way out and two defects
 

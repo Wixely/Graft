@@ -179,16 +179,17 @@ public static class RepositoryView
     internal static IReadOnlyList<GitTreeEntry> ReadTree(Repository repository, string treeId, string parent)
     {
         Limits.Require(repository.Objects.TryGetValue(treeId, out GitObject? tree) && tree.Type == 2, "tree");
-        Cursor cursor = new(tree!.Data);
+        byte[] treeData = tree!.Data;
+        Cursor cursor = new(treeData);
         List<GitTreeEntry> entries = [];
         while (cursor.Remaining > 0)
         {
             StringBuilder mode = new();
             byte value;
             while ((value = cursor.Byte()) != (byte)' ') mode.Append((char)value);
-            int start = cursor.Position;
+            int start = (int)cursor.Position;
             while (cursor.Byte() != 0) { }
-            string name = StrictUtf8(tree.Data.AsSpan(start, cursor.Position - start - 1));
+            string name = StrictUtf8(treeData.AsSpan(start, (int)cursor.Position - start - 1));
             string id = Convert.ToHexStringLower(cursor.Take(20));
             string type = mode.ToString() switch
             {

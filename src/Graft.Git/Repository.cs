@@ -59,7 +59,7 @@ public sealed class Repository
         if (persistence is null) return;
         RepositoryState state = persistence.Load();
         Limits.Require(state.Objects.Count <= Limits.ObjectCount, "repository-object-count");
-        Limits.Require(state.Objects.Values.Sum(value => (long)value.Data.Length) <= Limits.ExpandedBytes, "repository-budget");
+        Limits.Require(state.Objects.Values.Sum(value => (long)value.Size) <= Limits.ExpandedBytes, "repository-budget");
         Limits.Require(state.Refs.Count <= Limits.RefCount, "ref-count");
         foreach ((string name, string id) in state.Refs)
         {
@@ -115,7 +115,14 @@ public sealed class Repository
 
     public byte[] Receive(byte[] body, CancellationToken cancellationToken = default)
     {
-        var cursor = new Cursor(body);
+        using MemoryStream input = new(body, false);
+        return Receive(input, cancellationToken);
+    }
+
+    public byte[] Receive(Stream body, CancellationToken cancellationToken = default)
+    {
+        using TemporaryStorage? staging = persistence is null ? null : new();
+        var cursor = new Cursor(body, body.Position, body.Length);
         var commands = new List<(string Old, string New, string Name)>();
         var requested = new HashSet<string>(StringComparer.Ordinal);
         string? packet;
@@ -140,10 +147,10 @@ public sealed class Repository
         Limits.Require(commands.Count > 0, "empty-update");
         var pack = cursor.Remaining == 0
             ? new PackResult(new(StringComparer.Ordinal), 0, 0)
-            : Pack.Read(cursor.Take(cursor.Remaining), Objects, cancellationToken);
+            : Pack.Read(body, Objects, cancellationToken, staging?.DirectoryPath);
         var stagedObjects = new Dictionary<string, GitObject>(Objects, StringComparer.Ordinal);
         foreach (var pair in pack.Objects) stagedObjects[pair.Key] = pair.Value;
-        Limits.Require(stagedObjects.Count <= Limits.ObjectCount && stagedObjects.Values.Sum(o => (long)o.Data.Length) <= Limits.ExpandedBytes, "repository-budget");
+        Limits.Require(stagedObjects.Count <= Limits.ObjectCount && stagedObjects.Values.Sum(obj => (long)obj.Size) <= Limits.ExpandedBytes, "repository-budget");
         // Validate even unreachable submitted objects before making any of the batch visible.
         Graph.Walk(stagedObjects, pack.Objects.Keys, cancellationToken);
         var stagedRefs = new Dictionary<string, string>(Refs, StringComparer.Ordinal);
@@ -182,7 +189,15 @@ public sealed class Repository
 
     public byte[] Upload(byte[] body, CancellationToken cancellationToken = default)
     {
-        var cursor = new Cursor(body);
+        using MemoryStream input = new(body, false);
+        using MemoryStream output = new();
+        Upload(input, output, cancellationToken);
+        return output.ToArray();
+    }
+
+    public void Upload(Stream body, Stream output, CancellationToken cancellationToken = default)
+    {
+        var cursor = new Cursor(body, body.Position, body.Length);
         var wants = new HashSet<string>(StringComparer.Ordinal);
         var negotiation = false;
         var done = false;
@@ -210,16 +225,14 @@ public sealed class Repository
             else throw new GitInputException("unsupported-upload-command");
         }
         Limits.Require(wants.Count > 0, "missing-want");
-        using var output = new MemoryStream();
         // No multi_ack/side-band/thin-pack capability is advertised. Stateless rounds
         // return NAK; after done send a complete (not delta-compressed) reachable pack.
         Packet.Write(output, "NAK\n");
         if (done)
         {
             var reachable = Graph.Walk(Objects, wants, cancellationToken);
-            output.Write(Pack.Write(reachable.Order(StringComparer.Ordinal).Select(id => Objects[id]), cancellationToken));
+            Pack.Write(output, reachable.Order(StringComparer.Ordinal).Select(id => Objects[id]), cancellationToken);
         }
-        return output.ToArray();
     }
 }
 
@@ -312,7 +325,8 @@ public static class Graph
         if (obj.Type == 3) return links;
         if (obj.Type == 2)
         {
-            var cursor = new Cursor(obj.Data);
+            byte[] data = obj.Data;
+            var cursor = new Cursor(data);
             var names = new HashSet<string>(StringComparer.Ordinal);
             while (cursor.Remaining > 0)
             {
@@ -327,7 +341,7 @@ public static class Graph
                 Limits.Require(type >= 0, "tree-mode");
                 var start = cursor.Position;
                 while (cursor.Byte() != 0) { }
-                var name = obj.Data.AsSpan(start, cursor.Position - start - 1);
+                var name = data.AsSpan((int)start, (int)(cursor.Position - start - 1));
                 Limits.Require(name.Length > 0 && !name.Contains((byte)'/') && !name.SequenceEqual("."u8) && !name.SequenceEqual(".."u8), "tree-name");
                 Limits.Require(names.Add(Convert.ToHexString(name)), "tree-duplicate-name");
                 var id = Convert.ToHexStringLower(cursor.Take(20));

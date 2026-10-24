@@ -7,6 +7,7 @@ COPY --chown=1654:1654 deploy/container/data/ /data/
 COPY --chown=1654:1654 deploy/container/secrets/ /run/secrets/
 
 USER 1654:1654
+ENV TMPDIR=/data/temporary
 # The forge, and when enabled its Model Context Protocol endpoint at /mcp, on the one port.
 EXPOSE 8443
 VOLUME ["/data"]

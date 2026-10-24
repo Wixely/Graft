@@ -21,3 +21,5 @@ Preserve this history; supersede a decision explicitly instead of silently chang
 - [0017: Getting things out, without cloning](0017-getting-things-out.md) — accepted and implemented; raw files and archives always as an attachment of unknown type, and tags listed with both what they point at and what that resolves to
 
 Open architecture choices are in [architecture.md](../architecture.md); they are not accepted decisions.
+
+- [0018: Four GiB repositories](0018-repository-capacity.md) — implemented; disk-backed objects, pack transfers and archives replace the feasibility size budgets

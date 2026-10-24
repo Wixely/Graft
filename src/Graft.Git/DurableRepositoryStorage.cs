@@ -32,6 +32,7 @@ public sealed class DurableRepositoryStorage : IRepositoryPersistence
     public RepositoryState Load()
     {
         Dictionary<string, GitObject> objects = new(StringComparer.Ordinal);
+        long total = 0;
         foreach (string path in Directory.EnumerateFiles(objectsRoot, "*", SearchOption.AllDirectories))
         {
             string relative = Path.GetRelativePath(objectsRoot, path).Replace(Path.DirectorySeparatorChar, '/');
@@ -39,9 +40,13 @@ public sealed class DurableRepositoryStorage : IRepositoryPersistence
             Limits.Require(parts.Length == 2 && parts[0].Length == 2 && parts[1].Length == 38, "stored-object-path");
             string id = parts[0] + parts[1];
             Limits.Require(Limits.IsId(id), "stored-object-id");
-            byte[] encoded = File.ReadAllBytes(path);
-            Limits.Require(encoded.Length >= 1 && encoded[0] is >= 1 and <= 4, "stored-object-type");
-            GitObject value = new(encoded[0], encoded.AsSpan(1).ToArray());
+            using FileStream source = new(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            Limits.Require(source.Length is >= 1 and <= Limits.ObjectBytes + 1, "stored-object-size");
+            int type = source.ReadByte();
+            Limits.Require(type is >= 1 and <= 4, "stored-object-type");
+            int size = (int)source.Length - 1;
+            Limits.Require((total += size) <= Limits.ExpandedBytes && objects.Count < Limits.ObjectCount, "repository-budget");
+            GitObject value = new(type, size, path);
             Limits.Require(value.Id == id, "stored-object-hash");
             Limits.Require(objects.TryAdd(id, value), "stored-object-duplicate");
         }
@@ -69,22 +74,37 @@ public sealed class DurableRepositoryStorage : IRepositoryPersistence
             cancellationToken.ThrowIfCancellationRequested();
             Limits.Require(Limits.IsId(id) && value.Id == id, "object-hash");
             string finalPath = ObjectPath(id);
-            if (File.Exists(finalPath)) continue;
+            if (File.Exists(finalPath)) { value.StoredAt(finalPath); continue; }
             Directory.CreateDirectory(Path.GetDirectoryName(finalPath)!);
             string temporaryPath = Path.Combine(stagingRoot, "object-" + Guid.NewGuid().ToString("N") + ".tmp");
             try
             {
+                if (value.StoredPath is { } stored)
+                {
+                    using (FileStream source = new(stored, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                        source.Flush(flushToDisk: true);
+                    try
+                    {
+                        File.Move(stored, finalPath);
+                        value.StoredAt(finalPath);
+                        continue;
+                    }
+                    catch (IOException) when (!File.Exists(finalPath)) { }
+                }
                 using (FileStream output = new(temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
                 {
                     output.WriteByte((byte)value.Type);
-                    output.Write(value.Data);
+                    using Stream source = value.OpenRead();
+                    source.CopyTo(output);
                     output.Flush(flushToDisk: true);
                 }
                 File.Move(temporaryPath, finalPath, overwrite: false);
+                value.StoredAt(finalPath);
             }
             catch (IOException) when (File.Exists(finalPath))
             {
                 File.Delete(temporaryPath);
+                value.StoredAt(finalPath);
             }
             finally
             {

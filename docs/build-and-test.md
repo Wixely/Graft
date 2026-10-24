@@ -4,6 +4,11 @@ Recorded: 2026-09-18. Owner: Next agent. Review when dependency/toolchain or pub
 
 ## Developer baseline
 
+For repository capacity, `dotnet run --project tests/Graft.Git.Scale/Graft.Git.Scale.csproj`
+runs protocol checks and a 96 MiB durable receive/restart/fetch workflow. Append `-- --full`
+for the exact 4 GiB boundary (allow several GiB of free temporary disk space). Both use
+installed Git as an independent validator. See [capacity evidence](validation/2026-10-24-repository-capacity.md).
+
 Use .NET SDK 10.0.300 or a compatible later .NET 10 feature band (`global.json`), with PowerShell 5.1 on Windows. The probe's `NuGet.config` uses nuget.org only. NuGet versions are pinned in the project and lock file; avoid unrelated upgrades while reproducing acceptance.
 
 ```powershell

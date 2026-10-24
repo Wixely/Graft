@@ -83,7 +83,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: ${GRAFT_MEMORY_LIMIT:-512M}
+          memory: ${GRAFT_MEMORY_LIMIT:-2G}
           pids: 256
     # No healthcheck: the chiseled base carries no shell and no HTTP client, so there is nothing in the
     # image to probe with. Watch /healthz from whatever sits in front instead.

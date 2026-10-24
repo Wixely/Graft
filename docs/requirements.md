@@ -4,6 +4,10 @@ Recorded: 2026-09-18. Source: explicit user requests and corrections during Graf
 
 ## Confirmed
 
+- On 2026-10-24 the user requested support for 4 GB repositories. The implemented quota is
+  4 GiB of distinct uncompressed object payloads including history, with a 64 MiB per-object
+  bound. See [ADR 0018](decisions/0018-repository-capacity.md) for related limits and validation.
+
 - **Graft** is a locally hosted GitLab alternative written in managed C#/.NET 10.
 - On 2026-09-18 the user requested MVP preparation, "fully c#". The [MVP plan](mvp-plan.md) uses C# application logic and proposes managed C# Git; the precise native dependency boundary remains an explicit open interpretation.
 - Target GitLab-style applications, API operations and URL conventions. Include most GitLab functionality. GitHub compatibility is not required; all initial references to GitHub were corrected by the user.

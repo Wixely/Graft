@@ -167,7 +167,7 @@ public static class RepositoryMerge
         Dictionary<string, GitObject> staged = new(repository.Objects, StringComparer.Ordinal);
         foreach ((string id, GitObject value) in written) staged[id] = value;
         Limits.Require(staged.Count <= Limits.ObjectCount, "repository-object-count");
-        Limits.Require(staged.Values.Sum(value => (long)value.Data.Length) <= Limits.ExpandedBytes, "repository-budget");
+        Limits.Require(staged.Values.Sum(value => (long)value.Size) <= Limits.ExpandedBytes, "repository-budget");
 
         // The same checks a pushed batch gets. Both parents must remain reachable, which is what makes this
         // a merge rather than a rewrite of either branch.
