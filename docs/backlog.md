@@ -118,8 +118,10 @@ These are recorded so nobody reopens them as oversights. Each has a decision rec
 - **Repository bytes are never served with a guessed content type.** Raw files and archives are always an
   attachment of unknown type, so a browser cannot preview them.
   [ADR 0017](decisions/0017-getting-things-out.md).
-- **An archive is built in memory**, which is sound only because the Git engine bounds a repository. Raising
-  that bound means making this stream first. Same record.
+- **An archive is built on disk and streamed.** It was built in memory, which was sound only while the Git
+  engine bounded a repository at a few tens of megabytes; raising that bound to 4 GiB on 2026-10-24 removed
+  the assumption, and the archive was converted with it.
+  [ADR 0018](decisions/0018-repository-capacity.md) supersedes that part of ADR 0017.
 
 ## Operational, still open from the MVP plan
 

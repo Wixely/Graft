@@ -32,6 +32,11 @@ repository path cannot inject a header.
 
 ## Decision: an archive is built in memory, because the repository is bounded
 
+> **Superseded on 2026-10-24 by [ADR 0018](0018-repository-capacity.md).** Repository capacity rose to
+> 4 GiB, which removed the bound this section rests on, and archives now build on disk and stream to the
+> client. The reasoning below is kept because it records why the original choice was sound and what
+> exactly made it stop being so; the conclusion no longer describes the code.
+
 The whole tree is flattened, each blob read, and a gzipped tar or a zip assembled in memory before
 anything is written.
 
