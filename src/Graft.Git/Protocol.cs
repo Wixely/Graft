@@ -5,14 +5,14 @@ namespace Graft.Git;
 
 public sealed class GitInputException(string message) : Exception(message);
 
-// Deliberately small, fixed feasibility budgets; not production configuration.
 public static class Limits
 {
-    public const int RequestBytes = 16 * 1024 * 1024;
-    public const int ObjectBytes = 4 * 1024 * 1024;
-    public const int ExpandedBytes = 32 * 1024 * 1024;
-    public const int ObjectCount = 4096;
-    public const int RefCount = 128;
+    public const long RequestBytes = 5L * 1024 * 1024 * 1024;
+    public const int ObjectBytes = 64 * 1024 * 1024;
+    public const long ExpandedBytes = 4L * 1024 * 1024 * 1024;
+    public const long PackExpandedBytes = 2 * ExpandedBytes;
+    public const int ObjectCount = 1_000_000;
+    public const int RefCount = 4096;
     public const int DeltaDepth = 32;
     public const string Zero = "0000000000000000000000000000000000000000";
     public static void Require(bool value, string code)
@@ -27,22 +27,33 @@ public static class Limits
         text.Split('/').All(p => p.Length > 0 && p[0] != '.' && !p.EndsWith('.') && !p.EndsWith(".lock", StringComparison.Ordinal));
 }
 
-public sealed class Cursor(byte[] bytes, int start = 0, int? end = null)
+public sealed class Cursor
 {
-    public byte[] Bytes { get; } = bytes;
-    public int Position { get; set; } = start;
-    public int End { get; } = end ?? bytes.Length;
-    public int Remaining => End - Position;
+    private readonly Stream source;
+    public Cursor(byte[] bytes, int start = 0, int? end = null)
+        : this(new MemoryStream(bytes, false), start, end ?? bytes.Length) { }
+    public Cursor(Stream source, long start, long end)
+    {
+        this.source = source;
+        source.Position = start;
+        End = end;
+    }
+    public long Position => source.Position;
+    public long End { get; }
+    public long Remaining => End - Position;
     public byte Byte()
     {
         Limits.Require(Remaining > 0, "truncated");
-        return Bytes[Position++];
+        int value = source.ReadByte();
+        Limits.Require(value >= 0, "truncated");
+        return (byte)value;
     }
     public byte[] Take(int count)
     {
         Limits.Require(count >= 0 && count <= Remaining, "truncated");
-        var result = Bytes.AsSpan(Position, count).ToArray();
-        Position += count;
+        var result = new byte[count];
+        try { source.ReadExactly(result); }
+        catch (EndOfStreamException) { throw new GitInputException("truncated"); }
         return result;
     }
     public string? Packet()

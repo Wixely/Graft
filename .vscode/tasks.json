@@ -9,6 +9,14 @@
   ],
   "tasks": [
     {
+      "label": "build Git scale checks",
+      "type": "process",
+      "command": "dotnet",
+      "args": ["build", "tests/Graft.Git.Scale/Graft.Git.Scale.csproj"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": "$msCompile"
+    },
+    {
       "label": "build",
       "type": "process",
       "command": "dotnet",

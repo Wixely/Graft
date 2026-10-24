@@ -10,6 +10,16 @@
   ],
   "configurations": [
     {
+      "name": "Debug Git scale checks (96 MiB)",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build Git scale checks",
+      "program": "${workspaceFolder}/tests/Graft.Git.Scale/bin/Debug/net10.0/Graft.Git.Scale.dll",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "console": "internalConsole"
+    },
+    {
       "name": "Debug production browser fixture",
       "type": "coreclr",
       "request": "launch",

@@ -166,6 +166,8 @@ try
     await Git(stale, ["commit", "-m", "Stale competing commit"]);
     await GitFails(stale, ["push", "origin", "main"], "stale ref rejected");
 
+    await CheckLargerRepository(address, source, aliceUrl, bobUrl, aliceApiToken.Secret, project.Id);
+
     await using (GraftStore revoke = await GraftStore.OpenAsync(databasePath))
     {
         await revoke.RevokeMembershipAsync(aliceIdentity, project.Id, bob.Id);
@@ -309,6 +311,33 @@ ProcessStartInfo ServerStart()
     start.ArgumentList.Add("--webhooks");
     start.ArgumentList.Add(webhooksEnabled ? "true" : "false");
     return start;
+}
+
+async Task CheckLargerRepository(string address, string source, string readUrl, string writeUrl, string token, long projectId)
+{
+    await Git(source, ["checkout", "-b", "scale-validation"]);
+    byte[] random = RandomNumberGenerator.GetBytes(20 * 1024 * 1024);
+    File.WriteAllBytes(Path.Combine(source, "scale-random.bin"), random);
+    File.WriteAllBytes(Path.Combine(source, "scale-zero.bin"), new byte[40 * 1024 * 1024]);
+    await Git(source, ["add", "."]);
+    await Git(source, ["commit", "-m", "Exercise larger repository transport"]);
+    await Git(source, ["push", writeUrl, "scale-validation"]);
+    Check(true, "HTTP push exceeds old request, object and repository budgets");
+    string cloned = Path.Combine(root, "scale-clone");
+    await Git(root, ["clone", "--single-branch", "--branch", "scale-validation", readUrl, cloned]);
+    Check(File.ReadAllBytes(Path.Combine(cloned, "scale-random.bin")).AsSpan().SequenceEqual(random),
+        "larger HTTP clone preserves incompressible bytes");
+    await Git(cloned, ["fsck", "--full", "--strict"]);
+    using HttpResponseMessage response = await ApiGet(address,
+        $"/api/v4/projects/{projectId}/repository/archive.zip?sha=scale-validation", token);
+    Check(response.IsSuccessStatusCode, "larger repository archive downloads");
+    using Stream content = await response.Content.ReadAsStreamAsync();
+    using System.IO.Compression.ZipArchive archive = new(content);
+    System.IO.Compression.ZipArchiveEntry entry = archive.Entries.Single(item => item.FullName.EndsWith("scale-random.bin", StringComparison.Ordinal));
+    using Stream extracted = entry.Open();
+    byte[] digest = SHA256.HashData(extracted);
+    Check(digest.AsSpan().SequenceEqual(SHA256.HashData(random)), "disk-backed archive preserves large file bytes");
+    await Git(source, ["checkout", "main"]);
 }
 
 async Task<string> Git(string directory, string[] arguments)

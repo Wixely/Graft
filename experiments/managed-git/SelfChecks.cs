@@ -89,7 +89,11 @@ public static class SelfChecks
             Reject("oversized inflated object", () =>
                 Pack.Read(FixturePack([(3, new byte[Limits.ObjectBytes + 1], null)]), empty));
             Reject("total expanded budget", () =>
-                Pack.Read(FixturePack(Enumerable.Range(0, 9).Select(_ => (3, new byte[Limits.ObjectBytes], (string?)null)).ToArray()), empty));
+            {
+                using MemoryStream input = new(FixturePack(Enumerable.Range(0, 9)
+                    .Select(_ => (3, new byte[1024 * 1024], (string?)null)).ToArray()));
+                Pack.Read(input, empty, expandedBudget: 8 * 1024 * 1024);
+            });
             Reject("delta depth limit", () =>
             {
                 var entries = new List<(int, byte[], string?)> { (3, [1], null) };

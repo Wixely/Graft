@@ -89,7 +89,7 @@ public static class RepositoryAuthor
         Dictionary<string, GitObject> stagedObjects = new(repository.Objects, StringComparer.Ordinal);
         foreach ((string id, GitObject value) in written) stagedObjects[id] = value;
         Limits.Require(stagedObjects.Count <= Limits.ObjectCount, "repository-object-count");
-        Limits.Require(stagedObjects.Values.Sum(value => (long)value.Data.Length) <= Limits.ExpandedBytes, "repository-budget");
+        Limits.Require(stagedObjects.Values.Sum(value => (long)value.Size) <= Limits.ExpandedBytes, "repository-budget");
 
         // The same reachability validation a pushed batch gets, before anything becomes visible.
         Graph.Walk(stagedObjects, [commit.Id], cancellationToken);
@@ -193,15 +193,16 @@ public static class RepositoryAuthor
         Node node = new();
         if (treeId is null) return node;
         Limits.Require(repository.Objects.TryGetValue(treeId, out GitObject? tree) && tree.Type == 2, "tree");
-        Cursor cursor = new(tree!.Data);
+        byte[] treeData = tree!.Data;
+        Cursor cursor = new(treeData);
         while (cursor.Remaining > 0)
         {
             StringBuilder mode = new();
             byte value;
             while ((value = cursor.Byte()) != (byte)' ') mode.Append((char)value);
-            int start = cursor.Position;
+            int start = (int)cursor.Position;
             while (cursor.Byte() != 0) { }
-            string name = Utf8(tree.Data.AsSpan(start, cursor.Position - start - 1));
+            string name = Utf8(treeData.AsSpan(start, (int)cursor.Position - start - 1));
             string id = Convert.ToHexStringLower(cursor.Take(20));
             if (mode.ToString() is "40000" or "040000") node.PendingSubtrees[name] = id;
             else node.Leaves[name] = (mode.ToString(), id);

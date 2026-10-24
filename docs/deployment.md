@@ -22,6 +22,29 @@ Bootstrap is one-use and holds the same maintenance locks as backup and restore.
 
 ## Windows
 
+### Large repositories
+
+The repository quota is 4 GiB of uncompressed object history; individual objects are
+limited to 64 MiB. Git request bodies may reach 5 GiB, with a two-hour transfer deadline.
+A reverse proxy must permit these bodies and durations. Raising only a proxy limit does
+not change Graft's compiled limits. See [ADR 0018](decisions/0018-repository-capacity.md).
+
+Allow temporary disk space for a 5 GiB incoming pack and up to 8 GiB of expanded pack
+work per concurrent push, in addition to repository storage. Fetches and archives also
+spool to disk. On Windows, use a service-account temporary directory on a suitable disk;
+configure its `TEMP`/`TMP` environment before starting the process if needed. The container
+image and systemd template set `TMPDIR` to a `temporary` subdirectory of the writable data
+directory, avoiding a small or memory-backed `/tmp`. Graft creates staging directories as
+needed. After an abrupt termination, inspect and remove abandoned `graft-transfer-*`
+directories only while the server is stopped.
+
+The container's default memory ceiling is now 2 GiB, configurable with `GRAFT_MEMORY_LIMIT`.
+This is operational headroom, not a proven bound for one million objects or concurrent
+large transfers. Existing `.env` files retain their old explicit limits and must be reviewed.
+The revised container/systemd settings have not been exercised on Linux for this change.
+
+### Publish and run
+
 Publish a self-contained NativeAOT server, then run it interactively:
 
 ```powershell

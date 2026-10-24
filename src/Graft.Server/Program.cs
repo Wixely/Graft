@@ -39,6 +39,7 @@ if (!Arguments.TryParse(args, out Arguments? parsedSettings))
 }
 Arguments settings = parsedSettings!;
 
+Directory.CreateDirectory(Path.GetTempPath());
 Directory.CreateDirectory(settings.Repositories);
 using MaintenanceLease maintenanceLease = MaintenanceLease.Acquire(settings.Database, settings.Repositories);
 await using GraftStore store = await GraftStore.OpenAsync(settings.Database, default,
@@ -154,7 +155,7 @@ builder.Services.AddDnaXUploads(options =>
 builder.WebHost.ConfigureKestrel(options =>
 {
     options.Listen(settings.ListenAddress, settings.ListenPort, listen => listen.UseHttps(certificate));
-    options.Limits.MaxRequestBodySize = Limits.RequestBytes;
+    options.Limits.MaxRequestBodySize = 16 * 1024 * 1024;
     // Raised from 16: an upload holds its connection for the length of the transfer, so the previous ceiling
     // let a few concurrent uploads starve Git and API traffic. Still bounded for low-resource hosts.
     options.Limits.MaxConcurrentConnections = 64;
@@ -180,17 +181,24 @@ app.Use(async (context, next) =>
     context.Response.Headers.XContentTypeOptions = "nosniff";
     context.Response.Headers["Referrer-Policy"] = "no-referrer";
     context.Response.Headers.ContentSecurityPolicy = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'";
-    // Uploads are the one route group where a long request body is the point, so they get a longer bound and
-    // a raised body limit. Everything else keeps the original 30 second deadline and the Kestrel-wide cap;
-    // the Git routes additionally enforce Limits.RequestBytes while reading, so they are bounded regardless.
     bool uploading = context.Request.Path.StartsWithSegments(UploadPrefix);
+    bool gitTransfer = context.Request.Path.Value?.EndsWith(".git/git-receive-pack", StringComparison.Ordinal) == true ||
+        context.Request.Path.Value?.EndsWith(".git/git-upload-pack", StringComparison.Ordinal) == true;
+    bool archiveDownload = context.Request.Path.StartsWithSegments("/api") &&
+        context.Request.Path.Value!.Contains("/archive", StringComparison.Ordinal);
+    if (context.Request.Path.Value?.EndsWith(".git/git-receive-pack", StringComparison.Ordinal) == true)
+    {
+        IHttpMaxRequestBodySizeFeature? bodySize = context.Features.Get<IHttpMaxRequestBodySizeFeature>();
+        if (bodySize is { IsReadOnly: false }) bodySize.MaxRequestBodySize = Limits.RequestBytes;
+    }
     if (uploading)
     {
         IHttpMaxRequestBodySizeFeature? bodySize = context.Features.Get<IHttpMaxRequestBodySizeFeature>();
         if (bodySize is { IsReadOnly: false }) bodySize.MaxRequestBodySize = UploadLimits.MaximumRequestBytes;
     }
     using CancellationTokenSource deadline = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted);
-    deadline.CancelAfter(uploading ? TimeSpan.FromMinutes(30) : TimeSpan.FromSeconds(30));
+    deadline.CancelAfter(gitTransfer || archiveDownload ? TimeSpan.FromHours(2) :
+        uploading ? TimeSpan.FromMinutes(30) : TimeSpan.FromSeconds(30));
     context.RequestAborted = deadline.Token;
     try { await next(context); }
     catch (GitInputException error)
@@ -2657,6 +2665,12 @@ async Task CreateBranch(HttpContext context, ProjectDetails project, Authenticat
 /// </summary>
 static async Task WriteDownload(HttpContext context, byte[] content, string fileName, string contentType)
 {
+    using MemoryStream source = new(content, false);
+    await WriteDownloadStream(context, source, fileName, contentType);
+}
+
+static async Task WriteDownloadStream(HttpContext context, Stream content, string fileName, string contentType)
+{
     context.Response.ContentType = contentType;
     context.Response.Headers.XContentTypeOptions = "nosniff";
     // Only the characters a header can carry without quoting, so a repository path cannot inject one. A
@@ -2666,66 +2680,65 @@ static async Task WriteDownload(HttpContext context, byte[] content, string file
     if (safe.Length is 0 or > 100) safe = "download";
     context.Response.Headers.ContentDisposition = "attachment; filename=\"" + safe + "\"";
     context.Response.ContentLength = content.Length;
-    await context.Response.Body.WriteAsync(content, context.RequestAborted);
+    content.Position = 0;
+    await content.CopyToAsync(context.Response.Body, context.RequestAborted);
 }
 
 /// <summary>
 /// Writes the whole tree at a revision as a gzipped tar or a zip.
 ///
-/// <para>
-/// Built in memory, which is sound here and would not be in general: a repository is bounded at a few tens
-/// of megabytes by the Git engine's own limits, so an archive is bounded with it. Building it under the
-/// repository's lock and writing afterwards keeps a slow client from holding the repository while it reads.
-/// </para>
 /// </summary>
 async Task WriteArchive(HttpContext context, ProjectDetails project, RepositoryEndpoint endpoint,
     string revision, string format)
 {
-    byte[]? archive = null;
+    using TemporaryStorage staging = new();
+    using FileStream archive = staging.CreateFile();
     string? commitId = null;
     await WithRepository(endpoint, context, async repository =>
     {
         commitId = RepositoryView.ResolveCommit(repository, revision);
         if (commitId is null) { await ApiError(context, 404, "404 Revision Not Found"); return; }
         IReadOnlyList<GitTreeEntry> files = RepositoryView.FlatTree(repository, commitId)!;
+        Limits.Require(files.Sum(file => (long)repository.Objects[file.Id].Size) <= Limits.ExpandedBytes, "archive-budget");
         // Git's own convention: everything sits under one directory named for the project and the commit,
         // so unpacking two archives in one place cannot merge them.
         string prefix = project.Project.Slug + "-" + commitId[..8] + "/";
-        archive = format == "zip"
-            ? BuildZip(repository, files, prefix)
-            : BuildTarGz(repository, files, prefix, project.CreatedAtUtc);
+        if (format == "zip") BuildZip(archive, repository, files, prefix, context.RequestAborted);
+        else BuildTarGz(archive, repository, files, prefix, project.CreatedAtUtc, context.RequestAborted);
     });
-    if (archive is null || commitId is null) return;
-    await WriteDownload(context, archive, project.Project.Slug + "-" + commitId[..8] +
+    if (commitId is null) return;
+    await WriteDownloadStream(context, archive, project.Project.Slug + "-" + commitId[..8] +
         (format == "zip" ? ".zip" : ".tar.gz"), "application/octet-stream");
 }
 
-static byte[] BuildZip(Repository repository, IReadOnlyList<GitTreeEntry> files, string prefix)
+static void BuildZip(Stream output, Repository repository, IReadOnlyList<GitTreeEntry> files, string prefix,
+    CancellationToken cancellationToken)
 {
-    using MemoryStream output = new();
     using (System.IO.Compression.ZipArchive zip = new(output, System.IO.Compression.ZipArchiveMode.Create, true))
     {
         foreach (GitTreeEntry file in files)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             System.IO.Compression.ZipArchiveEntry entry = zip.CreateEntry(prefix + file.Path,
                 System.IO.Compression.CompressionLevel.Optimal);
             using Stream writing = entry.Open();
-            writing.Write(BlobBytes(repository, file.Id));
+            using Stream source = repository.Objects[file.Id].OpenRead();
+            source.CopyTo(writing);
         }
     }
-    return output.ToArray();
 }
 
-static byte[] BuildTarGz(Repository repository, IReadOnlyList<GitTreeEntry> files, string prefix, DateTimeOffset when)
+static void BuildTarGz(Stream output, Repository repository, IReadOnlyList<GitTreeEntry> files, string prefix,
+    DateTimeOffset when, CancellationToken cancellationToken)
 {
-    using MemoryStream output = new();
     using (System.IO.Compression.GZipStream compressed =
         new(output, System.IO.Compression.CompressionLevel.Optimal, true))
     using (System.Formats.Tar.TarWriter writer = new(compressed, System.Formats.Tar.TarEntryFormat.Pax, true))
     {
         foreach (GitTreeEntry file in files)
         {
-            byte[] content = BlobBytes(repository, file.Id);
+            cancellationToken.ThrowIfCancellationRequested();
+            using Stream content = repository.Objects[file.Id].OpenRead();
             System.Formats.Tar.PaxTarEntry entry = new(System.Formats.Tar.TarEntryType.RegularFile, prefix + file.Path)
             {
                 // Git stores one bit of permission that matters, and this carries it: an executable file
@@ -2737,18 +2750,11 @@ static byte[] BuildTarGz(Repository repository, IReadOnlyList<GitTreeEntry> file
                     : UnixFileMode.UserRead | UnixFileMode.UserWrite |
                       UnixFileMode.GroupRead | UnixFileMode.OtherRead,
                 ModificationTime = when,
-                DataStream = new MemoryStream(content)
+                DataStream = content
             };
             writer.WriteEntry(entry);
         }
     }
-    return output.ToArray();
-}
-
-static byte[] BlobBytes(Repository repository, string blobId)
-{
-    Limits.Require(repository.Objects.TryGetValue(blobId, out GitObject? blob) && blob.Type == 3, "blob");
-    return blob!.Data;
 }
 
 async Task BrowserTags(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
@@ -3397,15 +3403,17 @@ app.MapPost("/{projectNamespace}/{project}.git/{service}", async context =>
     }
     try
     {
-        using MemoryStream input = new();
-        byte[] buffer = new byte[8192];
+        using TemporaryStorage staging = new();
+        using FileStream input = staging.CreateFile();
+        long requestLimit = service == "git-receive-pack" ? Limits.RequestBytes : 16 * 1024 * 1024;
+        byte[] buffer = new byte[64 * 1024];
         int count;
         while ((count = await context.Request.Body.ReadAsync(buffer, context.RequestAborted)) > 0)
         {
-            Limits.Require(input.Length + count <= Limits.RequestBytes, "request-limit");
-            input.Write(buffer, 0, count);
+            Limits.Require(input.Length + count <= requestLimit, "request-limit");
+            await input.WriteAsync(buffer.AsMemory(0, count), context.RequestAborted);
         }
-        byte[] body = input.ToArray();
+        input.Position = 0;
 
         // A lone flush packet is the client settling authentication, not a request to act on. Git sends one
         // before any body it would be unable to send twice: once the body is streamed with chunked encoding
@@ -3416,7 +3424,7 @@ app.MapPost("/{projectNamespace}/{project}.git/{service}", async context =>
         // than the client's http.postBuffer, a megabyte by default, failed here while a smaller one went
         // through: only the large one is chunked, and only the chunked one is probed. Real Git answers an
         // empty request with an empty result, so this does too.
-        if (body is [(byte)'0', (byte)'0', (byte)'0', (byte)'0'])
+        if (input.Length == 4 && new Cursor(input, 0, 4).Take(4).AsSpan().SequenceEqual("0000"u8))
         {
             context.Response.ContentType = "application/x-" + service + "-result";
             return;
@@ -3428,11 +3436,20 @@ app.MapPost("/{projectNamespace}/{project}.git/{service}", async context =>
             ? new(authorized.Endpoint.Repository.Refs, StringComparer.Ordinal)
             : null;
 
-        byte[] data = service == "git-receive-pack"
-            ? authorized.Endpoint.Repository.Receive(body, context.RequestAborted)
-            : authorized.Endpoint.Repository.Upload(body, context.RequestAborted);
+        input.Position = 0;
         context.Response.ContentType = "application/x-" + service + "-result";
-        await context.Response.Body.WriteAsync(data, context.RequestAborted);
+        if (service == "git-receive-pack")
+        {
+            byte[] data = authorized.Endpoint.Repository.Receive(input, context.RequestAborted);
+            await context.Response.Body.WriteAsync(data, context.RequestAborted);
+        }
+        else
+        {
+            using FileStream output = staging.CreateFile();
+            authorized.Endpoint.Repository.Upload(input, output, context.RequestAborted);
+            output.Position = 0;
+            await output.CopyToAsync(context.Response.Body, context.RequestAborted);
+        }
 
         if (before is not null) pushed = Moved(before, authorized.Endpoint.Repository.Refs);
     }
