@@ -3395,7 +3395,17 @@ app.MapPost("/{projectNamespace}/{project}.git/{service}", async context =>
     if (authorized is null) return;
     List<(string Branch, string? From, string? To)> pushed = [];
     Limits.Require(context.Request.ContentType == "application/x-" + service + "-request", "content-type");
-    Limits.Require(!context.Request.Headers.ContainsKey("Content-Encoding"), "content-encoding");
+
+    // Git gzips a fetch negotiation body once it passes about a kilobyte, and offers no setting to stop it.
+    // Refusing every Content-Encoding therefore broke exactly the fetches that need several rounds of
+    // negotiation, which is what happens when two histories have diverged: the first rounds are small and
+    // succeed, and the round that grows past a kilobyte is compressed and refused. A small clone never
+    // reaches that point, so this looked like it worked until a repository had been used for a while.
+    //
+    // Only gzip, because that is the only encoding Git sends. Anything else is still refused by name.
+    string encoding = context.Request.Headers.ContentEncoding.ToString();
+    bool gzipped = string.Equals(encoding, "gzip", StringComparison.OrdinalIgnoreCase);
+    Limits.Require(encoding.Length == 0 || gzipped, "content-encoding: " + encoding);
     if (!await authorized.Endpoint.Gate.WaitAsync(0, context.RequestAborted))
     {
         context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
@@ -3408,11 +3418,22 @@ app.MapPost("/{projectNamespace}/{project}.git/{service}", async context =>
         long requestLimit = service == "git-receive-pack" ? Limits.RequestBytes : 16 * 1024 * 1024;
         byte[] buffer = new byte[64 * 1024];
         int count;
-        while ((count = await context.Request.Body.ReadAsync(buffer, context.RequestAborted)) > 0)
+        // The limit is applied to what comes out rather than to what arrived, which is the whole reason a
+        // compressed body can be accepted at all: a body that expands past the ceiling is refused at the
+        // moment it passes it, so a small input cannot become a large one here.
+        Stream body = gzipped
+            ? new System.IO.Compression.GZipStream(context.Request.Body, System.IO.Compression.CompressionMode.Decompress)
+            : context.Request.Body;
+        try
         {
-            Limits.Require(input.Length + count <= requestLimit, "request-limit");
-            await input.WriteAsync(buffer.AsMemory(0, count), context.RequestAborted);
+            while ((count = await body.ReadAsync(buffer, context.RequestAborted)) > 0)
+            {
+                Limits.Require(input.Length + count <= requestLimit, "request-limit");
+                await input.WriteAsync(buffer.AsMemory(0, count), context.RequestAborted);
+            }
         }
+        catch (InvalidDataException) { throw new GitInputException("content-encoding: malformed gzip"); }
+        finally { if (gzipped) await body.DisposeAsync(); }
         input.Position = 0;
 
         // A lone flush packet is the client settling authentication, not a request to act on. Git sends one
