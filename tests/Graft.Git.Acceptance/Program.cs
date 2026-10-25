@@ -218,6 +218,7 @@ try
     await CheckCollaboration(address, aliceIdentity, bob.Username, "carol");
     await CheckProjectDeletion(address, aliceIdentity, administratorIdentity, bob.Username, alicePassword);
     await CheckReview(address, aliceIdentity, bob.Username, "carol");
+    await CheckCompressedGitRequests(address, aliceIdentity);
     await CheckFetching(address, aliceIdentity, "carol");
     await CheckEmptyRepository(address, aliceIdentity, alicePassword);
     address = await CheckWebhooks(address, aliceIdentity);
@@ -4084,6 +4085,142 @@ async Task CheckEmptyRepository(string address, AuthenticatedIdentity alice, str
         "/api/v4/projects/" + projectId.ToString(System.Globalization.CultureInfo.InvariantCulture) +
         "/repository/archive.zip", apiToken))
         Check(archive.StatusCode == HttpStatusCode.NotFound, "an empty repository has no archive to take");
+}
+
+/// <summary>
+/// Git compresses a fetch negotiation body once it passes about a kilobyte and offers no setting to stop
+/// it, so a server that refuses Content-Encoding refuses exactly the fetches that need several rounds of
+/// negotiation. That is what happens once two histories have diverged, which is why a clone of a new
+/// repository worked and a pull against a busy one did not.
+/// </summary>
+async Task CheckCompressedGitRequests(string address, AuthenticatedIdentity alice)
+{
+    long projectId;
+    string pushToken;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        ProjectInfo created = await store.CreateProjectWithRepositoryAsync(alice, "compressed", "Compressed requests",
+            (project, cancellation) => { cancellation.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, project.StorageId)); return Task.CompletedTask; });
+        projectId = created.Id;
+        pushToken = (await store.CreateTokenAsync(alice, "compressed-git",
+            TokenScope.ReadRepository | TokenScope.WriteRepository, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+    }
+    _ = projectId;
+
+    string clone = Path.Combine(root, "compressed-source");
+    Directory.CreateDirectory(clone);
+    await Git(clone, ["init", "--initial-branch=main"]);
+    File.WriteAllText(Path.Combine(clone, "one.txt"), "one\n");
+    await Git(clone, ["add", "."]);
+    await Git(clone, ["commit", "-m", "One"]);
+    await Git(clone, ["remote", "add", "origin", AuthenticatedUrl(address, "alice", pushToken, "alice/compressed.git")]);
+    await Git(clone, ["push", "origin", "main"]);
+    string head = (await Git(clone, ["rev-parse", "HEAD"])).Trim();
+
+    // A real negotiation body: one want, a flush, and done. Sent twice, once as it stands and once gzipped,
+    // because the useful assertion is not that gzip is accepted but that it changes nothing.
+    byte[] request;
+    using (MemoryStream building = new())
+    {
+        Packet.Write(building, "want " + head + "\n");
+        Packet.Flush(building);
+        Packet.Write(building, "done\n");
+        request = building.ToArray();
+    }
+    string path = "/alice/compressed.git/git-upload-pack";
+
+    byte[] plainBody;
+    using (HttpResponseMessage plain = await GitPost(address, path, pushToken, request, encoding: null))
+    {
+        plainBody = await plain.Content.ReadAsByteArrayAsync();
+        Check(plain.IsSuccessStatusCode && plainBody.Length > 0, "an uncompressed negotiation request is answered");
+    }
+    using (HttpResponseMessage compressed = await GitPost(address, path, pushToken, Gzip(request), encoding: "gzip"))
+    {
+        byte[] body = await compressed.Content.ReadAsByteArrayAsync();
+        Check(compressed.IsSuccessStatusCode, "a gzipped negotiation request is answered rather than refused");
+        Check(body.SequenceEqual(plainBody),
+            "and answers exactly what the same request answered uncompressed, so compression changes nothing");
+    }
+
+    // The ceiling is applied to what comes out of the decompressor, not to what arrived, which is what lets
+    // a compressed body be accepted at all. Twenty mebibytes of zeros is a few kilobytes on the wire and is
+    // refused the moment it passes the limit while expanding.
+    byte[] bomb = Gzip(new byte[20 * 1024 * 1024]);
+    Check(bomb.Length < 128 * 1024, "the oversized body really is small while compressed");
+    using (HttpResponseMessage refused = await GitPost(address, path, pushToken, bomb, encoding: "gzip"))
+    {
+        string message = await refused.Content.ReadAsStringAsync();
+        Check(refused.StatusCode == HttpStatusCode.BadRequest && message.Contains("request-limit", StringComparison.Ordinal),
+            "a small body that expands past the limit is still refused, and says which limit");
+    }
+
+    using (HttpResponseMessage refused = await GitPost(address, path, pushToken, request, encoding: "br"))
+    {
+        string message = await refused.Content.ReadAsStringAsync();
+        Check(refused.StatusCode == HttpStatusCode.BadRequest && message.Contains("content-encoding", StringComparison.Ordinal),
+            "an encoding Git never sends is still refused by name");
+    }
+
+    using (HttpResponseMessage refused = await GitPost(address, path, pushToken, request, encoding: "gzip"))
+        Check(refused.StatusCode == HttpStatusCode.BadRequest,
+            "a body that claims to be gzip and is not is refused rather than read as rubbish");
+
+    // The whole point, end to end: a fetch that has to negotiate over a history long enough that Git
+    // compresses the request. Enough commits that the client's "have" lines pass a kilobyte on their own.
+    string other = Path.Combine(root, "compressed-other");
+    await Git(root, ["clone", AuthenticatedUrl(address, "alice", pushToken, "alice/compressed.git"), "compressed-other"]);
+    for (int commit = 0; commit < 60; commit++)
+    {
+        File.WriteAllText(Path.Combine(clone, "one.txt"), "one " + commit.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\n");
+        await Git(clone, ["commit", "-am", "Change " + commit.ToString(System.Globalization.CultureInfo.InvariantCulture)]);
+    }
+    await Git(clone, ["push", "origin", "main"]);
+    for (int commit = 0; commit < 60; commit++)
+    {
+        File.WriteAllText(Path.Combine(other, "mine.txt"), "mine " + commit.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\n");
+        await Git(other, ["add", "."]);
+        await Git(other, ["commit", "-m", "Mine " + commit.ToString(System.Globalization.CultureInfo.InvariantCulture)]);
+    }
+    // Diverged on both sides, which is what makes Git send rounds of "have" lines rather than one small
+    // request. This is the case that failed before.
+    await Git(other, ["fetch", "origin"]);
+    Check((await Git(other, ["rev-parse", "origin/main"])).Trim() ==
+        (await Git(clone, ["rev-parse", "HEAD"])).Trim(),
+        "a real fetch against a diverged history negotiates and completes");
+}
+
+static byte[] Gzip(byte[] content)
+{
+    using MemoryStream output = new();
+    using (System.IO.Compression.GZipStream compressing =
+        new(output, System.IO.Compression.CompressionLevel.SmallestSize, true))
+        compressing.Write(content);
+    return output.ToArray();
+}
+
+/// <summary>
+/// Posts a Git request body directly, so the Content-Encoding header can be set to things a real client
+/// would not send. Basic authentication, as the Git transport uses.
+/// </summary>
+async Task<HttpResponseMessage> GitPost(string address, string path, string token, byte[] body, string? encoding)
+{
+    HttpClientHandler handler = new()
+    {
+        ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
+        UseProxy = false
+    };
+    HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(60) };
+    HttpRequestMessage request = new(HttpMethod.Post, path) { Content = new ByteArrayContent(body) };
+    request.Content.Headers.ContentType = new("application/x-git-upload-pack-request");
+    if (encoding is not null) request.Content.Headers.ContentEncoding.Add(encoding);
+    request.Headers.Authorization = new("Basic",
+        Convert.ToBase64String(Encoding.UTF8.GetBytes("alice:" + token)));
+    HttpResponseMessage response = await client.SendAsync(request);
+    request.Dispose();
+    client.Dispose();
+    handler.Dispose();
+    return response;
 }
 void Check(bool condition, string name)
 {

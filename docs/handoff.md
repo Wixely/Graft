@@ -1,6 +1,28 @@
 # Next-agent handoff
 
-Updated: 2026-10-24. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
+Updated: 2026-10-25. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
+
+## Fixed on 2026-10-25: a pull that failed once histories diverged
+
+Reported from a live deployment. The Git transport refused any request carrying a `Content-Encoding`
+header, and Git compresses a fetch negotiation body once it passes about a kilobyte with no client setting
+to stop it. The refusal therefore fell on exactly the fetches that need several rounds of negotiation,
+which is what happens once two histories have diverged. A clone of a new repository never reaches that
+point, so this looked like nothing until a repository had been used for a while.
+
+`gzip` is now decompressed and every other encoding is still refused, by name. The size ceiling moved to
+the output of the decompressor rather than the input, which is what makes accepting compression safe: the
+existing read loop already counted what it read, so a body that expands past the limit is refused while
+expanding. That bound is the reason the header was refused originally, and moving it back would reopen the
+hole.
+
+Confirmed against real Git with `GIT_TRACE_CURL`, which showed one of three upload-pack requests in a
+diverged fetch carrying the header, and the same scenario is now in the suite. 645 to 653 assertions. See
+[the evidence](validation/2026-10-25-compressed-git-requests.md).
+
+**A deployment has to be rebuilt for this**, like the capacity work below it. The same report mentioned an
+earlier push refused with `repository-budget`, which is the size limit rather than anything to do with
+compression; a build from before 2026-10-24 still has the old ceiling.
 
 ## Added on 2026-10-24: repository capacity
 
