@@ -41,9 +41,9 @@ Each new browser page is reached from the project's tab row.
 NativeAOT publish was not re-run for this work; the suite ran against the managed server. The
 compatibility matrix carries each new row with its deviations.
 
-**Next action.** Operator: rebuild the deployment and run the migration by starting the server. Agent: a
-NativeAOT publish and the Git suite against it, then the three browser-page items in the backlog that
-this work left open.
+**Next action.** Operator: rebuild the deployment; the migrations run when the server starts. Agent: a
+NativeAOT publish and the Git suite against it, then webhook events for releases and the wiki, which this
+work did not add.
 
 ## Fixed on 2026-10-25: a pull that failed once histories diverged
 
