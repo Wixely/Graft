@@ -39,7 +39,21 @@ public sealed record ProjectResponse(
     /// nothing.</summary>
     [property: JsonPropertyName("global_slug")] string GlobalSlug = "",
     /// <summary>The shareable page for that slug, and <c>.git</c> after it is the clone URL.</summary>
-    [property: JsonPropertyName("global_web_url")] string GlobalWebUrl = "");
+    [property: JsonPropertyName("global_web_url")] string GlobalWebUrl = "",
+    /// <summary>The project this one was forked from, when it was. GitLab's field name.</summary>
+    [property: JsonPropertyName("forked_from_project")] ForkedFromResponse? ForkedFromProject = null,
+    [property: JsonPropertyName("forks_count")] long ForksCount = 0);
+
+/// <summary>What a repack did; GitLab answers housekeeping with an empty 201 and this says a little more.</summary>
+public sealed record HousekeepingResponse(
+    [property: JsonPropertyName("objects_packed")] int ObjectsPacked,
+    [property: JsonPropertyName("loose_objects_removed")] int LooseObjectsRemoved,
+    [property: JsonPropertyName("packs_removed")] int PacksRemoved);
+
+public sealed record ForkedFromResponse(
+    long Id,
+    [property: JsonPropertyName("path_with_namespace")] string PathWithNamespace,
+    [property: JsonPropertyName("web_url")] string WebUrl);
 
 public sealed record CommitResponse(
     string Id,
@@ -504,7 +518,13 @@ public sealed record MergeRequestResponse(
     [property: JsonPropertyName("code_owner_approval_required")] bool CodeOwnerApprovalRequired = false,
     /// <summary>The owned paths still waiting for an owner's current approval. Empty when the gate is
     /// satisfied or off.</summary>
-    [property: JsonPropertyName("code_owner_approvals_missing")] IReadOnlyList<string>? CodeOwnerApprovalsMissing = null);
+    [property: JsonPropertyName("code_owner_approvals_missing")] IReadOnlyList<string>? CodeOwnerApprovalsMissing = null,
+    /// <summary>The project the source branch lives in. GitLab's field; the same as <c>project_id</c> unless
+    /// the proposal came from a fork.</summary>
+    [property: JsonPropertyName("source_project_id")] long SourceProjectId = 0,
+    /// <summary>Graft's own: the fork's path when the proposal came from one, so a reader knows where the
+    /// branch is without a second request.</summary>
+    [property: JsonPropertyName("source_project_path")] string? SourceProjectPath = null);
 
 public sealed record IssuePageResponse(IReadOnlyList<IssueResponse> Issues, long Total, int Page, int PerPage);
 public sealed record MergeRequestPageResponse(IReadOnlyList<MergeRequestResponse> MergeRequests, long Total, int Page, int PerPage);
@@ -668,6 +688,135 @@ public sealed record TimeEntryResponse(
     string Summary,
     [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt);
 
+/// <summary>One line of one file that holds what was searched for, in GitLab's blob search shape.</summary>
+public sealed record BlobSearchResponse(
+    string Basename,
+    /// <summary>The matching line, trimmed to a bound.</summary>
+    string Data,
+    string Path,
+    string Filename,
+    string Id,
+    [property: JsonPropertyName("ref")] string Ref,
+    int Startline,
+    [property: JsonPropertyName("project_id")] long ProjectId,
+    [property: JsonPropertyName("web_url")] string WebUrl);
+
+/// <summary>
+/// Search results. One scope per request, as GitLab does, but one shape for every scope so a page can show
+/// whichever came back: the list for the scope asked for is filled and the others are empty.
+/// </summary>
+public sealed record SearchResponse(
+    string Scope,
+    string Search,
+    int Count,
+    bool Truncated,
+    IReadOnlyList<ProjectResponse> Projects,
+    IReadOnlyList<IssueResponse> Issues,
+    [property: JsonPropertyName("merge_requests")] IReadOnlyList<MergeRequestResponse> MergeRequests,
+    IReadOnlyList<BlobSearchResponse> Blobs,
+    [property: JsonPropertyName("wiki_blobs")] IReadOnlyList<WikiPageResponse> WikiBlobs,
+    IReadOnlyList<CommitResponse> Commits);
+
+/// <summary>The Git LFS batch request, as the client sends it.</summary>
+public sealed record LfsBatchRequest(string? Operation, string[]? Transfers, LfsObjectRequest[]? Objects);
+public sealed record LfsObjectRequest(string? Oid, long Size);
+
+/// <summary>The Git LFS batch response: one entry per object asked about, each with its actions or its error.</summary>
+public sealed record LfsBatchResponse(string Transfer, IReadOnlyList<LfsObjectResponse> Objects);
+// Null members are omitted rather than written: git-lfs reads `actions` as a map of pointers and follows
+// each one without a nil check, so a written `"download": null` crashes the client outright.
+public sealed record LfsObjectResponse(
+    string Oid,
+    long Size,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] bool? Authenticated,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] LfsActionsResponse? Actions,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] LfsObjectErrorResponse? Error);
+public sealed record LfsActionsResponse(
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] LfsActionResponse? Download,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] LfsActionResponse? Upload);
+public sealed record LfsActionResponse(
+    string Href,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyDictionary<string, string>? Header,
+    [property: JsonPropertyName("expires_in")] int ExpiresIn);
+public sealed record LfsObjectErrorResponse(int Code, string Message);
+
+/// <summary>A package in GitLab's shape, with its files inline because a listing wants them.</summary>
+public sealed record PackageResponse(
+    long Id,
+    string Name,
+    string Version,
+    [property: JsonPropertyName("package_type")] string PackageType,
+    string Description,
+    string Authors,
+    [property: JsonPropertyName("created_by")] string CreatedBy,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt,
+    [property: JsonPropertyName("updated_at")] DateTimeOffset UpdatedAt,
+    [property: JsonPropertyName("web_url")] string WebUrl,
+    [property: JsonPropertyName("package_files")] IReadOnlyList<PackageFileResponse> PackageFiles);
+
+public sealed record PackageFileResponse(
+    long Id,
+    [property: JsonPropertyName("file_name")] string FileName,
+    long Size,
+    [property: JsonPropertyName("file_sha256")] string FileSha256,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt,
+    [property: JsonPropertyName("download_url")] string DownloadUrl);
+
+/// <summary>An image within a project's registry, in GitLab's shape, with its tags inline.</summary>
+public sealed record ContainerRepositoryResponse(
+    long Id,
+    string Name,
+    string Path,
+    string Location,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt,
+    [property: JsonPropertyName("tags_count")] int TagsCount,
+    IReadOnlyList<ContainerTagResponse> Tags);
+
+public sealed record ContainerTagResponse(
+    string Name,
+    string Path,
+    string Location,
+    string Digest,
+    [property: JsonPropertyName("media_type")] string MediaType,
+    [property: JsonPropertyName("total_size")] long TotalSize,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt);
+
+/// <summary>The NuGet v3 service index: which resources this feed offers and where.</summary>
+public sealed record NuGetServiceIndex(string Version, IReadOnlyList<NuGetResource> Resources);
+public sealed record NuGetResource([property: JsonPropertyName("@id")] string Id, [property: JsonPropertyName("@type")] string Type, string? Comment = null);
+public sealed record NuGetVersions(IReadOnlyList<string> Versions);
+public sealed record NuGetRegistrationIndex(int Count, IReadOnlyList<NuGetRegistrationPage> Items);
+public sealed record NuGetRegistrationPage([property: JsonPropertyName("@id")] string Id, int Count, string Lower, string Upper, IReadOnlyList<NuGetRegistrationLeaf> Items);
+public sealed record NuGetRegistrationLeaf([property: JsonPropertyName("@id")] string Id, [property: JsonPropertyName("packageContent")] string PackageContent, [property: JsonPropertyName("catalogEntry")] NuGetCatalogEntry CatalogEntry);
+public sealed record NuGetCatalogEntry(
+    [property: JsonPropertyName("@id")] string Id,
+    string Authors,
+    string Description,
+    [property: JsonPropertyName("id")] string PackageId,
+    [property: JsonPropertyName("version")] string Version,
+    [property: JsonPropertyName("packageContent")] string PackageContent,
+    bool Listed,
+    [property: JsonPropertyName("published")] DateTimeOffset Published,
+    [property: JsonPropertyName("dependencyGroups")] IReadOnlyList<NuGetDependencyGroup> DependencyGroups);
+public sealed record NuGetDependencyGroup([property: JsonPropertyName("targetFramework")] string? TargetFramework, IReadOnlyList<NuGetDependency> Dependencies);
+public sealed record NuGetDependency([property: JsonPropertyName("id")] string PackageId, string Range);
+public sealed record NuGetSearchResponse([property: JsonPropertyName("totalHits")] int TotalHits, IReadOnlyList<NuGetSearchResult> Data);
+public sealed record NuGetSearchResult(
+    [property: JsonPropertyName("id")] string PackageId,
+    string Version,
+    string Description,
+    string Authors,
+    [property: JsonPropertyName("totalDownloads")] long TotalDownloads,
+    bool Verified,
+    IReadOnlyList<NuGetSearchVersion> Versions);
+public sealed record NuGetSearchVersion([property: JsonPropertyName("@id")] string Id, string Version, long Downloads);
+
+/// <summary>Docker registry v2 shapes.</summary>
+public sealed record RegistryTagList(string Name, IReadOnlyList<string> Tags);
+public sealed record RegistryCatalog(IReadOnlyList<string> Repositories);
+public sealed record RegistryErrors(IReadOnlyList<RegistryError> Errors);
+public sealed record RegistryError(string Code, string Message);
+
 /// <summary>Who owns one changed path, from the target branch's CODEOWNERS file.</summary>
 public sealed record CodeOwnerResponse(string Path, IReadOnlyList<string> Owners);
 
@@ -765,7 +914,10 @@ public sealed record MergeRequestCreateRequest(
     [property: JsonPropertyName("milestone_id")] long? MilestoneId = null,
     [property: JsonPropertyName("assignee_usernames")] string[]? AssigneeUsernames = null,
     [property: JsonPropertyName("reviewer_usernames")] string[]? ReviewerUsernames = null,
-    bool? Draft = null);
+    bool? Draft = null,
+    /// <summary>GitLab's field: the project the source branch is in, when it is a fork of this one. Sent to
+    /// the target project's route, as GitLab's clients do.</summary>
+    [property: JsonPropertyName("source_project_id")] long? SourceProjectId = null);
 
 /// <summary>
 /// Names a new branch and what it should point at. <c>Ref</c> is GitLab's spelling and takes a branch
@@ -895,6 +1047,24 @@ public sealed record MergeRequestChangesResponse(
 [JsonSerializable(typeof(TagResponse[]))]
 [JsonSerializable(typeof(ApprovalsRequiredRequest))]
 [JsonSerializable(typeof(CodeOwnerResponse))]
+[JsonSerializable(typeof(PackageResponse))]
+[JsonSerializable(typeof(PackageResponse[]))]
+[JsonSerializable(typeof(ContainerRepositoryResponse))]
+[JsonSerializable(typeof(ContainerRepositoryResponse[]))]
+[JsonSerializable(typeof(NuGetServiceIndex))]
+[JsonSerializable(typeof(NuGetVersions))]
+[JsonSerializable(typeof(NuGetRegistrationIndex))]
+[JsonSerializable(typeof(NuGetSearchResponse))]
+[JsonSerializable(typeof(RegistryTagList))]
+[JsonSerializable(typeof(RegistryCatalog))]
+[JsonSerializable(typeof(RegistryErrors))]
+[JsonSerializable(typeof(LfsBatchRequest))]
+[JsonSerializable(typeof(LfsBatchResponse))]
+[JsonSerializable(typeof(ForkedFromResponse))]
+[JsonSerializable(typeof(HousekeepingResponse))]
+[JsonSerializable(typeof(BlobSearchResponse))]
+[JsonSerializable(typeof(BlobSearchResponse[]))]
+[JsonSerializable(typeof(SearchResponse))]
 [JsonSerializable(typeof(WikiPageResponse))]
 [JsonSerializable(typeof(WikiPageResponse[]))]
 [JsonSerializable(typeof(WikiVersionResponse))]

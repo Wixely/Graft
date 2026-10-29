@@ -10,79 +10,105 @@ public sealed record GitObject
 {
     private byte[]? data;
     private string? path;
-    internal string? StoredPath => path;
+    private bool rawPayload;
+    private PackFile? pack;
+    private long packOffset;
+    internal string? StoredPath => rawPayload ? null : path;
+    internal PackFile? PackSource => pack;
     public int Type { get; }
     public int Size { get; }
     public GitObject(int type, byte[] data) { Type = type; this.data = data; Size = data.Length; }
+    /// <summary>An object kept as a loose file in Git's format, staged or stored.</summary>
     internal GitObject(int type, int size, string path) { Type = type; Size = size; this.path = path; }
+    /// <summary>An object kept in a pack, read on demand.</summary>
+    internal GitObject(int type, int size, PackFile pack, long offset) { Type = type; Size = size; this.pack = pack; packOffset = offset; }
     public byte[] Data
     {
         get
         {
             if (data is not null) return data;
-            using Stream source = OpenRead();
-            byte[] content = new byte[Size];
-            source.ReadExactly(content);
-            return content;
+            if (pack is not null)
+            {
+                byte[] content = pack.Read(packOffset);
+                Limits.Require(content.Length == Size, "stored-object-size");
+                return content;
+            }
+            if (rawPayload)
+            {
+                using Stream raw = OpenRead();
+                byte[] content = new byte[Size];
+                raw.ReadExactly(content);
+                return content;
+            }
+            return LooseObject.ReadData(path!, Type, Size);
         }
     }
+    /// <summary>
+    /// The content as a seekable stream. A loose object is inflated into memory first, because the archive
+    /// writers need to seek and an object is at most 64 MiB; hashing, which only ever reads forward, inflates
+    /// as it goes instead.
+    /// </summary>
     public Stream OpenRead()
     {
         if (data is not null) return new MemoryStream(data, false);
-        FileStream source = new(path!, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024);
-        source.Position = 1;
-        return new ObjectContentStream(source);
+        if (rawPayload)
+        {
+            FileStream source = new(path!, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024);
+            source.Position = 1;
+            return source;
+        }
+        return new MemoryStream(Data, false);
     }
-    internal void StoredAt(string destination) { path = destination; data = null; }
+
+    private Stream OpenForward()
+    {
+        if (path is not null && !rawPayload) return LooseObject.OpenContent(path, out _, out _);
+        return OpenRead();
+    }
+    internal void StoredAt(string destination) { path = destination; data = null; pack = null; rawPayload = false; }
+    internal void StoredIn(PackFile source, long offset) { pack = source; packOffset = offset; path = null; data = null; rawPayload = false; }
+
+    /// <summary>A new object with the same bytes, staged as a loose file of its own in <paramref name="directory"/>,
+    /// so a later durable commit moves the copy and never this object's own file.</summary>
+    internal GitObject CopyInto(string directory)
+    {
+        string destination = Path.Combine(directory, Guid.NewGuid().ToString("N"));
+        using (Stream source = OpenRead()) LooseObject.WriteFile(destination, Type, Size, source);
+        return new(Type, Size, destination);
+    }
+
+    /// <summary>
+    /// Moves the bytes out of memory into <paramref name="directory"/>. A real object is written in the loose
+    /// format so publication can move the file into place; a delta payload, which has no Git type, is written
+    /// raw behind a type byte and only ever read back to be resolved.
+    /// </summary>
     internal void Spill(string directory)
     {
         string destination = Path.Combine(directory, Guid.NewGuid().ToString("N"));
+        if (Type <= 4)
+        {
+            using (Stream source = OpenRead()) LooseObject.WriteFile(destination, Type, Size, source);
+            StoredAt(destination);
+            return;
+        }
         using (FileStream output = new(destination, FileMode.CreateNew, FileAccess.Write))
         {
             output.WriteByte((byte)Type);
             using Stream source = OpenRead();
             source.CopyTo(output);
         }
-        StoredAt(destination);
+        path = destination;
+        data = null;
+        rawPayload = true;
     }
-    private sealed class ObjectContentStream(FileStream source) : Stream
-    {
-        public override bool CanRead => true;
-        public override bool CanSeek => true;
-        public override bool CanWrite => false;
-        public override long Length => source.Length - 1;
-        public override long Position { get => source.Position - 1; set => Seek(value, SeekOrigin.Begin); }
-        public override int Read(byte[] buffer, int offset, int count) => source.Read(buffer, offset, count);
-        public override int Read(Span<byte> buffer) => source.Read(buffer);
-        public override long Seek(long offset, SeekOrigin origin)
-        {
-            long position = origin switch
-            {
-                SeekOrigin.Begin => offset,
-                SeekOrigin.Current => Position + offset,
-                SeekOrigin.End => Length + offset,
-                _ => throw new ArgumentOutOfRangeException(nameof(origin))
-            };
-            if (position < 0) throw new IOException("Negative object position.");
-            return source.Seek(position + 1, SeekOrigin.Begin) - 1;
-        }
-        public override void Flush() { }
-        public override void SetLength(long value) => throw new NotSupportedException();
-        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
-        protected override void Dispose(bool disposing)
-        {
-            if (disposing) source.Dispose();
-            base.Dispose(disposing);
-        }
-    }
-    public string TypeName => Type switch { 1 => "commit", 2 => "tree", 3 => "blob", 4 => "tag", _ => throw new GitInputException("object-type") };
+    public string TypeName => LooseObject.TypeName(Type);
     public string Id
     {
         get
         {
             using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
             hash.AppendData(Encoding.ASCII.GetBytes(TypeName + " " + Size.ToString(CultureInfo.InvariantCulture) + "\0"));
-            using Stream source = OpenRead();
+            using Stream source = OpenForward();
             byte[] buffer = new byte[64 * 1024];
             int count;
             while ((count = source.Read(buffer)) != 0) hash.AppendData(buffer.AsSpan(0, count));
@@ -289,47 +315,9 @@ public static class Pack
         return output.ToArray();
     }
 
-    public static void Write(Stream output, IEnumerable<GitObject> objects, CancellationToken cancellationToken = default)
-    {
-        var items = objects.ToArray();
-        Limits.Require(items.Length <= Limits.ObjectCount, "object-count");
-        long start = output.Position;
-        output.Write("PACK"u8);
-        Span<byte> number = stackalloc byte[4];
-        BinaryPrimitives.WriteUInt32BigEndian(number, 2); output.Write(number);
-        BinaryPrimitives.WriteUInt32BigEndian(number, (uint)items.Length); output.Write(number);
-        foreach (var obj in items)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            WriteHeader(output, obj.Type, obj.Size);
-            if (obj.Size == 0) Compress(output, []);
-            else
-            {
-                using Stream source = obj.OpenRead();
-                using var compressed = new ZLibStream(output, CompressionLevel.Fastest, leaveOpen: true);
-                byte[] buffer = new byte[64 * 1024];
-                int count;
-                while ((count = source.Read(buffer)) != 0)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    compressed.Write(buffer.AsSpan(0, count));
-                }
-            }
-            Limits.Require(output.Position - start <= Limits.RequestBytes - 20, "output-limit");
-        }
-        long end = output.Position;
-        output.Position = start;
-        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
-        byte[] hashingBuffer = new byte[64 * 1024];
-        while (output.Position < end)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            int count = output.Read(hashingBuffer, 0, (int)Math.Min(hashingBuffer.Length, end - output.Position));
-            Limits.Require(count > 0, "truncated");
-            hash.AppendData(hashingBuffer.AsSpan(0, count));
-        }
-        output.Write(hash.GetHashAndReset());
-    }
+    /// <summary>Writes a pack of whole and delta-compressed objects with offset deltas; see <see cref="PackBuilder"/>.</summary>
+    public static void Write(Stream output, IEnumerable<GitObject> objects, CancellationToken cancellationToken = default) =>
+        PackBuilder.Write(output, objects.Select(obj => new PackEntry(obj, null)), offsetDeltas: true, deltify: true, cancellationToken);
 
     public static void WriteHeader(Stream output, int type, int size)
     {

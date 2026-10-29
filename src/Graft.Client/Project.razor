@@ -28,6 +28,18 @@ else
             <p class="subtitle">@(repo.Project.Description.Length > 0 ? repo.Project.Description : "No description")</p>
         </div>
         <VisibilityLabel Visibility="@repo.Project.Visibility" PagePublished="repo.PagePublished" />
+        @if (repo.Project.ForkedFromProject is not null)
+        {
+            <span class="label accent">forked from <a href="@("/" + repo.Project.ForkedFromProject.PathWithNamespace)">@repo.Project.ForkedFromProject.PathWithNamespace</a></span>
+        }
+        @if (Api.Authenticated && !repo.CanManage)
+        {
+            <div class="page-header-actions">
+                <button type="button" class="secondary" @onclick="Fork" disabled="@busy" title="Copy this project into your own namespace, to propose changes from">
+                    <Icon Name="branch" />Fork@(repo.Project.ForksCount > 0 ? $" ({repo.Project.ForksCount})" : "")
+                </button>
+            </div>
+        }
     </div>
 
     <Banner Message="@message" Kind="@messageKind" />
@@ -44,6 +56,8 @@ else
         <a href="@(ProjectBase + "/-/releases")">Releases</a>
         <a href="@(ProjectBase + "/-/wiki")">Wiki</a>
         <a href="@(ProjectBase + "/-/snippets")">Snippets</a>
+        <a href="@(ProjectBase + "/-/packages")">Packages</a>
+        <a href="@(ProjectBase + "/-/search")">Search</a>
         @if (repo.CanPush)
         {
             <button type="button" class="@(tab == "upload" ? "active" : "")" @onclick='() => tab = "upload"'>Add files</button>
@@ -1074,6 +1088,22 @@ git push -u origin main</pre>
             Report(result);
             pendingBranch = null;
             if (result.Ok) await LoadRepository();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task Fork()
+    {
+        if (busy || repo is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult<ProjectResponse> result = await Api.SendAsync<VisibilityRequest, ProjectResponse>(HttpMethod.Post,
+                $"api/projects/{repo.Project.Id}/fork", new VisibilityRequest(null), ApiJson.Default.VisibilityRequest,
+                ApiJson.Default.ProjectResponse, "Forked.");
+            if (!result.Ok || result.Value is null) { message = result.Message; messageKind = "error"; return; }
+            Navigation.NavigateTo("/" + result.Value.PathWithNamespace);
         }
         finally { busy = false; }
     }

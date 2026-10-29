@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text;
 using Graft.Core;
 using Graft.Git;
 using Graft.Storage;
@@ -163,6 +164,9 @@ try
     // Both halves of the project page, printed so a developer does not have to work out either address.
     // The page is on the forge; the site is on the pages origin, which is the same listener under a name a
     // browser treats as a different origin.
+    // The token too, under the same rule: it is a throwaway on a disposable fixture, and a developer driving the
+    // API or a package client by hand needs one.
+    if (password == DefaultPassword) Console.WriteLine("TOKEN: " + token.Secret);
     Console.WriteLine("PAGE: " + address + "/-/p/page-only");
     Console.WriteLine("SITE: " + pagesOrigin + "/page-only/");
     Console.WriteLine("ISSUES: " + address + "/" + username + "/seeded/-/issues");
@@ -230,12 +234,20 @@ async Task<string> StartServer()
     start.ArgumentList.Add(pagesOrigin);
     server = Process.Start(start)!;
     Process active = server;
-    errorReader = active.StandardError.ReadToEndAsync();
+    // Whatever the server prints after it is ready is forwarded under a prefix, so a developer driving the
+    // fixture by hand sees what the server logged about the request they just made.
+    errorReader = Task.Run(async () =>
+    {
+        StringBuilder all = new();
+        while (await active.StandardError.ReadLineAsync() is string line) { all.AppendLine(line); Console.Error.WriteLine("SERVER: " + line); }
+        return all.ToString();
+    });
     outputReader = Task.Run(async () =>
     {
         while (await active.StandardOutput.ReadLineAsync() is string line)
         {
             if (line.StartsWith("READY: ", StringComparison.Ordinal)) ready.TrySetResult(line[7..]);
+            else if (ready.Task.IsCompleted) Console.WriteLine("SERVER: " + line);
         }
     });
     return await ready.Task.WaitAsync(TimeSpan.FromSeconds(20));

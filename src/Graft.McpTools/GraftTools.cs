@@ -827,6 +827,7 @@ public sealed class GraftTools
         [Description("The branch it should go into.")] string targetBranch,
         [Description("One line saying what the change does.")] string title,
         [Description("The detail. May be empty.")] string description,
+        [Description("Optional: the fork the source branch lives in, as a path, slug or id, when proposing to a project you cannot push to. Empty means the branch is in the project itself.")] string sourceProject,
         CancellationToken cancellationToken)
     {
         if (!graft.AllowWrites) return Refused(graft, "proposing a merge");
@@ -841,6 +842,12 @@ public sealed class GraftTools
             ["title"] = title.Trim()
         };
         if (!string.IsNullOrWhiteSpace(description)) body["description"] = description;
+        if (!string.IsNullOrWhiteSpace(sourceProject))
+        {
+            (ProjectResponse? fork, string? forkError) = await graft.GetAsync("api/v4/projects/" + Encode(sourceProject), ApiJson.Default.ProjectResponse, cancellationToken);
+            if (forkError is not null) return Failure("sourceProject: " + forkError);
+            body["source_project_id"] = fork!.Id;
+        }
         (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Post,
             "api/v4/projects/" + Encode(project) + "/merge_requests", body, cancellationToken);
         if (!ok) return Failure(GraftClient.Describe(status, response));
@@ -1041,6 +1048,56 @@ public sealed class GraftTools
             ["title"] = saved.Title,
             ["versions"] = saved.Versions,
             ["web_url"] = saved.WebUrl
+        });
+    }
+
+    [McpServerTool(Name = "graft_search")]
+    [Description("Searches. With a project: its code (scope blobs), commits, issues, merge requests or wiki. Without one: the server's projects, issues or merge requests, across whatever the token can see. A match is a case-insensitive substring; results are bounded and say when they were cut short.")]
+    public static async Task<string> Search(
+        GraftClient graft,
+        [Description("Optional: the project path like alice/widgets, its instance-wide slug, or its numeric id. Empty searches across the server.")] string project,
+        [Description("With a project: issues, merge_requests, blobs, wiki_blobs or commits. Without one: projects, issues or merge_requests.")] string scope,
+        [Description("What to look for, at most 200 characters.")] string query,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(query)) return Failure("query is required.");
+        string path = (string.IsNullOrWhiteSpace(project) ? "api/v4/search" : "api/v4/projects/" + Encode(project) + "/search") +
+            "?scope=" + Uri.EscapeDataString((scope ?? "").Trim()) + "&search=" + Uri.EscapeDataString(query.Trim());
+        (SearchResponse? found, string? error) = await graft.GetAsync(path, ApiJson.Default.SearchResponse, cancellationToken);
+        if (error is not null) return Failure(error);
+        return new JsonObject
+        {
+            ["scope"] = found!.Scope,
+            ["count"] = found.Count,
+            ["truncated"] = found.Truncated,
+            ["projects"] = Array(found.Projects, Summarise),
+            ["issues"] = Array(found.Issues, issue => new JsonObject { ["number"] = issue.Iid, ["title"] = issue.Title, ["state"] = issue.State, ["web_url"] = issue.WebUrl }),
+            ["merge_requests"] = Array(found.MergeRequests, request => new JsonObject { ["number"] = request.Iid, ["title"] = request.Title, ["state"] = request.State, ["web_url"] = request.WebUrl }),
+            ["blobs"] = Array(found.Blobs, blob => new JsonObject { ["path"] = blob.Path, ["line"] = blob.Startline, ["text"] = blob.Data }),
+            ["wiki"] = Array(found.WikiBlobs, page => new JsonObject { ["slug"] = page.Slug, ["title"] = page.Title }),
+            ["commits"] = Array(found.Commits, commit => new JsonObject { ["id"] = commit.Id, ["title"] = commit.Title, ["author"] = commit.AuthorName })
+        }.ToJsonString();
+    }
+
+    [McpServerTool(Name = "graft_fork")]
+    [Description("Forks a project into the token owner's own namespace: a copy with the original's content, to push to and propose from when the original cannot be written to. Needs only to be able to read the original. Refused unless writes are allowed on this server.")]
+    public static async Task<string> Fork(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowWrites) return Refused(graft, "forking");
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Post,
+            "api/v4/projects/" + Encode(project) + "/fork", new JsonObject(), cancellationToken);
+        if (!ok) return Failure(GraftClient.Describe(status, response));
+        return Created(response, ApiJson.Default.ProjectResponse, fork => new JsonObject
+        {
+            ["forked"] = true,
+            ["path"] = fork.PathWithNamespace,
+            ["id"] = fork.Id,
+            ["clone_url"] = fork.HttpUrlToRepo,
+            ["forked_from"] = fork.ForkedFromProject?.PathWithNamespace,
+            ["hint"] = "Push a branch to the fork, then graft_open_merge_request on the original with source_project_id set to this fork's id."
         });
     }
 

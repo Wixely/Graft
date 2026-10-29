@@ -139,7 +139,16 @@ public sealed record MergeProposal(
     /// <summary>Marked as not ready. A draft cannot be merged, however mergeable the branches are.</summary>
     bool Draft = false,
     long TimeEstimateSeconds = 0,
-    long TimeSpentSeconds = 0);
+    long TimeSpentSeconds = 0,
+    /// <summary>The project the source branch lives in when it is not this one: a fork. Null otherwise.</summary>
+    long? SourceProjectId = null,
+    string? SourceProjectPath = null)
+{
+    /// <summary>Where the engine reads the source from: the branch itself, or the server-owned mirror of a
+    /// fork's branch tip inside the target repository.</summary>
+    public string SourceReference => SourceProjectId is null ? SourceBranch : "refs/merge-requests/" + Iid.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/head";
+    public bool FromFork => SourceProjectId is not null;
+}
 
 /// <summary>
 /// One comment. The same shape on an issue and on a merge request, because it is the same thing.
@@ -275,3 +284,24 @@ public sealed record Snippet(
 
 /// <summary>Time somebody spent on an issue or proposal, in seconds, on a day, with a word about what.</summary>
 public sealed record TimeEntry(long Id, long UserId, string Username, long Seconds, DateOnly SpentOn, string Summary, DateTimeOffset CreatedAtUtc);
+
+/// <summary>A package: a name and a version in one format, with its files. The bytes live beside the repository.</summary>
+public sealed record Package(
+    long Id,
+    long ProjectId,
+    string PackageType,
+    string Name,
+    string Version,
+    string Description,
+    string Authors,
+    string CreatedByUsername,
+    DateTimeOffset CreatedAtUtc,
+    DateTimeOffset UpdatedAtUtc,
+    IReadOnlyList<PackageFile> Files);
+
+public sealed record PackageFile(long Id, string FileName, long Size, string Sha256, DateTimeOffset CreatedAtUtc);
+
+/// <summary>An image name within a project, with its tags.</summary>
+public sealed record ContainerRepository(long Id, long ProjectId, string Name, DateTimeOffset CreatedAtUtc, IReadOnlyList<ContainerTag> Tags);
+public sealed record ContainerTag(string Tag, string Digest, string MediaType, long Size, DateTimeOffset UpdatedAtUtc);
+public sealed record ContainerManifest(string Digest, string MediaType, long Size);

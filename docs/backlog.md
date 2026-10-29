@@ -53,6 +53,19 @@ The collaboration depth list from the 2026-10-28 review, taken on as one piece o
 - **Wiki, snippets, time tracking.** Wiki pages in the database with every save kept; snippets as a
   comment with a file; time as an estimate and an attributed ledger.
   [ADR 0023](decisions/0023-wiki-snippets-time.md).
+- **Search.** Code, commits, issues, proposals and wiki within a project; projects, issues and proposals
+  across the server. No index, bounded. [ADR 0024](decisions/0024-search.md).
+- **Forks.** A clone with an address; a proposal from a fork is mirrored into the original and its author
+  may talk about it and nothing else. [ADR 0025](decisions/0025-forks.md).
+- **Large files.** The LFS batch API and basic transfer, objects content-addressed beside the repository.
+  [ADR 0026](decisions/0026-large-files.md).
+- **Package feeds and a container registry.** Generic and NuGet packages, a Docker v2 registry.
+  [ADR 0027](decisions/0027-packages-and-registry.md).
+- **The Git engine beyond the bounded subset.** Repositories kept as bare Git repositories that Git itself
+  opens, the previous layout converted on first open, packs read through their index and written with
+  delta compression, housekeeping that packs everything and prunes nothing, fetch negotiation that sends
+  only what the client lacks, and protocol version 2. SHA-1 only, and no shallow or partial clones, by
+  decision. [ADR 0028](decisions/0028-git-engine.md).
 
 ## Near, and small
 
@@ -76,9 +89,6 @@ markup and the stylesheet disagree and one of them should change.
 administrator-only, because most of what it records is not about a project. A project-scoped view would need
 its own query and a rule about which entries are a project's business.
 
-**Search.** There is no search of code, of issues, or of anything but the public project listing's name and
-description match. Issue search is the one people miss first.
-
 **SSH.** Smart HTTP only. SSH means a host key, an authorized-keys store, a key management interface and a
 second transport to keep correct. It is the most requested thing on this list and the most work.
 
@@ -93,14 +103,9 @@ user-requested candidate rather than a chosen dependency.
 **GraphQL.** GitLab's newer clients increasingly prefer it. Not implemented, and implementing a useful
 subset is a large piece of work with its own schema to keep honest.
 
-**Large file storage.** No LFS. A repository with LFS pointers clones and pushes, and the pointers are
-ordinary text files that resolve to nothing.
-
 **Nested groups and namespaces.** A namespace is an account name. There are no groups, so there is no way to
 own projects collectively or to grant access to a team rather than to people one at a time.
 
-**Forks.** No fork, and therefore no proposal from outside a project's membership. With writing restricted
-to members, this is the mechanism an outside contributor would otherwise use.
 
 ## Known boundaries that are decisions, not gaps
 
@@ -134,6 +139,11 @@ These are recorded so nobody reopens them as oversights. Each has a decision rec
   engine bounded a repository at a few tens of megabytes; raising that bound to 4 GiB on 2026-10-24 removed
   the assumption, and the archive was converted with it.
   [ADR 0018](decisions/0018-repository-capacity.md) supersedes that part of ADR 0017.
+- **SHA-1 repositories only, no shallow or partial clones, no pruning.** The engine keeps Git's format and
+  speaks both protocol versions, and stops there by decision: a SHA-256 repository is a different object
+  format throughout, GitLab 18 does not host one, `deepen` and `filter` are refused by name, and an object
+  nothing points at is kept because a comment may still name its commit.
+  [ADR 0028](decisions/0028-git-engine.md).
 
 ## Operational, still open from the MVP plan
 

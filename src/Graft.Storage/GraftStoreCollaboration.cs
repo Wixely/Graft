@@ -130,7 +130,7 @@ public sealed partial class GraftStore
     }
 
     /// <summary>A confidential issue is for members and its author. Everybody else is told it does not exist.</summary>
-    private static bool MaySeeIssue(IssueRow row, PermissionDecision reader, AuthenticatedIdentity? identity) =>
+    private static bool MaySeeIssue(IssueRowBase row, PermissionDecision reader, AuthenticatedIdentity? identity) =>
         row.Confidential == 0 || reader.Grant == AccessGrant.Member || (identity is not null && identity.UserId == row.AuthorUserId);
 
     private static IssueQueryParameters IssueQuery(long projectId, IssueFilter filter, PermissionDecision reader,
@@ -306,9 +306,27 @@ public sealed partial class GraftStore
         CancellationToken cancellationToken = default) =>
         CreateMergeProposalAsync(actor, projectId, sourceBranch, targetBranch, title, description, null, cancellationToken);
 
+    public Task<MergeProposal> CreateMergeProposalAsync(
+        AuthenticatedIdentity actor,
+        long projectId,
+        string sourceBranch,
+        string targetBranch,
+        string title,
+        string description,
+        ProposalChanges? changes,
+        CancellationToken cancellationToken = default) =>
+        CreateMergeProposalAsync(actor, projectId, null, sourceBranch, targetBranch, title, description, changes, cancellationToken);
+
+    /// <summary>
+    /// Opens a proposal. <paramref name="sourceProjectId"/> names a fork the source branch lives in; then the
+    /// author needs the permission to push on the fork and to read the target, and nothing more. That is
+    /// the one way somebody outside a project's membership writes on it, and it is narrow on purpose: a
+    /// proposal from a fork is a branch of work with a name on it, not an anonymous message.
+    /// </summary>
     public async Task<MergeProposal> CreateMergeProposalAsync(
         AuthenticatedIdentity actor,
         long projectId,
+        long? sourceProjectId,
         string sourceBranch,
         string targetBranch,
         string title,
@@ -319,21 +337,36 @@ public sealed partial class GraftStore
         ArgumentNullException.ThrowIfNull(actor);
         string source = RequireBranch(sourceBranch, nameof(sourceBranch));
         string target = RequireBranch(targetBranch, nameof(targetBranch));
-        if (string.Equals(source, target, StringComparison.Ordinal))
+        if (sourceProjectId is null && string.Equals(source, target, StringComparison.Ordinal))
             throw new ArgumentException("A merge proposal needs two different branches.", nameof(sourceBranch));
+        if (sourceProjectId == projectId) sourceProjectId = null;
         string cleanTitle = RequireTitle(title);
         string cleanDescription = RequireBody(description, nameof(description), allowEmpty: true);
 
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
         await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
-        AuthenticatedIdentity author = await RequireParticipantAsync(db, transaction, actor, projectId, cancellationToken);
+        AuthenticatedIdentity author;
+        if (sourceProjectId is long fork)
+        {
+            ForkRow? relation = await db.QuerySingleOrDefaultAsync<ForkRow>(
+                "SELECT Id, ForkedFromProjectId FROM Projects WHERE Id = @Id AND State = 'ready';", new IdParameters(fork), transaction);
+            if (relation is null || relation.ForkedFromProjectId != projectId)
+                throw new ArgumentException("source_project_id must name a fork of this project.", nameof(sourceProjectId));
+            PermissionDecision push = await DecideAsync(db, transaction, actor, fork, ProjectAction.PushRepository, cancellationToken);
+            if (!push.Allowed) throw new UnauthorizedAccessException("Proposing from a fork needs the permission to push to the fork.");
+            PermissionDecision read = await DecideAsync(db, transaction, actor, projectId, ProjectAction.ReadCollaboration, cancellationToken);
+            if (!read.Allowed) throw new UnauthorizedAccessException(read.Explanation);
+            author = await RequireLiveIdentityAsync(db, transaction, actor, cancellationToken);
+        }
+        else author = await RequireParticipantAsync(db, transaction, actor, projectId, cancellationToken);
 
         // One open proposal per pair of branches. A second would be two conversations about one change, and
         // whichever was merged would silently decide the other.
         long open = await db.QuerySingleAsync<long>("""
             SELECT COUNT(*) FROM MergeRequests
-            WHERE ProjectId = @ProjectId AND SourceBranch = @Source AND TargetBranch = @Target AND State = 'opened';
-            """, new MergeBranchParameters(projectId, source, target), transaction);
+            WHERE ProjectId = @ProjectId AND SourceBranch = @Source AND TargetBranch = @Target AND State = 'opened'
+              AND COALESCE(SourceProjectId, 0) = @SourceProjectId;
+            """, new MergeBranchParameters(projectId, source, target, sourceProjectId ?? 0), transaction);
         if (open != 0)
             throw new CollaborationConflictException("An open merge proposal already exists for these branches.");
 
@@ -341,12 +374,12 @@ public sealed partial class GraftStore
         long iid = await NextNumberAsync(db, transaction, CommentSubject.MergeRequest, projectId);
         long id = await db.QuerySingleAsync<long>("""
             INSERT INTO MergeRequests (ProjectId, Iid, AuthorUserId, Title, Description, SourceBranch, TargetBranch,
-                                       State, CreatedAtUtc, UpdatedAtUtc, Draft)
+                                       State, CreatedAtUtc, UpdatedAtUtc, Draft, SourceProjectId)
             VALUES (@ProjectId, @Iid, @AuthorUserId, @Title, @Description, @SourceBranch, @TargetBranch,
-                    'opened', @CreatedAtUtc, @CreatedAtUtc, @Draft)
+                    'opened', @CreatedAtUtc, @CreatedAtUtc, @Draft, @SourceProjectId)
             RETURNING Id;
             """, new MergeInsertParameters(projectId, iid, author.UserId, cleanTitle, cleanDescription, source, target, now,
-                changes?.Draft == true ? 1 : 0),
+                changes?.Draft == true ? 1 : 0, sourceProjectId),
             transaction);
         if (changes is not null)
             await ApplyPlanningAsync(db, transaction, projectId, CommentSubject.MergeRequest, id, changes.Labels, changes.AddLabels,
@@ -415,6 +448,7 @@ public sealed partial class GraftStore
     private const string MergeSelect = """
         SELECT m.Id, m.ProjectId, m.Iid, m.AuthorUserId, a.Username AS AuthorUsername, m.Title, m.Description,
                m.SourceBranch, m.TargetBranch, m.State, m.MergeCommitSha, g.Username AS MergedByUsername,
+               m.SourceProjectId, sp.Slug AS SourceSlug, su.Username AS SourceNamespace,
                m.CreatedAtUtc, m.UpdatedAtUtc, m.ClosedAtUtc, m.Draft, m.TimeEstimateSeconds,
                (SELECT COALESCE(SUM(t.Seconds), 0) FROM TimeEntries t WHERE t.SubjectType = 'merge_request' AND t.SubjectId = m.Id) AS TimeSpentSeconds,
                m.MilestoneId, ms.Iid AS MilestoneIid, ms.Title AS MilestoneTitle,
@@ -425,6 +459,8 @@ public sealed partial class GraftStore
         JOIN Projects p ON p.Id = m.ProjectId
         LEFT JOIN Users g ON g.Id = m.MergedByUserId
         LEFT JOIN Milestones ms ON ms.Id = m.MilestoneId
+        LEFT JOIN Projects sp ON sp.Id = m.SourceProjectId
+        LEFT JOIN Users su ON su.Id = sp.OwnerUserId
 
         """;
 
@@ -832,8 +868,24 @@ public sealed partial class GraftStore
 
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
         await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
-        AuthenticatedIdentity author = await RequireParticipantAsync(db, transaction, actor, projectId, cancellationToken);
         long subjectId = await ResolveSubjectAsync(db, transaction, projectId, subject, iid);
+        // The author of a proposal from a fork is not a member and may still talk about their own
+        // proposal: a review they cannot answer would be a review they cannot pass. Anybody else needs
+        // membership, as every other write does.
+        AuthenticatedIdentity author;
+        PermissionDecision participate = await DecideAsync(db, transaction, actor, projectId, ProjectAction.WriteCollaboration, cancellationToken);
+        if (participate.Allowed) author = await RequireLiveIdentityAsync(db, transaction, actor, cancellationToken);
+        else
+        {
+            long own = subject == CommentSubject.MergeRequest
+                ? await db.QuerySingleAsync<long>("SELECT COUNT(*) FROM MergeRequests WHERE Id = @Id AND AuthorUserId = @ProjectId AND SourceProjectId IS NOT NULL;",
+                    new ScopedIdParameters(subjectId, actor.UserId), transaction)
+                : 0;
+            if (own == 0) throw new UnauthorizedAccessException(participate.Explanation);
+            PermissionDecision read = await DecideAsync(db, transaction, actor, projectId, ProjectAction.ReadCollaboration, cancellationToken);
+            if (!read.Allowed) throw new UnauthorizedAccessException(read.Explanation);
+            author = await RequireLiveIdentityAsync(db, transaction, actor, cancellationToken);
+        }
         // A member of any role may see a confidential issue, so a participant always may; the check matters
         // for the author rule only in that it cannot be reached by somebody the listing conceals it from.
 
@@ -1248,7 +1300,7 @@ public sealed partial class GraftStore
         return value;
     }
 
-    private static Issue ToIssue(IssueRow row) => new(
+    private static Issue ToIssue(IssueRowBase row) => new(
         row.Id, row.ProjectId, row.Iid, row.AuthorUserId, row.AuthorUsername, row.Title, row.Description,
         ParseState(row.State), Instant(row.CreatedAtUtc), Instant(row.UpdatedAtUtc),
         row.ClosedAtUtc is null ? null : Instant(row.ClosedAtUtc), row.Comments,
@@ -1257,7 +1309,7 @@ public sealed partial class GraftStore
         Confidential: row.Confidential != 0,
         TimeEstimateSeconds: row.TimeEstimateSeconds, TimeSpentSeconds: row.TimeSpentSeconds);
 
-    private static MergeProposal ToProposal(MergeRow row) => new(
+    private static MergeProposal ToProposal(MergeRowBase row) => new(
         row.Id, row.ProjectId, row.Iid, row.AuthorUserId, row.AuthorUsername, row.Title, row.Description,
         row.SourceBranch, row.TargetBranch, ParseState(row.State), row.MergeCommitSha, row.MergedByUsername,
         Instant(row.CreatedAtUtc), Instant(row.UpdatedAtUtc),
@@ -1265,7 +1317,9 @@ public sealed partial class GraftStore
         ApprovalsRequired: (int)row.ApprovalsRequired,
         Milestone: row.MilestoneId is null ? null : new MilestoneReference(row.MilestoneId.Value, row.MilestoneIid ?? 0, row.MilestoneTitle ?? ""),
         Draft: row.Draft != 0,
-        TimeEstimateSeconds: row.TimeEstimateSeconds, TimeSpentSeconds: row.TimeSpentSeconds);
+        TimeEstimateSeconds: row.TimeEstimateSeconds, TimeSpentSeconds: row.TimeSpentSeconds,
+        SourceProjectId: row.SourceProjectId,
+        SourceProjectPath: row.SourceProjectId is null ? null : row.SourceNamespace + "/" + row.SourceSlug);
 }
 
 /// <summary>The issue, proposal or comment named does not exist in this project.</summary>
@@ -1277,7 +1331,7 @@ public sealed class CollaborationConflictException(string message) : Exception(m
 internal sealed record IssueInsertParameters(long ProjectId, long Iid, long AuthorUserId, string Title,
     string Description, string CreatedAtUtc, string? DueDate, int Confidential);
 internal sealed record MergeInsertParameters(long ProjectId, long Iid, long AuthorUserId, string Title,
-    string Description, string SourceBranch, string TargetBranch, string CreatedAtUtc, int Draft);
+    string Description, string SourceBranch, string TargetBranch, string CreatedAtUtc, int Draft, long? SourceProjectId);
 internal sealed record IssueUpdateParameters(long Id, string? Title, string? Description, string State, string Now,
     int SetDueDate, string? DueDate, int? Confidential);
 internal sealed record MergeUpdateParameters(long Id, string? Title, string? Description, string State, string Now, int? Draft);
@@ -1287,7 +1341,8 @@ internal sealed record IssueQueryParameters(long ProjectId, string? State, int A
 internal sealed record MergeQueryParameters(long ProjectId, string? State, int AnyState, string Labels, int LabelCount,
     int MilestoneMode, long MilestoneIid, int PersonMode, string Person, string PersonKind, string? Search, int Take, int Skip);
 internal sealed record MergeRecordParameters(long ProjectId, long Iid, string Sha, long UserId, string Now);
-internal sealed record MergeBranchParameters(long ProjectId, string Source, string Target);
+internal sealed record MergeBranchParameters(long ProjectId, string Source, string Target, long SourceProjectId);
+internal sealed class ForkRow { public long Id { get; set; } public long? ForkedFromProjectId { get; set; } }
 internal sealed record CollaborationItemParameters(long ProjectId, long Iid);
 internal sealed record CollaborationListParameters(long ProjectId, string? State, int AnyState, int Take, int Skip);
 internal sealed record CommentInsertParameters(long ProjectId, string SubjectType, long SubjectId, long AuthorUserId,
@@ -1338,7 +1393,9 @@ internal sealed class CommentHomeRow
 
 internal sealed class SubjectRow { public long Id { get; set; } }
 
-internal sealed class IssueRow
+internal sealed class IssueRow : IssueRowBase { }
+
+internal class IssueRowBase
 {
     public long Id { get; set; }
     public long ProjectId { get; set; }
@@ -1361,8 +1418,13 @@ internal sealed class IssueRow
     public long TimeSpentSeconds { get; set; }
 }
 
-internal sealed class MergeRow
+internal sealed class MergeRow : MergeRowBase { }
+
+internal class MergeRowBase
 {
+    public long? SourceProjectId { get; set; }
+    public string? SourceSlug { get; set; }
+    public string? SourceNamespace { get; set; }
     public long Id { get; set; }
     public long ProjectId { get; set; }
     public long Iid { get; set; }
