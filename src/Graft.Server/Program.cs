@@ -187,11 +187,15 @@ app.Use(async (context, next) =>
         context.Request.Path.Value?.EndsWith(".git/git-upload-pack", StringComparison.Ordinal) == true;
     bool archiveDownload = context.Request.Path.StartsWithSegments("/api") &&
         context.Request.Path.Value!.Contains("/archive", StringComparison.Ordinal);
-    if (context.Request.Path.Value?.EndsWith(".git/git-receive-pack", StringComparison.Ordinal) == true)
+    bool largeFile = context.Request.Path.Value?.Contains(".git/info/lfs/objects/", StringComparison.Ordinal) == true ||
+        context.Request.Path.StartsWithSegments("/v2") ||
+        (context.Request.Path.Value?.Contains("/packages/", StringComparison.Ordinal) == true && context.Request.Method is "PUT" or "POST");
+    if (context.Request.Path.Value?.EndsWith(".git/git-receive-pack", StringComparison.Ordinal) == true || largeFile)
     {
         IHttpMaxRequestBodySizeFeature? bodySize = context.Features.Get<IHttpMaxRequestBodySizeFeature>();
         if (bodySize is { IsReadOnly: false }) bodySize.MaxRequestBodySize = Limits.RequestBytes;
     }
+    gitTransfer |= largeFile;
     if (uploading)
     {
         IHttpMaxRequestBodySizeFeature? bodySize = context.Features.Get<IHttpMaxRequestBodySizeFeature>();
@@ -1502,6 +1506,7 @@ app.MapGet("/api/v4/projects/{projectId}/repository/files/{filePath}/raw", async
     {
         GitFile? file = RepositoryView.File(repository, revision, filePath);
         if (file is null) { await ApiError(context, 404, "404 File Not Found"); return; }
+        if (await WriteLargeFile(context, project.Details.Project, file)) return;
         await WriteDownload(context, file.Content, Path.GetFileName(file.Path), "application/octet-stream");
     });
 });
@@ -1529,9 +1534,31 @@ app.MapGet("/api/projects/{projectId:long}/raw/{**filePath}", async context =>
     {
         GitFile? file = RepositoryView.File(repository, revision, filePath);
         if (file is null) { await ApiError(context, 404, "404 File Not Found"); return; }
+        if (await WriteLargeFile(context, scope.Value.Details.Project, file)) return;
         await WriteDownload(context, file.Content, Path.GetFileName(file.Path), "application/octet-stream");
     });
 });
+
+// A pointer in the tree stands for a large file kept beside the repository. The raw routes serve the file
+// it stands for when the repository holds it, which is what a reader following "download" expects, and the
+// pointer itself otherwise, which is at least the truth about what is there.
+async Task<bool> WriteLargeFile(HttpContext context, ProjectInfo project, GitFile file)
+{
+    LfsPointer? pointer = LfsPointer.TryParse(file.Content);
+    if (pointer is null) return false;
+    LargeFileStore large = new(Path.Combine(settings.Repositories, project.StorageId));
+    long? size = large.Size(pointer.Oid);
+    if (size is null) return false;
+    context.Response.ContentType = "application/octet-stream";
+    context.Response.Headers.XContentTypeOptions = "nosniff";
+    string safe = new([.. Path.GetFileName(file.Path).Where(character => char.IsAsciiLetterOrDigit(character) || character is '.' or '-' or '_')]);
+    context.Response.Headers.ContentDisposition = "attachment; filename=\"" + (safe.Length is 0 or > 100 ? "download" : safe) + "\"";
+    context.Response.Headers["X-Graft-Lfs-Oid"] = pointer.Oid;
+    context.Response.ContentLength = size;
+    using Stream content = large.OpenRead(pointer.Oid);
+    await content.CopyToAsync(context.Response.Body, context.RequestAborted);
+    return true;
+}
 
 // One route per extension rather than one with the extension as a parameter. A parameter inside a segment
 // matches by backtracking over a literal, which is exactly the kind of route that works in testing and
@@ -2249,7 +2276,74 @@ async Task<MergeRequestResponse> MergeResponseFor(HttpContext context, ProjectDe
         await PeopleFor(context, proposal.Assignees),
         await PeopleFor(context, proposal.Reviewers),
         proposal.Draft,
-        TimeStatsFor(proposal.TimeEstimateSeconds, proposal.TimeSpentSeconds));
+        TimeStatsFor(proposal.TimeEstimateSeconds, proposal.TimeSpentSeconds),
+        SourceProjectId: proposal.SourceProjectId ?? proposal.ProjectId,
+        SourceProjectPath: proposal.SourceProjectPath);
+}
+
+/// <summary>
+/// Brings a fork's branch tip into the target repository before the engine looks at it, so the proposal
+/// reads as the fork's branch stands now. A proposal from the project's own branch needs nothing. The
+/// fork's gate is taken first and released before the target's, so two gates are never held at once.
+/// </summary>
+async Task EnsureSource(HttpContext context, ProjectDetails project, MergeProposal proposal)
+{
+    if (!proposal.FromFork || proposal.State != CollaborationState.Opened) return;
+    ProjectDetails? fork = await store.GetReadyProjectAsync(proposal.SourceProjectId!.Value, context.RequestAborted);
+    if (fork is null) return;
+    RepositoryEndpoint source = EndpointFor(fork.Project);
+    Repository from;
+    string? tip;
+    await source.Gate.WaitAsync(context.RequestAborted);
+    try { from = source.Repository; tip = from.Refs.GetValueOrDefault("refs/heads/" + proposal.SourceBranch); }
+    finally { source.Gate.Release(); }
+    RepositoryEndpoint target = EndpointFor(project.Project);
+    await target.Gate.WaitAsync(context.RequestAborted);
+    try
+    {
+        if (tip is null) target.Repository.DropServerRef(proposal.SourceReference, context.RequestAborted);
+        else target.Repository.Mirror(from, tip, proposal.SourceReference, context.RequestAborted);
+    }
+    catch (GitInputException) { }
+    finally { target.Gate.Release(); }
+}
+
+async Task ForkProject(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required to fork"); return; }
+    try
+    {
+        ProjectInfo fork = await store.ForkProjectAsync(identity, project.Project.Id, async (upstream, created, cancellationToken) =>
+        {
+            RepositoryEndpoint source = EndpointFor(upstream);
+            await source.Gate.WaitAsync(cancellationToken);
+            try
+            {
+                DurableRepositoryStorage.Copy(Path.Combine(settings.Repositories, upstream.StorageId),
+                    Path.Combine(settings.Repositories, created.StorageId), cancellationToken);
+            }
+            finally { source.Gate.Release(); }
+        }, context.RequestAborted);
+        ProjectDetails details = (await store.GetReadyProjectAsync(fork.Id, context.RequestAborted))!;
+        context.Response.StatusCode = StatusCodes.Status201Created;
+        await context.Response.WriteAsJsonAsync(await ProjectResponseFor(context, details), ApiJson.Default.ProjectResponse, null, context.RequestAborted);
+    }
+    catch (CollaborationConflictException error) { await ApiError(context, 409, error.Message); }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "404 Project Not Found"); }
+    catch (IOException error) { await ApiError(context, 409, "the fork could not be created: " + error.Message); }
+}
+
+async Task ListForks(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (!await OnlyQuery(context, "page", "per_page")) return;
+    try
+    {
+        IReadOnlyList<ProjectDetails> forks = await store.ListForksAsync(identity, project.Project.Id, settings.PublicBrowsing, context.RequestAborted);
+        List<ProjectResponse> response = [];
+        foreach (ProjectDetails fork in forks) response.Add(await ProjectResponseFor(context, fork));
+        await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.ProjectResponseArray, null, context.RequestAborted);
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "404 Project Not Found"); }
 }
 
 // `tip` is the source branch as it stands now. A comment anchored to any other commit is outdated: the
@@ -2272,9 +2366,10 @@ async Task<string?> SourceTip(HttpContext context, ProjectDetails project, Authe
 {
     MergeProposal? proposal = await store.FindMergeProposalAsync(identity, project.Project.Id, iid, null, context.RequestAborted);
     if (proposal is null) return null;
+    await EnsureSource(context, project, proposal);
     RepositoryEndpoint endpoint = EndpointFor(project.Project);
     await endpoint.Gate.WaitAsync(context.RequestAborted);
-    try { return endpoint.Repository.Refs.GetValueOrDefault("refs/heads/" + proposal.SourceBranch); }
+    try { return endpoint.Repository.Refs.GetValueOrDefault(proposal.FromFork ? proposal.SourceReference : "refs/heads/" + proposal.SourceBranch); }
     finally { endpoint.Gate.Release(); }
 }
 
@@ -2282,9 +2377,10 @@ async Task<string?> SourceTip(HttpContext context, ProjectDetails project, Authe
 // every other read of it, because a merge analysis reads the whole object graph.
 async Task<MergeAnalysis> AnalyseProposal(HttpContext context, ProjectDetails project, MergeProposal proposal)
 {
+    await EnsureSource(context, project, proposal);
     RepositoryEndpoint endpoint = EndpointFor(project.Project);
     await endpoint.Gate.WaitAsync(context.RequestAborted);
-    try { return RepositoryMerge.Analyse(endpoint.Repository, proposal.SourceBranch, proposal.TargetBranch, context.RequestAborted); }
+    try { return RepositoryMerge.Analyse(endpoint.Repository, proposal.SourceReference, proposal.TargetBranch, context.RequestAborted); }
     finally { endpoint.Gate.Release(); }
 }
 
@@ -2505,13 +2601,28 @@ async Task CreateMergeRequest(HttpContext context, ProjectDetails project, Authe
 
     // Both branches must exist before the proposal does. A proposal naming a branch that was never there
     // is a typo rather than a plan, and catching it here is the difference between an error at the moment
-    // of the mistake and a proposal that can never be merged for reasons nobody can see.
+    // of the mistake and a proposal that can never be merged for reasons nobody can see. The source branch
+    // lives in the fork when one is named.
+    long? sourceProjectId = request.SourceProjectId is long given && given != project.Project.Id ? given : null;
+    ProjectDetails? sourceProject = project;
+    if (sourceProjectId is long forkId)
+    {
+        sourceProject = await store.GetReadyProjectAsync(forkId, context.RequestAborted);
+        if (sourceProject is null || !(await DecideFor(context, identity, forkId, ProjectAction.BrowseRepository)).Allowed)
+        { await ApiError(context, 400, "source_project_id does not name a project you can read"); return; }
+    }
+    RepositoryEndpoint sourceEndpoint = EndpointFor(sourceProject!.Project);
+    await sourceEndpoint.Gate.WaitAsync(context.RequestAborted);
+    try
+    {
+        if (!sourceEndpoint.Repository.Refs.ContainsKey("refs/heads/" + request.SourceBranch))
+        { await ApiError(context, 400, "source_branch does not exist"); return; }
+    }
+    finally { sourceEndpoint.Gate.Release(); }
     RepositoryEndpoint endpoint = EndpointFor(project.Project);
     await endpoint.Gate.WaitAsync(context.RequestAborted);
     try
     {
-        if (!endpoint.Repository.Refs.ContainsKey("refs/heads/" + request.SourceBranch))
-        { await ApiError(context, 400, "source_branch does not exist"); return; }
         if (!endpoint.Repository.Refs.ContainsKey("refs/heads/" + request.TargetBranch))
         { await ApiError(context, 400, "target_branch does not exist"); return; }
     }
@@ -2521,9 +2632,10 @@ async Task CreateMergeRequest(HttpContext context, ProjectDetails project, Authe
         request.AssigneeUsernames, request.ReviewerUsernames, request.Draft);
     try
     {
-        MergeProposal proposal = await store.CreateMergeProposalAsync(identity, project.Project.Id,
+        MergeProposal proposal = await store.CreateMergeProposalAsync(identity, project.Project.Id, sourceProjectId,
             request.SourceBranch, request.TargetBranch, request.Title, request.Description ?? "",
             changes.Any ? changes : null, context.RequestAborted);
+        await EnsureSource(context, project, proposal);
         await Notify(context, project.Project, WebhookEvent.MergeRequest, payload =>
         {
             payload["action"] = "opened";
@@ -2581,6 +2693,7 @@ async Task MergeRequestChanges(HttpContext context, ProjectDetails project, Auth
     if (!await OnlyQuery(context)) return;
     MergeProposal? proposal = await store.FindMergeProposalAsync(identity, project.Project.Id, Number(context), null, context.RequestAborted);
     if (proposal is null) { await ApiError(context, 404, "404 Merge Request Not Found"); return; }
+    await EnsureSource(context, project, proposal);
 
     RepositoryEndpoint endpoint = EndpointFor(project.Project);
     await endpoint.Gate.WaitAsync(context.RequestAborted);
@@ -2589,7 +2702,7 @@ async Task MergeRequestChanges(HttpContext context, ProjectDetails project, Auth
     bool truncated = false;
     try
     {
-        analysis = RepositoryMerge.Analyse(endpoint.Repository, proposal.SourceBranch, proposal.TargetBranch, context.RequestAborted);
+        analysis = RepositoryMerge.Analyse(endpoint.Repository, proposal.SourceReference, proposal.TargetBranch, context.RequestAborted);
         // Measured from where the branches last agreed, which is what review wants: the source's own
         // changes, not everything the target has gained since. For a merged proposal the branches have
         // converged and the base is the source itself, so this correctly shows nothing.
@@ -2646,6 +2759,7 @@ async Task AcceptMergeRequest(HttpContext context, ProjectDetails project, Authe
     if (proposal is null) { await ApiError(context, 404, "404 Merge Request Not Found"); return; }
     if (proposal.State != CollaborationState.Opened)
     { await ApiError(context, 409, "the proposal is not open"); return; }
+    await EnsureSource(context, project, proposal);
 
     // A draft is the author saying it is not ready. The branches may well merge; the person did not ask.
     if (proposal.Draft) { await ApiError(context, 409, "this proposal is marked as a draft; mark it ready before merging"); return; }
@@ -2680,7 +2794,7 @@ async Task AcceptMergeRequest(HttpContext context, ProjectDetails project, Authe
     bool sourceRemoved = false;
     try
     {
-        MergeAnalysis analysis = RepositoryMerge.Analyse(endpoint.Repository, proposal.SourceBranch,
+        MergeAnalysis analysis = RepositoryMerge.Analyse(endpoint.Repository, proposal.SourceReference,
             proposal.TargetBranch, context.RequestAborted);
         if (!analysis.CanMerge)
         {
@@ -2704,13 +2818,13 @@ async Task AcceptMergeRequest(HttpContext context, ProjectDetails project, Authe
             }
         }
         outcome = squash
-            ? RepositoryMerge.Squash(endpoint.Repository, proposal.SourceBranch, proposal.TargetBranch, author, message, context.RequestAborted)
-            : RepositoryMerge.Merge(endpoint.Repository, proposal.SourceBranch, proposal.TargetBranch, author, message, context.RequestAborted);
+            ? RepositoryMerge.Squash(endpoint.Repository, proposal.SourceReference, proposal.TargetBranch, author, message, context.RequestAborted)
+            : RepositoryMerge.Merge(endpoint.Repository, proposal.SourceReference, proposal.TargetBranch, author, message, context.RequestAborted);
 
         // Inside the same lock as the merge, so nothing can push to the source branch between the two and
         // have that push silently removed. Refused only when the source is the branch the project opens
         // at, which is not an error worth failing a completed merge over.
-        if (removeSource)
+        if (removeSource && !proposal.FromFork)
         {
             try
             {
@@ -3068,13 +3182,14 @@ static List<string> MissingOwnerApprovals(IReadOnlyList<CodeOwnerResponse> owner
 /// </summary>
 async Task<MergeRequestResponse> FullMergeResponse(HttpContext context, ProjectDetails project, MergeProposal proposal)
 {
+    await EnsureSource(context, project, proposal);
     RepositoryEndpoint endpoint = EndpointFor(project.Project);
     MergeAnalysis analysis;
     List<CodeOwnerResponse> owners = [];
     await endpoint.Gate.WaitAsync(context.RequestAborted);
     try
     {
-        analysis = RepositoryMerge.Analyse(endpoint.Repository, proposal.SourceBranch, proposal.TargetBranch, context.RequestAborted);
+        analysis = RepositoryMerge.Analyse(endpoint.Repository, proposal.SourceReference, proposal.TargetBranch, context.RequestAborted);
         if (analysis.SourceCommitId is not null && proposal.State == CollaborationState.Opened)
         {
             try
@@ -3109,6 +3224,7 @@ async Task RebaseMergeRequest(HttpContext context, ProjectDetails project, Authe
     MergeProposal? proposal = await store.FindMergeProposalAsync(identity, project.Project.Id, Number(context), null, context.RequestAborted);
     if (proposal is null) { await ApiError(context, 404, "404 Merge Request Not Found"); return; }
     if (proposal.State != CollaborationState.Opened) { await ApiError(context, 409, "the proposal is not open"); return; }
+    if (proposal.FromFork) { await ApiError(context, 409, "a proposal from a fork is rebased in the fork, by its author"); return; }
 
     GitIdentity committer = new(identity.Username, identity.Username + "@" + MergeAuthorHost, DateTimeOffset.UtcNow);
     RepositoryEndpoint endpoint = EndpointFor(project.Project);
@@ -3816,6 +3932,148 @@ async Task DeleteReleaseAsset(HttpContext context, ProjectDetails project, Authe
 }
 
 // ---------------------------------------------------------------------------------------------------
+// Search. One scope per request. A project search reads the project; a global search reads whatever the
+// caller may see, which for a stranger is what the operator publishes and for a member is their projects.
+// Nothing here is indexed: a search reads what is there, bounded, and says when it stopped early.
+// ---------------------------------------------------------------------------------------------------
+
+const int SearchLimit = 50;
+
+static bool TryReadSearch(HttpContext context, string[] scopes, out string scope, out string search, out string error)
+{
+    scope = context.Request.Query["scope"].ToString();
+    search = context.Request.Query["search"].ToString().Trim();
+    error = "";
+    if (!scopes.Contains(scope, StringComparer.Ordinal)) { error = "scope must be one of " + string.Join(", ", scopes); return false; }
+    if (search.Length is 0 or > 200) { error = "search is required and at most 200 characters"; return false; }
+    return true;
+}
+
+async Task ProjectSearch(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (!await OnlyQuery(context, "scope", "search", "ref")) return;
+    if (!TryReadSearch(context, ["issues", "merge_requests", "blobs", "wiki_blobs", "commits"], out string scope, out string search, out string error))
+    { await ApiError(context, 400, error); return; }
+    string revision = context.Request.Query["ref"].ToString() is { Length: > 0 } wanted ? wanted : "HEAD";
+
+    List<IssueResponse> issues = [];
+    List<MergeRequestResponse> proposals = [];
+    List<BlobSearchResponse> blobs = [];
+    List<WikiPageResponse> wiki = [];
+    List<CommitResponse> commits = [];
+    try
+    {
+        switch (scope)
+        {
+            case "issues":
+                foreach (Issue issue in (await store.ListIssuesAsync(identity, project.Project.Id, new IssueFilter(Search: search), 0, SearchLimit, context.RequestAborted)).Issues)
+                    issues.Add(await IssueResponseFor(context, project, issue));
+                break;
+            case "merge_requests":
+                foreach (MergeProposal proposal in (await store.ListMergeProposalsAsync(identity, project.Project.Id, new MergeFilter(Search: search), 0, SearchLimit, context.RequestAborted)).Proposals)
+                    proposals.Add(await MergeResponseFor(context, project, proposal, null));
+                break;
+            case "wiki_blobs":
+                foreach (WikiPage page in await store.SearchWikiAsync(identity, project.Project.Id, search, SearchLimit, context.RequestAborted))
+                    wiki.Add(WikiResponseFor(context, project, page, false));
+                break;
+            case "blobs":
+            case "commits":
+                // Repository content needs the repository grant, which a reader with only the conversation
+                // grant does not hold; the two are the same for every caller today, and checked separately
+                // so they stay separate.
+                PermissionDecision browse = await DecideFor(context, identity, project.Project.Id, ProjectAction.BrowseRepository);
+                if (!browse.Allowed) { await ApiError(context, 404, "project"); return; }
+                RepositoryEndpoint endpoint = EndpointFor(project.Project);
+                await endpoint.Gate.WaitAsync(context.RequestAborted);
+                try
+                {
+                    if (scope == "blobs")
+                    {
+                        string? commitId = RepositoryView.ResolveCommit(endpoint.Repository, revision);
+                        foreach (BlobMatch match in RepositorySearch.Blobs(endpoint.Repository, revision, search, SearchLimit, context.RequestAborted))
+                            blobs.Add(new(Path.GetFileName(match.Path), match.Text, match.Path, match.Path, match.BlobId, commitId ?? revision,
+                                match.Line, project.Project.Id,
+                                ProjectWebUrl(context, project) + "?ref=" + Uri.EscapeDataString(revision) + "&file=" + Uri.EscapeDataString(match.Path)));
+                    }
+                    else
+                        foreach (GitCommit commit in RepositorySearch.Commits(endpoint.Repository, revision, search, SearchLimit, context.RequestAborted))
+                            commits.Add(CommitResponseFor(context, project, commit));
+                }
+                finally { endpoint.Gate.Release(); }
+                break;
+        }
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "project"); return; }
+    catch (GitInputException error2) { await ApiError(context, 400, "search refused: " + error2.Message); return; }
+    int count = issues.Count + proposals.Count + blobs.Count + wiki.Count + commits.Count;
+    await context.Response.WriteAsJsonAsync(new SearchResponse(scope, search, count, count >= SearchLimit, [], issues, proposals, blobs, wiki, commits),
+        ApiJson.Default.SearchResponse, null, context.RequestAborted);
+}
+
+async Task GlobalSearch(HttpContext context, AuthenticatedIdentity? identity)
+{
+    if (!await OnlyQuery(context, "scope", "search")) return;
+    if (!TryReadSearch(context, ["projects", "issues", "merge_requests"], out string scope, out string search, out string error))
+    { await ApiError(context, 400, error); return; }
+    if (identity is null && !settings.PublicBrowsing) { await ApiError(context, 401, "authentication is required to search"); return; }
+    bool includePublic = settings.PublicBrowsing;
+
+    List<ProjectResponse> projects = [];
+    List<IssueResponse> issues = [];
+    List<MergeRequestResponse> proposals = [];
+    switch (scope)
+    {
+        case "projects":
+            foreach (ProjectDetails project in await store.SearchProjectsAsync(identity, search, includePublic, SearchLimit, context.RequestAborted))
+                projects.Add(await ProjectResponseFor(context, project));
+            break;
+        case "issues":
+            foreach (IssueHit hit in await store.SearchIssuesAsync(identity, search, includePublic, SearchLimit, context.RequestAborted))
+            {
+                ProjectDetails? project = await store.GetReadyProjectAsync(hit.Issue.ProjectId, context.RequestAborted);
+                if (project is not null) issues.Add(await IssueResponseFor(context, project, hit.Issue));
+            }
+            break;
+        case "merge_requests":
+            foreach (ProposalHit hit in await store.SearchMergeProposalsAsync(identity, search, includePublic, SearchLimit, context.RequestAborted))
+            {
+                ProjectDetails? project = await store.GetReadyProjectAsync(hit.Proposal.ProjectId, context.RequestAborted);
+                if (project is not null) proposals.Add(await MergeResponseFor(context, project, hit.Proposal, null));
+            }
+            break;
+    }
+    int count = projects.Count + issues.Count + proposals.Count;
+    await context.Response.WriteAsJsonAsync(new SearchResponse(scope, search, count, count >= SearchLimit, projects, issues, proposals, [], [], []),
+        ApiJson.Default.SearchResponse, null, context.RequestAborted);
+}
+
+app.MapGet("/api/search", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: false);
+    await GlobalSearch(context, browser?.Identity);
+});
+
+app.MapGet("/api/v4/search", async context =>
+{
+    (bool failed, AuthenticatedIdentity? identity) = await AuthenticateApiOptional(context);
+    if (failed) return;
+    await GlobalSearch(context, identity);
+});
+
+app.MapGet("/api/projects/{projectId:long}/search", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: false);
+    if (scope is not null) await ProjectSearch(context, scope.Value.Details, scope.Value.Identity);
+});
+
+app.MapGet("/api/v4/projects/{projectId}/search", async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is not null) await ProjectSearch(context, scope.Value.Details, scope.Value.Identity);
+});
+
+// ---------------------------------------------------------------------------------------------------
 // Wiki, snippets and time tracking.
 // ---------------------------------------------------------------------------------------------------
 
@@ -4075,6 +4333,593 @@ async Task ListTime(HttpContext context, ProjectDetails project, AuthenticatedId
     }
     catch (CollaborationNotFoundException error) { await ApiError(context, 404, error.Message); }
 }
+
+// ---------------------------------------------------------------------------------------------------
+// Package feeds and the container registry. Bytes live beside the repository; the store keeps what a
+// listing needs. Reading follows the repository, publishing needs a push. Package clients authenticate in
+// their own ways, so every way a token can arrive is accepted here.
+// ---------------------------------------------------------------------------------------------------
+
+async Task<AuthenticatedIdentity?> AuthenticateAnyToken(HttpContext context)
+{
+    string token = context.Request.Headers["PRIVATE-TOKEN"].ToString();
+    if (token.Length == 0) token = context.Request.Headers["X-NuGet-ApiKey"].ToString();
+    string authorization = context.Request.Headers.Authorization.ToString();
+    if (token.Length == 0 && authorization.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)) token = authorization[7..];
+    if (token.Length > 0) return await store.ResolveTokenAsync(token, context.RequestAborted);
+    return await Authenticate(context);
+}
+
+/// <summary>Resolves the project a package route names and decides the action, challenging with Basic when
+/// nobody is identified, because NuGet and Docker send credentials only once asked.</summary>
+async Task<(ProjectDetails Details, AuthenticatedIdentity? Identity)?> PackageProject(HttpContext context, ProjectAction action, string realm)
+{
+    AuthenticatedIdentity? identity = await AuthenticateAnyToken(context);
+    string identifier = context.Request.RouteValues["projectId"]?.ToString() ?? "";
+    try { identifier = Uri.UnescapeDataString(identifier); } catch (UriFormatException) { identifier = ""; }
+    ProjectDetails? details;
+    if (long.TryParse(identifier, out long id)) details = await store.GetReadyProjectAsync(id, context.RequestAborted);
+    else
+    {
+        string[] path = identifier.Split('/');
+        details = path.Length switch
+        {
+            2 => await store.FindReadyProjectDetailsAsync(path[0], path[1], context.RequestAborted),
+            1 => await store.FindReadyProjectDetailsByGlobalSlugAsync(path[0], context.RequestAborted),
+            _ => null
+        };
+    }
+    PermissionDecision? decision = details is null ? null : await DecideFor(context, identity, details.Project.Id, action);
+    if (decision is { Allowed: true }) return (details!, identity);
+    if (identity is null)
+    {
+        context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+        context.Response.Headers.WWWAuthenticate = "Basic realm=\"" + realm + "\", charset=\"UTF-8\"";
+        return null;
+    }
+    await ApiError(context, details is null || action is ProjectAction.BrowseRepository or ProjectAction.FetchRepository ? 404 : 403,
+        details is null ? "404 Project Not Found" : decision!.Explanation);
+    return null;
+}
+
+ProjectFiles FilesOf(ProjectInfo project) => new(Path.Combine(settings.Repositories, project.StorageId));
+
+PackageResponse PackageResponseFor(HttpContext context, ProjectDetails project, Package package)
+{
+    string api = Origin(context) + "/api/v4/projects/" + project.Project.Id.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/packages/";
+    return new(package.Id, package.Name, package.Version, package.PackageType, package.Description, package.Authors, package.CreatedByUsername,
+        package.CreatedAtUtc, package.UpdatedAtUtc, ProjectWebUrl(context, project) + "/-/packages",
+        [.. package.Files.Select(file => new PackageFileResponse(file.Id, file.FileName, file.Size, file.Sha256, file.CreatedAtUtc,
+            package.PackageType == "nuget"
+                ? api + "nuget/download/" + Uri.EscapeDataString(package.Name.ToLowerInvariant()) + "/" + Uri.EscapeDataString(package.Version.ToLowerInvariant()) + "/" + Uri.EscapeDataString(file.FileName)
+                : api + "generic/" + Uri.EscapeDataString(package.Name) + "/" + Uri.EscapeDataString(package.Version) + "/" + Uri.EscapeDataString(file.FileName)))]);
+}
+
+async Task ListPackages(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (!await OnlyQuery(context, "page", "per_page", "package_type", "package_name", "order_by", "sort")) return;
+    string type = context.Request.Query["package_type"].ToString();
+    if (type is not ("" or "generic" or "nuget")) { await ApiError(context, 400, "package_type must be generic or nuget"); return; }
+    IReadOnlyList<Package> packages = await store.ListPackagesAsync(identity, project.Project.Id, type.Length == 0 ? null : type,
+        Optional(context, "package_name"), context.RequestAborted);
+    await context.Response.WriteAsJsonAsync([.. packages.Select(package => PackageResponseFor(context, project, package))], ApiJson.Default.PackageResponseArray, null, context.RequestAborted);
+}
+
+async Task ReadPackage(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    long packageId = Convert.ToInt64(context.Request.RouteValues["packageId"], System.Globalization.CultureInfo.InvariantCulture);
+    Package? package = await store.FindPackageAsync(identity, project.Project.Id, packageId, context.RequestAborted);
+    if (package is null) { await ApiError(context, 404, "404 Package Not Found"); return; }
+    await context.Response.WriteAsJsonAsync(PackageResponseFor(context, project, package), ApiJson.Default.PackageResponse, null, context.RequestAborted);
+}
+
+async Task DeletePackage(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    long packageId = Convert.ToInt64(context.Request.RouteValues["packageId"], System.Globalization.CultureInfo.InvariantCulture);
+    try
+    {
+        Package package = await store.DeletePackageAsync(identity, project.Project.Id, packageId, context.RequestAborted);
+        FilesOf(project.Project).DeletePackageDirectory(package.PackageType, package.Name, package.Version);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Package Not Found"); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+}
+
+async Task DownloadPackageFile(HttpContext context, ProjectDetails project, Package package, string fileName)
+{
+    PackageFile? file = package.Files.FirstOrDefault(candidate => string.Equals(candidate.FileName, fileName, StringComparison.OrdinalIgnoreCase));
+    string path = file is null ? "" : FilesOf(project.Project).PackagePath(package.PackageType, package.Name, package.Version, file.FileName);
+    if (file is null || !File.Exists(path)) { await ApiError(context, 404, "404 File Not Found"); return; }
+    context.Response.ContentType = "application/octet-stream";
+    context.Response.Headers.XContentTypeOptions = "nosniff";
+    context.Response.Headers.ContentDisposition = "attachment; filename=\"" + new string([.. file.FileName.Where(c => char.IsAsciiLetterOrDigit(c) || c is '.' or '-' or '_')]) + "\"";
+    context.Response.Headers.ETag = "\"" + file.Sha256 + "\"";
+    using FileStream content = new(path, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, FileOptions.Asynchronous);
+    context.Response.ContentLength = content.Length;
+    await content.CopyToAsync(context.Response.Body, context.RequestAborted);
+}
+
+// Generic packages: PUT a file under a name and a version, GET it back. GitLab's own routes.
+async Task PutGenericPackage(HttpContext context, ProjectDetails project, AuthenticatedIdentity identity)
+{
+    string name = Uri.UnescapeDataString(context.Request.RouteValues["name"]?.ToString() ?? "");
+    string version = Uri.UnescapeDataString(context.Request.RouteValues["version"]?.ToString() ?? "");
+    string fileName = Uri.UnescapeDataString(context.Request.RouteValues["fileName"]?.ToString() ?? "");
+    if (context.Request.ContentLength > ProjectFiles.MaximumPackageBytes) { await ApiError(context, 413, "the file exceeds the 2 GiB package limit"); return; }
+    ProjectFiles files = FilesOf(project.Project);
+    string destination;
+    try { destination = files.PackagePath("generic", name, version, fileName); }
+    catch (ArgumentException) { await ApiError(context, 400, "package path"); return; }
+    if (name.Contains("..", StringComparison.Ordinal) || version.Contains('/') || fileName.Contains('/') || fileName.Contains('\\') || fileName.StartsWith('.'))
+    { await ApiError(context, 400, "package name, version and file name are not paths"); return; }
+    (string sha, long size) = await files.WriteAsync(destination, context.Request.Body, ProjectFiles.MaximumPackageBytes, context.RequestAborted);
+    try
+    {
+        await store.PutPackageFileAsync(identity, project.Project.Id, "generic", name, version, fileName, size, sha, cancellationToken: context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status201Created;
+        await context.Response.WriteAsJsonAsync(new ErrorResponse("201 Created"), ApiJson.Default.ErrorResponse, null, context.RequestAborted);
+    }
+    catch (UnauthorizedAccessException error) { File.Delete(destination); await ApiError(context, 403, error.Message); }
+    catch (ArgumentException error) { File.Delete(destination); await ApiError(context, 400, error.Message); }
+}
+
+async Task GetGenericPackage(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    string name = Uri.UnescapeDataString(context.Request.RouteValues["name"]?.ToString() ?? "");
+    string version = Uri.UnescapeDataString(context.Request.RouteValues["version"]?.ToString() ?? "");
+    string fileName = Uri.UnescapeDataString(context.Request.RouteValues["fileName"]?.ToString() ?? "");
+    Package? package = await store.FindPackageAsync(identity, project.Project.Id, "generic", name, version, context.RequestAborted);
+    if (package is null) { await ApiError(context, 404, "404 Package Not Found"); return; }
+    await DownloadPackageFile(context, project, package, fileName);
+}
+
+// NuGet v3: a service index naming four resources, all served here.
+string NuGetBase(HttpContext context, ProjectDetails project) =>
+    Origin(context) + "/api/v4/projects/" + project.Project.Id.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/packages/nuget";
+
+async Task NuGetIndex(HttpContext context, ProjectDetails project)
+{
+    string root = NuGetBase(context, project);
+    await context.Response.WriteAsJsonAsync(new NuGetServiceIndex("3.0.0",
+    [
+        new(root, "PackagePublish/2.0.0"),
+        new(root + "/download/", "PackageBaseAddress/3.0.0"),
+        new(root + "/metadata/", "RegistrationsBaseUrl/3.6.0"),
+        new(root + "/metadata/", "RegistrationsBaseUrl/3.4.0"),
+        new(root + "/metadata/", "RegistrationsBaseUrl"),
+        new(root + "/query", "SearchQueryService/3.5.0"),
+        new(root + "/query", "SearchQueryService/3.0.0-beta"),
+        new(root + "/query", "SearchQueryService")
+    ]), ApiJson.Default.NuGetServiceIndex, null, context.RequestAborted);
+}
+
+async Task NuGetPush(HttpContext context, ProjectDetails project, AuthenticatedIdentity identity)
+{
+    if (!context.Request.HasFormContentType) { await ApiError(context, 400, "a package is pushed as multipart form data"); return; }
+    IFormCollection form = await context.Request.ReadFormAsync(context.RequestAborted);
+    IFormFile? upload = form.Files.Count == 0 ? null : form.Files[0];
+    if (upload is null || upload.Length == 0) { await ApiError(context, 400, "the form carries no package"); return; }
+    if (upload.Length > ProjectFiles.MaximumPackageBytes) { await ApiError(context, 413, "the package exceeds the 2 GiB limit"); return; }
+    ProjectFiles files = FilesOf(project.Project);
+    string staging = files.UploadPath("nuget-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        await using (Stream source = upload.OpenReadStream())
+            await files.WriteAsync(staging, source, ProjectFiles.MaximumPackageBytes, context.RequestAborted);
+        NuGetManifest? manifest = NuGetManifest.Read(staging);
+        if (manifest is null) { await ApiError(context, 400, "the file is not a NuGet package with a .nuspec"); return; }
+        string fileName = manifest.Id.ToLowerInvariant() + "." + manifest.Version.ToLowerInvariant() + ".nupkg";
+        string destination = files.PackagePath("nuget", manifest.Id, manifest.Version, fileName);
+        Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+        File.Move(staging, destination, overwrite: true);
+        FileInfo stored = new(destination);
+        string sha;
+        using (FileStream read = stored.OpenRead()) sha = Convert.ToHexStringLower(await System.Security.Cryptography.SHA256.HashDataAsync(read, context.RequestAborted));
+        await store.PutPackageFileAsync(identity, project.Project.Id, "nuget", manifest.Id, manifest.Version, fileName, stored.Length, sha,
+            manifest.Description, manifest.Authors, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status201Created;
+    }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+    finally { if (File.Exists(staging)) File.Delete(staging); }
+}
+
+async Task NuGetVersions(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    string id = context.Request.RouteValues["packageName"]?.ToString() ?? "";
+    IReadOnlyList<Package> packages = await store.ListPackagesAsync(identity, project.Project.Id, "nuget", id, context.RequestAborted);
+    if (packages.Count == 0) { await ApiError(context, 404, "404 Package Not Found"); return; }
+    await context.Response.WriteAsJsonAsync(new NuGetVersions([.. packages.Select(package => package.Version.ToLowerInvariant()).OrderBy(v => v, StringComparer.Ordinal)]),
+        ApiJson.Default.NuGetVersions, null, context.RequestAborted);
+}
+
+async Task NuGetDownload(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    string id = context.Request.RouteValues["packageName"]?.ToString() ?? "";
+    string version = context.Request.RouteValues["version"]?.ToString() ?? "";
+    string fileName = context.Request.RouteValues["fileName"]?.ToString() ?? "";
+    Package? package = await store.FindPackageAsync(identity, project.Project.Id, "nuget", id, version, context.RequestAborted);
+    if (package is null) { await ApiError(context, 404, "404 Package Not Found"); return; }
+    if (fileName.EndsWith(".nuspec", StringComparison.OrdinalIgnoreCase))
+    {
+        // The manifest alone, read out of the package it came in.
+        PackageFile? nupkg = package.Files.FirstOrDefault(file => file.FileName.EndsWith(".nupkg", StringComparison.OrdinalIgnoreCase));
+        string path = nupkg is null ? "" : FilesOf(project.Project).PackagePath("nuget", package.Name, package.Version, nupkg.FileName);
+        if (nupkg is null || !File.Exists(path)) { await ApiError(context, 404, "404 File Not Found"); return; }
+        using System.IO.Compression.ZipArchive zip = System.IO.Compression.ZipFile.OpenRead(path);
+        System.IO.Compression.ZipArchiveEntry? spec = zip.Entries.FirstOrDefault(entry => !entry.FullName.Contains('/') && entry.FullName.EndsWith(".nuspec", StringComparison.OrdinalIgnoreCase));
+        if (spec is null) { await ApiError(context, 404, "404 File Not Found"); return; }
+        context.Response.ContentType = "application/xml";
+        context.Response.Headers.XContentTypeOptions = "nosniff";
+        using Stream specStream = spec.Open();
+        await specStream.CopyToAsync(context.Response.Body, context.RequestAborted);
+        return;
+    }
+    await DownloadPackageFile(context, project, package, fileName);
+}
+
+NuGetCatalogEntry NuGetEntryFor(HttpContext context, ProjectDetails project, Package package)
+{
+    string root = NuGetBase(context, project);
+    string id = package.Name.ToLowerInvariant();
+    string version = package.Version.ToLowerInvariant();
+    string content = root + "/download/" + Uri.EscapeDataString(id) + "/" + Uri.EscapeDataString(version) + "/" + Uri.EscapeDataString(id + "." + version + ".nupkg");
+    PackageFile? nupkg = package.Files.FirstOrDefault(file => file.FileName.EndsWith(".nupkg", StringComparison.OrdinalIgnoreCase));
+    string path = nupkg is null ? "" : FilesOf(project.Project).PackagePath("nuget", package.Name, package.Version, nupkg.FileName);
+    NuGetManifest? manifest = nupkg is null || !File.Exists(path) ? null : NuGetManifest.Read(path);
+    return new(root + "/metadata/" + Uri.EscapeDataString(id) + "/" + Uri.EscapeDataString(version) + ".json",
+        package.Authors, package.Description, package.Name, package.Version, content, true, package.CreatedAtUtc,
+        [.. (manifest?.DependencyGroups ?? []).Select(group => new NuGetDependencyGroup(group.Framework,
+            [.. group.Dependencies.Select(dependency => new NuGetDependency(dependency.Id, dependency.Range))]))]);
+}
+
+async Task NuGetRegistration(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    string id = context.Request.RouteValues["packageName"]?.ToString() ?? "";
+    string? version = context.Request.RouteValues["version"]?.ToString();
+    IReadOnlyList<Package> packages = await store.ListPackagesAsync(identity, project.Project.Id, "nuget", id, context.RequestAborted);
+    if (packages.Count == 0) { await ApiError(context, 404, "404 Package Not Found"); return; }
+    List<NuGetRegistrationLeaf> leaves = [.. packages.OrderBy(package => package.Version, StringComparer.OrdinalIgnoreCase).Select(package =>
+    {
+        NuGetCatalogEntry entry = NuGetEntryFor(context, project, package);
+        return new NuGetRegistrationLeaf(entry.Id, entry.PackageContent, entry);
+    })];
+    if (version is not null)
+    {
+        NuGetRegistrationLeaf? leaf = leaves.FirstOrDefault(candidate => string.Equals(candidate.CatalogEntry.Version, version, StringComparison.OrdinalIgnoreCase));
+        if (leaf is null) { await ApiError(context, 404, "404 Package Not Found"); return; }
+        await context.Response.WriteAsJsonAsync(new NuGetRegistrationIndex(1, [new(leaf.Id, 1, leaf.CatalogEntry.Version, leaf.CatalogEntry.Version, [leaf])]),
+            ApiJson.Default.NuGetRegistrationIndex, null, context.RequestAborted);
+        return;
+    }
+    string indexUrl = NuGetBase(context, project) + "/metadata/" + Uri.EscapeDataString(id.ToLowerInvariant()) + "/index.json";
+    await context.Response.WriteAsJsonAsync(new NuGetRegistrationIndex(1,
+        [new(indexUrl, leaves.Count, leaves[0].CatalogEntry.Version, leaves[^1].CatalogEntry.Version, leaves)]),
+        ApiJson.Default.NuGetRegistrationIndex, null, context.RequestAborted);
+}
+
+async Task NuGetQuery(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    string query = context.Request.Query["q"].ToString().Trim().ToLowerInvariant();
+    int skip = int.TryParse(context.Request.Query["skip"], out int s) && s >= 0 ? s : 0;
+    int take = int.TryParse(context.Request.Query["take"], out int t) && t is > 0 and <= 100 ? t : 20;
+    IReadOnlyList<Package> packages = await store.ListPackagesAsync(identity, project.Project.Id, "nuget", null, context.RequestAborted);
+    List<NuGetSearchResult> results = [];
+    foreach (IGrouping<string, Package> group in packages.GroupBy(package => package.Name.ToLowerInvariant()))
+    {
+        if (query.Length > 0 && !group.Key.Contains(query, StringComparison.Ordinal) && !group.Any(package => package.Description.Contains(query, StringComparison.OrdinalIgnoreCase))) continue;
+        Package latest = group.OrderBy(package => package.CreatedAtUtc).Last();
+        results.Add(new(latest.Name, latest.Version, latest.Description, latest.Authors, 0, false,
+            [.. group.Select(package => new NuGetSearchVersion(NuGetEntryFor(context, project, package).Id, package.Version, 0))]));
+    }
+    await context.Response.WriteAsJsonAsync(new NuGetSearchResponse(results.Count, [.. results.Skip(skip).Take(take)]), ApiJson.Default.NuGetSearchResponse, null, context.RequestAborted);
+}
+
+// Browser routes for a project's packages and images.
+ContainerRepositoryResponse ImageResponseFor(HttpContext context, ProjectDetails project, ContainerRepository image)
+{
+    string path = project.Project.Namespace + "/" + project.Project.Slug + (image.Name.Length == 0 ? "" : "/" + image.Name);
+    string host = context.Request.Host.Value ?? "";
+    return new(image.Id, image.Name, path, host + "/" + path, image.CreatedAtUtc, image.Tags.Count,
+        [.. image.Tags.Select(tag => new ContainerTagResponse(tag.Tag, path + ":" + tag.Tag, host + "/" + path + ":" + tag.Tag, tag.Digest, tag.MediaType, tag.Size, tag.UpdatedAtUtc))]);
+}
+
+async Task ListImages(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (!await OnlyQuery(context, "page", "per_page", "tags")) return;
+    IReadOnlyList<ContainerRepository> images = await store.ListContainerRepositoriesAsync(identity, project.Project.Id, context.RequestAborted);
+    await context.Response.WriteAsJsonAsync([.. images.Select(image => ImageResponseFor(context, project, image))], ApiJson.Default.ContainerRepositoryResponseArray, null, context.RequestAborted);
+}
+
+foreach ((string root, bool browserFamily) in new[] { ("/api/projects/{projectId:long}", true), ("/api/v4/projects/{projectId}", false) })
+{
+    async Task<(ProjectDetails Details, AuthenticatedIdentity? Identity)?> Scope(HttpContext context, bool write) =>
+        browserFamily ? await BrowserCollaboration(context, write) : await PackageProject(context, write ? ProjectAction.PushRepository : ProjectAction.BrowseRepository, "Graft Packages");
+
+    app.MapGet(root + "/packages", async context => { var scope = await Scope(context, false); if (scope is not null) await ListPackages(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapGet(root + "/packages/{packageId:long}", async context => { var scope = await Scope(context, false); if (scope is not null) await ReadPackage(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapDelete(root + "/packages/{packageId:long}", async context => { var scope = await Scope(context, true); if (scope is not null) await DeletePackage(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapGet(root + "/packages/generic/{name}/{version}/{fileName}", async context => { var scope = await Scope(context, false); if (scope is not null) await GetGenericPackage(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapGet(root + "/registry/repositories", async context => { var scope = await Scope(context, false); if (scope is not null) await ListImages(context, scope.Value.Details, scope.Value.Identity); });
+    if (browserFamily)
+    {
+        app.MapGet(root + "/packages/{packageId:long}/files/{fileName}", async context =>
+        {
+            var scope = await Scope(context, false);
+            if (scope is null) return;
+            long packageId = Convert.ToInt64(context.Request.RouteValues["packageId"], System.Globalization.CultureInfo.InvariantCulture);
+            Package? package = await store.FindPackageAsync(scope.Value.Identity, scope.Value.Details.Project.Id, packageId, context.RequestAborted);
+            if (package is null) { await ApiError(context, 404, "404 Package Not Found"); return; }
+            await DownloadPackageFile(context, scope.Value.Details, package, Uri.UnescapeDataString(context.Request.RouteValues["fileName"]?.ToString() ?? ""));
+        });
+        continue;
+    }
+    app.MapMethods(root + "/packages/generic/{name}/{version}/{fileName}", ["PUT"], async context =>
+    {
+        var scope = await PackageProject(context, ProjectAction.PushRepository, "Graft Packages");
+        if (scope is not null) await PutGenericPackage(context, scope.Value.Details, scope.Value.Identity!);
+    });
+    app.MapGet(root + "/packages/nuget/index.json", async context => { var scope = await Scope(context, false); if (scope is not null) await NuGetIndex(context, scope.Value.Details); });
+    // One mapping: ASP.NET already matches the trailing slash a NuGet client sends, and mapping both spellings
+    // makes the request ambiguous rather than doubly served.
+    app.MapMethods(root + "/packages/nuget", ["PUT"], async context => { var scope = await PackageProject(context, ProjectAction.PushRepository, "Graft Packages"); if (scope is not null) await NuGetPush(context, scope.Value.Details, scope.Value.Identity!); });
+    app.MapGet(root + "/packages/nuget/download/{packageName}/index.json", async context => { var scope = await Scope(context, false); if (scope is not null) await NuGetVersions(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapGet(root + "/packages/nuget/download/{packageName}/{version}/{fileName}", async context => { var scope = await Scope(context, false); if (scope is not null) await NuGetDownload(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapGet(root + "/packages/nuget/metadata/{packageName}/index.json", async context => { var scope = await Scope(context, false); if (scope is not null) await NuGetRegistration(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapGet(root + "/packages/nuget/metadata/{packageName}/{version}.json", async context => { var scope = await Scope(context, false); if (scope is not null) await NuGetRegistration(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapGet(root + "/packages/nuget/query", async context => { var scope = await Scope(context, false); if (scope is not null) await NuGetQuery(context, scope.Value.Details, scope.Value.Identity); });
+}
+
+// ---------------------------------------------------------------------------------------------------
+// The container registry: the Docker registry HTTP API, version 2. An image name is a project path and
+// optionally more segments beneath it. Blobs are content-addressed per project and shared by its images.
+// ---------------------------------------------------------------------------------------------------
+
+static async Task RegistryError(HttpContext context, int status, string code, string message)
+{
+    context.Response.StatusCode = status;
+    context.Response.Headers["Docker-Distribution-Api-Version"] = "registry/2.0";
+    await context.Response.WriteAsJsonAsync(new RegistryErrors([new(code, message)]), ApiJson.Default.RegistryErrors, null, context.RequestAborted);
+}
+
+async Task<(ProjectDetails Details, AuthenticatedIdentity? Identity, string Image)?> RegistryProject(HttpContext context, string[] nameSegments, ProjectAction action)
+{
+    AuthenticatedIdentity? identity = await AuthenticateAnyToken(context);
+    ProjectDetails? details = null;
+    string image = "";
+    if (nameSegments.Length >= 2)
+    {
+        details = string.Equals(nameSegments[0], GlobalNamespace, StringComparison.OrdinalIgnoreCase)
+            ? await store.FindReadyProjectDetailsByGlobalSlugAsync(nameSegments[1], context.RequestAborted)
+            : await store.FindReadyProjectDetailsAsync(nameSegments[0], nameSegments[1], context.RequestAborted);
+        image = string.Join('/', nameSegments.Skip(2));
+    }
+    PermissionDecision? decision = details is null ? null : await DecideFor(context, identity, details.Project.Id, action);
+    if (decision is { Allowed: true }) return (details!, identity, image);
+    if (identity is null)
+    {
+        context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+        context.Response.Headers["Docker-Distribution-Api-Version"] = "registry/2.0";
+        context.Response.Headers.WWWAuthenticate = "Basic realm=\"Graft Registry\"";
+        await context.Response.WriteAsJsonAsync(new RegistryErrors([new("UNAUTHORIZED", "authentication required")]), ApiJson.Default.RegistryErrors, null, context.RequestAborted);
+        return null;
+    }
+    await RegistryError(context, details is null ? 404 : 403, details is null ? "NAME_UNKNOWN" : "DENIED", details is null ? "repository name not known to registry" : decision!.Explanation);
+    return null;
+}
+
+static bool IsDigest(string value) => value.StartsWith("sha256:", StringComparison.Ordinal) && value.Length == 71 && value[7..].All(char.IsAsciiHexDigitLower);
+
+app.MapGet("/v2/", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateAnyToken(context);
+    context.Response.Headers["Docker-Distribution-Api-Version"] = "registry/2.0";
+    if (identity is null)
+    {
+        context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+        context.Response.Headers.WWWAuthenticate = "Basic realm=\"Graft Registry\"";
+        await context.Response.WriteAsJsonAsync(new RegistryErrors([new("UNAUTHORIZED", "authentication required")]), ApiJson.Default.RegistryErrors, null, context.RequestAborted);
+        return;
+    }
+    context.Response.ContentType = "application/json";
+    await context.Response.WriteAsync("{}", context.RequestAborted);
+});
+
+app.MapGet("/v2/_catalog", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateAnyToken(context);
+    context.Response.Headers["Docker-Distribution-Api-Version"] = "registry/2.0";
+    if (identity is null) { await RegistryError(context, 401, "UNAUTHORIZED", "authentication required"); return; }
+    List<string> names = [];
+    foreach (ProjectDetails project in (await store.ListAccessibleProjectsAsync(identity, 0, 100, context.RequestAborted)).Projects)
+        foreach (ContainerRepository image in await store.ListContainerRepositoriesAsync(identity, project.Project.Id, context.RequestAborted))
+            names.Add(project.Project.Namespace + "/" + project.Project.Slug + (image.Name.Length == 0 ? "" : "/" + image.Name));
+    await context.Response.WriteAsJsonAsync(new RegistryCatalog(names), ApiJson.Default.RegistryCatalog, null, context.RequestAborted);
+});
+
+app.MapMethods("/v2/{**rest}", ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"], async context =>
+{
+    context.Response.Headers["Docker-Distribution-Api-Version"] = "registry/2.0";
+    string rest = context.Request.RouteValues["rest"]?.ToString() ?? "";
+    string[] segments = rest.Split('/', StringSplitOptions.RemoveEmptyEntries);
+    // The operation is the last keyword segment; everything before it is the image name.
+    int keyword = -1;
+    for (int index = segments.Length - 1; index >= 0; index--)
+        if (segments[index] is "blobs" or "manifests" or "tags") { keyword = index; break; }
+    if (keyword < 2) { await RegistryError(context, 404, "NAME_UNKNOWN", "repository name not known to registry"); return; }
+    string[] name = segments[..keyword];
+    string[] operation = segments[(keyword + 1)..];
+    string verb = segments[keyword];
+    string method = context.Request.Method;
+    bool write = method is "POST" or "PUT" or "PATCH" or "DELETE";
+    var scope = await RegistryProject(context, name, write ? ProjectAction.PushRepository : ProjectAction.FetchRepository);
+    if (scope is null) return;
+    (ProjectDetails project, AuthenticatedIdentity? identity, string image) = scope.Value;
+    ProjectFiles files = FilesOf(project.Project);
+    string location = "/v2/" + string.Join('/', name);
+
+    if (verb == "tags" && operation is ["list"] && method == "GET")
+    {
+        ContainerRepository? repository = await store.FindContainerRepositoryAsync(identity, project.Project.Id, image, context.RequestAborted);
+        await context.Response.WriteAsJsonAsync(new RegistryTagList(string.Join('/', name), [.. (repository?.Tags ?? []).Select(tag => tag.Tag)]),
+            ApiJson.Default.RegistryTagList, null, context.RequestAborted);
+        return;
+    }
+
+    if (verb == "blobs" && operation.Length == 1 && method is "GET" or "HEAD")
+    {
+        string digest = operation[0];
+        string path = IsDigest(digest) ? files.BlobPath(digest[7..]) : "";
+        if (path.Length == 0 || !File.Exists(path)) { await RegistryError(context, 404, "BLOB_UNKNOWN", "blob unknown to registry"); return; }
+        FileInfo blob = new(path);
+        context.Response.ContentType = "application/octet-stream";
+        context.Response.ContentLength = blob.Length;
+        context.Response.Headers["Docker-Content-Digest"] = digest;
+        if (method == "HEAD") return;
+        using FileStream content = blob.OpenRead();
+        await content.CopyToAsync(context.Response.Body, context.RequestAborted);
+        return;
+    }
+
+    if (verb == "blobs" && operation is ["uploads"] && method == "POST")
+    {
+        string uploadId = Guid.NewGuid().ToString("N");
+        string? digest = Optional(context, "digest");
+        if (digest is not null)
+        {
+            // Monolithic: the whole blob in this request.
+            if (!IsDigest(digest)) { await RegistryError(context, 400, "DIGEST_INVALID", "provided digest did not match uploaded content"); return; }
+            try
+            {
+                await files.AppendUploadAsync(uploadId, context.Request.Body, context.RequestAborted);
+                (string sha, _) = await files.CompleteUploadAsync(uploadId, context.RequestAborted);
+                // The bytes are kept under what they actually hash to, which is harmless and content-addressed, and
+                // the client is told. Deleting them would delete a blob an honest push may already have stored.
+                if ("sha256:" + sha != digest) { await RegistryError(context, 400, "DIGEST_INVALID", "provided digest did not match uploaded content"); return; }
+            }
+            catch (InvalidDataException) { files.AbandonUpload(uploadId); await RegistryError(context, 413, "BLOB_UPLOAD_INVALID", "blob exceeds the 8 GiB limit"); return; }
+            context.Response.StatusCode = StatusCodes.Status201Created;
+            context.Response.Headers.Location = location + "/blobs/" + digest;
+            context.Response.Headers["Docker-Content-Digest"] = digest;
+            return;
+        }
+        Directory.CreateDirectory(Path.GetDirectoryName(files.UploadPath(uploadId))!);
+        await File.WriteAllBytesAsync(files.UploadPath(uploadId), [], context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status202Accepted;
+        context.Response.Headers.Location = location + "/blobs/uploads/" + uploadId;
+        context.Response.Headers["Docker-Upload-UUID"] = uploadId;
+        context.Response.Headers["Range"] = "0-0";
+        return;
+    }
+
+    if (verb == "blobs" && operation is ["uploads", string uploadKey] && ProjectFiles.IsUploadId(uploadKey))
+    {
+        if (!File.Exists(files.UploadPath(uploadKey))) { await RegistryError(context, 404, "BLOB_UPLOAD_UNKNOWN", "blob upload unknown to registry"); return; }
+        switch (method)
+        {
+            case "PATCH":
+            case "PUT":
+                long length;
+                try { length = await files.AppendUploadAsync(uploadKey, context.Request.Body, context.RequestAborted); }
+                catch (InvalidDataException) { files.AbandonUpload(uploadKey); await RegistryError(context, 413, "BLOB_UPLOAD_INVALID", "blob exceeds the 8 GiB limit"); return; }
+                if (method == "PATCH")
+                {
+                    context.Response.StatusCode = StatusCodes.Status202Accepted;
+                    context.Response.Headers.Location = location + "/blobs/uploads/" + uploadKey;
+                    context.Response.Headers["Docker-Upload-UUID"] = uploadKey;
+                    context.Response.Headers["Range"] = "0-" + Math.Max(0, length - 1).ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    return;
+                }
+                string? digest = Optional(context, "digest");
+                if (digest is null || !IsDigest(digest)) { await RegistryError(context, 400, "DIGEST_INVALID", "digest is required to complete an upload"); return; }
+                (string sha, _) = await files.CompleteUploadAsync(uploadKey, context.RequestAborted);
+                if ("sha256:" + sha != digest)
+                {
+                    // The bytes are kept under what they actually hash to, which is harmless, and the client is told.
+                    await RegistryError(context, 400, "DIGEST_INVALID", "provided digest did not match uploaded content");
+                    return;
+                }
+                context.Response.StatusCode = StatusCodes.Status201Created;
+                context.Response.Headers.Location = location + "/blobs/" + digest;
+                context.Response.Headers["Docker-Content-Digest"] = digest;
+                return;
+            case "GET":
+                context.Response.StatusCode = StatusCodes.Status204NoContent;
+                context.Response.Headers["Docker-Upload-UUID"] = uploadKey;
+                context.Response.Headers["Range"] = "0-" + Math.Max(0, new FileInfo(files.UploadPath(uploadKey)).Length - 1).ToString(System.Globalization.CultureInfo.InvariantCulture);
+                return;
+            case "DELETE":
+                files.AbandonUpload(uploadKey);
+                context.Response.StatusCode = StatusCodes.Status204NoContent;
+                return;
+        }
+    }
+
+    if (verb == "manifests" && operation.Length == 1)
+    {
+        string reference = operation[0];
+        if (method == "PUT")
+        {
+            if (identity is null) { await RegistryError(context, 401, "UNAUTHORIZED", "authentication required"); return; }
+            if (context.Request.ContentLength > 4 * 1024 * 1024) { await RegistryError(context, 413, "MANIFEST_INVALID", "manifest too large"); return; }
+            byte[] body;
+            using (MemoryStream buffer = new())
+            {
+                await context.Request.Body.CopyToAsync(buffer, context.RequestAborted);
+                if (buffer.Length > 4 * 1024 * 1024) { await RegistryError(context, 413, "MANIFEST_INVALID", "manifest too large"); return; }
+                body = buffer.ToArray();
+            }
+            if (body.Length == 0) { await RegistryError(context, 400, "MANIFEST_INVALID", "manifest is empty"); return; }
+            string mediaType = context.Request.ContentType ?? "application/vnd.docker.distribution.manifest.v2+json";
+            if (mediaType.Length > 200 || mediaType.Any(c => c is '\r' or '\n')) { await RegistryError(context, 400, "MANIFEST_INVALID", "content type"); return; }
+            string digest = "sha256:" + Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(body));
+            if (IsDigest(reference) && reference != digest) { await RegistryError(context, 400, "DIGEST_INVALID", "manifest digest does not match reference"); return; }
+            string path = files.ManifestPath(digest[7..]);
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            await File.WriteAllBytesAsync(path, body, context.RequestAborted);
+            try
+            {
+                ContainerRepository repository = await store.EnsureContainerRepositoryAsync(identity, project.Project.Id, image, context.RequestAborted);
+                await store.PutManifestAsync(identity, project.Project.Id, repository.Id, digest, mediaType, body.Length, IsDigest(reference) ? null : reference, context.RequestAborted);
+            }
+            catch (UnauthorizedAccessException error) { await RegistryError(context, 403, "DENIED", error.Message); return; }
+            catch (ArgumentException error) { await RegistryError(context, 400, "NAME_INVALID", error.Message); return; }
+            context.Response.StatusCode = StatusCodes.Status201Created;
+            context.Response.Headers.Location = location + "/manifests/" + digest;
+            context.Response.Headers["Docker-Content-Digest"] = digest;
+            return;
+        }
+        ContainerRepository? found = await store.FindContainerRepositoryAsync(identity, project.Project.Id, image, context.RequestAborted);
+        if (method is "GET" or "HEAD")
+        {
+            ContainerManifest? manifest = found is null ? null : await store.FindManifestAsync(found.Id, reference, context.RequestAborted);
+            string path = manifest is null ? "" : files.ManifestPath(manifest.Digest[7..]);
+            if (manifest is null || !File.Exists(path)) { await RegistryError(context, 404, "MANIFEST_UNKNOWN", "manifest unknown to registry"); return; }
+            context.Response.ContentType = manifest.MediaType;
+            context.Response.ContentLength = manifest.Size;
+            context.Response.Headers["Docker-Content-Digest"] = manifest.Digest;
+            if (method == "HEAD") return;
+            using FileStream content = new(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            await content.CopyToAsync(context.Response.Body, context.RequestAborted);
+            return;
+        }
+        if (method == "DELETE")
+        {
+            if (identity is null || found is null) { await RegistryError(context, 404, "MANIFEST_UNKNOWN", "manifest unknown to registry"); return; }
+            try
+            {
+                bool removed = await store.DeleteManifestAsync(identity, project.Project.Id, found.Id, reference, context.RequestAborted);
+                if (!removed) { await RegistryError(context, 404, "MANIFEST_UNKNOWN", "manifest unknown to registry"); return; }
+                context.Response.StatusCode = StatusCodes.Status202Accepted;
+            }
+            catch (UnauthorizedAccessException error) { await RegistryError(context, 403, "DENIED", error.Message); }
+            return;
+        }
+    }
+    await RegistryError(context, 404, "UNSUPPORTED", "the operation is not supported");
+});
 
 // The branch tip behind an anchored comment addressed by id alone, which the browser route does. Null when
 // the comment is not on a proposal or the branch is gone, both of which leave the anchor outdated.
@@ -4342,6 +5187,9 @@ foreach ((string root, bool browserFamily) in new[] { ("/api/projects/{projectId
 
     app.MapGet(root + "/users", async context => { var scope = await Scope(context, false); if (scope is not null) await ListAssignable(context, scope.Value.Details, scope.Value.Identity); });
 
+    app.MapPost(root + "/fork", async context => { var scope = await Scope(context, true); if (scope is not null) await ForkProject(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapGet(root + "/forks", async context => { var scope = await Scope(context, false); if (scope is not null) await ListForks(context, scope.Value.Details, scope.Value.Identity); });
+
     app.MapGet(root + "/releases", async context => { var scope = await Scope(context, false); if (scope is not null) await ListReleases(context, scope.Value.Details, scope.Value.Identity); });
     app.MapPost(root + "/releases", async context => { var scope = await Scope(context, true); if (scope is not null) await CreateRelease(context, scope.Value.Details, scope.Value.Identity); });
     app.MapGet(root + "/releases/{tag}", async context => { var scope = await Scope(context, false); if (scope is not null) await ReadRelease(context, scope.Value.Details, scope.Value.Identity); });
@@ -4565,6 +5413,50 @@ app.MapDelete("/api/v4/projects/{**projectId}", async context =>
     await DeleteProject(context, project.Identity, project.Details.Project.Id);
 });
 
+// Housekeeping: every object into one pack, loose files and older packs removed. GitLab schedules this and
+// answers 201 with nothing; Graft does it before answering and says what it did. Maintainer-equivalent, the
+// same standing the other project settings need, because it rewrites the repository's files even though it
+// changes none of its content.
+app.MapPost("/api/v4/projects/{**projectId}", async context =>
+{
+    string projectId = context.Request.RouteValues["projectId"]?.ToString() ?? "";
+    if (!projectId.EndsWith("/housekeeping", StringComparison.Ordinal))
+    { await ApiError(context, 404, "404 API endpoint not found"); return; }
+    context.Request.RouteValues["projectId"] = projectId[..^"/housekeeping".Length];
+    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.ManageProject);
+    if (project is null) return;
+    if (project.Identity is null) { await ApiError(context, 401, "401 Unauthorized"); return; }
+    if (!await OnlyQuery(context, "task")) return;
+    await WithRepository(EndpointFor(project.Details.Project), context, async repository =>
+    {
+        RepackResult result = repository.Repack(context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status201Created;
+        await context.Response.WriteAsJsonAsync(new HousekeepingResponse(result.Packed, result.LooseRemoved, result.PacksRemoved),
+            ApiJson.Default.HousekeepingResponse, null, context.RequestAborted);
+    });
+});
+
+app.MapPost("/api/projects/{projectId:long}/housekeeping", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    long projectId = Convert.ToInt64(context.Request.RouteValues["projectId"], System.Globalization.CultureInfo.InvariantCulture);
+    ProjectDetails? details = await store.GetReadyProjectAsync(projectId, context.RequestAborted);
+    if (details is null) { await ApiError(context, 404, "project"); return; }
+    PermissionDecision manage = await DecideFor(context, browser.Value.Identity, projectId, ProjectAction.ManageProject);
+    if (!manage.Allowed) { await ApiError(context, 404, "project"); return; }
+    await WithRepository(EndpointFor(details.Project), context, async repository =>
+    {
+        RepackResult result = repository.Repack(context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status201Created;
+        await context.Response.WriteAsJsonAsync(new HousekeepingResponse(result.Packed, result.LooseRemoved, result.PacksRemoved),
+            ApiJson.Default.HousekeepingResponse, null, context.RequestAborted);
+    });
+});
+
 app.Map("/api/v4/{**path}", context => ApiError(context, 404, "404 API endpoint not found"));
 
 app.MapGet("/{projectNamespace}/{project}.git/info/refs", async context =>
@@ -4585,12 +5477,116 @@ app.MapGet("/{projectNamespace}/{project}.git/info/refs", async context =>
     }
     try
     {
-        byte[] data = authorized.Endpoint.Repository.Advertise(service);
+        // Protocol version 2 is spoken when the client asks for it by header; a push has no version 2 and
+        // falls back to the version 0 advertisement whatever the header says, as Git expects.
+        byte[] data = WantsProtocolV2(context) && service == "git-upload-pack"
+            ? authorized.Endpoint.Repository.AdvertiseV2(service)
+            : authorized.Endpoint.Repository.Advertise(service);
         context.Response.ContentType = "application/x-" + service + "-advertisement";
         await context.Response.Body.WriteAsync(data, context.RequestAborted);
     }
     finally { authorized.Endpoint.Gate.Release(); }
 });
+
+// ---------------------------------------------------------------------------------------------------
+// Git LFS: the batch API and the basic transfer. A large file is content-addressed by SHA-256 beside the
+// repository's objects; a pointer in the tree names it. The same credential and the same permission as the
+// Git transport: downloading needs what a fetch needs, uploading what a push needs.
+// ---------------------------------------------------------------------------------------------------
+
+const string LfsMediaType = "application/vnd.git-lfs+json";
+
+app.MapPost("/{projectNamespace}/{project}.git/info/lfs/objects/batch", async context =>
+{
+    LfsBatchRequest? request;
+    try { request = await context.Request.ReadFromJsonAsync(ApiJson.Default.LfsBatchRequest, context.RequestAborted); }
+    catch (JsonException) { await LfsError(context, 400, "the batch request is not valid JSON"); return; }
+    if (request is null || request.Operation is not ("download" or "upload")) { await LfsError(context, 400, "operation must be download or upload"); return; }
+    if (request.Transfers is { Length: > 0 } && !request.Transfers.Contains("basic")) { await LfsError(context, 422, "only the basic transfer is supported"); return; }
+    if (request.Objects is not { Length: > 0 and <= 1000 }) { await LfsError(context, 422, "objects is required, at most a thousand at a time"); return; }
+
+    AuthorizedRepository? authorized = await Authorize(context, request.Operation == "upload" ? ProjectAction.PushRepository : ProjectAction.FetchRepository);
+    if (authorized is null) return;
+    LargeFileStore store2 = new(Path.Combine(settings.Repositories, authorized.Project.StorageId));
+    string origin = Origin(context) + "/" + Uri.EscapeDataString(authorized.Project.Namespace) + "/" + Uri.EscapeDataString(authorized.Project.Slug) + ".git/info/lfs/objects/";
+    // The transfer requests carry the credential the batch arrived with, so a client that was told the
+    // action is already authenticated does not go back to its credential helper for every object.
+    string authorization = context.Request.Headers.Authorization.ToString();
+    Dictionary<string, string>? header = authorization.Length == 0 ? null : new() { ["Authorization"] = authorization };
+
+    List<LfsObjectResponse> objects = [];
+    foreach (LfsObjectRequest wanted in request.Objects)
+    {
+        if (wanted.Oid is null || !LargeFileStore.IsOid(wanted.Oid) || wanted.Size < 0)
+        { objects.Add(new(wanted.Oid ?? "", wanted.Size, null, null, new(422, "oid is a lowercase SHA-256 and size is not negative"))); continue; }
+        long? stored = store2.Size(wanted.Oid);
+        if (request.Operation == "download")
+        {
+            objects.Add(stored is null
+                ? new(wanted.Oid, wanted.Size, null, null, new(404, "the object is not in this repository"))
+                : new(wanted.Oid, stored.Value, true, new(new(origin + wanted.Oid, header, 3600), null), null));
+        }
+        else
+        {
+            if (wanted.Size > LargeFileStore.MaximumBytes) { objects.Add(new(wanted.Oid, wanted.Size, null, null, new(422, "the object exceeds the 4 GiB limit"))); continue; }
+            // Already here: nothing to upload, which the protocol says by omitting the action.
+            objects.Add(stored is not null
+                ? new(wanted.Oid, wanted.Size, true, null, null)
+                : new(wanted.Oid, wanted.Size, true, new(null, new(origin + wanted.Oid, header, 3600)), null));
+        }
+    }
+    context.Response.ContentType = LfsMediaType;
+    await context.Response.WriteAsJsonAsync(new LfsBatchResponse("basic", objects.ToArray()), ApiJson.Default.LfsBatchResponse, LfsMediaType, context.RequestAborted);
+});
+
+app.MapMethods("/{projectNamespace}/{project}.git/info/lfs/objects/{oid}", ["PUT"], async context =>
+{
+    string oid = context.Request.RouteValues["oid"]?.ToString() ?? "";
+    if (!LargeFileStore.IsOid(oid)) { await LfsError(context, 404, "no such object"); return; }
+    AuthorizedRepository? authorized = await Authorize(context, ProjectAction.PushRepository);
+    if (authorized is null) return;
+    long? declared = context.Request.ContentLength;
+    if (declared is null) { await LfsError(context, 411, "Content-Length is required"); return; }
+    if (declared > LargeFileStore.MaximumBytes) { await LfsError(context, 413, "the object exceeds the 4 GiB limit"); return; }
+    LargeFileStore store2 = new(Path.Combine(settings.Repositories, authorized.Project.StorageId));
+    try
+    {
+        await store2.StoreAsync(oid, declared.Value, context.Request.Body, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status200OK;
+    }
+    catch (GitInputException error)
+    {
+        await LfsError(context, error.Message == "lfs-hash-mismatch" ? 422 : 400, error.Message switch
+        {
+            "lfs-hash-mismatch" => "the bytes do not hash to the oid they were sent as",
+            "lfs-size-mismatch" or "lfs-size-exceeded" => "the bytes are not the size that was declared",
+            _ => "the object was refused: " + error.Message
+        });
+    }
+});
+
+app.MapGet("/{projectNamespace}/{project}.git/info/lfs/objects/{oid}", async context =>
+{
+    string oid = context.Request.RouteValues["oid"]?.ToString() ?? "";
+    if (!LargeFileStore.IsOid(oid)) { await LfsError(context, 404, "no such object"); return; }
+    AuthorizedRepository? authorized = await Authorize(context, ProjectAction.FetchRepository);
+    if (authorized is null) return;
+    LargeFileStore store2 = new(Path.Combine(settings.Repositories, authorized.Project.StorageId));
+    long? size = store2.Size(oid);
+    if (size is null) { await LfsError(context, 404, "no such object"); return; }
+    context.Response.ContentType = "application/octet-stream";
+    context.Response.Headers.XContentTypeOptions = "nosniff";
+    context.Response.ContentLength = size;
+    using Stream content = store2.OpenRead(oid);
+    await content.CopyToAsync(context.Response.Body, context.RequestAborted);
+});
+
+static async Task LfsError(HttpContext context, int status, string message)
+{
+    context.Response.StatusCode = status;
+    context.Response.ContentType = LfsMediaType;
+    await context.Response.WriteAsJsonAsync(new ErrorResponse(message), ApiJson.Default.ErrorResponse, LfsMediaType, context.RequestAborted);
+}
 
 app.MapPost("/{projectNamespace}/{project}.git/{service}", async context =>
 {
@@ -4677,7 +5673,8 @@ app.MapPost("/{projectNamespace}/{project}.git/{service}", async context =>
         else
         {
             using FileStream output = staging.CreateFile();
-            authorized.Endpoint.Repository.Upload(input, output, context.RequestAborted);
+            if (WantsProtocolV2(context)) authorized.Endpoint.Repository.ServeV2(input, output, context.RequestAborted);
+            else authorized.Endpoint.Repository.Upload(input, output, context.RequestAborted);
             output.Position = 0;
             await output.CopyToAsync(context.Response.Body, context.RequestAborted);
         }
@@ -5339,13 +6336,16 @@ async Task<ProjectResponse> ProjectResponseForLocked(HttpContext context, Projec
     string? avatarUrl = await store.HasAvatarAsync(AvatarOwner.Project, details.Project.Id, context.RequestAborted)
         ? AvatarUrl(context, AvatarOwner.Project, details.Project.Id)
         : null;
+    ForkInfo forks = await store.GetForkInfoAsync(details.Project.Id, context.RequestAborted);
     return new(details.Project.Id, details.Description, details.Project.Name,
         details.Project.Namespace + " / " + details.Project.Name, details.Project.Slug, path, details.CreatedAtUtc,
         defaultBranch, VisibilityName(details.Project.Visibility), null, webUrl + ".git", webUrl, avatarUrl,
         new(details.Project.OwnerUserId, details.Project.Namespace, details.Project.Namespace, "user", details.Project.Namespace,
             origin + "/" + Uri.EscapeDataString(details.Project.Namespace)),
         details.Project.GlobalSlug,
-        details.Project.GlobalSlug.Length == 0 ? "" : origin + GlobalPrefix + "/" + Uri.EscapeDataString(details.Project.GlobalSlug));
+        details.Project.GlobalSlug.Length == 0 ? "" : origin + GlobalPrefix + "/" + Uri.EscapeDataString(details.Project.GlobalSlug),
+        forks.UpstreamId is long upstreamId ? new ForkedFromResponse(upstreamId, forks.UpstreamPath!, origin + "/" + forks.UpstreamPath) : null,
+        forks.ForksCount);
 }
 
 /// <summary>
@@ -5489,6 +6489,10 @@ static async Task ApiError(HttpContext context, int status, string message)
     context.Response.StatusCode = status;
     await context.Response.WriteAsJsonAsync(new ErrorResponse(message), ApiJson.Default.ErrorResponse, null, context.RequestAborted);
 }
+
+/// <summary>Git names the protocol version it can speak in a header; the value may carry other keys separated by colons.</summary>
+static bool WantsProtocolV2(HttpContext context) =>
+    context.Request.Headers["Git-Protocol"].ToString().Split(':').Any(part => part.Trim() == "version=2");
 
 static string Origin(HttpContext context) => context.Request.Scheme + "://" + context.Request.Host.Value;
 

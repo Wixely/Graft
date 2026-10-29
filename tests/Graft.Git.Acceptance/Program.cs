@@ -222,7 +222,12 @@ try
     await CheckReviewOptions(address, aliceIdentity, bob.Username, "carol");
     await CheckReleases(address, aliceIdentity, "carol");
     await CheckKnowledge(address, aliceIdentity, bob.Username, "carol");
+    await CheckSearch(address, aliceIdentity, "carol");
+    address = await CheckForks(address, aliceIdentity, administratorIdentity);
+    await CheckLargeFiles(address, aliceIdentity);
+    await CheckPackages(address, aliceIdentity, "carol");
     await CheckCompressedGitRequests(address, aliceIdentity);
+    await CheckGitEngine(address, aliceIdentity);
     await CheckFetching(address, aliceIdentity, "carol");
     await CheckEmptyRepository(address, aliceIdentity, alicePassword);
     address = await CheckWebhooks(address, aliceIdentity);
@@ -359,7 +364,7 @@ async Task GitFails(string directory, string[] arguments, string name)
     Check(exitCode != 0, name);
 }
 
-async Task<(int ExitCode, string Output, string Errors)> RunGit(string directory, string[] arguments)
+async Task<(int ExitCode, string Output, string Errors)> RunGit(string directory, string[] arguments, IDictionary<string, string>? environment = null)
 {
     ProcessStartInfo start = new("git")
     {
@@ -374,6 +379,7 @@ async Task<(int ExitCode, string Output, string Errors)> RunGit(string directory
     start.Environment["GIT_CONFIG_NOSYSTEM"] = "1";
     start.Environment["GIT_CONFIG_GLOBAL"] = gitConfig;
     start.Environment["GIT_TERMINAL_PROMPT"] = "0";
+    if (environment is not null) foreach ((string key, string value) in environment) start.Environment[key] = value;
     foreach (string value in new[]
     {
         "user.name=Fixture", "user.email=fixture@example.invalid", "commit.gpgSign=false", "credential.helper=",
@@ -4586,6 +4592,874 @@ async Task CheckKnowledge(string address, AuthenticatedIdentity alice, string bo
 }
 
 /// <summary>
+/// Search: a project's code, commits, issues, proposals and wiki, and the server's projects and issues
+/// across whatever the caller may see.
+/// </summary>
+async Task CheckSearch(string address, AuthenticatedIdentity alice, string strangerUsername)
+{
+    long projectId;
+    string aliceApi;
+    string strangerApi;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        ProjectInfo created = await store.CreateProjectWithRepositoryAsync(alice, "haystack", "Haystack",
+            (project, cancellation) => { cancellation.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, project.StorageId)); return Task.CompletedTask; }, "A place to lose a needle");
+        projectId = created.Id;
+        UserAccount stranger = Required(await store.FindActiveUserAsync(strangerUsername), "stranger account");
+        aliceApi = (await store.CreateTokenAsync(alice, "find-api", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        strangerApi = (await store.CreateTokenAsync(new(stranger.Id, stranger.Username, false, IdentityKind.BrowserSession), "find-stranger", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+    }
+    string prefix = "/api/v4/projects/" + projectId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    string clone = Path.Combine(root, "haystack-clone");
+    Directory.CreateDirectory(clone);
+    await Git(clone, ["init", "--initial-branch=main"]);
+    Directory.CreateDirectory(Path.Combine(clone, "src"));
+    File.WriteAllText(Path.Combine(clone, "src", "lamp.cs"), "// the Needle is here\nclass Lamp { }\n");
+    File.WriteAllText(Path.Combine(clone, "notes.txt"), "nothing to see\n");
+    File.WriteAllBytes(Path.Combine(clone, "blob.bin"), [0, 1, 2, (byte)'n', (byte)'e', (byte)'e', (byte)'d', (byte)'l', (byte)'e', 0]);
+    await Git(clone, ["add", "."]);
+    await Git(clone, ["commit", "-m", "Hide a needle in the haystack"]);
+    await Git(clone, ["remote", "add", "origin", AuthenticatedUrl(address, "alice", aliceApi, "alice/haystack.git")]);
+    await Git(clone, ["push", "origin", "main"]);
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/issues", aliceApi, new { title = "Lost a needle", description = "Somewhere in the haystack." }))
+        Check(created.StatusCode == HttpStatusCode.Created, "an issue to find is opened");
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/issues", aliceApi, new { title = "Secret needle", confidential = true }))
+        Check(created.StatusCode == HttpStatusCode.Created, "a confidential issue to not find is opened");
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/wikis", aliceApi, new { title = "Sewing", content = "Keep the needle in the cushion." }))
+        Check(created.StatusCode == HttpStatusCode.Created, "a wiki page to find is written");
+
+    using (HttpResponseMessage found = await ApiGet(address, prefix + "/search?scope=blobs&search=needle", aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await found.Content.ReadAsStreamAsync());
+        JsonElement blobs = json.RootElement.GetProperty("blobs");
+        Check(found.IsSuccessStatusCode && blobs.GetArrayLength() == 1 && blobs[0].GetProperty("path").GetString() == "src/lamp.cs" &&
+            blobs[0].GetProperty("startline").GetInt32() == 1 && blobs[0].GetProperty("data").GetString()!.Contains("Needle", StringComparison.Ordinal),
+            "code search finds the line, without regard to case, and skips the binary file");
+    }
+    using (HttpResponseMessage found = await ApiGet(address, prefix + "/search?scope=commits&search=haystack", aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await found.Content.ReadAsStreamAsync());
+        Check(found.IsSuccessStatusCode && json.RootElement.GetProperty("commits").GetArrayLength() == 1, "commit search finds the message");
+    }
+    using (HttpResponseMessage found = await ApiGet(address, prefix + "/search?scope=issues&search=needle", aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await found.Content.ReadAsStreamAsync());
+        Check(found.IsSuccessStatusCode && json.RootElement.GetProperty("issues").GetArrayLength() == 2, "issue search finds both for a member");
+    }
+    using (HttpResponseMessage found = await ApiGet(address, prefix + "/search?scope=wiki_blobs&search=cushion", aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await found.Content.ReadAsStreamAsync());
+        Check(found.IsSuccessStatusCode && json.RootElement.GetProperty("wiki_blobs").GetArrayLength() == 1 &&
+            json.RootElement.GetProperty("wiki_blobs")[0].GetProperty("slug").GetString() == "sewing", "wiki search finds the page by its content");
+    }
+    using (HttpResponseMessage bad = await ApiGet(address, prefix + "/search?scope=users&search=needle", aliceApi))
+        Check(bad.StatusCode == HttpStatusCode.BadRequest, "an unknown scope is refused");
+    using (HttpResponseMessage bad = await ApiGet(address, prefix + "/search?scope=blobs&search=", aliceApi))
+        Check(bad.StatusCode == HttpStatusCode.BadRequest, "an empty search is refused");
+
+    // Across the server.
+    using (HttpResponseMessage found = await ApiGet(address, "/api/v4/search?scope=projects&search=haystack", aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await found.Content.ReadAsStreamAsync());
+        Check(found.IsSuccessStatusCode && json.RootElement.GetProperty("projects").EnumerateArray()
+            .Any(project => project.GetProperty("path").GetString() == "haystack"), "a global search finds a project by name");
+    }
+    using (HttpResponseMessage found = await ApiGet(address, "/api/v4/search?scope=issues&search=needle", aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await found.Content.ReadAsStreamAsync());
+        Check(found.IsSuccessStatusCode && json.RootElement.GetProperty("issues").GetArrayLength() == 2, "a global search finds an owner's issues, confidential included");
+    }
+    using (HttpResponseMessage found = await ApiGet(address, "/api/v4/search?scope=issues&search=needle", strangerApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await found.Content.ReadAsStreamAsync());
+        Check(found.IsSuccessStatusCode && json.RootElement.GetProperty("issues").GetArrayLength() == 0, "a stranger's global search finds nothing in a private project");
+    }
+    using (HttpResponseMessage anonymous = await ApiGet(address, "/api/v4/search?scope=issues&search=needle", null))
+    {
+        // With publishing on, a stranger may search and sees nothing of a private project; with it off, the
+        // search itself is refused, because there is nothing a stranger could be shown.
+        if (publicBrowsing)
+        {
+            using JsonDocument json = JsonDocument.Parse(await anonymous.Content.ReadAsStreamAsync());
+            Check(anonymous.IsSuccessStatusCode && json.RootElement.GetProperty("issues").GetArrayLength() == 0,
+                "an anonymous global search sees nothing of a private project");
+        }
+        else Check(anonymous.StatusCode == HttpStatusCode.Unauthorized, "an anonymous global search needs public browsing, which this server has off");
+    }
+    using (HttpResponseMessage hidden = await ApiGet(address, prefix + "/search?scope=blobs&search=needle", strangerApi))
+        Check(hidden.StatusCode == HttpStatusCode.NotFound, "a stranger cannot search a private project");
+}
+
+/// <summary>
+/// Forks: a stranger copies a public project into their own namespace, pushes to the copy, proposes the
+/// branch to the original, talks about their own proposal and nothing else, and the original's maintainer
+/// merges it without ever reading the fork at merge time.
+/// </summary>
+async Task<string> CheckForks(string address, AuthenticatedIdentity alice, AuthenticatedIdentity administrator)
+{
+    bool wasPublic = publicBrowsing;
+    if (!publicBrowsing)
+    {
+        await StopServer();
+        publicBrowsing = true;
+        address = await StartServer();
+    }
+    long upstreamId;
+    string aliceApi;
+    string erinApi;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        ProjectInfo created = await store.CreateProjectWithRepositoryAsync(alice, "upstream", "Upstream",
+            (project, cancellation) => { cancellation.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, project.StorageId)); return Task.CompletedTask; });
+        upstreamId = created.Id;
+        await store.SetProjectVisibilityAsync(alice, upstreamId, ProjectVisibility.Public);
+        UserAccount erin = await store.CreateUserAsync(administrator, "erin", Password());
+        AuthenticatedIdentity erinIdentity = new(erin.Id, erin.Username, false, IdentityKind.BrowserSession);
+        aliceApi = (await store.CreateTokenAsync(alice, "fork-owner", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        erinApi = (await store.CreateTokenAsync(erinIdentity, "fork-stranger", TokenScope.Api | TokenScope.WriteRepository, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+    }
+    string upstream = "/api/v4/projects/" + upstreamId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    string clone = Path.Combine(root, "upstream-clone");
+    Directory.CreateDirectory(clone);
+    await Git(clone, ["init", "--initial-branch=main"]);
+    File.WriteAllText(Path.Combine(clone, "up.txt"), "upstream\n");
+    await Git(clone, ["add", "."]);
+    await Git(clone, ["commit", "-m", "Upstream base"]);
+    await Git(clone, ["remote", "add", "origin", AuthenticatedUrl(address, "alice", aliceApi, "alice/upstream.git")]);
+    await Git(clone, ["push", "origin", "main"]);
+    using (HttpResponseMessage created = await ApiPost(address, upstream + "/issues", aliceApi, new { title = "Not erin's" }))
+        Check(created.StatusCode == HttpStatusCode.Created, "an issue a stranger will not be able to comment on");
+
+    // Erin cannot write to upstream, and can fork it.
+    await Git(clone, ["remote", "add", "erin", AuthenticatedUrl(address, "erin", erinApi, "alice/upstream.git")]);
+    await GitFails(clone, ["push", "erin", "main:refs/heads/erin-cannot"], "a stranger cannot push to a public project");
+    long forkId;
+    using (HttpResponseMessage forked = await ApiPost(address, upstream + "/fork", erinApi, new { }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await forked.Content.ReadAsStreamAsync());
+        forkId = json.RootElement.GetProperty("id").GetInt64();
+        Check(forked.StatusCode == HttpStatusCode.Created &&
+            json.RootElement.GetProperty("path_with_namespace").GetString() == "erin/upstream" &&
+            json.RootElement.GetProperty("forked_from_project").GetProperty("id").GetInt64() == upstreamId &&
+            json.RootElement.GetProperty("visibility").GetString() == "public",
+            "a stranger forks a public project into their own namespace, keeping its visibility");
+    }
+    using (HttpResponseMessage again = await ApiPost(address, upstream + "/fork", erinApi, new { }))
+        Check(again.StatusCode == HttpStatusCode.Conflict, "one fork per person per project");
+    using (HttpResponseMessage own = await ApiPost(address, upstream + "/fork", aliceApi, new { }))
+        Check(own.StatusCode == HttpStatusCode.Conflict, "a project is not forked into the namespace it lives in");
+    using (HttpResponseMessage read = await ApiGet(address, upstream, aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await read.Content.ReadAsStreamAsync());
+        Check(read.IsSuccessStatusCode && json.RootElement.GetProperty("forks_count").GetInt64() == 1, "the original counts its forks");
+    }
+    using (HttpResponseMessage forks = await ApiGet(address, upstream + "/forks", null))
+    {
+        using JsonDocument json = JsonDocument.Parse(await forks.Content.ReadAsStreamAsync());
+        Check(forks.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 1 &&
+            json.RootElement[0].GetProperty("path_with_namespace").GetString() == "erin/upstream", "and lists the public ones to anybody");
+    }
+
+    // The fork is a real repository with the original's content, and Erin can push to it.
+    string forkClone = Path.Combine(root, "fork-clone");
+    await Git(root, ["clone", AuthenticatedUrl(address, "erin", erinApi, "erin/upstream.git"), "fork-clone"]);
+    Check(File.ReadAllText(Path.Combine(forkClone, "up.txt")).Trim() == "upstream", "the fork clones with the original's content");
+    await Git(forkClone, ["checkout", "-b", "fix"]);
+    File.WriteAllText(Path.Combine(forkClone, "fix.txt"), "from the fork\n");
+    await Git(forkClone, ["add", "."]);
+    await Git(forkClone, ["commit", "-m", "A fix from outside"]);
+    await Git(forkClone, ["push", "origin", "fix"]);
+
+    long iid;
+    using (HttpResponseMessage proposed = await ApiPost(address, upstream + "/merge_requests", erinApi,
+        new { source_project_id = forkId, source_branch = "fix", target_branch = "main", title = "A fix from outside" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await proposed.Content.ReadAsStreamAsync());
+        iid = json.RootElement.GetProperty("iid").GetInt64();
+        Check(proposed.StatusCode == HttpStatusCode.Created &&
+            json.RootElement.GetProperty("source_project_id").GetInt64() == forkId &&
+            json.RootElement.GetProperty("source_project_path").GetString() == "erin/upstream" &&
+            json.RootElement.GetProperty("merge_method").GetString() == "fast_forward",
+            "a stranger proposes a branch of their fork to the original, which already knows how it would merge");
+    }
+    await Git(clone, ["push", "origin", "main:refs/heads/other"]);
+    using (HttpResponseMessage refused = await ApiPost(address, upstream + "/merge_requests", erinApi,
+        new { source_branch = "other", target_branch = "main", title = "Not from a fork" }))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden, "a stranger still cannot propose from the original's own branches");
+    using (HttpResponseMessage talk = await ApiPost(address, upstream + "/merge_requests/" + iid + "/notes", erinApi, new { body = "Here is why." }))
+        Check(talk.StatusCode == HttpStatusCode.Created, "the author of a proposal from a fork may talk about it");
+    using (HttpResponseMessage refused = await ApiPost(address, upstream + "/issues/1/notes", erinApi, new { body = "And about this?" }))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden, "and about nothing else on the original");
+    using (HttpResponseMessage changes = await ApiGet(address, upstream + "/merge_requests/" + iid + "/changes", aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await changes.Content.ReadAsStreamAsync());
+        Check(changes.IsSuccessStatusCode && json.RootElement.GetProperty("files")[0].GetProperty("path").GetString() == "fix.txt",
+            "the original's maintainer sees the fork's change as a diff");
+    }
+    string advertised = await Git(clone, ["ls-remote", "origin"]);
+    Check(advertised.Contains("refs/merge-requests/" + iid + "/head", StringComparison.Ordinal),
+        "the original advertises the proposal's tip under refs/merge-requests, as GitLab does");
+    await GitFails(clone, ["push", "origin", "main:refs/merge-requests/" + iid + "/head"], "a client cannot push a proposal reference");
+    using (HttpResponseMessage rebase = await ApiPut(address, upstream + "/merge_requests/" + iid + "/rebase", aliceApi, new { }))
+        Check(rebase.StatusCode == HttpStatusCode.Conflict, "a proposal from a fork is not rebased by the original");
+
+    // Erin pushes more to the fork; the proposal follows the branch.
+    File.WriteAllText(Path.Combine(forkClone, "fix.txt"), "from the fork, revised\n");
+    await Git(forkClone, ["commit", "-am", "Revise the fix"]);
+    await Git(forkClone, ["push", "origin", "fix"]);
+    using (HttpResponseMessage merged = await ApiPut(address, upstream + "/merge_requests/" + iid + "/merge", aliceApi, new { should_remove_source_branch = true }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await merged.Content.ReadAsStreamAsync());
+        Check(merged.IsSuccessStatusCode && json.RootElement.GetProperty("merge_request").GetProperty("state").GetString() == "merged" &&
+            !json.RootElement.GetProperty("source_branch_removed").GetBoolean(),
+            "the maintainer merges the fork's branch as it now stands, and the fork's branch is not theirs to remove");
+    }
+    await Git(clone, ["fetch", "origin"]);
+    await Git(clone, ["checkout", "-B", "verify", "origin/main"]);
+    Check(File.ReadAllText(Path.Combine(clone, "fix.txt")).Contains("revised", StringComparison.Ordinal), "the original has the fork's latest work");
+    Check((await Git(forkClone, ["ls-remote", "origin", "refs/heads/fix"])).Contains("refs/heads/fix", StringComparison.Ordinal), "the fork's branch is untouched");
+    Check((await RunGit(clone, ["fsck", "--strict", "--no-progress"])).ExitCode == 0, "the mirrored objects pass git fsck");
+
+    if (!wasPublic)
+    {
+        await StopServer();
+        publicBrowsing = false;
+        address = await StartServer();
+    }
+    return address;
+}
+
+/// <summary>
+/// Git LFS, driven by the real git-lfs client: a tracked file is pushed as a pointer plus an object, a
+/// fresh clone gets the content back, and the raw route serves the content the pointer stands for.
+/// </summary>
+async Task CheckLargeFiles(string address, AuthenticatedIdentity alice)
+{
+    if ((await RunGit(root, ["lfs", "version"])).ExitCode != 0)
+    {
+        Console.WriteLine("SKIP: git-lfs is not installed, so the LFS transfer is exercised over HTTP only.");
+    }
+    long projectId;
+    string aliceApi;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        ProjectInfo created = await store.CreateProjectWithRepositoryAsync(alice, "heavy", "Heavy",
+            (project, cancellation) => { cancellation.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, project.StorageId)); return Task.CompletedTask; });
+        projectId = created.Id;
+        aliceApi = (await store.CreateTokenAsync(alice, "heavy-api", TokenScope.Api | TokenScope.WriteRepository, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+    }
+    string remote = AuthenticatedUrl(address, "alice", aliceApi, "alice/heavy.git");
+    byte[] payload = new byte[300 * 1024];
+    RandomNumberGenerator.Fill(payload);
+    string oid = Convert.ToHexStringLower(SHA256.HashData(payload));
+
+    // The batch API by hand first, so a refusal is explained by the protocol rather than by the client.
+    using (HttpResponseMessage batch = await ApiPostJson(address, "/alice/heavy.git/info/lfs/objects/batch", null,
+        "{\"operation\":\"download\",\"objects\":[{\"oid\":\"" + oid + "\",\"size\":" + payload.Length + "}]}"))
+        Check(batch.StatusCode == HttpStatusCode.Unauthorized, "an LFS batch on a private repository asks for credentials");
+    using (HttpResponseMessage batch = await LfsBatch(address, "/alice/heavy.git/info/lfs/objects/batch", aliceApi, "upload", oid, payload.Length))
+    {
+        using JsonDocument json = JsonDocument.Parse(await batch.Content.ReadAsStreamAsync());
+        JsonElement entry = json.RootElement.GetProperty("objects")[0];
+        Check(batch.IsSuccessStatusCode && batch.Content.Headers.ContentType?.MediaType == "application/vnd.git-lfs+json" &&
+            entry.GetProperty("actions").GetProperty("upload").GetProperty("href").GetString()!.EndsWith("/info/lfs/objects/" + oid, StringComparison.Ordinal),
+            "an upload batch offers an upload action for an object the repository lacks");
+    }
+    using (HttpResponseMessage wrong = await LfsTransfer(address, "/alice/heavy.git/info/lfs/objects/" + oid, aliceApi, payload[..1000]))
+        Check(wrong.StatusCode == HttpStatusCode.UnprocessableContent || wrong.StatusCode == HttpStatusCode.BadRequest,
+            "bytes that do not hash to their oid are refused and not kept");
+    using (HttpResponseMessage stored = await LfsTransfer(address, "/alice/heavy.git/info/lfs/objects/" + oid, aliceApi, payload))
+        Check(stored.IsSuccessStatusCode, "the object is stored once its hash and size match");
+    using (HttpResponseMessage batch = await LfsBatch(address, "/alice/heavy.git/info/lfs/objects/batch", aliceApi, "upload", oid, payload.Length))
+    {
+        using JsonDocument json = JsonDocument.Parse(await batch.Content.ReadAsStreamAsync());
+        Check(batch.IsSuccessStatusCode && !json.RootElement.GetProperty("objects")[0].TryGetProperty("actions", out _),
+            "an object already stored is offered no upload action");
+    }
+    using (HttpResponseMessage download = await LfsTransfer(address, "/alice/heavy.git/info/lfs/objects/" + oid, aliceApi, null))
+        Check(download.IsSuccessStatusCode && (await download.Content.ReadAsByteArrayAsync()).AsSpan().SequenceEqual(payload),
+            "the object downloads byte for byte");
+
+    // Now the real client, end to end.
+    if ((await RunGit(root, ["lfs", "version"])).ExitCode == 0)
+    {
+        string work = Path.Combine(root, "heavy-work");
+        Directory.CreateDirectory(work);
+        await Git(work, ["init", "--initial-branch=main"]);
+        await Git(work, ["lfs", "install", "--local"]);
+        await Git(work, ["lfs", "track", "*.bin"]);
+        byte[] big = new byte[1024 * 1024];
+        RandomNumberGenerator.Fill(big);
+        File.WriteAllBytes(Path.Combine(work, "model.bin"), big);
+        File.WriteAllText(Path.Combine(work, "readme.txt"), "with a large file\n");
+        await Git(work, ["add", "."]);
+        await Git(work, ["commit", "-m", "Add a large file"]);
+        await Git(work, ["remote", "add", "origin", remote]);
+        await Git(work, ["push", "origin", "main"]);
+        string bigOid = Convert.ToHexStringLower(SHA256.HashData(big));
+        Check(File.Exists(Path.Combine(repositoriesRoot, (await StorageIdOf(projectId))!, "lfs", bigOid[..2], bigOid[2..4], bigOid)),
+            "git-lfs pushed the object beside the repository, content-addressed");
+
+        string fresh = Path.Combine(root, "heavy-fresh");
+        await Git(root, ["clone", remote, "heavy-fresh"]);
+        // The suite runs Git with a private, empty global config, so the clone has no LFS filter until it is
+        // installed there; a developer with `git lfs install` behind them gets this during the clone itself.
+        await Git(fresh, ["lfs", "install", "--local"]);
+        (int pullCode, string pullOut, string pullErr) = await RunGit(fresh, ["lfs", "pull"]);
+        bool restored = File.ReadAllBytes(Path.Combine(fresh, "model.bin")).AsSpan().SequenceEqual(big);
+        Check(restored, restored ? "a fresh clone gets the large file's content back through LFS"
+            : "a fresh clone gets the large file's content back through LFS; git lfs pull exit " + pullCode + ": " + Redact(pullOut + pullErr));
+
+        using (HttpResponseMessage raw = await ApiGet(address, "/api/v4/projects/" + projectId + "/repository/files/model.bin/raw", aliceApi))
+            Check(raw.IsSuccessStatusCode && (await raw.Content.ReadAsByteArrayAsync()).AsSpan().SequenceEqual(big) &&
+                raw.Headers.Contains("X-Graft-Lfs-Oid"),
+                "the raw route serves the content a pointer stands for");
+        using (HttpResponseMessage file = await ApiGet(address, "/api/v4/projects/" + projectId + "/repository/files/model.bin?ref=main", aliceApi))
+        {
+            using JsonDocument json = JsonDocument.Parse(await file.Content.ReadAsStreamAsync());
+            Check(file.IsSuccessStatusCode && json.RootElement.GetProperty("size").GetInt64() < 200,
+                "the file API still describes the pointer, which is what is in the tree");
+        }
+    }
+}
+
+async Task<HttpResponseMessage> LfsBatch(string address, string path, string? token, string operation, string oid, long size)
+{
+    HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false };
+    HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
+    HttpRequestMessage request = new(HttpMethod.Post, path)
+    {
+        Content = new StringContent("{\"operation\":\"" + operation + "\",\"transfers\":[\"basic\"],\"objects\":[{\"oid\":\"" + oid + "\",\"size\":" + size + "}]}",
+            Encoding.UTF8, "application/vnd.git-lfs+json")
+    };
+    if (token is not null) request.Headers.Authorization = new("Basic", Convert.ToBase64String(Encoding.UTF8.GetBytes("alice:" + token)));
+    HttpResponseMessage response = await client.SendAsync(request);
+    request.Dispose();
+    client.Dispose();
+    handler.Dispose();
+    return response;
+}
+
+/// <summary>The basic transfer by hand, with the Basic credential git-lfs itself sends: a PUT of the bytes, or a GET when there are none.</summary>
+async Task<HttpResponseMessage> LfsTransfer(string address, string path, string token, byte[]? content)
+{
+    HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false };
+    HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
+    HttpRequestMessage request = new(content is null ? HttpMethod.Get : HttpMethod.Put, path);
+    if (content is not null)
+    {
+        request.Content = new ByteArrayContent(content);
+        request.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
+    }
+    request.Headers.Authorization = new("Basic", Convert.ToBase64String(Encoding.UTF8.GetBytes("alice:" + token)));
+    HttpResponseMessage response = await client.SendAsync(request);
+    request.Dispose();
+    client.Dispose();
+    handler.Dispose();
+    return response;
+}
+
+async Task<string?> StorageIdOf(long projectId)
+{
+    await using GraftStore store = await GraftStore.OpenAsync(databasePath);
+    return (await store.GetReadyProjectAsync(projectId))?.Project.StorageId;
+}
+
+/// <summary>
+/// The Git engine beyond the bounded subset: a repository directory Git itself can open, a legacy directory
+/// converted on first use, fetch negotiation that sends only what the client lacks, delta compression in
+/// the packs Graft writes, protocol version 2, and housekeeping that packs everything with an index Git
+/// agrees with byte for byte.
+/// </summary>
+async Task CheckGitEngine(string address, AuthenticatedIdentity alice)
+{
+    GitIdentity who = new("Graft Fixture", "fixture@example.invalid", DateTimeOffset.FromUnixTimeSeconds(1_700_000_000).ToOffset(TimeSpan.Zero));
+
+    // A directory in the format Graft used before: raw content behind a type byte, and a reference snapshot.
+    Repository authored = new();
+    authored.CommitFiles("main", [new("readme.txt", "legacy layout\n"u8.ToArray()), new("a/b.txt", "nested\n"u8.ToArray())], who, "First");
+    AuthoredCommit second = authored.CommitFiles("main", [new("readme.txt", "legacy layout, revised\n"u8.ToArray())], who, "Second");
+    string legacy = Path.Combine(root, "legacy-layout");
+    foreach ((string id, GitObject obj) in authored.Objects)
+    {
+        string path = Path.Combine(legacy, "objects", id[..2], id[2..]);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        using FileStream output = new(path, FileMode.CreateNew);
+        output.WriteByte((byte)obj.Type);
+        output.Write(obj.Data);
+    }
+    File.WriteAllText(Path.Combine(legacy, "refs.snapshot"), second.CommitId + " refs/heads/main\n", Encoding.ASCII);
+    Repository migrated = new(new DurableRepositoryStorage(legacy));
+    Check(migrated.Refs["refs/heads/main"] == second.CommitId && migrated.Objects.Count == authored.Objects.Count,
+        "a repository in the previous layout opens and is converted");
+    Check(!File.Exists(Path.Combine(legacy, "refs.snapshot")) && File.Exists(Path.Combine(legacy, "packed-refs")) &&
+        File.ReadAllText(Path.Combine(legacy, "HEAD")).Trim() == "ref: refs/heads/main",
+        "the conversion leaves packed-refs and HEAD where Git looks for them");
+    await Git(legacy, ["fsck", "--full", "--strict"]);
+    Check((await Git(legacy, ["rev-parse", "refs/heads/main"])).Trim() == second.CommitId, "Git itself opens the converted directory and reads its references");
+    Check((await Git(legacy, ["cat-file", "-p", "refs/heads/main:readme.txt"])) == "legacy layout, revised\n", "Git reads a converted loose object");
+    Check(new Repository(new DurableRepositoryStorage(legacy)).Objects.Count == authored.Objects.Count, "opening a converted directory again changes nothing");
+    Check(migrated.Objects[second.CommitId].Data.AsSpan().SequenceEqual(authored.Objects[second.CommitId].Data), "a converted object reads back byte for byte");
+
+    // A project pushed by a real client, with a file that grows so that its versions delta against each other.
+    long projectId;
+    string apiToken;
+    string gitToken;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        ProjectInfo created = await store.CreateProjectWithRepositoryAsync(alice, "engine", "Engine",
+            (project, cancellation) => { cancellation.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, project.StorageId)); return Task.CompletedTask; });
+        projectId = created.Id;
+        apiToken = (await store.CreateTokenAsync(alice, "engine-api", TokenScope.Api | TokenScope.ReadRepository | TokenScope.WriteRepository, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        gitToken = (await store.CreateTokenAsync(alice, "engine-git", TokenScope.ReadRepository | TokenScope.WriteRepository, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+    }
+    string remote = AuthenticatedUrl(address, "alice", gitToken, "alice/engine.git");
+    string repo = Path.Combine(repositoriesRoot, (await StorageIdOf(projectId))!);
+    string work = Path.Combine(root, "engine-work");
+    Directory.CreateDirectory(work);
+    await Git(work, ["init", "--initial-branch=main"]);
+    StringBuilder text = new();
+    for (int line = 0; line < 120; line++) text.Append("line ").Append(line).Append(": the quick brown fox jumps over the lazy dog, again and again\n");
+    List<string> commits = [];
+    for (int round = 0; round < 4; round++)
+    {
+        text.Append("appended in round ").Append(round).Append('\n');
+        File.WriteAllText(Path.Combine(work, "story.txt"), text.ToString());
+        File.WriteAllText(Path.Combine(work, "round" + round + ".txt"), "round " + round + "\n");
+        await Git(work, ["add", "."]);
+        await Git(work, ["commit", "-m", "Round " + round]);
+        commits.Add((await Git(work, ["rev-parse", "HEAD"])).Trim());
+    }
+    await Git(work, ["remote", "add", "origin", remote]);
+    await Git(work, ["push", "origin", "main"]);
+    string tip = commits[^1];
+    await Git(repo, ["fsck", "--full", "--strict"]);
+    Check((await Git(repo, ["symbolic-ref", "HEAD"])).Trim() == "refs/heads/main", "a pushed repository is a bare Git repository whose HEAD names the default branch");
+    Check((await Git(repo, ["rev-parse", "refs/heads/main"])).Trim() == tip, "Git reads the pushed reference from packed-refs");
+    Check((await Git(repo, ["cat-file", "-p", tip + ":story.txt"])) == text.ToString(), "Git reads a pushed loose object");
+
+    // Negotiation by hand: a client that already has the first commit is sent only what came after it.
+    int expectedNew = (await Git(work, ["rev-list", "--objects", commits[0] + ".." + tip])).Split('\n', StringSplitOptions.RemoveEmptyEntries).Length;
+    byte[] request;
+    using (MemoryStream building = new())
+    {
+        Packet.Write(building, "want " + tip + " multi_ack_detailed ofs-delta agent=graft-suite\n");
+        Packet.Flush(building);
+        Packet.Write(building, "have " + commits[0] + "\n");
+        Packet.Write(building, "done\n");
+        request = building.ToArray();
+    }
+    using (HttpResponseMessage response = await GitPost(address, "/alice/engine.git/git-upload-pack", gitToken, request, encoding: null))
+    {
+        byte[] body = await response.Content.ReadAsByteArrayAsync();
+        Cursor cursor = new(body);
+        string first = cursor.Packet() ?? "";
+        string final = cursor.Packet() ?? "";
+        Check(response.IsSuccessStatusCode && first == "ACK " + commits[0] + " common\n" && final == "ACK " + commits[0] + "\n",
+            "a have the repository knows is acknowledged as common and the final acknowledgment names it");
+        PackResult pack = Pack.Read(body[(int)cursor.Position..], new Dictionary<string, GitObject>(StringComparer.Ordinal));
+        Check(pack.Objects.Count == expectedNew, "the pack carries exactly the objects the client lacks, " + expectedNew + " of them");
+        Check(pack.OffsetDeltas > 0, "the pack Graft writes is delta-compressed, with offset deltas because the client offered them");
+        Check(pack.Objects.ContainsKey(tip) && !pack.Objects.ContainsKey(commits[0]), "what the client has is left out");
+    }
+    using (MemoryStream building = new())
+    {
+        Packet.Write(building, "want " + tip + " multi_ack_detailed ofs-delta\n");
+        Packet.Flush(building);
+        Packet.Write(building, "have " + commits[1] + "\n");
+        Packet.Write(building, "have " + Limits.Zero[..39] + "1\n");
+        Packet.Flush(building);
+        request = building.ToArray();
+    }
+    using (HttpResponseMessage response = await GitPost(address, "/alice/engine.git/git-upload-pack", gitToken, request, encoding: null))
+    {
+        string body = Encoding.ASCII.GetString(await response.Content.ReadAsByteArrayAsync());
+        Check(body.Contains("ACK " + commits[1] + " common\n", StringComparison.Ordinal) && body.Contains("ACK " + commits[1] + " ready\n", StringComparison.Ordinal) &&
+            body.EndsWith("0008NAK\n", StringComparison.Ordinal),
+            "a negotiation round acknowledges the common commit, says the pack is ready, and ends with NAK as upload-pack does");
+    }
+    using (MemoryStream building = new())
+    {
+        Packet.Write(building, "want " + tip + " multi_ack_detailed\n");
+        Packet.Flush(building);
+        Packet.Write(building, "have " + Limits.Zero[..39] + "1\n");
+        Packet.Flush(building);
+        request = building.ToArray();
+    }
+    using (HttpResponseMessage response = await GitPost(address, "/alice/engine.git/git-upload-pack", gitToken, request, encoding: null))
+        Check(Encoding.ASCII.GetString(await response.Content.ReadAsByteArrayAsync()) == "0008NAK\n", "a have the repository does not know earns a bare NAK");
+
+    // Protocol version 2 by hand, then through Git with its packets traced.
+    using (HttpResponseMessage advertisement = await GitRequest(address, HttpMethod.Get, "/alice/engine.git/info/refs?service=git-upload-pack", gitToken, null, null, ("Git-Protocol", "version=2")))
+    {
+        string body = Encoding.ASCII.GetString(await advertisement.Content.ReadAsByteArrayAsync());
+        Check(advertisement.IsSuccessStatusCode && body.Contains("000eversion 2\n", StringComparison.Ordinal) && body.Contains("ls-refs=unborn\n", StringComparison.Ordinal) &&
+            body.Contains("fetch\n", StringComparison.Ordinal) && body.Contains("object-format=sha1\n", StringComparison.Ordinal),
+            "a client asking for protocol version 2 is given the version 2 capability advertisement");
+    }
+    using (HttpResponseMessage advertisement = await GitRequest(address, HttpMethod.Get, "/alice/engine.git/info/refs?service=git-receive-pack", gitToken, null, null, ("Git-Protocol", "version=2")))
+        Check(Encoding.ASCII.GetString(await advertisement.Content.ReadAsByteArrayAsync()).Contains(tip + " refs/heads/main", StringComparison.Ordinal),
+            "a push still receives the version 0 advertisement, which is the only one a push has");
+    using (MemoryStream building = new())
+    {
+        Packet.Write(building, "command=ls-refs\n");
+        Packet.Write(building, "agent=graft-suite\n");
+        Packet.Write(building, "object-format=sha1\n");
+        Packet.Delimiter(building);
+        Packet.Write(building, "peel\n");
+        Packet.Write(building, "symrefs\n");
+        Packet.Write(building, "ref-prefix HEAD\n");
+        Packet.Write(building, "ref-prefix refs/heads/\n");
+        Packet.Flush(building);
+        request = building.ToArray();
+    }
+    using (HttpResponseMessage response = await GitRequest(address, HttpMethod.Post, "/alice/engine.git/git-upload-pack", gitToken, request, "application/x-git-upload-pack-request", ("Git-Protocol", "version=2")))
+    {
+        string body = Encoding.ASCII.GetString(await response.Content.ReadAsByteArrayAsync());
+        Check(response.IsSuccessStatusCode && body.Contains(tip + " HEAD symref-target:refs/heads/main\n", StringComparison.Ordinal) &&
+            body.Contains(tip + " refs/heads/main\n", StringComparison.Ordinal) && body.EndsWith("0000", StringComparison.Ordinal),
+            "ls-refs lists the references under the prefixes asked for, with HEAD's target");
+    }
+    using (MemoryStream building = new())
+    {
+        Packet.Write(building, "command=fetch\n");
+        Packet.Write(building, "object-format=sha1\n");
+        Packet.Delimiter(building);
+        Packet.Write(building, "thin-pack\n");
+        Packet.Write(building, "ofs-delta\n");
+        Packet.Write(building, "want " + tip + "\n");
+        Packet.Write(building, "have " + commits[0] + "\n");
+        Packet.Write(building, "done\n");
+        Packet.Flush(building);
+        request = building.ToArray();
+    }
+    using (HttpResponseMessage response = await GitRequest(address, HttpMethod.Post, "/alice/engine.git/git-upload-pack", gitToken, request, "application/x-git-upload-pack-request", ("Git-Protocol", "version=2")))
+    {
+        byte[] body = await response.Content.ReadAsByteArrayAsync();
+        Cursor cursor = new(body);
+        (PacketKind kind, string? section) = cursor.Line();
+        Check(response.IsSuccessStatusCode && kind == PacketKind.Data && section == "packfile\n", "a version 2 fetch with done answers with the packfile section at once");
+        using MemoryStream packData = new();
+        while (true)
+        {
+            string header = Encoding.ASCII.GetString(cursor.Take(4));
+            int length = Convert.ToInt32(header, 16);
+            if (length == 0) break;
+            byte[] payload = cursor.Take(length - 4);
+            Check(payload[0] == 1, "pack data travels on sideband one");
+            packData.Write(payload, 1, payload.Length - 1);
+        }
+        Check(cursor.Remaining == 0, "the version 2 response ends with a flush");
+        PackResult pack = Pack.Read(packData.ToArray(), new Dictionary<string, GitObject>(StringComparer.Ordinal));
+        Check(pack.Objects.Count == expectedNew, "the version 2 pack carries exactly what the client lacks");
+    }
+    using (MemoryStream building = new())
+    {
+        Packet.Write(building, "command=fetch\n");
+        Packet.Delimiter(building);
+        Packet.Write(building, "want " + tip + "\n");
+        Packet.Write(building, "have " + commits[2] + "\n");
+        Packet.Flush(building);
+        request = building.ToArray();
+    }
+    using (HttpResponseMessage response = await GitRequest(address, HttpMethod.Post, "/alice/engine.git/git-upload-pack", gitToken, request, "application/x-git-upload-pack-request", ("Git-Protocol", "version=2")))
+    {
+        string body = Encoding.ASCII.GetString(await response.Content.ReadAsByteArrayAsync());
+        Check(body.StartsWith("0014acknowledgments\n" + "0031ACK " + commits[2] + "\n" + "000aready\n0001", StringComparison.Ordinal) && body.Contains("000dpackfile\n", StringComparison.Ordinal),
+            "a version 2 fetch without done acknowledges the common commit, says ready, and sends the pack in the same response");
+    }
+    using (MemoryStream building = new())
+    {
+        Packet.Write(building, "command=fetch\n");
+        Packet.Delimiter(building);
+        Packet.Write(building, "want " + tip + "\n");
+        Packet.Write(building, "deepen 1\n");
+        Packet.Write(building, "done\n");
+        Packet.Flush(building);
+        request = building.ToArray();
+    }
+    using (HttpResponseMessage response = await GitRequest(address, HttpMethod.Post, "/alice/engine.git/git-upload-pack", gitToken, request, "application/x-git-upload-pack-request", ("Git-Protocol", "version=2")))
+        Check(response.StatusCode == HttpStatusCode.BadRequest && (await response.Content.ReadAsStringAsync()).Contains("fetch-unsupported: deepen", StringComparison.Ordinal),
+            "a shallow fetch is refused by name rather than answered with a full history");
+
+    string traced = Path.Combine(root, "engine-v2-clone");
+    (int cloneCode, _, string cloneTrace) = await RunGit(root, ["-c", "protocol.version=2", "clone", remote, "engine-v2-clone"], new Dictionary<string, string> { ["GIT_TRACE_PACKET"] = "1" });
+    Check(cloneCode == 0 && cloneTrace.Contains("command=ls-refs", StringComparison.Ordinal) && cloneTrace.Contains("command=fetch", StringComparison.Ordinal),
+        "Git clones over protocol version 2 when it asks for it, listing references and fetching as two commands");
+    Check(File.ReadAllText(Path.Combine(traced, "story.txt")) == text.ToString(), "the version 2 clone has the content");
+    await Git(traced, ["fsck", "--full", "--strict"]);
+    text.Append("appended after the clone\n");
+    File.WriteAllText(Path.Combine(work, "story.txt"), text.ToString());
+    await Git(work, ["commit", "-am", "After the clone"]);
+    await Git(work, ["push", "origin", "main"]);
+    (int fetchCode, _, string fetchTrace) = await RunGit(traced, ["-c", "protocol.version=2", "pull", "--ff-only"], new Dictionary<string, string> { ["GIT_TRACE_PACKET"] = "1" });
+    Check(fetchCode == 0 && fetchTrace.Contains("have " + tip, StringComparison.Ordinal) && File.ReadAllText(Path.Combine(traced, "story.txt")) == text.ToString(),
+        "an incremental fetch over version 2 tells the server what it has and receives the rest");
+    tip = (await Git(work, ["rev-parse", "HEAD"])).Trim();
+
+    // Housekeeping: everything into one pack with an index, and Git agrees with the index byte for byte.
+    using (HttpResponseMessage refused = await ApiPostJson(address, "/api/v4/projects/" + projectId + "/housekeeping", gitToken, "{}"))
+        Check(refused.StatusCode is HttpStatusCode.Forbidden or HttpStatusCode.NotFound, "housekeeping needs the api scope, like every other project setting, and a token without it learns nothing");
+    int looseBefore = Directory.EnumerateDirectories(Path.Combine(repo, "objects")).Where(d => Path.GetFileName(d).Length == 2).Sum(d => Directory.EnumerateFiles(d).Count());
+    Check(looseBefore > 0 && Directory.EnumerateFiles(Path.Combine(repo, "objects", "pack")).Count() == 0, "before housekeeping every object is loose and there is no pack");
+    using (HttpResponseMessage packed = await ApiPostJson(address, "/api/v4/projects/" + projectId + "/housekeeping", apiToken, "{}"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await packed.Content.ReadAsStreamAsync());
+        Check(packed.StatusCode == HttpStatusCode.Created && json.RootElement.GetProperty("objects_packed").GetInt32() == looseBefore &&
+            json.RootElement.GetProperty("loose_objects_removed").GetInt32() == looseBefore,
+            "housekeeping packs every object and says so");
+    }
+    string[] packFiles = [.. Directory.EnumerateFiles(Path.Combine(repo, "objects", "pack"))];
+    string? packPath = packFiles.FirstOrDefault(path => path.EndsWith(".pack", StringComparison.Ordinal));
+    Check(packFiles.Length == 2 && packPath is not null && File.Exists(Path.ChangeExtension(packPath, ".idx")), "one pack and its index remain");
+    int looseAfter = Directory.EnumerateDirectories(Path.Combine(repo, "objects")).Where(d => Path.GetFileName(d).Length == 2).Sum(d => Directory.EnumerateFiles(d).Count());
+    Check(looseAfter == 0, "no loose objects remain after housekeeping");
+    await Git(repo, ["fsck", "--full", "--strict"]);
+    string verify = await Git(repo, ["verify-pack", "-v", Path.ChangeExtension(packPath!, ".idx")]);
+    Check(verify.Split('\n').Any(line => line.Split(' ', StringSplitOptions.RemoveEmptyEntries) is { Length: >= 7 } fields && fields[1] == "blob"),
+        "Git verifies the pack and finds blobs stored as deltas in it");
+    string indexCheck = Path.Combine(root, "engine-index-check");
+    Directory.CreateDirectory(indexCheck);
+    File.Copy(packPath!, Path.Combine(indexCheck, "check.pack"));
+    await Git(indexCheck, ["index-pack", "--strict", "check.pack"]);
+    Check(File.ReadAllBytes(Path.Combine(indexCheck, "check.idx")).AsSpan().SequenceEqual(File.ReadAllBytes(Path.ChangeExtension(packPath!, ".idx"))),
+        "the index Graft wrote is byte for byte the index Git writes for the same pack");
+    Check((await Git(repo, ["cat-file", "-p", tip + ":story.txt"])) == text.ToString(), "Git reads a packed object from the repository Graft keeps");
+
+    // Reading and writing go on across the pack: the API, a clone, and a push that leaves new loose objects beside it.
+    using (HttpResponseMessage file = await ApiGet(address, "/api/v4/projects/" + projectId + "/repository/files/story.txt/raw?ref=main", apiToken))
+        Check(file.IsSuccessStatusCode && Encoding.UTF8.GetString(await file.Content.ReadAsByteArrayAsync()) == text.ToString(), "the API reads a file from the pack");
+    string afterPack = Path.Combine(root, "engine-after-pack");
+    await Git(root, ["clone", remote, "engine-after-pack"]);
+    Check(File.ReadAllText(Path.Combine(afterPack, "story.txt")) == text.ToString(), "a clone is served from the pack");
+    await Git(afterPack, ["fsck", "--full", "--strict"]);
+    File.WriteAllText(Path.Combine(afterPack, "after.txt"), "after the pack\n");
+    await Git(afterPack, ["add", "."]);
+    await Git(afterPack, ["commit", "-m", "After the pack"]);
+    await Git(afterPack, ["push", "origin", "main"]);
+    await Git(repo, ["fsck", "--full", "--strict"]);
+    Check(Directory.EnumerateDirectories(Path.Combine(repo, "objects")).Where(d => Path.GetFileName(d).Length == 2).Sum(d => Directory.EnumerateFiles(d).Count()) == 3,
+        "a push after housekeeping leaves its three new objects loose beside the pack");
+    await Git(traced, ["pull", "--ff-only"]);
+    Check(File.Exists(Path.Combine(traced, "after.txt")), "a fetch across the pack and the loose objects brings the new commit");
+
+    // Automatic housekeeping at the end of a push that leaves more loose objects than the threshold.
+    Repository many = new();
+    for (int batch = 0; batch < 11; batch++)
+        many.CommitFiles("main", [.. Enumerable.Range(0, 100).Select(n => new FileChange("files/" + batch + "/" + n + ".txt", Encoding.ASCII.GetBytes("file " + batch + "-" + n + "\n")))], who, "Batch " + batch);
+    string automatic = Path.Combine(root, "engine-automatic");
+    Repository receiving = new(new DurableRepositoryStorage(automatic));
+    receiving.Receive(Push((Limits.Zero, many.Refs["refs/heads/main"], "refs/heads/main"), Pack.Write(many.Objects.Values)));
+    Check(many.Objects.Count > Repository.AutoRepackLooseObjects && receiving.LooseObjectCount == 0 &&
+        Directory.EnumerateFiles(Path.Combine(automatic, "objects", "pack"), "*.idx").Count() == 1,
+        "a push that leaves more than " + Repository.AutoRepackLooseObjects + " loose objects is packed before it is answered");
+    Check(receiving.Objects.Count == many.Objects.Count && receiving.Objects[many.Refs["refs/heads/main"]].Data.AsSpan().SequenceEqual(many.Objects[many.Refs["refs/heads/main"]].Data),
+        "the repository reads the same objects from the pack it just wrote");
+    await Git(automatic, ["fsck", "--full", "--strict"]);
+    Check(new Repository(new DurableRepositoryStorage(automatic)).Objects.Count == many.Objects.Count, "a repository held in a pack opens again with everything");
+}
+
+async Task<HttpResponseMessage> GitRequest(string address, HttpMethod method, string path, string token, byte[]? body, string? contentType, params (string Name, string Value)[] headers)
+{
+    HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false };
+    HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(60) };
+    HttpRequestMessage request = new(method, path);
+    if (body is not null)
+    {
+        request.Content = new ByteArrayContent(body);
+        if (contentType is not null) request.Content.Headers.ContentType = new(contentType);
+    }
+    foreach ((string name, string value) in headers) request.Headers.Add(name, value);
+    request.Headers.Authorization = new("Basic", Convert.ToBase64String(Encoding.UTF8.GetBytes("alice:" + token)));
+    HttpResponseMessage response = await client.SendAsync(request);
+    request.Dispose();
+    client.Dispose();
+    handler.Dispose();
+    return response;
+}
+
+/// <summary>
+/// Package feeds and the container registry, over the protocols their clients speak: a generic file, a
+/// NuGet v3 push and the feed that serves it, and a Docker v2 push and pull.
+/// </summary>
+async Task CheckPackages(string address, AuthenticatedIdentity alice, string reporterUsername)
+{
+    long projectId;
+    string aliceApi;
+    string reporterApi;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        ProjectInfo created = await store.CreateProjectWithRepositoryAsync(alice, "crate", "Crate",
+            (project, cancellation) => { cancellation.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, project.StorageId)); return Task.CompletedTask; });
+        projectId = created.Id;
+        UserAccount reporter = Required(await store.FindActiveUserAsync(reporterUsername), "reporter account");
+        await store.SetMembershipAsync(alice, projectId, reporter.Id, ProjectRole.Reporter);
+        aliceApi = (await store.CreateTokenAsync(alice, "crate-api", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        reporterApi = (await store.CreateTokenAsync(new(reporter.Id, reporter.Username, false, IdentityKind.BrowserSession), "crate-reporter", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+    }
+    string prefix = "/api/v4/projects/" + projectId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    // Generic packages.
+    byte[] build = Encoding.UTF8.GetBytes("a build artefact\n");
+    using (HttpResponseMessage refused = await ApiPutBytes(address, prefix + "/packages/generic/tool/1.0.0/tool.bin", reporterApi, build, "application/octet-stream"))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden, "publishing a package needs the permission to push");
+    using (HttpResponseMessage stored = await ApiPutBytes(address, prefix + "/packages/generic/tool/1.0.0/tool.bin", aliceApi, build, "application/octet-stream"))
+        Check(stored.StatusCode == HttpStatusCode.Created, "a generic package file is published under a name and a version");
+    using (HttpResponseMessage fetched = await ApiGet(address, prefix + "/packages/generic/tool/1.0.0/tool.bin", reporterApi))
+        Check(fetched.IsSuccessStatusCode && (await fetched.Content.ReadAsByteArrayAsync()).AsSpan().SequenceEqual(build) &&
+            fetched.Content.Headers.ContentDisposition?.DispositionType == "attachment", "a reader downloads it byte for byte, as an attachment");
+    using (HttpResponseMessage challenge = await ApiGet(address, prefix + "/packages/generic/tool/1.0.0/tool.bin", null))
+        Check(challenge.StatusCode == HttpStatusCode.Unauthorized && challenge.Headers.WwwAuthenticate.Any(h => h.Scheme == "Basic"),
+            "an anonymous package client is challenged with Basic, which is what package clients answer");
+    using (HttpResponseMessage listing = await ApiGet(address, prefix + "/packages", reporterApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await listing.Content.ReadAsStreamAsync());
+        Check(listing.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 1 &&
+            json.RootElement[0].GetProperty("package_type").GetString() == "generic" &&
+            json.RootElement[0].GetProperty("package_files")[0].GetProperty("file_sha256").GetString() == Convert.ToHexStringLower(SHA256.HashData(build)),
+            "the package listing names the file and its hash");
+    }
+
+    // NuGet: a package built by hand, pushed as the client pushes it, and read back through the feed.
+    string nupkg = Path.Combine(root, "Widgets.Core.1.2.3.nupkg");
+    using (FileStream zip = new(nupkg, FileMode.Create))
+    using (System.IO.Compression.ZipArchive archive = new(zip, System.IO.Compression.ZipArchiveMode.Create))
+    {
+        using (StreamWriter spec = new(archive.CreateEntry("Widgets.Core.nuspec").Open()))
+            spec.Write("<?xml version=\"1.0\"?><package xmlns=\"http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd\"><metadata><id>Widgets.Core</id><version>1.2.3</version><authors>Alice</authors><description>Widgets for everyone.</description><dependencies><group targetFramework=\"net10.0\"><dependency id=\"Newtonsoft.Json\" version=\"13.0.3\" /></group></dependencies></metadata></package>");
+        using (StreamWriter lib = new(archive.CreateEntry("lib/net10.0/Widgets.Core.dll").Open())) lib.Write("not really a dll");
+    }
+    using (HttpResponseMessage index = await ApiGet(address, prefix + "/packages/nuget/index.json", aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await index.Content.ReadAsStreamAsync());
+        Check(index.IsSuccessStatusCode && json.RootElement.GetProperty("resources").EnumerateArray().Any(r => r.GetProperty("@type").GetString() == "PackageBaseAddress/3.0.0"),
+            "the NuGet service index names the feed's resources");
+    }
+    using (HttpResponseMessage pushed = await NuGetPushPackage(address, prefix + "/packages/nuget", aliceApi, nupkg))
+        Check(pushed.StatusCode == HttpStatusCode.Created, "a NuGet package is pushed as the client pushes it, with the token as the API key" +
+            (pushed.StatusCode == HttpStatusCode.Created ? "" : " (got " + (int)pushed.StatusCode + ": " + Redact(await pushed.Content.ReadAsStringAsync()) + ")"));
+    using (HttpResponseMessage versions = await ApiGet(address, prefix + "/packages/nuget/download/widgets.core/index.json", reporterApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await versions.Content.ReadAsStreamAsync());
+        Check(versions.IsSuccessStatusCode && json.RootElement.GetProperty("versions")[0].GetString() == "1.2.3", "the flat container lists the version, by lowercase id");
+    }
+    using (HttpResponseMessage content = await ApiGet(address, prefix + "/packages/nuget/download/widgets.core/1.2.3/widgets.core.1.2.3.nupkg", reporterApi))
+        Check(content.IsSuccessStatusCode && (await content.Content.ReadAsByteArrayAsync()).AsSpan().SequenceEqual(File.ReadAllBytes(nupkg)), "the package downloads byte for byte");
+    using (HttpResponseMessage spec = await ApiGet(address, prefix + "/packages/nuget/download/widgets.core/1.2.3/widgets.core.nuspec", reporterApi))
+        Check(spec.IsSuccessStatusCode && (await spec.Content.ReadAsStringAsync()).Contains("<id>Widgets.Core</id>", StringComparison.Ordinal), "the nuspec is read out of the package");
+    using (HttpResponseMessage registration = await ApiGet(address, prefix + "/packages/nuget/metadata/widgets.core/index.json", reporterApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await registration.Content.ReadAsStreamAsync());
+        JsonElement entry = json.RootElement.GetProperty("items")[0].GetProperty("items")[0].GetProperty("catalogEntry");
+        Check(registration.IsSuccessStatusCode && entry.GetProperty("id").GetString() == "Widgets.Core" &&
+            entry.GetProperty("description").GetString() == "Widgets for everyone." &&
+            entry.GetProperty("dependencyGroups")[0].GetProperty("dependencies")[0].GetProperty("id").GetString() == "Newtonsoft.Json",
+            "the registration carries the package's description and dependencies");
+    }
+    using (HttpResponseMessage search = await ApiGet(address, prefix + "/packages/nuget/query?q=widget", reporterApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await search.Content.ReadAsStreamAsync());
+        Check(search.IsSuccessStatusCode && json.RootElement.GetProperty("totalHits").GetInt32() == 1, "the search service finds the package");
+    }
+    using (HttpResponseMessage junk = await NuGetPushPackage(address, prefix + "/packages/nuget", aliceApi, nupkg + ".missing"))
+        Check(junk.StatusCode == HttpStatusCode.BadRequest, "a push of something that is not a package is refused");
+
+    // The container registry, as a Docker client speaks to it.
+    byte[] layer = Encoding.UTF8.GetBytes("layer bytes " + new string('x', 5000));
+    string layerDigest = "sha256:" + Convert.ToHexStringLower(SHA256.HashData(layer));
+    string image = "/v2/alice/crate/app";
+    using (HttpResponseMessage ping = await ApiGet(address, "/v2/", null))
+        Check(ping.StatusCode == HttpStatusCode.Unauthorized && ping.Headers.WwwAuthenticate.Any(h => h.Scheme == "Basic"), "the registry challenges an anonymous client with Basic");
+    using (HttpResponseMessage ping = await RegistryRequest(address, HttpMethod.Get, "/v2/", aliceApi, null, null))
+        Check(ping.IsSuccessStatusCode && ping.Headers.Contains("Docker-Distribution-Api-Version"), "an identified client is told the API version");
+    using (HttpResponseMessage missing = await RegistryRequest(address, HttpMethod.Head, image + "/blobs/" + layerDigest, aliceApi, null, null))
+        Check(missing.StatusCode == HttpStatusCode.NotFound, "a blob not yet pushed is unknown");
+    string? uploadLocation;
+    using (HttpResponseMessage started = await RegistryRequest(address, HttpMethod.Post, image + "/blobs/uploads/", aliceApi, null, null))
+    {
+        uploadLocation = started.Headers.Location?.ToString();
+        Check(started.StatusCode == HttpStatusCode.Accepted && uploadLocation is { Length: > 0 } && started.Headers.Contains("Docker-Upload-UUID"), "a blob upload is started");
+    }
+    using (HttpResponseMessage patched = await RegistryRequest(address, HttpMethod.Patch, uploadLocation!, aliceApi, layer[..3000], "application/octet-stream"))
+        Check(patched.StatusCode == HttpStatusCode.Accepted && patched.Headers.TryGetValues("Range", out IEnumerable<string>? range) && range.First() == "0-2999", "a chunk is appended and the range reported");
+    using (HttpResponseMessage completed = await RegistryRequest(address, HttpMethod.Put, uploadLocation + "?digest=" + layerDigest, aliceApi, layer[3000..], "application/octet-stream"))
+        Check(completed.StatusCode == HttpStatusCode.Created && completed.Headers.TryGetValues("Docker-Content-Digest", out IEnumerable<string>? d) && d.First() == layerDigest, "the upload completes under its digest");
+    using (HttpResponseMessage wrong = await RegistryRequest(address, HttpMethod.Post, image + "/blobs/uploads/?digest=sha256:" + new string('0', 64), aliceApi, layer, "application/octet-stream"))
+        Check(wrong.StatusCode == HttpStatusCode.BadRequest, "a blob whose bytes do not hash to the digest is refused");
+    using (HttpResponseMessage head = await RegistryRequest(address, HttpMethod.Head, image + "/blobs/" + layerDigest, aliceApi, null, null))
+    {
+        long? length = head.Content.Headers.ContentLength;
+        bool there = head.IsSuccessStatusCode && length == layer.Length;
+        Check(there, there ? "the blob is there, with its length" : "the blob is there, with its length (got " + (int)head.StatusCode + ", length " + (length?.ToString() ?? "none") + ", headers: " + head.Headers + head.Content.Headers + ")");
+    }
+    string manifest = "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.docker.distribution.manifest.v2+json\",\"config\":{\"mediaType\":\"application/vnd.docker.container.image.v1+json\",\"size\":" + layer.Length + ",\"digest\":\"" + layerDigest + "\"},\"layers\":[{\"mediaType\":\"application/vnd.docker.image.rootfs.diff.tar.gzip\",\"size\":" + layer.Length + ",\"digest\":\"" + layerDigest + "\"}]}";
+    byte[] manifestBytes = Encoding.UTF8.GetBytes(manifest);
+    string manifestDigest = "sha256:" + Convert.ToHexStringLower(SHA256.HashData(manifestBytes));
+    using (HttpResponseMessage refused = await RegistryRequest(address, HttpMethod.Put, image + "/manifests/latest", reporterApi, manifestBytes, "application/vnd.docker.distribution.manifest.v2+json", username: reporterUsername))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden, "a Reporter cannot push an image" + (refused.StatusCode == HttpStatusCode.Forbidden ? "" : " (got " + (int)refused.StatusCode + ": " + Redact(await refused.Content.ReadAsStringAsync()) + " " + refused.Headers + ")"));
+    using (HttpResponseMessage pushed = await RegistryRequest(address, HttpMethod.Put, image + "/manifests/latest", aliceApi, manifestBytes, "application/vnd.docker.distribution.manifest.v2+json"))
+        Check(pushed.StatusCode == HttpStatusCode.Created && pushed.Headers.TryGetValues("Docker-Content-Digest", out IEnumerable<string>? md) && md.First() == manifestDigest, "a manifest is pushed under a tag");
+    using (HttpResponseMessage pulled = await RegistryRequest(address, HttpMethod.Get, image + "/manifests/latest", reporterApi, null, null, username: reporterUsername))
+        Check(pulled.IsSuccessStatusCode && pulled.Content.Headers.ContentType?.MediaType == "application/vnd.docker.distribution.manifest.v2+json" &&
+            (await pulled.Content.ReadAsByteArrayAsync()).AsSpan().SequenceEqual(manifestBytes), "a reader pulls the manifest by tag, with the type it was pushed as");
+    using (HttpResponseMessage byDigest = await RegistryRequest(address, HttpMethod.Get, image + "/manifests/" + manifestDigest, reporterApi, null, null, username: reporterUsername))
+        Check(byDigest.IsSuccessStatusCode, "and by digest");
+    using (HttpResponseMessage pulledBlob = await RegistryRequest(address, HttpMethod.Get, image + "/blobs/" + layerDigest, reporterApi, null, null, username: reporterUsername))
+        Check(pulledBlob.IsSuccessStatusCode && (await pulledBlob.Content.ReadAsByteArrayAsync()).AsSpan().SequenceEqual(layer), "and the layer byte for byte");
+    using (HttpResponseMessage tags = await RegistryRequest(address, HttpMethod.Get, image + "/tags/list", reporterApi, null, null, username: reporterUsername))
+    {
+        using JsonDocument json = JsonDocument.Parse(await tags.Content.ReadAsStreamAsync());
+        Check(tags.IsSuccessStatusCode && json.RootElement.GetProperty("name").GetString() == "alice/crate/app" && json.RootElement.GetProperty("tags")[0].GetString() == "latest", "the tag list names the image and its tag");
+    }
+    using (HttpResponseMessage images = await ApiGet(address, prefix + "/registry/repositories", reporterApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await images.Content.ReadAsStreamAsync());
+        Check(images.IsSuccessStatusCode && json.RootElement[0].GetProperty("path").GetString() == "alice/crate/app" && json.RootElement[0].GetProperty("tags_count").GetInt32() == 1,
+            "the project lists its images in GitLab's shape");
+    }
+    using (HttpResponseMessage untagged = await RegistryRequest(address, HttpMethod.Delete, image + "/manifests/latest", aliceApi, null, null))
+        Check(untagged.StatusCode == HttpStatusCode.Accepted, "a tag is removed");
+    using (HttpResponseMessage gone = await RegistryRequest(address, HttpMethod.Get, image + "/manifests/latest", aliceApi, null, null))
+        Check(gone.StatusCode == HttpStatusCode.NotFound, "and the tag is gone while the manifest stays reachable by digest");
+}
+
+async Task<HttpResponseMessage> NuGetPushPackage(string address, string path, string token, string file)
+{
+    HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false };
+    HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(30) };
+    MultipartFormDataContent form = new();
+    byte[] bytes = File.Exists(file) ? File.ReadAllBytes(file) : Encoding.UTF8.GetBytes("not a package");
+    form.Add(new ByteArrayContent(bytes), "package", "package.nupkg");
+    HttpRequestMessage request = new(HttpMethod.Put, path) { Content = form };
+    request.Headers.Add("X-NuGet-ApiKey", token);
+    HttpResponseMessage response = await client.SendAsync(request);
+    request.Dispose();
+    client.Dispose();
+    handler.Dispose();
+    return response;
+}
+
+async Task<HttpResponseMessage> RegistryRequest(string address, HttpMethod method, string path, string? token, byte[]? body, string? contentType, string username = "alice")
+{
+    HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false };
+    HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(30) };
+    HttpRequestMessage request = new(method, path);
+    if (body is not null)
+    {
+        request.Content = new ByteArrayContent(body);
+        request.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue(contentType ?? "application/octet-stream");
+    }
+    if (token is not null) request.Headers.Authorization = new("Basic", Convert.ToBase64String(Encoding.UTF8.GetBytes(username + ":" + token)));
+    HttpResponseMessage response = await client.SendAsync(request);
+    request.Dispose();
+    client.Dispose();
+    handler.Dispose();
+    return response;
+}
+
+/// <summary>
 /// Webhooks, against a receiver this suite runs. Proves the delivery arrives, that it is signed with the
 /// hook's own secret, and that a server without the operator's switch has no hook routes at all.
 /// </summary>
@@ -5138,7 +6012,7 @@ async Task Throws<TException>(Func<Task> action, string name) where TException :
 static string Password() => Convert.ToHexString(RandomNumberGenerator.GetBytes(24));
 static string AuthenticatedUrl(string address, string username, string token, string path) =>
     address.Replace("https://", "https://" + Uri.EscapeDataString(username) + ":" + Uri.EscapeDataString(token) + "@", StringComparison.Ordinal) + "/" + path;
-static string Redact(string message) => message.Contains("graft_pat_", StringComparison.Ordinal) ? "credential-bearing operation failed" : message;
+static string Redact(string message) => System.Text.RegularExpressions.Regex.Replace(message, "graft_pat_[A-Za-z0-9_-]+", "graft_pat_REDACTED");
 static GitObject Commit(string tree, string parent, string message) => new(1, Encoding.UTF8.GetBytes(
     $"tree {tree}\nparent {parent}\nauthor Fixture <fixture@example.invalid> 1700000000 +0000\ncommitter Fixture <fixture@example.invalid> 1700000000 +0000\n\n{message}\n"));
 static byte[] Push((string Old, string New, string Name) command, byte[] pack)

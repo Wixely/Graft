@@ -1,0 +1,147 @@
+@page "/{Namespace}/{Slug}/-/packages"
+@page "/projects/{Slug}/-/packages"
+@inject GraftApi Api
+
+<PageTitle>Packages &middot; Graft</PageTitle>
+
+@if (loading)
+{
+    <p role="status" class="secondary-text">Loading…</p>
+}
+else if (project is null)
+{
+    <div class="page-header"><div><h1>Unavailable</h1><p class="subtitle">@message</p></div></div>
+    <a class="button secondary" href="/"><Icon Name="chevron-left" />Back to projects</a>
+}
+else
+{
+    <div class="page-header">
+        <div>
+            <h1>Packages and images</h1>
+            <p class="subtitle"><a href="@ProjectUrl">@project.Namespace.Name / @project.Name</a></p>
+        </div>
+    </div>
+
+    <Banner Message="@message" Kind="@messageKind" />
+
+    <div class="panel">
+        <div class="panel-header"><Icon Name="archive" /><h2>Packages</h2><span class="spacer"></span><span class="label">@packages.Length</span></div>
+        @if (packages.Length == 0) { <div class="panel-empty">Nothing published. Push a NuGet package to the feed, or PUT a file to the generic registry, with a token.</div> }
+        else
+        {
+            <div class="list">
+                @foreach (PackageResponse package in packages)
+                {
+                    <div class="list-item">
+                        <Icon Name="archive" />
+                        <span class="list-item-main">
+                            <strong>@package.Name <code>@package.Version</code></strong>
+                            <small>@package.PackageType &middot; @package.CreatedBy &middot; @package.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd")@(package.Description.Length > 0 ? " · " + package.Description : "")</small>
+                            <span class="list-labels">
+                                @foreach (PackageFileResponse file in package.PackageFiles)
+                                {
+                                    <a class="label" href="@($"/api/projects/{projectId}/packages/{package.Id}/files/{Uri.EscapeDataString(file.FileName)}")" download>@file.FileName (@file.Size bytes)</a>
+                                }
+                            </span>
+                        </span>
+                        @if (canPush)
+                        {
+                            <button type="button" class="link danger-text" @onclick="() => Delete(package)" disabled="@busy">Delete</button>
+                        }
+                    </div>
+                }
+            </div>
+        }
+        <div class="panel-body">
+            <p class="field-hint">
+                NuGet feed: <code>@Origin/api/v4/projects/@projectId/packages/nuget/index.json</code>, pushed with a token as the API key.
+                Generic: <code>PUT @Origin/api/v4/projects/@projectId/packages/generic/&lt;name&gt;/&lt;version&gt;/&lt;file&gt;</code>.
+            </p>
+        </div>
+    </div>
+
+    <div class="panel">
+        <div class="panel-header"><Icon Name="folder" /><h2>Container images</h2><span class="spacer"></span><span class="label">@images.Length</span></div>
+        @if (images.Length == 0) { <div class="panel-empty">No images. Push one with <code>docker push @Host/@project.PathWithNamespace/&lt;image&gt;:&lt;tag&gt;</code> after <code>docker login @Host</code> with a token.</div> }
+        else
+        {
+            <div class="list">
+                @foreach (ContainerRepositoryResponse image in images)
+                {
+                    <div class="list-item">
+                        <Icon Name="folder" />
+                        <span class="list-item-main">
+                            <strong class="mono">@image.Location</strong>
+                            <span class="list-labels">
+                                @foreach (ContainerTagResponse tag in image.Tags) { <span class="label" title="@tag.Digest">@tag.Name</span> }
+                                @if (image.Tags.Count == 0) { <span class="secondary-text">no tags</span> }
+                            </span>
+                        </span>
+                    </div>
+                }
+            </div>
+        }
+    </div>
+}
+
+@code {
+    [Parameter] public string Namespace { get; set; } = "";
+    [Parameter] public string Slug { get; set; } = "";
+
+    private ProjectResponse? project;
+    private long projectId;
+    private bool canPush;
+    private PackageResponse[] packages = [];
+    private ContainerRepositoryResponse[] images = [];
+    private bool loading = true;
+    private bool busy;
+    private string message = "";
+    private string messageKind = "info";
+
+    private bool ViaSlug => Namespace.Length == 0;
+    private string ProjectUrl => ViaSlug
+        ? $"/projects/{Uri.EscapeDataString(Slug)}"
+        : $"/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
+    private string Origin => project is null ? "" : new Uri(project.WebUrl).GetLeftPart(UriPartial.Authority);
+    private string Host => project is null ? "" : new Uri(project.WebUrl).Authority;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        loading = true;
+        try
+        {
+            await Api.EnsureSessionAsync();
+            string path = ViaSlug
+                ? $"api/graft/slugs/{Uri.EscapeDataString(Slug)}"
+                : $"api/browser/projects/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
+            (bool reached, RepositoryPageResponse? page) = await Api.GetOptionalAsync(path, ApiJson.Default.RepositoryPageResponse);
+            if (!reached) { message = "Graft could not be reached."; return; }
+            if (page is null) { message = "That repository could not be found."; return; }
+            project = page.Project;
+            projectId = page.Project.Id;
+            canPush = page.CanPush;
+            await Load();
+        }
+        finally { loading = false; }
+    }
+
+    private async Task Load()
+    {
+        packages = await Api.GetAsync($"api/projects/{projectId}/packages", ApiJson.Default.PackageResponseArray) ?? [];
+        images = await Api.GetAsync($"api/projects/{projectId}/registry/repositories", ApiJson.Default.ContainerRepositoryResponseArray) ?? [];
+    }
+
+    private async Task Delete(PackageResponse package)
+    {
+        if (busy) return;
+        busy = true;
+        try
+        {
+            ApiResult result = await Api.DeleteAsync($"api/projects/{projectId}/packages/{package.Id}", $"{package.Name} {package.Version} deleted.");
+            message = result.Message;
+            messageKind = result.Ok ? "success" : "error";
+            if (result.Ok) await Load();
+        }
+        finally { busy = false; }
+    }
+}

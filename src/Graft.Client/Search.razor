@@ -1,0 +1,211 @@
+@page "/-/search"
+@page "/{Namespace}/{Slug}/-/search"
+@page "/projects/{Slug}/-/search"
+@inject GraftApi Api
+@inject NavigationManager Navigation
+
+<PageTitle>Search &middot; Graft</PageTitle>
+
+@if (loading)
+{
+    <p role="status" class="secondary-text">Loading…</p>
+}
+else if (InProject && project is null)
+{
+    <div class="page-header"><div><h1>Unavailable</h1><p class="subtitle">@message</p></div></div>
+    <a class="button secondary" href="/"><Icon Name="chevron-left" />Back to projects</a>
+}
+else
+{
+    <div class="page-header">
+        <div>
+            <h1>Search</h1>
+            <p class="subtitle">
+                @if (project is not null) { <a href="@ProjectUrl">@project.Namespace.Name / @project.Name</a> }
+                else { <span>Everything you can see on this server.</span> }
+            </p>
+        </div>
+    </div>
+
+    <form class="form inline" @onsubmit="Run" @onsubmit:preventDefault>
+        <div class="form-row">
+            <input type="search" @bind="query" placeholder="@(InProject ? "Search this project" : "Search projects, issues and merge requests")" aria-label="Search" maxlength="200" />
+            <button type="submit" disabled="@busy">Search</button>
+        </div>
+    </form>
+
+    <div class="tabs">
+        @foreach (string option in Scopes)
+        {
+            <button type="button" class="@(scope == option ? "active" : "")" @onclick="() => ChooseScope(option)">@ScopeName(option)</button>
+        }
+    </div>
+
+    <Banner Message="@message" Kind="@messageKind" />
+
+    @if (results is not null)
+    {
+        <div class="panel">
+            <div class="panel-header">
+                <Icon Name="search" /><h2>@ScopeName(results.Scope) matching &ldquo;@results.Search&rdquo;</h2>
+                <span class="spacer"></span><span class="label">@results.Count@(results.Truncated ? "+" : "")</span>
+            </div>
+            @if (results.Count == 0) { <div class="panel-empty">Nothing matched.</div> }
+            else
+            {
+                <div class="list">
+                    @foreach (ProjectResponse hit in results.Projects)
+                    {
+                        <a class="list-item" href="@("/" + hit.PathWithNamespace)">
+                            <Icon Name="repository" />
+                            <span class="list-item-main"><strong>@hit.NameWithNamespace</strong><small>@hit.Description</small></span>
+                            <span class="label">@hit.Visibility</span>
+                        </a>
+                    }
+                    @foreach (IssueResponse hit in results.Issues)
+                    {
+                        <a class="list-item" href="@LinkFor(hit.WebUrl)">
+                            <Icon Name="issue" Class="@(hit.State == "closed" ? "icon muted" : "icon")" />
+                            <span class="list-item-main"><strong>@hit.Title</strong><small>#@hit.Iid &middot; @hit.State &middot; @hit.Author.Username</small></span>
+                        </a>
+                    }
+                    @foreach (MergeRequestResponse hit in results.MergeRequests)
+                    {
+                        <a class="list-item" href="@LinkFor(hit.WebUrl)">
+                            <Icon Name="merge" Class="@(hit.State == "opened" ? "icon" : "icon muted")" />
+                            <span class="list-item-main"><strong>@hit.Title</strong><small>!@hit.Iid &middot; @hit.State &middot; <code>@hit.SourceBranch</code> into <code>@hit.TargetBranch</code></small></span>
+                        </a>
+                    }
+                    @foreach (BlobSearchResponse hit in results.Blobs)
+                    {
+                        <a class="list-item" href="@LinkFor(hit.WebUrl)">
+                            <Icon Name="file" />
+                            <span class="list-item-main"><strong class="mono">@hit.Path:@hit.Startline</strong><small class="mono">@hit.Data</small></span>
+                        </a>
+                    }
+                    @foreach (WikiPageResponse hit in results.WikiBlobs)
+                    {
+                        <a class="list-item" href="@LinkFor(hit.WebUrl)">
+                            <Icon Name="file" />
+                            <span class="list-item-main"><strong>@hit.Title</strong><small>wiki &middot; @hit.Slug</small></span>
+                        </a>
+                    }
+                    @foreach (CommitResponse hit in results.Commits)
+                    {
+                        <a class="list-item" href="@LinkFor(hit.WebUrl)">
+                            <Icon Name="commit" />
+                            <span class="list-item-main"><strong>@hit.Title</strong><small><code>@hit.ShortId</code> &middot; @hit.AuthorName</small></span>
+                        </a>
+                    }
+                </div>
+            }
+            @if (results.Truncated)
+            {
+                <div class="panel-footer"><span class="secondary-text">Only the first @results.Count are shown. Narrow the search to see the rest.</span></div>
+            }
+        </div>
+    }
+}
+
+@code {
+    [Parameter] public string Namespace { get; set; } = "";
+    [Parameter] public string Slug { get; set; } = "";
+
+    private static readonly string[] GlobalScopes = ["projects", "issues", "merge_requests"];
+    private static readonly string[] ProjectScopes = ["issues", "merge_requests", "blobs", "wiki_blobs", "commits"];
+
+    private ProjectResponse? project;
+    private long projectId;
+    private SearchResponse? results;
+    private string query = "";
+    private string scope = "";
+    private bool loading = true;
+    private bool busy;
+    private string message = "";
+    private string messageKind = "info";
+
+    private bool InProject => Slug.Length > 0;
+    private bool ViaSlug => Namespace.Length == 0;
+    private string ProjectUrl => ViaSlug
+        ? $"/projects/{Uri.EscapeDataString(Slug)}"
+        : $"/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
+    private string[] Scopes => InProject ? ProjectScopes : GlobalScopes;
+
+    private static string ScopeName(string value) => value switch
+    {
+        "projects" => "Projects",
+        "issues" => "Issues",
+        "merge_requests" => "Merge requests",
+        "blobs" => "Code",
+        "wiki_blobs" => "Wiki",
+        "commits" => "Commits",
+        _ => value
+    };
+
+    /// <summary>Links from the server are absolute; the router wants them relative to this origin.</summary>
+    private string LinkFor(string url) => Uri.TryCreate(url, UriKind.Absolute, out Uri? absolute) ? absolute.PathAndQuery : url;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        loading = true;
+        message = "";
+        try
+        {
+            await Api.EnsureSessionAsync();
+            if (InProject)
+            {
+                string path = ViaSlug
+                    ? $"api/graft/slugs/{Uri.EscapeDataString(Slug)}"
+                    : $"api/browser/projects/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
+                (bool reached, RepositoryPageResponse? repo) = await Api.GetOptionalAsync(path, ApiJson.Default.RepositoryPageResponse);
+                if (!reached) { message = "Graft could not be reached."; return; }
+                if (repo is null) { message = "That repository could not be found."; return; }
+                project = repo.Project;
+                projectId = repo.Project.Id;
+            }
+            ReadQuery();
+            if (scope.Length == 0) scope = Scopes[0];
+            if (query.Length > 0) await Run();
+        }
+        finally { loading = false; }
+    }
+
+    private void ReadQuery()
+    {
+        string raw = new Uri(Navigation.Uri).Query;
+        if (raw.Length <= 1) return;
+        foreach (string pair in raw[1..].Split('&'))
+        {
+            int split = pair.IndexOf('=');
+            if (split < 0) continue;
+            string key = pair[..split];
+            string value = Uri.UnescapeDataString(pair[(split + 1)..].Replace('+', ' '));
+            if (key == "q") query = value;
+            else if (key == "scope" && Scopes.Contains(value)) scope = value;
+        }
+    }
+
+    private async Task ChooseScope(string next)
+    {
+        scope = next;
+        if (query.Trim().Length > 0) await Run();
+    }
+
+    private async Task Run()
+    {
+        if (busy || query.Trim().Length == 0) return;
+        busy = true;
+        message = "";
+        try
+        {
+            string path = InProject
+                ? $"api/projects/{projectId}/search?scope={scope}&search={Uri.EscapeDataString(query.Trim())}"
+                : $"api/search?scope={scope}&search={Uri.EscapeDataString(query.Trim())}";
+            (bool reached, SearchResponse? found) = await Api.GetOptionalAsync(path, ApiJson.Default.SearchResponse);
+            if (!reached) { message = "Graft could not be reached."; messageKind = "error"; return; }
+            if (found is null) { message = "The search was refused. Sign in to search beyond what is public."; messageKind = "error"; return; }
+            results = found;
+        }
+        finally { busy = false; }
+    }
+}

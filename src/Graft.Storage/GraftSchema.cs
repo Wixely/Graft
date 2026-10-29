@@ -4,7 +4,7 @@ namespace Graft.Storage;
 
 public static class GraftSchema
 {
-    public static DnaXMigrationManifest Manifest { get; } = new(15,
+    public static DnaXMigrationManifest Manifest { get; } = new(17,
     [
         DnaXMigration.Sql(1, "initial-identity-project-schema", "Create identity and private project schema", """
             CREATE TABLE Users (
@@ -527,6 +527,82 @@ public static class GraftSchema
             CREATE INDEX IX_WikiPageVersions_Page ON WikiPageVersions(PageId, Id);
             CREATE INDEX IX_Snippets_Project ON Snippets(ProjectId, UpdatedAtUtc);
             CREATE INDEX IX_TimeEntries_Subject ON TimeEntries(SubjectType, SubjectId, Id);
+            """),
+        // Forks.
+        //
+        // A fork remembers where it came from, and that is all the relation is: SET NULL on deletion, so a
+        // fork outlives its upstream as an ordinary project. A proposal may name a source project other than
+        // its own; null means the proposal's own project, which is every proposal that existed before this.
+        // The fork's branch tip is mirrored into the target repository under refs/merge-requests/<iid>/head
+        // by the server, so the target never has to read the fork at merge time.
+        DnaXMigration.Sql(16, "forks", "Let a project be forked, and a proposal come from a fork", """
+            ALTER TABLE Projects ADD COLUMN ForkedFromProjectId INTEGER NULL REFERENCES Projects(Id) ON DELETE SET NULL;
+            ALTER TABLE MergeRequests ADD COLUMN SourceProjectId INTEGER NULL REFERENCES Projects(Id);
+
+            CREATE INDEX IX_Projects_ForkedFrom ON Projects(ForkedFromProjectId);
+            """),
+        // Packages and container images.
+        //
+        // A package is a name and a version in one of a few formats, with files. The bytes live on disk
+        // beside the repository, under packages/, because a package is a build artefact and can be large;
+        // the database holds what a listing needs and the hash the download promises. The same for images:
+        // a container repository is an image name within a project, its tags point at manifests by digest,
+        // and blobs are content-addressed on disk and shared across the project's images. Deleting an image
+        // leaves its blobs, which a later sweep may reclaim; a blob two images share belongs to both.
+        DnaXMigration.Sql(17, "packages-registry", "Package feeds and a container registry", """
+            CREATE TABLE Packages (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                PackageType TEXT NOT NULL CHECK (PackageType IN ('generic', 'nuget')),
+                Name TEXT NOT NULL,
+                NormalizedName TEXT NOT NULL,
+                Version TEXT NOT NULL,
+                NormalizedVersion TEXT NOT NULL,
+                Description TEXT NOT NULL DEFAULT '',
+                Authors TEXT NOT NULL DEFAULT '',
+                CreatedByUserId INTEGER NOT NULL REFERENCES Users(Id),
+                CreatedAtUtc TEXT NOT NULL,
+                UpdatedAtUtc TEXT NOT NULL,
+                UNIQUE (ProjectId, PackageType, NormalizedName, NormalizedVersion)
+            );
+
+            CREATE TABLE PackageFiles (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                PackageId INTEGER NOT NULL REFERENCES Packages(Id) ON DELETE CASCADE,
+                FileName TEXT NOT NULL,
+                Size INTEGER NOT NULL,
+                Sha256 TEXT NOT NULL,
+                CreatedAtUtc TEXT NOT NULL,
+                UNIQUE (PackageId, FileName)
+            );
+
+            CREATE TABLE ContainerRepositories (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                Name TEXT NOT NULL,
+                CreatedAtUtc TEXT NOT NULL,
+                UNIQUE (ProjectId, Name)
+            );
+
+            CREATE TABLE ContainerManifests (
+                RepositoryId INTEGER NOT NULL REFERENCES ContainerRepositories(Id) ON DELETE CASCADE,
+                Digest TEXT NOT NULL,
+                MediaType TEXT NOT NULL,
+                Size INTEGER NOT NULL,
+                CreatedAtUtc TEXT NOT NULL,
+                PRIMARY KEY (RepositoryId, Digest)
+            );
+
+            CREATE TABLE ContainerTags (
+                RepositoryId INTEGER NOT NULL REFERENCES ContainerRepositories(Id) ON DELETE CASCADE,
+                Tag TEXT NOT NULL,
+                Digest TEXT NOT NULL,
+                UpdatedAtUtc TEXT NOT NULL,
+                PRIMARY KEY (RepositoryId, Tag)
+            );
+
+            CREATE INDEX IX_Packages_Project ON Packages(ProjectId, PackageType, NormalizedName);
+            CREATE INDEX IX_ContainerRepositories_Project ON ContainerRepositories(ProjectId);
             """)
     ]);
 }

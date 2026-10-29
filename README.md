@@ -232,7 +232,7 @@ Linux static NativeAOT requires the separate toolchain/runbook; a Windows build 
 | --- | --- |
 | `docs/` | Requirements, decisions, architecture questions, work queue and evidence |
 | `src/Graft.Core/`, `src/Graft.Storage/` | MVP authorization policy and DnaX/SQLite persistence |
-| `src/Graft.Git/`, `src/Graft.Server/` | Managed Git engine (read, pack transport, server-side object authoring and unified diff), durable storage, markdown rendering and authenticated HTTPS/API host |
+| `src/Graft.Git/`, `src/Graft.Server/` | Managed Git engine (bare Git repository on disk, loose and packed objects with delta compression, smart HTTP protocol versions 0 and 2, server-side object authoring and unified diff), markdown rendering and authenticated HTTPS/API host |
 | `src/Graft.Client/`, `src/Graft.Contracts/` | Blazor WebAssembly client (themed UI, routed pages, rendered READMEs, commit diffs, clone menu, vendored DnaX upload and diagram modules) and source-generated wire contracts |
 | `src/Graft.Operations/`, `src/Graft.Admin/` | Quiescence lease, backup/restore, import inventory and NativeAOT administration CLI |
 | `deploy/` | systemd, optional container and isolated static-musl build definitions |

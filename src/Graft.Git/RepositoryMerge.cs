@@ -77,7 +77,7 @@ public static class RepositoryMerge
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(repository);
-        string? source = repository.Refs.GetValueOrDefault("refs/heads/" + sourceBranch);
+        string? source = repository.Refs.GetValueOrDefault(SourceReference(sourceBranch));
         string? target = repository.Refs.GetValueOrDefault("refs/heads/" + targetBranch);
         if (source is null || target is null) return new(MergeKind.Unresolved, null, source, target, []);
         if (!repository.Objects.TryGetValue(source, out GitObject? sourceCommit) || sourceCommit.Type != 1 ||
@@ -129,7 +129,7 @@ public static class RepositoryMerge
         ArgumentNullException.ThrowIfNull(repository);
         ArgumentNullException.ThrowIfNull(author);
         string targetReference = "refs/heads/" + targetBranch;
-        Limits.Require(Limits.IsRef("refs/heads/" + sourceBranch) && Limits.IsRef(targetReference), "branch");
+        Limits.Require(Limits.IsRef(SourceReference(sourceBranch)) && Limits.IsRef(targetReference), "branch");
 
         MergeAnalysis analysis = Analyse(repository, sourceBranch, targetBranch, cancellationToken);
         Limits.Require(analysis.CanMerge, analysis.Kind switch
@@ -213,7 +213,7 @@ public static class RepositoryMerge
         ArgumentNullException.ThrowIfNull(repository);
         ArgumentNullException.ThrowIfNull(author);
         string targetReference = "refs/heads/" + targetBranch;
-        Limits.Require(Limits.IsRef("refs/heads/" + sourceBranch) && Limits.IsRef(targetReference), "branch");
+        Limits.Require(Limits.IsRef(SourceReference(sourceBranch)) && Limits.IsRef(targetReference), "branch");
 
         MergeAnalysis analysis = Analyse(repository, sourceBranch, targetBranch, cancellationToken);
         Limits.Require(analysis.CanMerge, analysis.Kind switch
@@ -280,8 +280,8 @@ public static class RepositoryMerge
     {
         ArgumentNullException.ThrowIfNull(repository);
         ArgumentNullException.ThrowIfNull(committer);
-        string sourceReference = "refs/heads/" + sourceBranch;
-        Limits.Require(Limits.IsRef(sourceReference) && Limits.IsRef("refs/heads/" + targetBranch), "branch");
+        string sourceReference = SourceReference(sourceBranch);
+        Limits.Require(Limits.IsClientRef(sourceReference) && Limits.IsRef("refs/heads/" + targetBranch), "rebase-source");
 
         MergeAnalysis analysis = Analyse(repository, sourceBranch, targetBranch, cancellationToken);
         Limits.Require(analysis.Kind != MergeKind.Unresolved, "merge-unresolved");
@@ -343,6 +343,11 @@ public static class RepositoryMerge
     }
 
     private const int MaximumRebasedCommits = 200;
+
+    /// <summary>A source is a branch name, or a full reference when it starts with <c>refs/</c>, which is how a
+    /// proposal from a fork names the server-owned reference its tip was mirrored to.</summary>
+    private static string SourceReference(string source) =>
+        source.StartsWith("refs/", StringComparison.Ordinal) ? source : "refs/heads/" + source;
 
     /// <summary>
     /// Stages new objects beside the repository's own, applies the same checks a pushed batch gets, and

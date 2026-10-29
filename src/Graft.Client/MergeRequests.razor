@@ -55,9 +55,17 @@ else if (Number is null)
                     <select id="mr-source" @bind="draftSource">
                         @foreach (string branch in branches) { <option value="@branch">@branch</option> }
                     </select>
+                    @if (project.ForkedFromProject is not null)
+                    {
+                        <label for="mr-into">Into project</label>
+                        <select id="mr-into" @bind="draftIntoUpstream" @bind:after="LoadTargetBranches">
+                            <option value="false">This fork, @project.PathWithNamespace</option>
+                            <option value="true">The original, @project.ForkedFromProject.PathWithNamespace</option>
+                        </select>
+                    }
                     <label for="mr-target">Into branch</label>
                     <select id="mr-target" @bind="draftTarget">
-                        @foreach (string branch in branches) { <option value="@branch">@branch</option> }
+                        @foreach (string branch in (draftIntoUpstream == "true" ? upstreamBranches : branches)) { <option value="@branch">@branch</option> }
                     </select>
                     <label for="mr-title">Title</label>
                     <input id="mr-title" @bind="draftTitle" required maxlength="255" autocomplete="off" />
@@ -166,8 +174,10 @@ else
             <h1>@proposal.Title</h1>
             <p class="subtitle">
                 !@proposal.Iid in <a href="@ProjectUrl">@project.Namespace.Name / @project.Name</a> &middot;
+                @if (proposal.SourceProjectPath is not null) { <a href="@("/" + proposal.SourceProjectPath)">@proposal.SourceProjectPath</a><span>:</span> }
                 <code>@proposal.SourceBranch</code> into <code>@proposal.TargetBranch</code> &middot;
                 by @proposal.Author.Username
+                @if (proposal.SourceProjectPath is not null) { <span class="label accent">from a fork</span> }
             </p>
         </div>
         <span class="label @StateClass(proposal.State)">@proposal.State</span>
@@ -577,6 +587,8 @@ else
     private string state = "opened";
     private string draftSource = "";
     private string draftTarget = "";
+    private string draftIntoUpstream = "false";
+    private string[] upstreamBranches = [];
     private string draftTitle = "";
     private string draftBody = "";
     private bool draftDraft;
@@ -742,6 +754,8 @@ else
 
     private static string Short(string? sha) => sha is null || sha.Length < 8 ? sha ?? "" : sha[..8];
 
+    private static string LinkFor(string url) => Uri.TryCreate(url, UriKind.Absolute, out Uri? absolute) ? absolute.PathAndQuery : url;
+
     private static string StateClass(string state) => state switch
     {
         "merged" => "accent",
@@ -858,6 +872,15 @@ else
         await LoadList();
     }
 
+    /// <summary>The original's branches, read through the browser route that answers any reader of it.</summary>
+    private async Task LoadTargetBranches()
+    {
+        if (draftIntoUpstream != "true" || project?.ForkedFromProject is null) { draftTarget = branches.FirstOrDefault() ?? ""; return; }
+        (bool reached, RepositoryPageResponse? page) = await Api.GetOptionalAsync($"api/browser/projects/{project.ForkedFromProject.Id}", ApiJson.Default.RepositoryPageResponse);
+        upstreamBranches = reached && page is not null ? [.. page.Branches.Select(branch => branch.Name)] : [];
+        draftTarget = page?.Project.DefaultBranch is { Length: > 0 } preferred && upstreamBranches.Contains(preferred) ? preferred : upstreamBranches.FirstOrDefault() ?? "";
+    }
+
     private async Task LoadList()
     {
         string query = $"api/projects/{projectId}/merge-requests?state={state}&per_page=100";
@@ -894,10 +917,15 @@ else
         message = "";
         try
         {
+            // A proposal into the original goes to the original's route and names this fork as its source,
+            // which is how GitLab's own clients do it.
+            bool intoUpstream = draftIntoUpstream == "true" && project?.ForkedFromProject is not null;
+            long targetProjectId = intoUpstream ? project!.ForkedFromProject!.Id : projectId;
             ApiResult<MergeRequestResponse> result = await Api.SendAsync<MergeRequestCreateRequest, MergeRequestResponse>(
-                HttpMethod.Post, $"api/projects/{projectId}/merge-requests",
+                HttpMethod.Post, $"api/projects/{targetProjectId}/merge-requests",
                 new MergeRequestCreateRequest(draftSource, draftTarget, draftTitle, draftBody,
-                    null, null, null, draftReviewers.Count == 0 ? null : [.. draftReviewers], draftDraft ? true : null),
+                    null, null, null, intoUpstream ? null : draftReviewers.Count == 0 ? null : [.. draftReviewers], draftDraft ? true : null,
+                    intoUpstream ? projectId : null),
                 ApiJson.Default.MergeRequestCreateRequest, ApiJson.Default.MergeRequestResponse, "Merge proposed.");
             if (!result.Ok || result.Value is null) { Report(result.Ok, result.Message); return; }
             draftTitle = "";
@@ -905,7 +933,7 @@ else
             draftDraft = false;
             draftReviewers.Clear();
             composing = false;
-            Navigation.NavigateTo(MergeRequestUrl(result.Value.Iid));
+            Navigation.NavigateTo(intoUpstream ? LinkFor(result.Value.WebUrl) : MergeRequestUrl(result.Value.Iid));
         }
         finally { busy = false; }
     }
