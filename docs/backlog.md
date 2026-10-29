@@ -74,13 +74,14 @@ The collaboration depth list from the 2026-10-28 review, taken on as one piece o
   [ADR 0029](decisions/0029-file-deletion.md).
 - **Token rotation.** The same row, a new secret; a button in the browser and GitLab's `rotate` routes with the
   secret in the response. [ADR 0030](decisions/0030-token-rotation.md).
+- **Icons filled despite asking not to be.** The stylesheet rule went; the markup's `fill="none"` was right.
+  Rendering all twenty-five both ways showed the fill hiding the fold on the file, the shackle on the lock,
+  the mark in the alert and the lines on the repository, and turning the chevrons and the check into wedges.
+  No decision record: it was a defect, and the backlog entry had already said one side had to change.
 
 ## Near, and small
 
-**Icons are filled despite asking not to be.** The icon set is authored as stroke geometry with
-`fill="none"`, and a stylesheet rule sets `fill: currentColor`, which overrides the attribute. Every closed
-shape is therefore solid. The set reads acceptably this way and was designed around it in practice, but the
-markup and the stylesheet disagree and one of them should change.
+Nothing is here at the moment. Everything below needs a decision before it is built.
 
 ## Larger, and worth deciding deliberately
 

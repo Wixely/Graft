@@ -22,8 +22,8 @@
             <circle cx="8" cy="8" r="2.5" />
             <path d="M0.75 8h4.75M10.5 8h4.75" />
             break;
-        @* One circle rather than a ring. The stylesheet fills closed shapes, so a second circle inside this
-           one would be covered by it rather than reading as a hole. *@
+        @* An open ring. Nothing here is filled unless it says so, as the three dots of the settings icon
+           do; the stylesheet once filled every closed shape and hid the detail inside most of these. *@
         case "issue":
             <circle cx="8" cy="8" r="5.25" />
             break;

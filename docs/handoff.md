@@ -37,10 +37,17 @@ Then the second item of the same list, token rotation. [ADR 0030](decisions/0030
 
 Git suite 913 to 947; MCP suite 101 to 104. No migration: rotation changes columns that were already there.
 
+Then the last item, the icons. The stylesheet's `fill: currentColor` on `.icon` is gone and the markup's
+`fill="none"` stands. The choice was made by rendering every icon both ways in a headless browser rather than
+by reading: filled, the file lost its fold, the lock its shackle, the alert its mark, the repository its
+lines, and the chevrons and the check became wedges. Every icon in the set now reads as the strokes it was
+drawn as; the three dots of the settings icon, which set their own fill, are unchanged. No suite covers how
+an icon looks, so this was checked by eye and the comparison is not kept.
+
 **Next action.** Unchanged from the entry below: operator, back up the repositories directory before
 deploying this build, because the Git engine entry's format conversion is still the deployment's first
-upgrade step. Agent: the last "Near, and small" item, the icon fill rule, needs no decision either; then the
-NativeAOT publish with the Git suite against it.
+upgrade step. Agent: the "Near, and small" list is empty; the NativeAOT publish with the Git suite against
+it is next, and everything else in the backlog needs a decision from the user first.
 
 
 ## Added on 2026-10-29, later the same day: the outside, the builds, and the Git engine
