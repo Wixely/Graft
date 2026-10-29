@@ -178,7 +178,7 @@ a:hover { text-decoration: underline; }
 
 /* Icons */
 
-.icon { display: block; width: 16px; height: 16px; flex: none; fill: currentColor; }
+.icon { display: block; width: 16px; height: 16px; flex: none; }
 .icon-large { width: 20px; height: 20px; }
 
 /* Application shell: fixed top bar, optional left sidebar, content column. */
