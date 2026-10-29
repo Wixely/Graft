@@ -586,9 +586,13 @@ public sealed class GraftTools
                 ? null
                 : Array(notes, note => new JsonObject
                 {
+                    ["id"] = note.Id,
                     ["author"] = note.Author.Username,
                     ["created_at"] = note.CreatedAt.ToString("O", CultureInfo.InvariantCulture),
-                    ["body"] = note.Body
+                    ["body"] = note.Body,
+                    ["reply_to"] = note.ParentId,
+                    ["resolved"] = note.ParentId is null ? note.Resolved : null,
+                    ["edited"] = note.EditedAt is not null
                 })
         }.ToJsonString();
     }
@@ -649,6 +653,7 @@ public sealed class GraftTools
         [Description("Optional: the file to comment on, as graft_read_merge_request reports its path. Empty comments on the whole thing.")] string file,
         [Description("Optional: the line number within that file. Zero when commenting on the whole thing.")] long line,
         [Description("Optional: old for a removed line, new for an added or unchanged one. Empty when commenting on the whole thing.")] string side,
+        [Description("Optional: the id of a comment to answer, as graft_read_issue and graft_read_merge_request report it. Zero starts a new thread. A reply joins that comment's thread and cannot name a line of its own.")] long reply_to,
         CancellationToken cancellationToken)
     {
         if (!graft.AllowWrites) return Refused(graft, "commenting");
@@ -661,6 +666,7 @@ public sealed class GraftTools
             if (string.IsNullOrWhiteSpace(file) || line <= 0 || side is not ("old" or "new"))
                 return Failure("A comment on a line needs file, a line above zero, and side of old or new, together.");
             if (subject != "merge_request") return Failure("Only a merge request has a diff to comment on.");
+            if (reply_to > 0) return Failure("A reply follows its thread; give reply_to or a line, not both.");
         }
 
         JsonObject payload = new() { ["body"] = body };
@@ -670,6 +676,7 @@ public sealed class GraftTools
             payload["line"] = line;
             payload["side"] = side;
         }
+        if (reply_to > 0) payload["parent_id"] = reply_to;
         string path = "api/v4/projects/" + Encode(project) +
             (subject == "issue" ? "/issues/" : "/merge_requests/") + Number(number) + "/notes";
         (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Post, path, payload, cancellationToken);
@@ -680,7 +687,8 @@ public sealed class GraftTools
                 ["subject"] = subject,
                 ["number"] = number,
                 ["file"] = anchored ? file.Trim() : null,
-                ["line"] = anchored ? line : null
+                ["line"] = anchored ? line : null,
+                ["reply_to"] = reply_to > 0 ? reply_to : null
             }.ToJsonString()
             : Failure(GraftClient.Describe(status, response));
     }
@@ -782,8 +790,15 @@ public sealed class GraftTools
                 ? null
                 : Array(notes, note => new JsonObject
                 {
+                    ["id"] = note.Id,
                     ["author"] = note.Author.Username,
-                    ["body"] = note.Body
+                    ["body"] = note.Body,
+                    ["file"] = note.Path,
+                    ["line"] = note.Line,
+                    ["outdated"] = note.Path is null ? null : note.Outdated,
+                    ["reply_to"] = note.ParentId,
+                    ["resolved"] = note.ParentId is null ? note.Resolved : null,
+                    ["edited"] = note.EditedAt is not null
                 })
         }.ToJsonString();
     }

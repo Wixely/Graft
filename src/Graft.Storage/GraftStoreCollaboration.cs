@@ -528,11 +528,16 @@ public sealed partial class GraftStore
         int? line = null,
         DiffSide? side = null,
         string? anchorCommitSha = null,
+        long? parentCommentId = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(actor);
         string cleanBody = RequireBody(body, nameof(body), allowEmpty: false);
         bool anchored = path is not null || line is not null || side is not null || anchorCommitSha is not null;
+        // A reply sits where its thread sits. It carries no anchor of its own, because a reply anchored to a
+        // different line would be a new thread pretending to be an answer.
+        if (anchored && parentCommentId is not null)
+            throw new ArgumentException("A reply follows its thread and cannot name a line of its own.", nameof(parentCommentId));
         if (anchored)
         {
             if (path is null || line is null || side is null || anchorCommitSha is null)
@@ -550,15 +555,27 @@ public sealed partial class GraftStore
         AuthenticatedIdentity author = await RequireParticipantAsync(db, transaction, actor, projectId, cancellationToken);
         long subjectId = await ResolveSubjectAsync(db, transaction, projectId, subject, iid);
 
+        // The parent must be on this same issue or proposal, and a reply to a reply attaches to the thread's
+        // first comment, which keeps every thread exactly one level deep however it was addressed.
+        if (parentCommentId is not null)
+        {
+            CommentThreadRow? parent = await db.QuerySingleOrDefaultAsync<CommentThreadRow>("""
+                SELECT Id, ParentCommentId, ResolvedAtUtc FROM Comments
+                WHERE Id = @Id AND ProjectId = @ProjectId AND SubjectType = @SubjectType AND SubjectId = @SubjectId;
+                """, new CommentThreadParameters(parentCommentId.Value, projectId, SubjectName(subject), subjectId), transaction);
+            if (parent is null) throw new CollaborationNotFoundException("The comment being answered is unavailable.");
+            parentCommentId = parent.ParentCommentId ?? parent.Id;
+        }
+
         string now = Now();
         long id = await db.QuerySingleAsync<long>("""
             INSERT INTO Comments (ProjectId, SubjectType, SubjectId, AuthorUserId, Body, CreatedAtUtc,
-                                  Path, Line, Side, AnchorCommitSha)
+                                  Path, Line, Side, AnchorCommitSha, ParentCommentId)
             VALUES (@ProjectId, @SubjectType, @SubjectId, @AuthorUserId, @Body, @CreatedAtUtc,
-                    @Path, @Line, @Side, @AnchorCommitSha)
+                    @Path, @Line, @Side, @AnchorCommitSha, @ParentCommentId)
             RETURNING Id;
             """, new CommentInsertParameters(projectId, SubjectName(subject), subjectId, author.UserId, cleanBody, now,
-                path, line, side is null ? null : SideName(side.Value), anchorCommitSha),
+                path, line, side is null ? null : SideName(side.Value), anchorCommitSha, parentCommentId),
             transaction);
         // The subject's own timestamp moves, so a list ordered by activity is possible later and a reader
         // can see that a closed issue is still being discussed.
@@ -567,7 +584,149 @@ public sealed partial class GraftStore
             : "UPDATE MergeRequests SET UpdatedAtUtc = @UpdatedAtUtc WHERE Id = @Id;",
             new TouchParameters(subjectId, now), transaction);
         await transaction.CommitAsync(cancellationToken);
-        return new(id, author.UserId, author.Username, cleanBody, Instant(now), path, line, side, anchorCommitSha);
+        return new(id, author.UserId, author.Username, cleanBody, Instant(now), path, line, side, anchorCommitSha,
+            parentCommentId);
+    }
+
+    /// <summary>
+    /// Changes a comment's words. The author, or a Maintainer, exactly as for deleting one; the edit is
+    /// recorded as having happened, because a comment rewritten silently after it was answered would make
+    /// the answers to it read as answers to something else.
+    /// </summary>
+    public async Task<Comment> EditCommentAsync(
+        AuthenticatedIdentity actor,
+        long projectId,
+        long commentId,
+        string body,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(actor);
+        string cleanBody = RequireBody(body, nameof(body), allowEmpty: false);
+
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
+        AuthenticatedIdentity editor = await RequireParticipantAsync(db, transaction, actor, projectId, cancellationToken);
+        CommentOwnerRow? existing = await db.QuerySingleOrDefaultAsync<CommentOwnerRow>(
+            "SELECT Id, AuthorUserId FROM Comments WHERE Id = @Id AND ProjectId = @ProjectId;",
+            new CommentOwnerParameters(commentId, projectId), transaction);
+        if (existing is null) throw new CollaborationNotFoundException("Comment is unavailable.");
+        await RequireEditorAsync(db, transaction, editor, projectId, existing.AuthorUserId, textChanged: true, cancellationToken);
+
+        string now = Now();
+        await db.ExecuteAsync("UPDATE Comments SET Body = @Body, EditedAtUtc = @Now WHERE Id = @Id;",
+            new CommentEditParameters(commentId, cleanBody, now), transaction);
+        await AuditAsync(db, transaction, editor.UserId, "edit-comment", "comment",
+            commentId.ToString(CultureInfo.InvariantCulture), "Comment edited.", now);
+        await transaction.CommitAsync(cancellationToken);
+        return await ReadCommentAsync(db, commentId) ?? throw new CollaborationNotFoundException("Comment is unavailable.");
+    }
+
+    /// <summary>
+    /// Marks a thread settled, or reopens it. Addressed by any comment in the thread and applied to its
+    /// first comment, which is where the flag lives.
+    ///
+    /// <para>
+    /// Who may: anybody who could push, because resolving is a judgement that the point was dealt with and
+    /// that is the standing a merge needs; and the person who started the thread, because they may withdraw
+    /// their own point. A Reporter who commented cannot close somebody else's thread, which is the rule
+    /// that stops a conversation being tidied away by the person it was about.
+    /// </para>
+    /// </summary>
+    public async Task<Comment> SetThreadResolvedAsync(
+        AuthenticatedIdentity actor,
+        long projectId,
+        long commentId,
+        bool resolved,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(actor);
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
+        AuthenticatedIdentity resolver = await RequireParticipantAsync(db, transaction, actor, projectId, cancellationToken);
+        CommentThreadOwnerRow? existing = await db.QuerySingleOrDefaultAsync<CommentThreadOwnerRow>("""
+            SELECT root.Id, root.AuthorUserId, root.ResolvedAtUtc
+            FROM Comments c
+            JOIN Comments root ON root.Id = COALESCE(c.ParentCommentId, c.Id)
+            WHERE c.Id = @Id AND c.ProjectId = @ProjectId;
+            """, new CommentOwnerParameters(commentId, projectId), transaction);
+        if (existing is null) throw new CollaborationNotFoundException("Comment is unavailable.");
+
+        if (existing.AuthorUserId != resolver.UserId)
+        {
+            PermissionDecision permission = await DecideAsync(db, transaction, resolver, projectId,
+                ProjectAction.PushRepository, cancellationToken);
+            if (!permission.Allowed)
+                throw new UnauthorizedAccessException("Resolving a thread needs the permission to push, or to have started it.");
+        }
+
+        string now = Now();
+        if (resolved)
+            await db.ExecuteAsync("""
+                UPDATE Comments SET ResolvedAtUtc = COALESCE(ResolvedAtUtc, @Now),
+                                    ResolvedByUserId = COALESCE(ResolvedByUserId, @UserId)
+                WHERE Id = @Id;
+                """, new ThreadResolveParameters(existing.Id, resolver.UserId, now), transaction);
+        else
+            await db.ExecuteAsync("UPDATE Comments SET ResolvedAtUtc = NULL, ResolvedByUserId = NULL WHERE Id = @Id;",
+                new IdParameters(existing.Id), transaction);
+        await AuditAsync(db, transaction, resolver.UserId, resolved ? "resolve-thread" : "unresolve-thread", "comment",
+            existing.Id.ToString(CultureInfo.InvariantCulture), resolved ? "Thread resolved." : "Thread reopened.", now);
+        await transaction.CommitAsync(cancellationToken);
+        return await ReadCommentAsync(db, existing.Id) ?? throw new CollaborationNotFoundException("Comment is unavailable.");
+    }
+
+    /// <summary>One comment by row id, with no permission check: callers have already made one.</summary>
+    private static async Task<Comment?> ReadCommentAsync(SqliteConnection db, long commentId)
+    {
+        CommentRow? row = await db.QuerySingleOrDefaultAsync<CommentRow>("""
+            SELECT c.Id, c.AuthorUserId, u.Username AS AuthorUsername, c.Body, c.CreatedAtUtc,
+                   c.Path, c.Line, c.Side, c.AnchorCommitSha, c.ParentCommentId, c.EditedAtUtc,
+                   c.ResolvedAtUtc, r.Username AS ResolvedByUsername
+            FROM Comments c
+            JOIN Users u ON u.Id = c.AuthorUserId
+            LEFT JOIN Users r ON r.Id = c.ResolvedByUserId
+            WHERE c.Id = @Id;
+            """, new IdParameters(commentId));
+        return row is null ? null : ToComment(row);
+    }
+
+    /// <summary>Which issue or proposal a comment sits on, by its public number, or null for no such comment.</summary>
+    public async Task<(CommentSubject Subject, long Iid)?> FindCommentSubjectAsync(
+        long projectId,
+        long commentId,
+        CancellationToken cancellationToken = default)
+    {
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        CommentHomeRow? row = await db.QuerySingleOrDefaultAsync<CommentHomeRow>("""
+            SELECT c.SubjectType, COALESCE(i.Iid, m.Iid) AS Iid
+            FROM Comments c
+            LEFT JOIN Issues i ON c.SubjectType = 'issue' AND i.Id = c.SubjectId
+            LEFT JOIN MergeRequests m ON c.SubjectType = 'merge_request' AND m.Id = c.SubjectId
+            WHERE c.Id = @Id AND c.ProjectId = @ProjectId;
+            """, new CommentOwnerParameters(commentId, projectId));
+        if (row is null || row.Iid is null) return null;
+        return (row.SubjectType == "issue" ? CommentSubject.Issue : CommentSubject.MergeRequest, row.Iid.Value);
+    }
+
+    /// <summary>
+    /// Finds which issue or proposal a comment belongs to, or null when it is not on the subject named.
+    /// Lets a route that addresses a comment beneath an issue refuse one that belongs to another.
+    /// </summary>
+    public async Task<bool> CommentBelongsToAsync(
+        long projectId,
+        CommentSubject subject,
+        long iid,
+        long commentId,
+        CancellationToken cancellationToken = default)
+    {
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        long subjectId;
+        try { subjectId = await ResolveSubjectAsync(db, null, projectId, subject, iid); }
+        catch (CollaborationNotFoundException) { return false; }
+        return await db.QuerySingleAsync<long>("""
+            SELECT COUNT(*) FROM Comments
+            WHERE Id = @Id AND ProjectId = @ProjectId AND SubjectType = @SubjectType AND SubjectId = @SubjectId;
+            """, new CommentThreadParameters(commentId, projectId, SubjectName(subject), subjectId)) == 1;
     }
 
     public async Task<IReadOnlyList<Comment>> ListCommentsAsync(
@@ -585,9 +744,11 @@ public sealed partial class GraftStore
         long subjectId = await ResolveSubjectAsync(db, null, projectId, subject, iid);
         IEnumerable<CommentRow> rows = await db.QueryAsync<CommentRow>("""
             SELECT c.Id, c.AuthorUserId, u.Username AS AuthorUsername, c.Body, c.CreatedAtUtc,
-                   c.Path, c.Line, c.Side, c.AnchorCommitSha
+                   c.Path, c.Line, c.Side, c.AnchorCommitSha, c.ParentCommentId, c.EditedAtUtc,
+                   c.ResolvedAtUtc, r.Username AS ResolvedByUsername
             FROM Comments c
             JOIN Users u ON u.Id = c.AuthorUserId
+            LEFT JOIN Users r ON r.Id = c.ResolvedByUserId
             WHERE c.SubjectType = @SubjectType AND c.SubjectId = @SubjectId
             ORDER BY c.Id
             LIMIT @Take OFFSET @Skip;
@@ -614,6 +775,13 @@ public sealed partial class GraftStore
             new CommentOwnerParameters(commentId, projectId), transaction);
         if (existing is null) throw new CollaborationNotFoundException("Comment is unavailable.");
         await RequireEditorAsync(db, transaction, editor, projectId, existing.AuthorUserId, textChanged: true, cancellationToken);
+
+        // The first comment of a thread carries the replies to it. Removing it would remove, or orphan,
+        // words other people wrote, so a thread with answers is kept; the author can edit it instead.
+        long replies = await db.QuerySingleAsync<long>("SELECT COUNT(*) FROM Comments WHERE ParentCommentId = @Id;",
+            new IdParameters(commentId), transaction);
+        if (replies > 0)
+            throw new CollaborationConflictException("This comment has replies, so it cannot be deleted; edit it instead.");
 
         await db.ExecuteAsync("DELETE FROM Comments WHERE Id = @Id;", new IdParameters(commentId), transaction);
         await AuditAsync(db, transaction, editor.UserId, "delete-comment", "comment",
@@ -744,7 +912,11 @@ public sealed partial class GraftStore
 
     private static Comment ToComment(CommentRow row) => new(
         row.Id, row.AuthorUserId, row.AuthorUsername, row.Body, Instant(row.CreatedAtUtc),
-        row.Path, row.Line is null ? null : (int)row.Line.Value, ParseSide(row.Side), row.AnchorCommitSha);
+        row.Path, row.Line is null ? null : (int)row.Line.Value, ParseSide(row.Side), row.AnchorCommitSha,
+        row.ParentCommentId,
+        row.EditedAtUtc is null ? null : Instant(row.EditedAtUtc),
+        row.ResolvedAtUtc is null ? null : Instant(row.ResolvedAtUtc),
+        row.ResolvedByUsername);
 
     private static string RequireTitle(string value)
     {
@@ -814,7 +986,10 @@ internal sealed record MergeBranchParameters(long ProjectId, string Source, stri
 internal sealed record CollaborationItemParameters(long ProjectId, long Iid);
 internal sealed record CollaborationListParameters(long ProjectId, string? State, int AnyState, int Take, int Skip);
 internal sealed record CommentInsertParameters(long ProjectId, string SubjectType, long SubjectId, long AuthorUserId,
-    string Body, string CreatedAtUtc, string? Path, int? Line, string? Side, string? AnchorCommitSha);
+    string Body, string CreatedAtUtc, string? Path, int? Line, string? Side, string? AnchorCommitSha, long? ParentCommentId);
+internal sealed record CommentThreadParameters(long Id, long ProjectId, string SubjectType, long SubjectId);
+internal sealed record CommentEditParameters(long Id, string Body, string Now);
+internal sealed record ThreadResolveParameters(long Id, long UserId, string Now);
 internal sealed record ApprovalParameters(long MergeRequestId, long UserId, string SourceCommitSha, string CreatedAtUtc);
 internal sealed record ApprovalCountParameters(long ProjectId, long Iid, string Sha);
 internal sealed record CommentListParameters(string SubjectType, long SubjectId, int Take, int Skip);
@@ -834,6 +1009,26 @@ internal sealed class CommentOwnerRow
 {
     public long Id { get; set; }
     public long AuthorUserId { get; set; }
+}
+
+internal sealed class CommentThreadRow
+{
+    public long Id { get; set; }
+    public long? ParentCommentId { get; set; }
+    public string? ResolvedAtUtc { get; set; }
+}
+
+internal sealed class CommentThreadOwnerRow
+{
+    public long Id { get; set; }
+    public long AuthorUserId { get; set; }
+    public string? ResolvedAtUtc { get; set; }
+}
+
+internal sealed class CommentHomeRow
+{
+    public string SubjectType { get; set; } = "";
+    public long? Iid { get; set; }
 }
 
 internal sealed class SubjectRow { public long Id { get; set; } }
@@ -886,6 +1081,10 @@ internal sealed class CommentRow
     public long? Line { get; set; }
     public string? Side { get; set; }
     public string? AnchorCommitSha { get; set; }
+    public long? ParentCommentId { get; set; }
+    public string? EditedAtUtc { get; set; }
+    public string? ResolvedAtUtc { get; set; }
+    public string? ResolvedByUsername { get; set; }
 }
 
 internal sealed class ApprovalRow

@@ -32,14 +32,16 @@ cloning. [ADR 0017](decisions/0017-getting-things-out.md).
 - **Raw file download**, always as an attachment of unknown type.
 - **Archives**, as a gzipped tar or a zip.
 
+## Closed on 2026-10-29
+
+The collaboration depth list from the 2026-10-28 review, taken on as one piece of work.
+
+- **Replies, threads and resolving a conversation.** One level deep, resolvable by whoever could push or
+  whoever started the thread, hiding nothing. [ADR 0019](decisions/0019-conversation.md).
+- **Editing a comment.** The author or a Maintainer, with the edit recorded. A first comment with replies
+  cannot be deleted. Same record.
+
 ## Near, and small
-
-**Replies, threads and resolving a conversation.** A line comment is standalone: there is no reply, no
-thread, and no marking a conversation settled. With line comments in place this is the next thing a reviewer
-reaches for, and it is mostly a parent id on a comment plus a resolved flag with a rule about who may set it.
-
-**Editing a comment.** It can be deleted by its author or a Maintainer and that is all. An edit wants a
-record that it was edited, which is the part worth thinking about rather than the storage.
 
 **Releases.** Tags exist; a release does not. No notes, no attachments, no marking a tag as a release, and
 no listing of them. The tag machinery is in place, so this is the notes-and-files half.

@@ -2190,7 +2190,8 @@ async Task<NoteResponse> NoteResponseFor(HttpContext context, Comment comment, s
     comment.CreatedAtUtc, comment.Path, comment.Line,
     comment.Side is null ? null : comment.Side == DiffSide.Old ? "old" : "new",
     comment.AnchorCommitSha,
-    comment.AnchorCommitSha is not null && !string.Equals(comment.AnchorCommitSha, tip, StringComparison.Ordinal));
+    comment.AnchorCommitSha is not null && !string.Equals(comment.AnchorCommitSha, tip, StringComparison.Ordinal),
+    comment.ParentId, comment.EditedAtUtc, comment.ResolvedAtUtc is not null, comment.ResolvedByUsername, comment.ResolvedAtUtc);
 
 /// <summary>
 /// Where a proposal's source branch points right now, or null when it no longer resolves. This is the
@@ -2357,7 +2358,7 @@ async Task CreateNote(HttpContext context, ProjectDetails project, Authenticated
         Comment comment = await store.AddCommentAsync(identity, project.Project.Id, subject, Number(context),
             request.Body, request.Path, request.Line,
             anchored ? request.Side == "old" ? DiffSide.Old : DiffSide.New : null,
-            anchor, context.RequestAborted);
+            anchor, request.ParentId, context.RequestAborted);
         await Notify(context, project.Project, WebhookEvent.Comment, payload =>
         {
             payload["action"] = "created";
@@ -3003,17 +3004,66 @@ static WebhookResponse WebhookResponseFor(Webhook hook) => new(
     [.. WebhookEvents.All.Where(entry => hook.Events.HasFlag(entry.Value)).Select(entry => entry.Name)],
     hook.Active, hook.CreatedByUsername, hook.CreatedAtUtc, hook.LastStatus, hook.LastError, hook.LastDeliveredAtUtc);
 
-async Task DeleteNote(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+// `subject` is set on the GitLab-shaped route, where the comment is addressed beneath an issue or a
+// proposal; a comment that is not on that one is a 404 rather than being reached through the wrong door.
+async Task DeleteNote(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity,
+    CommentSubject? subject = null)
 {
     if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
     long commentId = Convert.ToInt64(context.Request.RouteValues["commentId"], System.Globalization.CultureInfo.InvariantCulture);
+    if (subject is not null && !await store.CommentBelongsToAsync(project.Project.Id, subject.Value, Number(context), commentId, context.RequestAborted))
+    { await ApiError(context, 404, "404 Note Not Found"); return; }
     try
     {
         await store.DeleteCommentAsync(identity, project.Project.Id, commentId, context.RequestAborted);
         context.Response.StatusCode = StatusCodes.Status204NoContent;
     }
     catch (CollaborationNotFoundException error) { await ApiError(context, 404, error.Message); }
+    catch (CollaborationConflictException error) { await ApiError(context, 409, error.Message); }
     catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+}
+
+// Editing the words and settling the thread arrive through one route because GitLab's note update does
+// both, and because the two rules differ: the words belong to the author or a Maintainer, the thread to
+// anybody who could push or whoever started it. The store applies each rule to its own half.
+async Task UpdateNote(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity,
+    CommentSubject? subject = null)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    NoteUpdateRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.NoteUpdateRequest, context.RequestAborted);
+    if (request is null || (request.Body is null && request.Resolved is null))
+    { await ApiError(context, 400, "body or resolved is required"); return; }
+    long commentId = Convert.ToInt64(context.Request.RouteValues["commentId"], System.Globalization.CultureInfo.InvariantCulture);
+    if (subject is not null && !await store.CommentBelongsToAsync(project.Project.Id, subject.Value, Number(context), commentId, context.RequestAborted))
+    { await ApiError(context, 404, "404 Note Not Found"); return; }
+    try
+    {
+        Comment? comment = null;
+        if (request.Body is not null)
+            comment = await store.EditCommentAsync(identity, project.Project.Id, commentId, request.Body, context.RequestAborted);
+        if (request.Resolved is not null)
+            comment = await store.SetThreadResolvedAsync(identity, project.Project.Id, commentId, request.Resolved.Value, context.RequestAborted);
+        // The anchor's currency needs the branch tip, which only a proposal has; the edited comment is
+        // reported against it so the response says the same thing a fresh listing would.
+        string? tip = comment!.Path is not null && subject is not CommentSubject.Issue
+            ? await SourceTipOfComment(context, project, identity, commentId)
+            : null;
+        await context.Response.WriteAsJsonAsync(await NoteResponseFor(context, comment, tip),
+            ApiJson.Default.NoteResponse, null, context.RequestAborted);
+    }
+    catch (CollaborationNotFoundException error) { await ApiError(context, 404, error.Message); }
+    catch (CollaborationConflictException error) { await ApiError(context, 409, error.Message); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+}
+
+// The branch tip behind an anchored comment addressed by id alone, which the browser route does. Null when
+// the comment is not on a proposal or the branch is gone, both of which leave the anchor outdated.
+async Task<string?> SourceTipOfComment(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity, long commentId)
+{
+    (CommentSubject Subject, long Iid)? home = await store.FindCommentSubjectAsync(project.Project.Id, commentId, context.RequestAborted);
+    return home is { Subject: CommentSubject.MergeRequest } ? await SourceTip(context, project, identity, home.Value.Iid) : null;
 }
 
 static string StateText(CollaborationState state) => state switch
@@ -3223,6 +3273,30 @@ app.MapDelete("/api/projects/{projectId:long}/comments/{commentId:long}", async 
     if (scope is null) return;
     await DeleteNote(context, scope.Value.Details, scope.Value.Identity);
 });
+
+app.MapPost("/api/projects/{projectId:long}/comments/{commentId:long}", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: true);
+    if (scope is null) return;
+    await UpdateNote(context, scope.Value.Details, scope.Value.Identity);
+});
+
+foreach ((string segment, CommentSubject noteSubject) in new[] { ("issues", CommentSubject.Issue), ("merge_requests", CommentSubject.MergeRequest) })
+{
+    app.MapMethods("/api/v4/projects/{projectId}/" + segment + "/{iid:long}/notes/{commentId:long}", ["PUT"], async context =>
+    {
+        var scope = await ApiCollaboration(context);
+        if (scope is null) return;
+        await UpdateNote(context, scope.Value.Details, scope.Value.Identity, noteSubject);
+    });
+
+    app.MapDelete("/api/v4/projects/{projectId}/" + segment + "/{iid:long}/notes/{commentId:long}", async context =>
+    {
+        var scope = await ApiCollaboration(context);
+        if (scope is null) return;
+        await DeleteNote(context, scope.Value.Details, scope.Value.Identity, noteSubject);
+    });
+}
 
 app.MapGet("/api/v4/projects/{projectId}/issues", async context =>
 {

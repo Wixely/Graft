@@ -4,7 +4,7 @@ namespace Graft.Storage;
 
 public static class GraftSchema
 {
-    public static DnaXMigrationManifest Manifest { get; } = new(10,
+    public static DnaXMigrationManifest Manifest { get; } = new(12,
     [
         DnaXMigration.Sql(1, "initial-identity-project-schema", "Create identity and private project schema", """
             CREATE TABLE Users (
@@ -287,6 +287,117 @@ public static class GraftSchema
             );
 
             CREATE INDEX IX_Webhooks_Project ON Webhooks(ProjectId, Active);
+            """),
+        // A comment becomes a conversation.
+        //
+        // ParentCommentId makes a reply: null for a comment that starts a thread, otherwise the id of the
+        // comment it answers. Threads are one level deep on purpose, so a reply to a reply is stored as a
+        // reply to the thread's first comment; a tree of indented replies is how a conversation stops being
+        // readable, and GitLab's own discussions are flat for the same reason.
+        //
+        // ResolvedAtUtc and ResolvedByUserId live on the first comment of a thread and mean the whole thread
+        // is settled. Nothing is deleted or hidden by resolving; the record of who said what stays, and the
+        // flag says the conversation reached an end.
+        //
+        // EditedAtUtc is set whenever the body changes after posting. A comment that could be rewritten
+        // without a trace would let a conversation be revised after the replies to it were written, so the
+        // fact of an edit is recorded even though the earlier text is not.
+        DnaXMigration.Sql(11, "conversation", "Let a comment be answered, edited and the thread resolved", """
+            ALTER TABLE Comments ADD COLUMN ParentCommentId INTEGER NULL REFERENCES Comments(Id);
+            ALTER TABLE Comments ADD COLUMN EditedAtUtc TEXT NULL;
+            ALTER TABLE Comments ADD COLUMN ResolvedAtUtc TEXT NULL;
+            ALTER TABLE Comments ADD COLUMN ResolvedByUserId INTEGER NULL REFERENCES Users(Id);
+
+            CREATE INDEX IX_Comments_Parent ON Comments(ParentCommentId);
+            """),
+        // Planning: the words a project uses to sort its work, and who is doing it.
+        //
+        // Labels belong to a project and are applied to issues and merge requests alike through one join
+        // table keyed the way Comments are, by subject type and row id. A label's name is unique per project
+        // without regard to case, so "Bug" and "bug" cannot both exist; the colour is a stored hex string
+        // the browser paints, validated before it is written so markup can never be smuggled through it.
+        //
+        // Milestones are numbered per project like issues, because people refer to them by number. An issue
+        // or proposal names at most one. Deleting a milestone leaves its issues, which is why the reference
+        // is SET NULL rather than CASCADE: the plan can be abandoned without losing the work.
+        //
+        // Assignees and reviewers share a table with a Kind, because they differ only in what the name
+        // means: an assignee is doing the work, a reviewer is asked to look at it. A proposal may have
+        // both; an issue has only assignees, which the store enforces because SQLite cannot.
+        //
+        // Confidential issues are readable by members and the author, never by the public grant a public
+        // project gives a stranger. DueDate is a date, not an instant: a deadline has no time zone.
+        //
+        // A board is a named set of lists, each bound to one label, over the project's open issues. Moving
+        // an issue between lists swaps labels; the board stores no position of its own, so the same issue
+        // reads the same way from the list view and from the board.
+        DnaXMigration.Sql(12, "planning", "Labels, milestones, assignees, due dates, confidential issues and boards", """
+            CREATE TABLE Labels (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                Name TEXT NOT NULL,
+                NormalizedName TEXT NOT NULL,
+                Color TEXT NOT NULL,
+                Description TEXT NOT NULL DEFAULT '',
+                CreatedAtUtc TEXT NOT NULL,
+                UNIQUE (ProjectId, NormalizedName)
+            );
+
+            CREATE TABLE SubjectLabels (
+                SubjectType TEXT NOT NULL CHECK (SubjectType IN ('issue', 'merge_request')),
+                SubjectId INTEGER NOT NULL,
+                LabelId INTEGER NOT NULL REFERENCES Labels(Id) ON DELETE CASCADE,
+                PRIMARY KEY (SubjectType, SubjectId, LabelId)
+            );
+
+            CREATE TABLE Milestones (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                Iid INTEGER NOT NULL,
+                Title TEXT NOT NULL,
+                Description TEXT NOT NULL DEFAULT '',
+                State TEXT NOT NULL CHECK (State IN ('active', 'closed')),
+                DueDate TEXT NULL,
+                StartDate TEXT NULL,
+                CreatedAtUtc TEXT NOT NULL,
+                UpdatedAtUtc TEXT NOT NULL,
+                UNIQUE (ProjectId, Iid)
+            );
+
+            CREATE TABLE SubjectPeople (
+                SubjectType TEXT NOT NULL CHECK (SubjectType IN ('issue', 'merge_request')),
+                SubjectId INTEGER NOT NULL,
+                UserId INTEGER NOT NULL REFERENCES Users(Id) ON DELETE CASCADE,
+                Kind TEXT NOT NULL CHECK (Kind IN ('assignee', 'reviewer')),
+                PRIMARY KEY (SubjectType, SubjectId, UserId, Kind)
+            );
+
+            ALTER TABLE Issues ADD COLUMN MilestoneId INTEGER NULL REFERENCES Milestones(Id) ON DELETE SET NULL;
+            ALTER TABLE Issues ADD COLUMN DueDate TEXT NULL;
+            ALTER TABLE Issues ADD COLUMN Confidential INTEGER NOT NULL DEFAULT 0 CHECK (Confidential IN (0, 1));
+            ALTER TABLE MergeRequests ADD COLUMN MilestoneId INTEGER NULL REFERENCES Milestones(Id) ON DELETE SET NULL;
+
+            CREATE TABLE Boards (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                Name TEXT NOT NULL,
+                CreatedAtUtc TEXT NOT NULL
+            );
+
+            CREATE TABLE BoardLists (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                BoardId INTEGER NOT NULL REFERENCES Boards(Id) ON DELETE CASCADE,
+                LabelId INTEGER NOT NULL REFERENCES Labels(Id) ON DELETE CASCADE,
+                Position INTEGER NOT NULL,
+                UNIQUE (BoardId, LabelId)
+            );
+
+            CREATE INDEX IX_Labels_Project ON Labels(ProjectId);
+            CREATE INDEX IX_SubjectLabels_Label ON SubjectLabels(LabelId);
+            CREATE INDEX IX_Milestones_Project ON Milestones(ProjectId, State);
+            CREATE INDEX IX_SubjectPeople_User ON SubjectPeople(UserId);
+            CREATE INDEX IX_Issues_Milestone ON Issues(MilestoneId);
+            CREATE INDEX IX_Boards_Project ON Boards(ProjectId);
             """)
     ]);
 }
