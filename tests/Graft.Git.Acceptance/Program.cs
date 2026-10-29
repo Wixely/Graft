@@ -3607,6 +3607,99 @@ async Task CheckReview(string address, AuthenticatedIdentity alice, string bobUs
         Check(refused.StatusCode == HttpStatusCode.BadRequest, "an issue has no diff, so a line comment on one is refused");
     }
 
+    // Conversation: replies, editing, resolving, and what deleting may not do.
+    long rootId;
+    long replyId;
+    using (HttpResponseMessage listing = await ApiGet(address, notes, aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await listing.Content.ReadAsStreamAsync());
+        rootId = json.RootElement.EnumerateArray().First(note => note.GetProperty("line").GetInt32() == 4).GetProperty("id").GetInt64();
+    }
+    using (HttpResponseMessage reply = await ApiPost(address, notes, aliceApi, new { body = "Because the wick needs a fourth strand.", parent_id = rootId }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await reply.Content.ReadAsStreamAsync());
+        replyId = json.RootElement.GetProperty("id").GetInt64();
+        Check(reply.StatusCode == HttpStatusCode.Created && json.RootElement.GetProperty("parent_id").GetInt64() == rootId &&
+            json.RootElement.GetProperty("path").ValueKind == JsonValueKind.Null,
+            "a reply joins its thread and carries no anchor of its own");
+    }
+    using (HttpResponseMessage nested = await ApiPost(address, notes, reviewerApi, new { body = "Agreed.", parent_id = replyId }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await nested.Content.ReadAsStreamAsync());
+        Check(nested.StatusCode == HttpStatusCode.Created && json.RootElement.GetProperty("parent_id").GetInt64() == rootId,
+            "a reply to a reply attaches to the thread's first comment, so threads stay one level deep");
+    }
+    using (HttpResponseMessage both = await ApiPost(address, notes, aliceApi,
+        new { body = "A reply on a line", parent_id = rootId, path = "lamp.txt", line = 2, side = "new" }))
+        Check(both.StatusCode == HttpStatusCode.BadRequest, "a reply cannot name a line of its own");
+    using (HttpResponseMessage elsewhere = await ApiPost(address, prefix + "/issues", aliceApi, new { title = "Another subject" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await elsewhere.Content.ReadAsStreamAsync());
+        long issue = json.RootElement.GetProperty("iid").GetInt64();
+        using HttpResponseMessage refused = await ApiPost(address, prefix + "/issues/" + issue + "/notes", aliceApi,
+            new { body = "Answering a comment that is not here", parent_id = rootId });
+        Check(refused.StatusCode == HttpStatusCode.NotFound, "a reply cannot answer a comment on a different issue or proposal");
+    }
+
+    using (HttpResponseMessage refused = await ApiPut(address, notes + "/" + rootId, strangerApi, new { body = "Rewritten by a Reporter" }))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden, "a Reporter cannot edit somebody else's comment");
+    using (HttpResponseMessage edited = await ApiPut(address, notes + "/" + rootId, reviewerApi, new { body = "Why four strands?" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await edited.Content.ReadAsStreamAsync());
+        Check(edited.IsSuccessStatusCode && json.RootElement.GetProperty("body").GetString() == "Why four strands?" &&
+            json.RootElement.GetProperty("edited_at").ValueKind != JsonValueKind.Null &&
+            json.RootElement.GetProperty("path").GetString() == "lamp.txt",
+            "the author edits their own comment, the edit is recorded, and the anchor survives");
+    }
+    using (HttpResponseMessage edited = await ApiPut(address, notes + "/" + replyId, aliceApi, new { body = "Because the wick needs a fourth strand, as agreed." }))
+        Check(edited.IsSuccessStatusCode, "a Maintainer edits somebody else's comment");
+    using (HttpResponseMessage nothing = await ApiPut(address, notes + "/" + rootId, aliceApi, new { }))
+        Check(nothing.StatusCode == HttpStatusCode.BadRequest, "an edit has to change the words or the thread");
+
+    using (HttpResponseMessage refused = await ApiPut(address, notes + "/" + rootId, strangerApi, new { resolved = true }))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden,
+            "resolving a thread needs the permission to push, or to have started it; a Reporter has neither");
+    using (HttpResponseMessage resolved = await ApiPut(address, notes + "/" + replyId, reviewerApi, new { resolved = true }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await resolved.Content.ReadAsStreamAsync());
+        Check(resolved.IsSuccessStatusCode && json.RootElement.GetProperty("id").GetInt64() == rootId &&
+            json.RootElement.GetProperty("resolved").GetBoolean() &&
+            json.RootElement.GetProperty("resolved_by").GetString() == bobUsername,
+            "resolving through a reply settles the whole thread and names who settled it");
+    }
+    using (HttpResponseMessage listing = await ApiGet(address, notes, aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await listing.Content.ReadAsStreamAsync());
+        JsonElement root = json.RootElement.EnumerateArray().First(note => note.GetProperty("id").GetInt64() == rootId);
+        JsonElement reply = json.RootElement.EnumerateArray().First(note => note.GetProperty("id").GetInt64() == replyId);
+        Check(root.GetProperty("resolved").GetBoolean() && !reply.GetProperty("resolved").GetBoolean(),
+            "a listing reports the thread's state on its first comment and not on its replies");
+    }
+    using (HttpResponseMessage reopened = await ApiPut(address, notes + "/" + rootId, aliceApi, new { resolved = false }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await reopened.Content.ReadAsStreamAsync());
+        Check(reopened.IsSuccessStatusCode && !json.RootElement.GetProperty("resolved").GetBoolean() &&
+            json.RootElement.GetProperty("resolved_by").ValueKind == JsonValueKind.Null,
+            "a resolved thread can be reopened");
+    }
+    // The Reporter started a thread of their own, which they may resolve despite being unable to push.
+    long reporterThread;
+    using (HttpResponseMessage listing = await ApiGet(address, notes, aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await listing.Content.ReadAsStreamAsync());
+        reporterThread = json.RootElement.EnumerateArray()
+            .First(note => note.GetProperty("author").GetProperty("username").GetString() == strangerUsername).GetProperty("id").GetInt64();
+    }
+    using (HttpResponseMessage own = await ApiPut(address, notes + "/" + reporterThread, strangerApi, new { resolved = true }))
+        Check(own.IsSuccessStatusCode, "whoever started a thread may resolve it, whatever their role");
+
+    using (HttpResponseMessage refused = await ApiDelete(address, notes + "/" + rootId, reviewerApi))
+        Check(refused.StatusCode == HttpStatusCode.Conflict, "a comment with replies cannot be deleted");
+    using (HttpResponseMessage wrongDoor = await ApiDelete(address, prefix + "/merge_requests/99/notes/" + replyId, aliceApi))
+        Check(wrongDoor.StatusCode == HttpStatusCode.NotFound, "a comment is not reachable beneath a proposal it is not on");
+    using (HttpResponseMessage deleted = await ApiDelete(address, notes + "/" + replyId, aliceApi))
+        Check(deleted.StatusCode == HttpStatusCode.NoContent, "a reply can be deleted over the GitLab-shaped route");
+
     // Approvals.
     using (HttpResponseMessage required = await ApiPut(address, prefix + "/approvals", aliceApi, new { approvals_before_merge = 1 }))
         Check(required.StatusCode == HttpStatusCode.NoContent, "a Maintainer sets how many approvals a merge needs");
@@ -3649,6 +3742,7 @@ async Task CheckReview(string address, AuthenticatedIdentity alice, string bobUs
     {
         using JsonDocument json = JsonDocument.Parse(await stale.Content.ReadAsStreamAsync());
         Check(stale.IsSuccessStatusCode && json.RootElement.EnumerateArray()
+            .Where(note => note.GetProperty("path").ValueKind != JsonValueKind.Null)
             .All(note => note.GetProperty("outdated").GetBoolean()),
             "a comment written against an earlier commit is reported as outdated rather than moved");
         Check(json.RootElement[0].GetProperty("anchor_commit_sha").GetString() == anchor,

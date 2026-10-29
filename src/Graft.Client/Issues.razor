@@ -138,15 +138,11 @@ else
         else
         {
             <div class="list">
-                @foreach (NoteResponse note in comments)
+                @foreach (NoteResponse root in comments.Where(note => note.ParentId is null))
                 {
-                    <div class="list-item comment">
-                        <span class="avatar avatar-small" aria-hidden="true">@Initial(note.Author.Username)</span>
-                        <span class="list-item-main">
-                            <small><strong>@note.Author.Username</strong> &middot; @note.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")</small>
-                            <pre class="commit-message">@note.Body</pre>
-                        </span>
-                    </div>
+                    <CommentThread Root="root" Replies="RepliesTo(root.Id)" CanParticipate="canParticipate"
+                                   CanPush="canPush" CanManage="canManage" Username="@Api.Username" Busy="busy"
+                                   OnReply="Reply" OnEdit="EditComment" OnDelete="DeleteComment" OnResolve="ResolveThread" />
                 }
             </div>
         }
@@ -188,6 +184,7 @@ else
     private long projectId;
     private bool canParticipate;
     private bool canManage;
+    private bool canPush;
     private IssueResponse[] issues = [];
     private IssueResponse? issue;
     private NoteResponse[] comments = [];
@@ -215,7 +212,7 @@ else
     private bool CanChangeState => issue is not null && canParticipate &&
         (canManage || string.Equals(issue.Author.Username, Api.Username, StringComparison.Ordinal));
 
-    private static string Initial(string name) => name.Length == 0 ? "?" : name[..1].ToUpperInvariant();
+    private NoteResponse[] RepliesTo(long rootId) => [.. comments.Where(note => note.ParentId == rootId)];
 
     protected override async Task OnParametersSetAsync()
     {
@@ -251,7 +248,68 @@ else
         projectId = page.Project.Id;
         canParticipate = page.CanParticipate;
         canManage = page.CanManage;
+        canPush = page.CanPush;
         return true;
+    }
+
+    private async Task Reply((long ParentId, string Body) reply)
+    {
+        if (busy || issue is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/projects/{projectId}/issues/{issue.Iid}/comments",
+                new NoteCreateRequest(reply.Body, ParentId: reply.ParentId), ApiJson.Default.NoteCreateRequest, "Reply added.");
+            Report(result.Ok, result.Message);
+            if (result.Ok) await LoadOne();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task EditComment((long Id, string Body) edit)
+    {
+        if (busy) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/projects/{projectId}/comments/{edit.Id}",
+                new NoteUpdateRequest(edit.Body), ApiJson.Default.NoteUpdateRequest, "Comment edited.");
+            Report(result.Ok, result.Message);
+            if (result.Ok) await LoadOne();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task DeleteComment(long id)
+    {
+        if (busy) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.DeleteAsync($"api/projects/{projectId}/comments/{id}", "Comment deleted.");
+            Report(result.Ok, result.Message);
+            if (result.Ok) await LoadOne();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task ResolveThread((long Id, bool Resolved) change)
+    {
+        if (busy) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/projects/{projectId}/comments/{change.Id}",
+                new NoteUpdateRequest(Resolved: change.Resolved), ApiJson.Default.NoteUpdateRequest,
+                change.Resolved ? "Thread resolved." : "Thread reopened.");
+            Report(result.Ok, result.Message);
+            if (result.Ok) await LoadOne();
+        }
+        finally { busy = false; }
     }
 
     private async Task Filter(string next)

@@ -332,13 +332,9 @@ else
                                 {
                                     <tr class="diff-comment">
                                         <td colspan="4">
-                                            <div class="list-item comment">
-                                                <span class="avatar avatar-small" aria-hidden="true">@Initial(note.Author.Username)</span>
-                                                <span class="list-item-main">
-                                                    <small><strong>@note.Author.Username</strong> &middot; @note.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")</small>
-                                                    <pre class="commit-message">@note.Body</pre>
-                                                </span>
-                                            </div>
+                                            <CommentThread Root="note" Replies="RepliesTo(note.Id)" CanParticipate="canParticipate"
+                                                           CanPush="canPush" CanManage="canManage" Username="@Api.Username" Busy="busy"
+                                                           OnReply="Reply" OnEdit="EditComment" OnDelete="DeleteComment" OnResolve="ResolveThread" />
                                         </td>
                                     </tr>
                                 }
@@ -381,16 +377,10 @@ else
                     <div class="list">
                         @foreach (NoteResponse note in stale)
                         {
-                            <div class="list-item comment">
-                                <span class="avatar avatar-small" aria-hidden="true">@Initial(note.Author.Username)</span>
-                                <span class="list-item-main">
-                                    <small>
-                                        <strong>@note.Author.Username</strong> on line @note.Line
-                                        at <code>@Short(note.AnchorCommitSha)</code>
-                                    </small>
-                                    <pre class="commit-message">@note.Body</pre>
-                                </span>
-                            </div>
+                            <CommentThread Root="note" Replies="RepliesTo(note.Id)" CanParticipate="canParticipate"
+                                           CanPush="canPush" CanManage="canManage" Username="@Api.Username" Busy="busy"
+                                           Caption="StaleCaption"
+                                           OnReply="Reply" OnEdit="EditComment" OnDelete="DeleteComment" OnResolve="ResolveThread" />
                         }
                     </div>
                 </div>
@@ -415,13 +405,9 @@ else
             <div class="list">
                 @foreach (NoteResponse note in GeneralComments)
                 {
-                    <div class="list-item comment">
-                        <span class="avatar avatar-small" aria-hidden="true">@Initial(note.Author.Username)</span>
-                        <span class="list-item-main">
-                            <small><strong>@note.Author.Username</strong> &middot; @note.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")</small>
-                            <pre class="commit-message">@note.Body</pre>
-                        </span>
-                    </div>
+                    <CommentThread Root="note" Replies="RepliesTo(note.Id)" CanParticipate="canParticipate"
+                                   CanPush="canPush" CanManage="canManage" Username="@Api.Username" Busy="busy"
+                                   OnReply="Reply" OnEdit="EditComment" OnDelete="DeleteComment" OnResolve="ResolveThread" />
                 }
             </div>
         }
@@ -519,17 +505,83 @@ else
         }
     }
 
-    /// <summary>Comments that belong in the conversation rather than on a line.</summary>
-    private NoteResponse[] GeneralComments => [.. comments.Where(note => note.Path is null)];
+    /// <summary>Threads that belong in the conversation rather than on a line. Replies sit under their
+    /// first comment wherever that is, so only first comments are placed.</summary>
+    private NoteResponse[] GeneralComments => [.. comments.Where(note => note.Path is null && note.ParentId is null)];
 
-    /// <summary>Comments sitting on one line of one file, as that file looks now.</summary>
+    /// <summary>Threads sitting on one line of one file, as that file looks now.</summary>
     private NoteResponse[] AnchoredAt(string path, int? line, string side) => line is null
         ? []
         : [.. comments.Where(note => !note.Outdated && note.Path == path && note.Line == line && note.Side == side)];
 
-    /// <summary>Comments on this file written against a commit that is no longer the branch tip.</summary>
+    /// <summary>Threads on this file written against a commit that is no longer the branch tip.</summary>
     private NoteResponse[] OutdatedFor(string path) =>
         [.. comments.Where(note => note.Outdated && note.Path == path)];
+
+    private NoteResponse[] RepliesTo(long rootId) => [.. comments.Where(note => note.ParentId == rootId)];
+
+    private string? StaleCaption(NoteResponse note) =>
+        note.Path is null ? null : $"on line {note.Line} at {Short(note.AnchorCommitSha)}";
+
+    private async Task Reply((long ParentId, string Body) reply)
+    {
+        if (busy || proposal is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/projects/{projectId}/merge-requests/{proposal.Iid}/comments",
+                new NoteCreateRequest(reply.Body, ParentId: reply.ParentId), ApiJson.Default.NoteCreateRequest, "Reply added.");
+            Report(result.Ok, result.Message);
+            if (result.Ok) await LoadOne();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task EditComment((long Id, string Body) edit)
+    {
+        if (busy) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/projects/{projectId}/comments/{edit.Id}",
+                new NoteUpdateRequest(edit.Body), ApiJson.Default.NoteUpdateRequest, "Comment edited.");
+            Report(result.Ok, result.Message);
+            if (result.Ok) await LoadOne();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task DeleteComment(long id)
+    {
+        if (busy) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.DeleteAsync($"api/projects/{projectId}/comments/{id}", "Comment deleted.");
+            Report(result.Ok, result.Message);
+            if (result.Ok) await LoadOne();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task ResolveThread((long Id, bool Resolved) change)
+    {
+        if (busy) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/projects/{projectId}/comments/{change.Id}",
+                new NoteUpdateRequest(Resolved: change.Resolved), ApiJson.Default.NoteUpdateRequest,
+                change.Resolved ? "Thread resolved." : "Thread reopened.");
+            Report(result.Ok, result.Message);
+            if (result.Ok) await LoadOne();
+        }
+        finally { busy = false; }
+    }
 
     private bool IsCommentingAt(string path, int? line, string side) =>
         line is not null && commentingPath == path && commentingLine == line && commentingSide == side;

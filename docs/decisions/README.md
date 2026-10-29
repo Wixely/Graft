@@ -23,3 +23,4 @@ Preserve this history; supersede a decision explicitly instead of silently chang
 Open architecture choices are in [architecture.md](../architecture.md); they are not accepted decisions.
 
 - [0018: Four GiB repositories](0018-repository-capacity.md) — implemented; disk-backed objects, pack transfers and archives replace the feasibility size budgets
+- [0019: A comment becomes a conversation](0019-conversation.md) — accepted and implemented; threads one level deep, resolving needs the standing to push or to have started the thread, edits recorded, a first comment with replies kept

@@ -1,0 +1,143 @@
+@* One conversation: a first comment and the replies to it.
+
+   Shared by the issue page, the merge request page and the line of a diff, so the three cannot drift in
+   what a reader may do to a comment. Every body is bound as text and never as markup. The component holds
+   only the state of its own forms; the page owns the comments and reloads them after a change, because the
+   server is the one that knows what a change did. *@
+
+<div class="comment-thread @(Root.Resolved ? "resolved" : "")">
+    @RenderComment(Root, isRoot: true)
+    @if (Replies.Length > 0)
+    {
+        <div class="comment-replies">
+            @foreach (NoteResponse reply in Replies) { @RenderComment(reply, isRoot: false) }
+        </div>
+    }
+    @if (replying)
+    {
+        <form class="form comment-reply-form" @onsubmit="SubmitReply" @onsubmit:preventDefault>
+            <label for="@("reply-" + Root.Id)">Reply</label>
+            <textarea id="@("reply-" + Root.Id)" @bind="replyBody" rows="3" maxlength="50000" required></textarea>
+            <div class="form-actions">
+                <button type="submit" disabled="@Busy">@(Busy ? "Posting…" : "Reply")</button>
+                <button type="button" class="secondary" @onclick="() => replying = false" disabled="@Busy">Cancel</button>
+            </div>
+        </form>
+    }
+    else if (CanParticipate || CanResolve)
+    {
+        <div class="comment-actions">
+            @if (CanParticipate)
+            {
+                <button type="button" class="link" @onclick="() => replying = true" disabled="@Busy">Reply</button>
+            }
+            @if (CanResolve)
+            {
+                <button type="button" class="link" @onclick="() => OnResolve.InvokeAsync((Root.Id, !Root.Resolved))" disabled="@Busy">
+                    @(Root.Resolved ? "Reopen thread" : "Resolve thread")
+                </button>
+            }
+            @if (Root.Resolved)
+            {
+                <span class="secondary-text">Resolved by @Root.ResolvedBy</span>
+            }
+        </div>
+    }
+    else if (Root.Resolved)
+    {
+        <div class="comment-actions"><span class="secondary-text">Resolved by @Root.ResolvedBy</span></div>
+    }
+</div>
+
+@code {
+    [Parameter, EditorRequired] public NoteResponse Root { get; set; } = default!;
+    [Parameter] public NoteResponse[] Replies { get; set; } = [];
+    /// <summary>Whether this reader may comment at all. Decides the reply box and the edit controls.</summary>
+    [Parameter] public bool CanParticipate { get; set; }
+    /// <summary>Whether this reader could push. Resolving a thread needs that, or to have started it.</summary>
+    [Parameter] public bool CanPush { get; set; }
+    /// <summary>Whether this reader is a Maintainer, who may edit and delete anyone's words.</summary>
+    [Parameter] public bool CanManage { get; set; }
+    [Parameter] public string Username { get; set; } = "";
+    [Parameter] public bool Busy { get; set; }
+    /// <summary>Extra text shown beside a comment's author, such as the line a stale comment was about.</summary>
+    [Parameter] public Func<NoteResponse, string?>? Caption { get; set; }
+    [Parameter] public EventCallback<(long ParentId, string Body)> OnReply { get; set; }
+    [Parameter] public EventCallback<(long Id, string Body)> OnEdit { get; set; }
+    [Parameter] public EventCallback<long> OnDelete { get; set; }
+    [Parameter] public EventCallback<(long Id, bool Resolved)> OnResolve { get; set; }
+
+    private bool replying;
+    private string replyBody = "";
+    private long? editingId;
+    private string editBody = "";
+
+    private bool CanResolve => CanParticipate &&
+        (CanPush || string.Equals(Root.Author.Username, Username, StringComparison.Ordinal));
+
+    private bool CanEdit(NoteResponse note) => CanParticipate &&
+        (CanManage || string.Equals(note.Author.Username, Username, StringComparison.Ordinal));
+
+    private static string Initial(string name) => name.Length == 0 ? "?" : name[..1].ToUpperInvariant();
+
+    private RenderFragment RenderComment(NoteResponse note, bool isRoot) => __builder =>
+    {
+        <div class="list-item comment @(isRoot ? "" : "reply")">
+            <span class="avatar avatar-small" aria-hidden="true">@Initial(note.Author.Username)</span>
+            <span class="list-item-main">
+                <small>
+                    <strong>@note.Author.Username</strong> &middot; @note.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")
+                    @if (note.EditedAt is not null) { <span> &middot; edited</span> }
+                    @if (Caption?.Invoke(note) is { Length: > 0 } caption) { <span> &middot; @caption</span> }
+                </small>
+                @if (editingId == note.Id)
+                {
+                    <form class="form" @onsubmit="SubmitEdit" @onsubmit:preventDefault>
+                        <textarea @bind="editBody" rows="3" maxlength="50000" required aria-label="Edit comment"></textarea>
+                        <div class="form-actions">
+                            <button type="submit" disabled="@Busy">@(Busy ? "Saving…" : "Save")</button>
+                            <button type="button" class="secondary" @onclick="() => editingId = null" disabled="@Busy">Cancel</button>
+                        </div>
+                    </form>
+                }
+                else
+                {
+                    <pre class="commit-message">@note.Body</pre>
+                }
+            </span>
+            @if (CanEdit(note) && editingId != note.Id)
+            {
+                <span class="list-item-actions">
+                    <button type="button" class="link" @onclick="() => StartEdit(note)" disabled="@Busy">Edit</button>
+                    @* A thread's first comment carries its replies, so the server refuses to delete one that
+                       has any; the control is hidden in that case rather than offered and refused. *@
+                    @if (!isRoot || Replies.Length == 0)
+                    {
+                        <button type="button" class="link danger-text" @onclick="() => OnDelete.InvokeAsync(note.Id)" disabled="@Busy">Delete</button>
+                    }
+                </span>
+            }
+        </div>
+    };
+
+    private void StartEdit(NoteResponse note)
+    {
+        editingId = note.Id;
+        editBody = note.Body;
+    }
+
+    private async Task SubmitReply()
+    {
+        if (string.IsNullOrWhiteSpace(replyBody)) return;
+        await OnReply.InvokeAsync((Root.Id, replyBody));
+        replyBody = "";
+        replying = false;
+    }
+
+    private async Task SubmitEdit()
+    {
+        if (editingId is null || string.IsNullOrWhiteSpace(editBody)) return;
+        await OnEdit.InvokeAsync((editingId.Value, editBody));
+        editingId = null;
+    }
+}

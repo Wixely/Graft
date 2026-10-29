@@ -443,7 +443,22 @@ public sealed record NoteResponse(
     /// <summary><c>old</c> or <c>new</c>.</summary>
     string? Side = null,
     [property: JsonPropertyName("anchor_commit_sha")] string? AnchorCommitSha = null,
-    bool Outdated = false);
+    bool Outdated = false,
+    /// <summary>The comment this one answers, or null for the first comment of a thread.</summary>
+    [property: JsonPropertyName("parent_id")] long? ParentId = null,
+    /// <summary>When the body was last changed after posting, or null if never.</summary>
+    [property: JsonPropertyName("edited_at")] DateTimeOffset? EditedAt = null,
+    /// <summary>Whether this thread has been marked settled. Only meaningful on the first comment of a
+    /// thread; always false on a reply, whose thread's state is on its parent.</summary>
+    bool Resolved = false,
+    [property: JsonPropertyName("resolved_by")] string? ResolvedBy = null,
+    [property: JsonPropertyName("resolved_at")] DateTimeOffset? ResolvedAt = null);
+
+/// <summary>
+/// Edits a comment, or marks its thread settled. Either field may be sent alone. <c>resolved</c> applies
+/// to the thread the comment belongs to, however deep in it the comment is.
+/// </summary>
+public sealed record NoteUpdateRequest(string? Body = null, bool? Resolved = null);
 
 /// <summary>One person's approval, and whether it still counts.</summary>
 public sealed record ApprovalResponse(
@@ -503,7 +518,10 @@ public sealed record NoteCreateRequest(
     string? Path = null,
     int? Line = null,
     /// <summary><c>old</c> or <c>new</c>: which side of the diff the line sits on.</summary>
-    string? Side = null);
+    string? Side = null,
+    /// <summary>The comment to answer. A reply joins that comment's thread and cannot name a line of its
+    /// own. Graft's own field: GitLab replies through a separate discussions resource.</summary>
+    [property: JsonPropertyName("parent_id")] long? ParentId = null);
 
 public sealed record MergeRequestCreateRequest(
     [property: JsonPropertyName("source_branch")] string? SourceBranch,
@@ -615,6 +633,7 @@ public sealed record MergeRequestChangesResponse(
 [JsonSerializable(typeof(IssueCreateRequest))]
 [JsonSerializable(typeof(IssueUpdateRequest))]
 [JsonSerializable(typeof(NoteCreateRequest))]
+[JsonSerializable(typeof(NoteUpdateRequest))]
 [JsonSerializable(typeof(MergeRequestCreateRequest))]
 [JsonSerializable(typeof(BranchCreateRequest))]
 [JsonSerializable(typeof(TagCreateRequest))]

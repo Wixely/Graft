@@ -43,7 +43,62 @@ public sealed record Issue(
     DateTimeOffset CreatedAtUtc,
     DateTimeOffset UpdatedAtUtc,
     DateTimeOffset? ClosedAtUtc,
-    long Comments = 0);
+    long Comments = 0,
+    IReadOnlyList<Label>? Labels = null,
+    MilestoneReference? Milestone = null,
+    IReadOnlyList<Person>? Assignees = null,
+    /// <summary>A date with no time, because a deadline has no time zone.</summary>
+    DateOnly? DueDate = null,
+    /// <summary>Readable by members and the author only, however public the project is.</summary>
+    bool Confidential = false,
+    /// <summary>Seconds of work estimated, or zero. Spent time is a separate ledger.</summary>
+    long TimeEstimateSeconds = 0,
+    long TimeSpentSeconds = 0);
+
+/// <summary>A project's label: a word and a colour, applied to issues and proposals alike.</summary>
+public sealed record Label(long Id, string Name, string Color, string Description);
+
+/// <summary>A milestone as an issue names it, by number and title; the full record is <see cref="Milestone"/>.</summary>
+public sealed record MilestoneReference(long Id, long Iid, string Title);
+
+/// <summary>Someone assigned to or asked to review a piece of work.</summary>
+public sealed record Person(long UserId, string Username);
+
+public enum MilestoneState
+{
+    Active = 0,
+    Closed = 1
+}
+
+/// <summary>
+/// A milestone: a named point to aim at, with the open and closed issues counted towards it. Numbered per
+/// project like issues, because that is how people refer to them.
+/// </summary>
+public sealed record Milestone(
+    long Id,
+    long ProjectId,
+    long Iid,
+    string Title,
+    string Description,
+    MilestoneState State,
+    DateOnly? DueDate,
+    DateOnly? StartDate,
+    DateTimeOffset CreatedAtUtc,
+    DateTimeOffset UpdatedAtUtc,
+    long OpenIssues = 0,
+    long ClosedIssues = 0,
+    long MergeRequests = 0);
+
+/// <summary>A board: a name and the labels its lists are bound to, in order.</summary>
+public sealed record Board(long Id, long ProjectId, string Name, IReadOnlyList<BoardList> Lists);
+public sealed record BoardList(long Id, Label Label, int Position);
+
+/// <summary>Which relation to a piece of work a person has.</summary>
+public enum PersonKind
+{
+    Assignee = 0,
+    Reviewer = 1
+}
 
 /// <summary>
 /// A proposal to bring one branch into another.
@@ -76,7 +131,15 @@ public sealed record MergeProposal(
     /// satisfied only by the ones whose <see cref="Approval.Current"/> is true.</summary>
     IReadOnlyList<Approval>? Approvals = null,
     /// <summary>How many current approvals this project requires before a merge. Zero means none.</summary>
-    int ApprovalsRequired = 0);
+    int ApprovalsRequired = 0,
+    IReadOnlyList<Label>? Labels = null,
+    MilestoneReference? Milestone = null,
+    IReadOnlyList<Person>? Assignees = null,
+    IReadOnlyList<Person>? Reviewers = null,
+    /// <summary>Marked as not ready. A draft cannot be merged, however mergeable the branches are.</summary>
+    bool Draft = false,
+    long TimeEstimateSeconds = 0,
+    long TimeSpentSeconds = 0);
 
 /// <summary>
 /// One comment. The same shape on an issue and on a merge request, because it is the same thing.
@@ -101,7 +164,17 @@ public sealed record Comment(
     /// commented on the old side and an added line only on the new, so this is not redundant with the
     /// line number.</summary>
     DiffSide? Side = null,
-    string? AnchorCommitSha = null);
+    string? AnchorCommitSha = null,
+    /// <summary>The comment this one answers, or null for the first comment of a thread. Threads are one
+    /// level deep: a reply to a reply is stored as a reply to the thread's first comment.</summary>
+    long? ParentId = null,
+    /// <summary>When the body was last changed after posting, or null if never. The earlier text is not
+    /// kept; the fact that it changed is.</summary>
+    DateTimeOffset? EditedAtUtc = null,
+    /// <summary>Set on the first comment of a thread when the conversation was marked settled. Null on a
+    /// reply, and null on an unresolved thread.</summary>
+    DateTimeOffset? ResolvedAtUtc = null,
+    string? ResolvedByUsername = null);
 
 /// <summary>Which side of a diff a line belongs to.</summary>
 public enum DiffSide
@@ -128,3 +201,14 @@ public sealed record Approval(
 
 public sealed record IssuePage(IReadOnlyList<Issue> Issues, long Total);
 public sealed record MergeProposalPage(IReadOnlyList<MergeProposal> Proposals, long Total);
+
+/// <summary>
+/// An optional change to a field that can itself be null. <c>default</c> leaves the field alone;
+/// <see cref="To"/> sets it, including to null. Exists so an update can clear a milestone or a due date
+/// without a second parameter per field saying whether the first one meant anything.
+/// </summary>
+public readonly record struct Change<T>(bool Set, T? Value)
+{
+    public static Change<T> To(T? value) => new(true, value);
+    public static Change<T> Unchanged => default;
+}
