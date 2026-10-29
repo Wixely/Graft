@@ -2,6 +2,61 @@
 
 Updated: 2026-10-29. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
 
+## Added on 2026-10-29, later the same day: the outside, the builds, and the Git engine
+
+The user asked for the second list from the 2026-10-28 review as one piece of work: forks, search,
+package feeds and a container registry, LFS, and the Git engine's own self-description taken as a list of
+things to stop being true. Five decision records:
+
+- **[ADR 0024](decisions/0024-search.md)**: search without an index. Code, commits, issues, proposals and
+  wiki within a project; projects, issues and proposals across them. Bounded at 50 results, 1 MiB files and
+  20,000 files; a global search sees what the caller sees.
+- **[ADR 0025](decisions/0025-forks.md)**: a fork is a clone with an address. A proposal from a fork is
+  mirrored into the original under `refs/merge-requests/<iid>/head`, fetchable and never pushable, before
+  the engine reads it; rebase and source-branch removal are refused for it; its author may comment on it
+  and do nothing else in the original.
+- **[ADR 0026](decisions/0026-large-files.md)**: LFS. The batch API and basic transfer, objects
+  content-addressed by SHA-256 beside the repository and hashed on the way in, under the Git transport's
+  credential and permissions. No locking API.
+- **[ADR 0027](decisions/0027-packages-and-registry.md)**: generic and NuGet v3 packages, and a Docker v2
+  registry, bytes beside the repository and rows in the database, Basic authentication with a token and no
+  bearer service, reading following the repository and publishing needing a push.
+- **[ADR 0028](decisions/0028-git-engine.md)**: the engine keeps repositories the way Git does. A
+  repository directory is a bare Git repository Git itself opens; the previous layout converts on first
+  open; packs are read through their index and written with delta compression; housekeeping packs
+  everything and prunes nothing; a fetch sends only what the client lacks; protocol version 2 is spoken.
+  SHA-1 only, no shallow or partial clones, no thin packs sent, by decision.
+
+Migrations 16 and 17; manifest version 17. The agent surface went from 35 to 37 tools: `graft_search` and
+`graft_fork` are new, and `graft_open_merge_request` takes a source project. Git suite 795 to 913;
+MCP suite 101.
+
+**The repository format changed.** Every repository the deployment holds converts itself the first time
+it is opened after this build is deployed: each loose object is rewritten in place as a zlib stream and
+`refs.snapshot` becomes `packed-refs`. The conversion is recognised by file content rather than a version
+marker, so an interruption resumes. Back the repositories directory up before deploying, because this is
+the one change here that rewrites what is already on disk. After it, `git fsck` can be run against any
+repository directory, which is the quickest way to check the result.
+
+**Found by building rather than by reading.** git-lfs 3.7.1 crashes with a Go nil dereference when a batch
+response writes `"download": null` inside `actions`, so the LFS response records omit null members; and
+the JSON writer overwrites a content type it is not told, so the LFS media type is passed to it explicitly.
+The suite's isolated Git configuration has no LFS filter, so a test clone needs `git lfs install --local`
+before `git lfs pull`. A NuGet push route mapped twice, once with the trailing slash the client sends, made every push an ambiguous match that failed before any middleware could answer; ASP.NET matches the trailing slash on its own, and the duplicate is gone. The browser fixture now prints its throwaway token and forwards the server's log lines under `SERVER:`, which is how that was found.
+
+**Not done, and worth saying.** No real `docker` or `nuget` client ran against the server, because
+neither is installed where the suite runs; the protocol checks are the ones those clients make. The
+NativeAOT publish was not re-run; the suite ran against the managed server. Webhooks still report only
+pushes, issues, proposals and comments. The negotiation excludes what the client has by walking the whole
+history from the common commits on every fetch, which is correct and costs a walk; a reachability bitmap
+would make it cheap. Nothing is pruned, so a repository that had history rewritten keeps the old objects
+in its pack.
+
+**Next action.** Operator: back up the repositories directory, rebuild the deployment, and run `git fsck
+--full` against one converted repository before opening the server to users again. Agent: a NativeAOT
+publish with the Git suite against it; then reachability bitmaps or a commit-graph for negotiation, and a
+pruning rule that respects the commits comments and proposals still name.
+
 ## Added on 2026-10-29: the collaboration depth list, built out
 
 The user asked for the collaboration gaps from the 2026-10-28 review to be built, as one piece of work.

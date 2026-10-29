@@ -118,3 +118,7 @@ transport check and the LFS and fork checks, still passes against the new layout
 Not verified: the conversion of the live deployment's repositories, which happens when it is upgraded; a
 NativeAOT publish of this build; performance of a repack or a negotiation walk on a repository near the
 4 GiB ceiling on the legacy host.
+
+**Found by building, not by reading.** The tar archive writer needs a seekable stream for each entry, and
+an object inflated straight from its loose file is not one; an object's content is therefore inflated into
+memory when read, which is at most 64 MiB, while hashing, which only reads forward, inflates as it goes.
