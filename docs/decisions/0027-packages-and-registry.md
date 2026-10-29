@@ -70,7 +70,7 @@ removed while the manifest stays reachable by digest.
 Not verified: a real `docker` or `nuget` client against this server, because neither is installed where
 the suite runs. The protocol checks are the ones those clients make, in the order they make them.
 
-**Found by building, not by reading.** The NuGet push route was mapped twice, once with the trailing slash
+**Also found by building.** The NuGet push route was mapped twice, once with the trailing slash
 the client sends, and ASP.NET treats the two spellings as one route: every push was an ambiguous match that
 failed in routing, before any handler or middleware could answer, as an empty 500. One mapping serves both
 spellings. The browser fixture forwards the server's log lines under `SERVER:` now, because the suite's
