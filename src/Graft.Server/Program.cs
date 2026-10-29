@@ -706,7 +706,10 @@ Func<HttpContext, Task> rotateApiToken = async context =>
         null, true, rotated.Grant.ExpiresAtUtc.UtcDateTime.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
         rotated.Grant.Secret), ApiJson.Default.PersonalAccessTokenResponse, null, context.RequestAborted);
 };
-app.MapPost("/api/v4/personal_access_tokens/{tokenId}/rotate", rotateApiToken);
+// Mapped through a lambda rather than the delegate variable, because the Request Delegate Generator can
+// only see a lambda or a method group; a variable would fall back to the runtime factory, which the native
+// build does not carry. The publish is what found this.
+app.MapPost("/api/v4/personal_access_tokens/{tokenId}/rotate", async context => await rotateApiToken(context));
 
 // Claims the secret of a token just created, once. The handle is removed before the secret is written, so
 // a second attempt finds nothing even if the first never reached the caller; losing a secret to a dropped

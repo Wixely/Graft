@@ -44,10 +44,21 @@ lines, and the chevrons and the check became wedges. Every icon in the set now r
 drawn as; the three dots of the settings icon, which set their own fill, are unchanged. No suite covers how
 an icon looks, so this was checked by eye and the comparison is not kept.
 
-**Next action.** Unchanged from the entry below: operator, back up the repositories directory before
-deploying this build, because the Git engine entry's format conversion is still the deployment's first
-upgrade step. Agent: the "Near, and small" list is empty; the NativeAOT publish with the Git suite against
-it is next, and everything else in the backlog needs a decision from the user first.
+**Then the NativeAOT publish, with both suites against it.** [Evidence](validation/2026-10-29-nativeaot-forge.md).
+The forge as of this entry publishes native with zero ILC warnings, starts as `MODE: NativeAOT`, and passes
+**947 of 947** Git and **104 of 104** MCP assertions as a native binary, the same counts as managed. The
+publish found one defect in the day's work: the token rotation route was mapped through a delegate variable,
+which the compile-time endpoint generator cannot see, so the native build refused it; it is a lambda now,
+and the managed suite could never have caught it. Two caveats carried from before: `DnaX.Uploads` is still
+pinned at `10.0.0-alpha.7`, so the run used a package packed from the unreleased DnaX fix branch and the pin
+was reverted afterwards; and the publish's own restore lacked the `win-x64` target, so restore first and
+publish with `--no-restore`, as build-and-test.md now says.
+
+**Next action.** Operator: back up the repositories directory before deploying this build, because the Git
+engine entry's format conversion is still the deployment's first upgrade step; and decide whether to merge
+and release the DnaX fix branch, which is what stands between this repository as pinned and a native forge.
+Agent: the "Near, and small" list is empty and the native build is verified; everything left in the backlog
+needs a decision from the user first.
 
 
 ## Added on 2026-10-29, later the same day: the outside, the builds, and the Git engine
