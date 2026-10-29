@@ -2131,7 +2131,68 @@ async Task<IssueResponse> IssueResponseFor(HttpContext context, ProjectDetails p
     await AuthorFor(context, issue.AuthorUserId, issue.AuthorUsername),
     issue.CreatedAtUtc, issue.UpdatedAtUtc, issue.ClosedAtUtc,
     ProjectWebUrl(context, project) + "/-/issues/" + issue.Iid.ToString(System.Globalization.CultureInfo.InvariantCulture),
-    issue.Comments);
+    issue.Comments,
+    [.. (issue.Labels ?? []).Select(label => label.Name)],
+    [.. (issue.Labels ?? []).Select(LabelResponseFor)],
+    issue.Milestone is null ? null : new MilestoneReferenceResponse(issue.Milestone.Id, issue.Milestone.Iid, issue.Milestone.Title),
+    await PeopleFor(context, issue.Assignees),
+    issue.DueDate?.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
+    issue.Confidential,
+    TimeStatsFor(issue.TimeEstimateSeconds, issue.TimeSpentSeconds));
+
+async Task<UserResponse[]> PeopleFor(HttpContext context, IReadOnlyList<Person>? people)
+{
+    List<UserResponse> result = [];
+    foreach (Person person in people ?? []) result.Add(await AuthorFor(context, person.UserId, person.Username));
+    return [.. result];
+}
+
+static LabelResponse LabelResponseFor(Label label) => new(label.Id, label.Name, label.Color, TextColorFor(label.Color), label.Description);
+
+// Relative luminance of the stored colour decides whether dark or light text reads against it. The colour
+// is six validated hex digits, so the parse cannot fail.
+static string TextColorFor(string color)
+{
+    int r = Convert.ToInt32(color.Substring(1, 2), 16), g = Convert.ToInt32(color.Substring(3, 2), 16), b = Convert.ToInt32(color.Substring(5, 2), 16);
+    double luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+    return luminance > 0.55 ? "#1f2328" : "#ffffff";
+}
+
+static TimeStatsResponse TimeStatsFor(long estimate, long spent) =>
+    new(estimate, spent, TimeTracking.Humanize(estimate), TimeTracking.Humanize(spent));
+
+MilestoneResponse MilestoneResponseFor(HttpContext context, ProjectDetails project, Milestone milestone) => new(
+    milestone.Id, milestone.Iid, milestone.ProjectId, milestone.Title, milestone.Description,
+    milestone.State == MilestoneState.Closed ? "closed" : "active",
+    milestone.DueDate?.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
+    milestone.StartDate?.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
+    milestone.CreatedAtUtc, milestone.UpdatedAtUtc,
+    ProjectWebUrl(context, project) + "/-/milestones/" + milestone.Id.ToString(System.Globalization.CultureInfo.InvariantCulture),
+    milestone.OpenIssues, milestone.ClosedIssues, milestone.MergeRequests);
+
+static BoardResponse BoardResponseFor(Board board) => new(board.Id, board.Name, board.ProjectId,
+    [.. board.Lists.Select(list => new BoardListResponse(list.Id, LabelResponseFor(list.Label), list.Position))]);
+
+// GitLab's own convention for labels in a request: one string, comma-separated. An empty string is an empty
+// set, which on an update means "remove them all"; an absent field is null and means "leave them".
+static string[]? LabelList(string? value) => value is null
+    ? null
+    : [.. value.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)];
+
+// A date field: absent leaves it alone, empty clears it, otherwise YYYY-MM-DD. Returns false for anything else.
+static bool TryReadDay(string? value, out Change<DateOnly?> change)
+{
+    change = default;
+    if (value is null) return true;
+    if (value.Length == 0) { change = Change<DateOnly?>.To(null); return true; }
+    if (!DateOnly.TryParseExact(value, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture,
+        System.Globalization.DateTimeStyles.None, out DateOnly day)) return false;
+    change = Change<DateOnly?>.To(day);
+    return true;
+}
+
+// GitLab clears a milestone with zero. Null is absent and leaves it alone.
+static Change<long?> MilestoneChange(long? value) => value is null ? default : Change<long?>.To(value == 0 ? null : value);
 
 /// <summary>
 /// Re-reads the proposal's approvals against the branch tip the analysis just resolved. The store cannot
@@ -2179,7 +2240,14 @@ async Task<MergeRequestResponse> MergeResponseFor(HttpContext context, ProjectDe
         method, analysis?.Conflicts, proposal.Comments,
         proposal.ApprovalsRequired, Math.Max(0, proposal.ApprovalsRequired - current),
         proposal.Approvals is null ? null : [.. proposal.Approvals.Select(approval => new ApprovalResponse(
-            approval.UserId, approval.Username, approval.SourceCommitSha, approval.Current, approval.CreatedAtUtc))]);
+            approval.UserId, approval.Username, approval.SourceCommitSha, approval.Current, approval.CreatedAtUtc))],
+        [.. (proposal.Labels ?? []).Select(label => label.Name)],
+        [.. (proposal.Labels ?? []).Select(LabelResponseFor)],
+        proposal.Milestone is null ? null : new MilestoneReferenceResponse(proposal.Milestone.Id, proposal.Milestone.Iid, proposal.Milestone.Title),
+        await PeopleFor(context, proposal.Assignees),
+        await PeopleFor(context, proposal.Reviewers),
+        proposal.Draft,
+        TimeStatsFor(proposal.TimeEstimateSeconds, proposal.TimeSpentSeconds));
 }
 
 // `tip` is the source branch as it stands now. A comment anchored to any other commit is outdated: the
@@ -2220,15 +2288,28 @@ async Task<MergeAnalysis> AnalyseProposal(HttpContext context, ProjectDetails pr
 
 async Task ListIssues(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
 {
-    if (!await OnlyQuery(context, "state", "page", "per_page")) return;
+    if (!await OnlyQuery(context, "state", "page", "per_page", "labels", "without_labels", "milestone_id", "assignee_username", "search", "confidential")) return;
     if (!TryReadState(context.Request.Query["state"].ToString(), out CollaborationState? state, merged: false))
     { await ApiError(context, 400, "state must be opened, closed or all"); return; }
     (int Page, int PerPage)? pagination = await Pagination(context);
     if (pagination is null) return;
     (int page, int perPage) = pagination.Value;
+    bool? confidential = context.Request.Query["confidential"].ToString() switch
+    {
+        "" => null,
+        "true" => true,
+        "false" => false,
+        _ => (bool?)null
+    };
+    if (context.Request.Query["confidential"].ToString() is not ("" or "true" or "false"))
+    { await ApiError(context, 400, "confidential must be true or false"); return; }
+    IssueFilter filter = new(state,
+        LabelList(Optional(context, "labels")), LabelList(Optional(context, "without_labels")),
+        Optional(context, "milestone_id"), Optional(context, "assignee_username"), Optional(context, "search"), confidential);
 
-    IssuePage issues = await store.ListIssuesAsync(identity, project.Project.Id, state,
-        (page - 1) * perPage, perPage, context.RequestAborted);
+    IssuePage issues;
+    try { issues = await store.ListIssuesAsync(identity, project.Project.Id, filter, (page - 1) * perPage, perPage, context.RequestAborted); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); return; }
     List<IssueResponse> response = [];
     foreach (Issue issue in issues.Issues) response.Add(await IssueResponseFor(context, project, issue));
     SetPagination(context, page, perPage, issues.Total);
@@ -2236,16 +2317,22 @@ async Task ListIssues(HttpContext context, ProjectDetails project, Authenticated
         ApiJson.Default.IssuePageResponse, null, context.RequestAborted);
 }
 
+static string? Optional(HttpContext context, string name) =>
+    context.Request.Query[name].ToString() is { Length: > 0 } value ? value : null;
+
 async Task CreateIssue(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
 {
     if (identity is null) { await ApiError(context, 401, "authentication is required to open an issue"); return; }
     if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
     IssueCreateRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.IssueCreateRequest, context.RequestAborted);
     if (request?.Title is not { Length: > 0 }) { await ApiError(context, 400, "title is required"); return; }
+    if (!TryReadDay(request.DueDate, out Change<DateOnly?> dueDate)) { await ApiError(context, 400, "due_date is YYYY-MM-DD"); return; }
+    IssueChanges changes = new(LabelList(request.Labels), null, null, MilestoneChange(request.MilestoneId),
+        request.AssigneeUsernames, dueDate, request.Confidential);
     try
     {
         Issue issue = await store.CreateIssueAsync(identity, project.Project.Id, request.Title,
-            request.Description ?? "", context.RequestAborted);
+            request.Description ?? "", changes.Any ? changes : null, context.RequestAborted);
         await Notify(context, project.Project, WebhookEvent.Issue, payload =>
         {
             payload["action"] = "opened";
@@ -2282,12 +2369,17 @@ async Task UpdateIssue(HttpContext context, ProjectDetails project, Authenticate
     if (request is null) { await ApiError(context, 400, "issue"); return; }
     if (!TryReadStateEvent(request.StateEvent, out CollaborationState? state))
     { await ApiError(context, 400, "state_event must be close or reopen"); return; }
-    if (request.Title is null && request.Description is null && state is null)
+    if (!TryReadDay(request.DueDate, out Change<DateOnly?> dueDate)) { await ApiError(context, 400, "due_date is YYYY-MM-DD"); return; }
+    if (request.ReviewerUsernames is not null || request.Draft is not null)
+    { await ApiError(context, 400, "an issue has no reviewers and no draft state"); return; }
+    IssueChanges changes = new(LabelList(request.Labels), LabelList(request.AddLabels), LabelList(request.RemoveLabels),
+        MilestoneChange(request.MilestoneId), request.AssigneeUsernames, dueDate, request.Confidential);
+    if (request.Title is null && request.Description is null && state is null && !changes.Any)
     { await ApiError(context, 400, "nothing to change"); return; }
     try
     {
         Issue issue = await store.UpdateIssueAsync(identity, project.Project.Id, Number(context),
-            request.Title, request.Description, state, context.RequestAborted);
+            request.Title, request.Description, state, changes.Any ? changes : null, context.RequestAborted);
         if (state is not null)
             await Notify(context, project.Project, WebhookEvent.Issue, payload =>
             {
@@ -2379,15 +2471,18 @@ async Task CreateNote(HttpContext context, ProjectDetails project, Authenticated
 
 async Task ListMergeRequests(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
 {
-    if (!await OnlyQuery(context, "state", "page", "per_page")) return;
+    if (!await OnlyQuery(context, "state", "page", "per_page", "labels", "milestone_id", "assignee_username", "reviewer_username", "search")) return;
     if (!TryReadState(context.Request.Query["state"].ToString(), out CollaborationState? state, merged: true))
     { await ApiError(context, 400, "state must be opened, closed, merged or all"); return; }
     (int Page, int PerPage)? pagination = await Pagination(context);
     if (pagination is null) return;
     (int page, int perPage) = pagination.Value;
+    MergeFilter filter = new(state, LabelList(Optional(context, "labels")), Optional(context, "milestone_id"),
+        Optional(context, "assignee_username"), Optional(context, "reviewer_username"), Optional(context, "search"));
 
-    MergeProposalPage proposals = await store.ListMergeProposalsAsync(identity, project.Project.Id, state,
-        (page - 1) * perPage, perPage, context.RequestAborted);
+    MergeProposalPage proposals;
+    try { proposals = await store.ListMergeProposalsAsync(identity, project.Project.Id, filter, (page - 1) * perPage, perPage, context.RequestAborted); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); return; }
     List<MergeRequestResponse> response = [];
     foreach (MergeProposal proposal in proposals.Proposals)
         response.Add(await MergeResponseFor(context, project, proposal, null));
@@ -2420,10 +2515,13 @@ async Task CreateMergeRequest(HttpContext context, ProjectDetails project, Authe
     }
     finally { endpoint.Gate.Release(); }
 
+    ProposalChanges changes = new(LabelList(request.Labels), null, null, MilestoneChange(request.MilestoneId),
+        request.AssigneeUsernames, request.ReviewerUsernames, request.Draft);
     try
     {
         MergeProposal proposal = await store.CreateMergeProposalAsync(identity, project.Project.Id,
-            request.SourceBranch, request.TargetBranch, request.Title, request.Description ?? "", context.RequestAborted);
+            request.SourceBranch, request.TargetBranch, request.Title, request.Description ?? "",
+            changes.Any ? changes : null, context.RequestAborted);
         await Notify(context, project.Project, WebhookEvent.MergeRequest, payload =>
         {
             payload["action"] = "opened";
@@ -2457,12 +2555,16 @@ async Task UpdateMergeRequest(HttpContext context, ProjectDetails project, Authe
     if (request is null) { await ApiError(context, 400, "merge request"); return; }
     if (!TryReadStateEvent(request.StateEvent, out CollaborationState? state))
     { await ApiError(context, 400, "state_event must be close or reopen"); return; }
-    if (request.Title is null && request.Description is null && state is null)
+    if (request.DueDate is not null || request.Confidential is not null)
+    { await ApiError(context, 400, "a merge request has no due date and cannot be confidential"); return; }
+    ProposalChanges changes = new(LabelList(request.Labels), LabelList(request.AddLabels), LabelList(request.RemoveLabels),
+        MilestoneChange(request.MilestoneId), request.AssigneeUsernames, request.ReviewerUsernames, request.Draft);
+    if (request.Title is null && request.Description is null && state is null && !changes.Any)
     { await ApiError(context, 400, "nothing to change"); return; }
     try
     {
         MergeProposal proposal = await store.UpdateMergeProposalAsync(identity, project.Project.Id, Number(context),
-            request.Title, request.Description, state, context.RequestAborted);
+            request.Title, request.Description, state, changes.Any ? changes : null, context.RequestAborted);
         await context.Response.WriteAsJsonAsync(
             await MergeResponseFor(context, project, proposal, await AnalyseProposal(context, project, proposal)),
             ApiJson.Default.MergeRequestResponse, null, context.RequestAborted);
@@ -2538,6 +2640,9 @@ async Task AcceptMergeRequest(HttpContext context, ProjectDetails project, Authe
     if (proposal is null) { await ApiError(context, 404, "404 Merge Request Not Found"); return; }
     if (proposal.State != CollaborationState.Opened)
     { await ApiError(context, 409, "the proposal is not open"); return; }
+
+    // A draft is the author saying it is not ready. The branches may well merge; the person did not ask.
+    if (proposal.Draft) { await ApiError(context, 409, "this proposal is marked as a draft; mark it ready before merging"); return; }
 
     // The approval gate, checked here rather than only in the browser, so a client that simply does not
     // ask cannot merge past it. Counted against the branch as it stands now, so an approval given before
@@ -3058,6 +3163,303 @@ async Task UpdateNote(HttpContext context, ProjectDetails project, Authenticated
     catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
 }
 
+// ---------------------------------------------------------------------------------------------------
+// Planning: labels, milestones, boards, and the people who can be put on a piece of work.
+// Reading follows the conversation; organising needs the permission to push. The store decides both.
+// ---------------------------------------------------------------------------------------------------
+
+async Task ListLabels(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (!await OnlyQuery(context, "page", "per_page", "search")) return;
+    IReadOnlyList<Label> labels = await store.ListLabelsAsync(identity, project.Project.Id, context.RequestAborted);
+    string search = context.Request.Query["search"].ToString();
+    if (search.Length > 0) labels = [.. labels.Where(label => label.Name.Contains(search, StringComparison.OrdinalIgnoreCase))];
+    await context.Response.WriteAsJsonAsync([.. labels.Select(LabelResponseFor)], ApiJson.Default.LabelResponseArray, null, context.RequestAborted);
+}
+
+async Task CreateLabel(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    LabelRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.LabelRequest, context.RequestAborted);
+    if (request?.Name is not { Length: > 0 }) { await ApiError(context, 400, "name is required"); return; }
+    if (request.Color is not { Length: > 0 }) { await ApiError(context, 400, "color is required"); return; }
+    try
+    {
+        Label label = await store.CreateLabelAsync(identity, project.Project.Id, request.Name, request.Color,
+            request.Description ?? "", context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status201Created;
+        await context.Response.WriteAsJsonAsync(LabelResponseFor(label), ApiJson.Default.LabelResponse, null, context.RequestAborted);
+    }
+    catch (CollaborationConflictException error) { await ApiError(context, 409, error.Message); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+}
+
+// GitLab addresses a label by id or by name in the path. Both are accepted; a name is matched the way the
+// store matches it, without regard to case.
+async Task<long?> LabelIdFromRoute(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    string key = context.Request.RouteValues["labelId"]?.ToString() ?? "";
+    try { key = Uri.UnescapeDataString(key); } catch (UriFormatException) { return null; }
+    if (long.TryParse(key, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out long id)) return id;
+    IReadOnlyList<Label> labels = await store.ListLabelsAsync(identity, project.Project.Id, context.RequestAborted);
+    return labels.FirstOrDefault(label => string.Equals(label.Name, key.Trim(), StringComparison.OrdinalIgnoreCase))?.Id;
+}
+
+async Task UpdateLabel(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    LabelRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.LabelRequest, context.RequestAborted);
+    if (request is null || (request.Name is null && request.Color is null && request.Description is null))
+    { await ApiError(context, 400, "nothing to change"); return; }
+    long? labelId = await LabelIdFromRoute(context, project, identity);
+    if (labelId is null) { await ApiError(context, 404, "404 Label Not Found"); return; }
+    try
+    {
+        Label label = await store.UpdateLabelAsync(identity, project.Project.Id, labelId.Value, request.Name, request.Color,
+            request.Description, context.RequestAborted);
+        await context.Response.WriteAsJsonAsync(LabelResponseFor(label), ApiJson.Default.LabelResponse, null, context.RequestAborted);
+    }
+    catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Label Not Found"); }
+    catch (CollaborationConflictException error) { await ApiError(context, 409, error.Message); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+}
+
+async Task DeleteLabel(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    long? labelId = await LabelIdFromRoute(context, project, identity);
+    if (labelId is null) { await ApiError(context, 404, "404 Label Not Found"); return; }
+    try
+    {
+        await store.DeleteLabelAsync(identity, project.Project.Id, labelId.Value, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Label Not Found"); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+}
+
+async Task ListMilestones(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (!await OnlyQuery(context, "state", "page", "per_page")) return;
+    MilestoneState? state = context.Request.Query["state"].ToString() switch
+    {
+        "" or "all" => null,
+        "active" => MilestoneState.Active,
+        "closed" => MilestoneState.Closed,
+        _ => (MilestoneState?)MilestoneState.Active
+    };
+    if (context.Request.Query["state"].ToString() is not ("" or "all" or "active" or "closed"))
+    { await ApiError(context, 400, "state must be active, closed or all"); return; }
+    IReadOnlyList<Milestone> milestones = await store.ListMilestonesAsync(identity, project.Project.Id, state, context.RequestAborted);
+    await context.Response.WriteAsJsonAsync([.. milestones.Select(milestone => MilestoneResponseFor(context, project, milestone))],
+        ApiJson.Default.MilestoneResponseArray, null, context.RequestAborted);
+}
+
+long MilestoneId(HttpContext context) =>
+    Convert.ToInt64(context.Request.RouteValues["milestoneId"], System.Globalization.CultureInfo.InvariantCulture);
+
+async Task ReadMilestone(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (!await OnlyQuery(context)) return;
+    Milestone? milestone = await store.FindMilestoneAsync(identity, project.Project.Id, MilestoneId(context), context.RequestAborted);
+    if (milestone is null) { await ApiError(context, 404, "404 Milestone Not Found"); return; }
+    await context.Response.WriteAsJsonAsync(MilestoneResponseFor(context, project, milestone), ApiJson.Default.MilestoneResponse, null, context.RequestAborted);
+}
+
+async Task CreateMilestone(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    MilestoneRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.MilestoneRequest, context.RequestAborted);
+    if (request?.Title is not { Length: > 0 }) { await ApiError(context, 400, "title is required"); return; }
+    if (!TryReadDay(request.DueDate, out Change<DateOnly?> due) || !TryReadDay(request.StartDate, out Change<DateOnly?> start))
+    { await ApiError(context, 400, "dates are YYYY-MM-DD"); return; }
+    try
+    {
+        Milestone milestone = await store.CreateMilestoneAsync(identity, project.Project.Id, request.Title, request.Description ?? "",
+            due.Value, start.Value, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status201Created;
+        await context.Response.WriteAsJsonAsync(MilestoneResponseFor(context, project, milestone), ApiJson.Default.MilestoneResponse, null, context.RequestAborted);
+    }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+}
+
+async Task UpdateMilestone(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    MilestoneRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.MilestoneRequest, context.RequestAborted);
+    if (request is null) { await ApiError(context, 400, "milestone"); return; }
+    MilestoneState? state = request.StateEvent switch
+    {
+        null or "" => null,
+        "close" => MilestoneState.Closed,
+        "activate" => MilestoneState.Active,
+        _ => (MilestoneState?)MilestoneState.Active
+    };
+    if (request.StateEvent is not (null or "" or "close" or "activate"))
+    { await ApiError(context, 400, "state_event must be close or activate"); return; }
+    if (!TryReadDay(request.DueDate, out Change<DateOnly?> due) || !TryReadDay(request.StartDate, out Change<DateOnly?> start))
+    { await ApiError(context, 400, "dates are YYYY-MM-DD"); return; }
+    if (request.Title is null && request.Description is null && state is null && !due.Set && !start.Set)
+    { await ApiError(context, 400, "nothing to change"); return; }
+    try
+    {
+        Milestone milestone = await store.UpdateMilestoneAsync(identity, project.Project.Id, MilestoneId(context),
+            request.Title, request.Description, state, due, start, context.RequestAborted);
+        await context.Response.WriteAsJsonAsync(MilestoneResponseFor(context, project, milestone), ApiJson.Default.MilestoneResponse, null, context.RequestAborted);
+    }
+    catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Milestone Not Found"); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+}
+
+async Task DeleteMilestone(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    try
+    {
+        await store.DeleteMilestoneAsync(identity, project.Project.Id, MilestoneId(context), context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Milestone Not Found"); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+}
+
+async Task ListBoards(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (!await OnlyQuery(context, "page", "per_page")) return;
+    IReadOnlyList<Board> boards = await store.ListBoardsAsync(identity, project.Project.Id, context.RequestAborted);
+    await context.Response.WriteAsJsonAsync([.. boards.Select(BoardResponseFor)], ApiJson.Default.BoardResponseArray, null, context.RequestAborted);
+}
+
+long BoardId(HttpContext context) =>
+    Convert.ToInt64(context.Request.RouteValues["boardId"], System.Globalization.CultureInfo.InvariantCulture);
+
+async Task ReadBoard(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (!await OnlyQuery(context)) return;
+    Board? board = await store.FindBoardAsync(identity, project.Project.Id, BoardId(context), context.RequestAborted);
+    if (board is null) { await ApiError(context, 404, "404 Board Not Found"); return; }
+    await context.Response.WriteAsJsonAsync(BoardResponseFor(board), ApiJson.Default.BoardResponse, null, context.RequestAborted);
+}
+
+async Task CreateBoard(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    BoardRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.BoardRequest, context.RequestAborted);
+    if (request?.Name is not { Length: > 0 }) { await ApiError(context, 400, "name is required"); return; }
+    try
+    {
+        Board board = await store.CreateBoardAsync(identity, project.Project.Id, request.Name, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status201Created;
+        await context.Response.WriteAsJsonAsync(BoardResponseFor(board), ApiJson.Default.BoardResponse, null, context.RequestAborted);
+    }
+    catch (CollaborationConflictException error) { await ApiError(context, 409, error.Message); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+}
+
+async Task UpdateBoard(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    BoardRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.BoardRequest, context.RequestAborted);
+    if (request?.Name is not { Length: > 0 }) { await ApiError(context, 400, "name is required"); return; }
+    try
+    {
+        Board board = await store.RenameBoardAsync(identity, project.Project.Id, BoardId(context), request.Name, context.RequestAborted);
+        await context.Response.WriteAsJsonAsync(BoardResponseFor(board), ApiJson.Default.BoardResponse, null, context.RequestAborted);
+    }
+    catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Board Not Found"); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+}
+
+async Task DeleteBoard(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    try
+    {
+        await store.DeleteBoardAsync(identity, project.Project.Id, BoardId(context), context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Board Not Found"); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+}
+
+async Task CreateBoardList(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    BoardListRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.BoardListRequest, context.RequestAborted);
+    long? labelId = request?.LabelId;
+    if (labelId is null && request?.Label is { Length: > 0 } name)
+        labelId = (await store.ListLabelsAsync(identity, project.Project.Id, context.RequestAborted))
+            .FirstOrDefault(label => string.Equals(label.Name, name.Trim(), StringComparison.OrdinalIgnoreCase))?.Id;
+    if (labelId is null) { await ApiError(context, 400, "label_id or label is required and must name an existing label"); return; }
+    try
+    {
+        Board board = await store.AddBoardListAsync(identity, project.Project.Id, BoardId(context), labelId.Value, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status201Created;
+        await context.Response.WriteAsJsonAsync(BoardResponseFor(board), ApiJson.Default.BoardResponse, null, context.RequestAborted);
+    }
+    catch (CollaborationNotFoundException error) { await ApiError(context, 404, error.Message); }
+    catch (CollaborationConflictException error) { await ApiError(context, 409, error.Message); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+}
+
+long ListId(HttpContext context) =>
+    Convert.ToInt64(context.Request.RouteValues["listId"], System.Globalization.CultureInfo.InvariantCulture);
+
+async Task UpdateBoardList(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    BoardListRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.BoardListRequest, context.RequestAborted);
+    if (request?.Position is not >= 1) { await ApiError(context, 400, "position is required, counted from one"); return; }
+    try
+    {
+        Board board = await store.MoveBoardListAsync(identity, project.Project.Id, BoardId(context), ListId(context),
+            request.Position.Value, context.RequestAborted);
+        await context.Response.WriteAsJsonAsync(BoardResponseFor(board), ApiJson.Default.BoardResponse, null, context.RequestAborted);
+    }
+    catch (CollaborationNotFoundException error) { await ApiError(context, 404, error.Message); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+}
+
+async Task DeleteBoardList(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    try
+    {
+        await store.DeleteBoardListAsync(identity, project.Project.Id, BoardId(context), ListId(context), context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (CollaborationNotFoundException error) { await ApiError(context, 404, error.Message); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+}
+
+// The people who can be put on a piece of work. GitLab serves this as /projects/:id/users; it is the
+// membership seen from the inside, readable by anybody who may write on the project.
+async Task ListAssignable(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    if (!await OnlyQuery(context, "page", "per_page", "search")) return;
+    try
+    {
+        IReadOnlyList<Person> people = await store.ListAssignableAsync(identity, project.Project.Id, context.RequestAborted);
+        await context.Response.WriteAsJsonAsync(await PeopleFor(context, people), ApiJson.Default.UserResponseArray, null, context.RequestAborted);
+    }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+}
+
 // The branch tip behind an anchored comment addressed by id alone, which the browser route does. Null when
 // the comment is not on a proposal or the branch is gone, both of which leave the anchor outdated.
 async Task<string?> SourceTipOfComment(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity, long commentId)
@@ -3280,6 +3682,36 @@ app.MapPost("/api/projects/{projectId:long}/comments/{commentId:long}", async co
     if (scope is null) return;
     await UpdateNote(context, scope.Value.Details, scope.Value.Identity);
 });
+
+// Planning routes, twice like everything else in this family. The browser family keeps the hyphenated
+// spelling it already uses; the API family is GitLab's.
+foreach ((string root, bool browserFamily) in new[] { ("/api/projects/{projectId:long}", true), ("/api/v4/projects/{projectId}", false) })
+{
+    async Task<(ProjectDetails Details, AuthenticatedIdentity? Identity)?> Scope(HttpContext context, bool write) =>
+        browserFamily ? await BrowserCollaboration(context, write) : await ApiCollaboration(context);
+
+    app.MapGet(root + "/labels", async context => { var scope = await Scope(context, false); if (scope is not null) await ListLabels(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapPost(root + "/labels", async context => { var scope = await Scope(context, true); if (scope is not null) await CreateLabel(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapMethods(root + "/labels/{labelId}", [browserFamily ? "POST" : "PUT"], async context => { var scope = await Scope(context, true); if (scope is not null) await UpdateLabel(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapDelete(root + "/labels/{labelId}", async context => { var scope = await Scope(context, true); if (scope is not null) await DeleteLabel(context, scope.Value.Details, scope.Value.Identity); });
+
+    app.MapGet(root + "/milestones", async context => { var scope = await Scope(context, false); if (scope is not null) await ListMilestones(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapPost(root + "/milestones", async context => { var scope = await Scope(context, true); if (scope is not null) await CreateMilestone(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapGet(root + "/milestones/{milestoneId:long}", async context => { var scope = await Scope(context, false); if (scope is not null) await ReadMilestone(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapMethods(root + "/milestones/{milestoneId:long}", [browserFamily ? "POST" : "PUT"], async context => { var scope = await Scope(context, true); if (scope is not null) await UpdateMilestone(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapDelete(root + "/milestones/{milestoneId:long}", async context => { var scope = await Scope(context, true); if (scope is not null) await DeleteMilestone(context, scope.Value.Details, scope.Value.Identity); });
+
+    app.MapGet(root + "/boards", async context => { var scope = await Scope(context, false); if (scope is not null) await ListBoards(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapPost(root + "/boards", async context => { var scope = await Scope(context, true); if (scope is not null) await CreateBoard(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapGet(root + "/boards/{boardId:long}", async context => { var scope = await Scope(context, false); if (scope is not null) await ReadBoard(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapMethods(root + "/boards/{boardId:long}", [browserFamily ? "POST" : "PUT"], async context => { var scope = await Scope(context, true); if (scope is not null) await UpdateBoard(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapDelete(root + "/boards/{boardId:long}", async context => { var scope = await Scope(context, true); if (scope is not null) await DeleteBoard(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapPost(root + "/boards/{boardId:long}/lists", async context => { var scope = await Scope(context, true); if (scope is not null) await CreateBoardList(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapMethods(root + "/boards/{boardId:long}/lists/{listId:long}", [browserFamily ? "POST" : "PUT"], async context => { var scope = await Scope(context, true); if (scope is not null) await UpdateBoardList(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapDelete(root + "/boards/{boardId:long}/lists/{listId:long}", async context => { var scope = await Scope(context, true); if (scope is not null) await DeleteBoardList(context, scope.Value.Details, scope.Value.Identity); });
+
+    app.MapGet(root + "/users", async context => { var scope = await Scope(context, false); if (scope is not null) await ListAssignable(context, scope.Value.Details, scope.Value.Identity); });
+}
 
 foreach ((string segment, CommentSubject noteSubject) in new[] { ("issues", CommentSubject.Issue), ("merge_requests", CommentSubject.MergeRequest) })
 {

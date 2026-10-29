@@ -49,6 +49,22 @@ else if (Number is null)
                     <label for="issue-body">Description</label>
                     <textarea id="issue-body" @bind="draftBody" rows="6" maxlength="50000"></textarea>
                     <p class="field-hint">Shown as written. Markdown is not rendered here.</p>
+                    @if (allLabels.Length > 0)
+                    {
+                        <fieldset class="checkbox-group">
+                            <legend>Labels</legend>
+                            @foreach (LabelResponse label in allLabels)
+                            {
+                                <label class="checkbox">
+                                    <input type="checkbox" checked="@draftLabels.Contains(label.Name)" @onchange="e => { if (e.Value is true) draftLabels.Add(label.Name); else draftLabels.Remove(label.Name); }" />
+                                    <LabelChip Label="label" />
+                                </label>
+                            }
+                        </fieldset>
+                    }
+                    <label for="issue-due">Due date</label>
+                    <input id="issue-due" type="date" @bind="draftDue" />
+                    <label class="checkbox"><input type="checkbox" @bind="draftConfidential" /> Confidential: readable by members and you, never by the public</label>
                     <div class="form-actions">
                         <button type="submit" disabled="@busy">@(busy ? "Opening…" : "Open issue")</button>
                         <button type="button" class="secondary" @onclick="() => composing = false" disabled="@busy">Cancel</button>
@@ -62,6 +78,28 @@ else if (Number is null)
         <button type="button" class="@(state == "opened" ? "active" : "")" @onclick='() => Filter("opened")'>Open</button>
         <button type="button" class="@(state == "closed" ? "active" : "")" @onclick='() => Filter("closed")'>Closed</button>
         <button type="button" class="@(state == "all" ? "active" : "")" @onclick='() => Filter("all")'>All</button>
+    </div>
+
+    <div class="list-filters">
+        <input type="search" placeholder="Search titles and descriptions" aria-label="Search issues" @bind="filterSearch" @bind:after="LoadList" />
+        <select aria-label="Label" @bind="filterLabel" @bind:after="LoadList">
+            <option value="">Any label</option>
+            @foreach (LabelResponse label in allLabels) { <option value="@label.Name">@label.Name</option> }
+        </select>
+        <select aria-label="Milestone" @bind="filterMilestone" @bind:after="LoadList">
+            <option value="">Any milestone</option>
+            <option value="None">No milestone</option>
+            @foreach (MilestoneResponse milestone in milestones) { <option value="@milestone.Id">@milestone.Title</option> }
+        </select>
+        @if (canParticipate)
+        {
+            <select aria-label="Assignee" @bind="filterAssignee" @bind:after="LoadList">
+                <option value="">Any assignee</option>
+                <option value="None">Unassigned</option>
+                @foreach (UserResponse person in people) { <option value="@person.Username">@person.Username</option> }
+            </select>
+        }
+        <a class="button secondary" href="@(ProjectUrl + "/-/labels")"><Icon Name="folder" />Labels</a>
     </div>
 
     <div class="panel">
@@ -91,7 +129,17 @@ else if (Number is null)
                                 {
                                     <span> &middot; @issue.UserNotesCount @(issue.UserNotesCount == 1 ? "comment" : "comments")</span>
                                 }
+                                @if (issue.Milestone is not null) { <span> &middot; @issue.Milestone.Title</span> }
+                                @if (issue.DueDate is not null) { <span> &middot; due @issue.DueDate</span> }
+                                @if (issue.Assignees is { Count: > 0 }) { <span> &middot; @string.Join(", ", issue.Assignees.Select(person => person.Username))</span> }
                             </small>
+                            @if (issue.LabelDetails is { Count: > 0 } || issue.Confidential)
+                            {
+                                <span class="list-labels">
+                                    @if (issue.Confidential) { <span class="label">confidential</span> }
+                                    @foreach (LabelResponse label in issue.LabelDetails ?? []) { <LabelChip Label="label" /> }
+                                </span>
+                            }
                         </span>
                         <span class="label @(issue.State == "closed" ? "" : "success")">@issue.State</span>
                     </div>
@@ -123,6 +171,8 @@ else
 
     <Banner Message="@message" Kind="@messageKind" />
 
+    <div class="work-layout">
+    <div class="work-main">
     @if (issue.Description.Length > 0)
     {
         @* Repository and user content, bound as text and never as markup. *@
@@ -173,6 +223,13 @@ else
             </div>
         }
     </div>
+    </div>
+    <WorkMeta ProjectUrl="@ProjectUrl" AllLabels="allLabels" Milestones="milestones" People="people"
+              SelectedLabels="@([.. issue.LabelDetails ?? []])" Milestone="issue.Milestone" Assignees="@(issue.Assignees ?? [])"
+              DueDate="@issue.DueDate" ShowDueDate="true" Confidential="issue.Confidential" ShowConfidential="true"
+              TimeStats="issue.TimeStats"
+              CanTriage="@(canParticipate && (canPush || IsAuthor))" CanEditFlags="@CanChangeState" Busy="busy" OnSave="SaveMeta" />
+    </div>
 }
 
 @code {
@@ -192,6 +249,16 @@ else
     private string state = "opened";
     private string draftTitle = "";
     private string draftBody = "";
+    private DateOnly? draftDue;
+    private bool draftConfidential;
+    private readonly HashSet<string> draftLabels = new(StringComparer.OrdinalIgnoreCase);
+    private LabelResponse[] allLabels = [];
+    private MilestoneResponse[] milestones = [];
+    private UserResponse[] people = [];
+    private string filterSearch = "";
+    private string filterLabel = "";
+    private string filterMilestone = "";
+    private string filterAssignee = "";
     private string commentBody = "";
     private string message = "";
     private string messageKind = "info";
@@ -212,7 +279,32 @@ else
     private bool CanChangeState => issue is not null && canParticipate &&
         (canManage || string.Equals(issue.Author.Username, Api.Username, StringComparison.Ordinal));
 
+    private bool IsAuthor => issue is not null && string.Equals(issue.Author.Username, Api.Username, StringComparison.Ordinal);
+
     private NoteResponse[] RepliesTo(long rootId) => [.. comments.Where(note => note.ParentId == rootId)];
+
+    /// <summary>The project's vocabulary, for the filters and the sidebar. People are only for members.</summary>
+    private async Task LoadVocabulary()
+    {
+        allLabels = await Api.GetAsync($"api/projects/{projectId}/labels", ApiJson.Default.LabelResponseArray) ?? [];
+        milestones = await Api.GetAsync($"api/projects/{projectId}/milestones?state=all", ApiJson.Default.MilestoneResponseArray) ?? [];
+        people = canParticipate ? await Api.GetAsync($"api/projects/{projectId}/users", ApiJson.Default.UserResponseArray) ?? [] : [];
+    }
+
+    private async Task SaveMeta(IssueUpdateRequest request)
+    {
+        if (busy || issue is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/projects/{projectId}/issues/{issue.Iid}", request,
+                ApiJson.Default.IssueUpdateRequest, "Details saved.");
+            Report(result.Ok, result.Message);
+            if (result.Ok) await LoadOne();
+        }
+        finally { busy = false; }
+    }
 
     protected override async Task OnParametersSetAsync()
     {
@@ -225,6 +317,12 @@ else
             // whose name to compare against an issue's author.
             await Api.EnsureSessionAsync();
             if (!await ResolveProject()) return;
+            await LoadVocabulary();
+            // A link from the labels page arrives with the label in the query.
+            string query = new Uri(Navigation.Uri).Query;
+            if (query.Length > 1)
+                foreach (string pair in query[1..].Split('&'))
+                    if (pair.StartsWith("labels=", StringComparison.Ordinal)) filterLabel = Uri.UnescapeDataString(pair[7..]);
             if (Number is null) await LoadList();
             else await LoadOne();
         }
@@ -320,8 +418,12 @@ else
 
     private async Task LoadList()
     {
-        IssuePageResponse? page = await Api.GetAsync(
-            $"api/projects/{projectId}/issues?state={state}&per_page=100", ApiJson.Default.IssuePageResponse);
+        string query = $"api/projects/{projectId}/issues?state={state}&per_page=100";
+        if (filterLabel.Length > 0) query += "&labels=" + Uri.EscapeDataString(filterLabel);
+        if (filterMilestone.Length > 0) query += "&milestone_id=" + Uri.EscapeDataString(filterMilestone);
+        if (filterAssignee.Length > 0) query += "&assignee_username=" + Uri.EscapeDataString(filterAssignee);
+        if (filterSearch.Trim().Length > 0) query += "&search=" + Uri.EscapeDataString(filterSearch.Trim());
+        IssuePageResponse? page = await Api.GetAsync(query, ApiJson.Default.IssuePageResponse);
         issues = page is null ? [] : [.. page.Issues];
         total = page?.Total ?? 0;
     }
@@ -343,11 +445,16 @@ else
         {
             ApiResult<IssueResponse> result = await Api.SendAsync<IssueCreateRequest, IssueResponse>(
                 HttpMethod.Post, $"api/projects/{projectId}/issues",
-                new IssueCreateRequest(draftTitle, draftBody), ApiJson.Default.IssueCreateRequest,
-                ApiJson.Default.IssueResponse, "Issue opened.");
+                new IssueCreateRequest(draftTitle, draftBody,
+                    draftLabels.Count == 0 ? null : string.Join(",", draftLabels), null, null,
+                    draftDue?.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture), draftConfidential ? true : null),
+                ApiJson.Default.IssueCreateRequest, ApiJson.Default.IssueResponse, "Issue opened.");
             if (!result.Ok || result.Value is null) { Report(result.Ok, result.Message); return; }
             draftTitle = "";
             draftBody = "";
+            draftDue = null;
+            draftConfidential = false;
+            draftLabels.Clear();
             composing = false;
             Navigation.NavigateTo(IssueUrl(result.Value.Iid));
         }

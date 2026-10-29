@@ -1,0 +1,201 @@
+@* The planning sidebar of an issue or a merge request: labels, milestone, people, and the flags.
+
+   One component for both, so the two pages cannot drift. The page hands it the project's vocabulary and
+   the current values; it raises one request carrying everything, with set semantics, and the page sends it
+   to its own update route. Nothing here decides who may change what: the controls are hidden when the page
+   says the reader cannot, and the server decides again when the request arrives. *@
+
+<div class="panel work-meta">
+    <div class="panel-header"><Icon Name="settings" /><h2>Details</h2></div>
+    <div class="panel-body">
+        <div class="meta-row">
+            <span class="meta-key">Labels</span>
+            <span class="meta-value">
+                @if (SelectedLabels.Length == 0) { <span class="secondary-text">None</span> }
+                @foreach (LabelResponse label in SelectedLabels) { <LabelChip Label="label" /> }
+            </span>
+        </div>
+        <div class="meta-row">
+            <span class="meta-key">Milestone</span>
+            <span class="meta-value">
+                @if (Milestone is null) { <span class="secondary-text">None</span> }
+                else { <a href="@(ProjectUrl + "/-/milestones/" + Milestone.Id)">@Milestone.Title</a> }
+            </span>
+        </div>
+        <div class="meta-row">
+            <span class="meta-key">@(Reviewers is null ? "Assignees" : "Assignees")</span>
+            <span class="meta-value">@(Assignees.Count == 0 ? "Nobody" : string.Join(", ", Assignees.Select(person => person.Username)))</span>
+        </div>
+        @if (Reviewers is not null)
+        {
+            <div class="meta-row">
+                <span class="meta-key">Reviewers</span>
+                <span class="meta-value">@(Reviewers.Count == 0 ? "Nobody asked" : string.Join(", ", Reviewers.Select(person => person.Username)))</span>
+            </div>
+        }
+        @if (ShowDueDate)
+        {
+            <div class="meta-row">
+                <span class="meta-key">Due</span>
+                <span class="meta-value">@(DueDate is { Length: > 0 } ? DueDate : "No date")</span>
+            </div>
+        }
+        @if (ShowConfidential && Confidential)
+        {
+            <div class="meta-row"><span class="meta-key">Visibility</span><span class="meta-value"><span class="label">confidential</span></span></div>
+        }
+        @if (ShowDraft && Draft)
+        {
+            <div class="meta-row"><span class="meta-key">Readiness</span><span class="meta-value"><span class="label">draft</span></span></div>
+        }
+        @if (TimeStats is not null && (TimeStats.TimeEstimate > 0 || TimeStats.TotalTimeSpent > 0))
+        {
+            <div class="meta-row">
+                <span class="meta-key">Time</span>
+                <span class="meta-value">
+                    @(TimeStats.HumanTotalTimeSpent ?? "0m") spent@(TimeStats.TimeEstimate > 0 ? $" of {TimeStats.HumanTimeEstimate} estimated" : "")
+                </span>
+            </div>
+        }
+    </div>
+    @if (CanTriage || CanEditFlags)
+    {
+        <div class="panel-footer">
+            <button type="button" class="secondary" @onclick="() => editing = !editing" disabled="@Busy">@(editing ? "Cancel" : "Edit details")</button>
+        </div>
+    }
+    @if (editing)
+    {
+        <div class="panel-body">
+            <form class="form" @onsubmit="Save" @onsubmit:preventDefault>
+                @if (CanTriage)
+                {
+                    <fieldset class="checkbox-group">
+                        <legend>Labels</legend>
+                        @if (AllLabels.Length == 0) { <span class="secondary-text">This project has no labels yet.</span> }
+                        @foreach (LabelResponse label in AllLabels)
+                        {
+                            <label class="checkbox">
+                                <input type="checkbox" checked="@labelChoice.Contains(label.Name)" @onchange="e => Toggle(labelChoice, label.Name, e)" />
+                                <LabelChip Label="label" />
+                            </label>
+                        }
+                    </fieldset>
+                    <label for="meta-milestone">Milestone</label>
+                    <select id="meta-milestone" @bind="milestoneChoice">
+                        <option value="0">None</option>
+                        @foreach (MilestoneResponse milestone in Milestones.Where(m => m.State == "active" || m.Id == (Milestone?.Id ?? 0)))
+                        {
+                            <option value="@milestone.Id">@milestone.Title@(milestone.State == "closed" ? " (closed)" : "")</option>
+                        }
+                    </select>
+                    <fieldset class="checkbox-group">
+                        <legend>Assignees</legend>
+                        @foreach (UserResponse person in People)
+                        {
+                            <label class="checkbox">
+                                <input type="checkbox" checked="@assigneeChoice.Contains(person.Username)" @onchange="e => Toggle(assigneeChoice, person.Username, e)" />
+                                @person.Username
+                            </label>
+                        }
+                    </fieldset>
+                    @if (Reviewers is not null)
+                    {
+                        <fieldset class="checkbox-group">
+                            <legend>Reviewers</legend>
+                            @foreach (UserResponse person in People)
+                            {
+                                <label class="checkbox">
+                                    <input type="checkbox" checked="@reviewerChoice.Contains(person.Username)" @onchange="e => Toggle(reviewerChoice, person.Username, e)" />
+                                    @person.Username
+                                </label>
+                            }
+                        </fieldset>
+                    }
+                    @if (ShowDueDate)
+                    {
+                        <label for="meta-due">Due date</label>
+                        <input id="meta-due" type="date" @bind="dueChoice" />
+                    }
+                }
+                @if (CanEditFlags && ShowConfidential)
+                {
+                    <label class="checkbox"><input type="checkbox" @bind="confidentialChoice" /> Confidential: members and the author only</label>
+                }
+                @if (CanEditFlags && ShowDraft)
+                {
+                    <label class="checkbox"><input type="checkbox" @bind="draftChoice" /> Draft: not ready to merge</label>
+                }
+                <div class="form-actions">
+                    <button type="submit" disabled="@Busy">@(Busy ? "Saving…" : "Save")</button>
+                </div>
+            </form>
+        </div>
+    }
+</div>
+
+@code {
+    [Parameter] public string ProjectUrl { get; set; } = "";
+    [Parameter] public LabelResponse[] AllLabels { get; set; } = [];
+    [Parameter] public MilestoneResponse[] Milestones { get; set; } = [];
+    [Parameter] public UserResponse[] People { get; set; } = [];
+    [Parameter] public LabelResponse[] SelectedLabels { get; set; } = [];
+    [Parameter] public MilestoneReferenceResponse? Milestone { get; set; }
+    [Parameter] public IReadOnlyList<UserResponse> Assignees { get; set; } = [];
+    /// <summary>Null for an issue, which has no reviewers; a list, possibly empty, for a proposal.</summary>
+    [Parameter] public IReadOnlyList<UserResponse>? Reviewers { get; set; }
+    [Parameter] public string? DueDate { get; set; }
+    [Parameter] public bool ShowDueDate { get; set; }
+    [Parameter] public bool Confidential { get; set; }
+    [Parameter] public bool ShowConfidential { get; set; }
+    [Parameter] public bool Draft { get; set; }
+    [Parameter] public bool ShowDraft { get; set; }
+    [Parameter] public TimeStatsResponse? TimeStats { get; set; }
+    /// <summary>Whether the reader may change labels, milestone, people and date: the author or a Developer.</summary>
+    [Parameter] public bool CanTriage { get; set; }
+    /// <summary>Whether the reader may change confidentiality or readiness: the author or a Maintainer.</summary>
+    [Parameter] public bool CanEditFlags { get; set; }
+    [Parameter] public bool Busy { get; set; }
+    [Parameter] public EventCallback<IssueUpdateRequest> OnSave { get; set; }
+
+    private bool editing;
+    private HashSet<string> labelChoice = new(StringComparer.OrdinalIgnoreCase);
+    private HashSet<string> assigneeChoice = new(StringComparer.OrdinalIgnoreCase);
+    private HashSet<string> reviewerChoice = new(StringComparer.OrdinalIgnoreCase);
+    private string milestoneChoice = "0";
+    private DateOnly? dueChoice;
+    private bool confidentialChoice;
+    private bool draftChoice;
+
+    protected override void OnParametersSet()
+    {
+        if (editing) return;
+        labelChoice = new(SelectedLabels.Select(label => label.Name), StringComparer.OrdinalIgnoreCase);
+        assigneeChoice = new(Assignees.Select(person => person.Username), StringComparer.OrdinalIgnoreCase);
+        reviewerChoice = new((Reviewers ?? []).Select(person => person.Username), StringComparer.OrdinalIgnoreCase);
+        milestoneChoice = (Milestone?.Id ?? 0).ToString();
+        dueChoice = DateOnly.TryParseExact(DueDate, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.None, out DateOnly due) ? due : null;
+        confidentialChoice = Confidential;
+        draftChoice = Draft;
+    }
+
+    private static void Toggle(HashSet<string> set, string value, ChangeEventArgs e)
+    {
+        if (e.Value is true) set.Add(value); else set.Remove(value);
+    }
+
+    private async Task Save()
+    {
+        IssueUpdateRequest request = new(null, null, null,
+            Labels: CanTriage ? string.Join(",", labelChoice) : null,
+            MilestoneId: CanTriage ? long.Parse(milestoneChoice) : null,
+            AssigneeUsernames: CanTriage ? [.. assigneeChoice] : null,
+            ReviewerUsernames: CanTriage && Reviewers is not null ? [.. reviewerChoice] : null,
+            DueDate: CanTriage && ShowDueDate ? dueChoice?.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture) ?? "" : null,
+            Confidential: CanEditFlags && ShowConfidential && confidentialChoice != Confidential ? confidentialChoice : null,
+            Draft: CanEditFlags && ShowDraft && draftChoice != Draft ? draftChoice : null);
+        await OnSave.InvokeAsync(request);
+        editing = false;
+    }
+}

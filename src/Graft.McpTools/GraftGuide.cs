@@ -53,6 +53,10 @@ public static class GraftGuide
         project does not give you. graft_merge fast-forwards where it can and otherwise writes a merge
         commit, and refuses when both branches changed the same file rather than guessing.
 
+        Planning. Labels are a project's own words and must exist before they are applied; graft_list_labels
+        shows them and graft_triage applies them, with a milestone, assignees and a due date. Triaging needs
+        the permission to push, or to be the author.
+
         Ask graft_help for detail on: addressing, permissions, visibility, pages, writing, collaboration,
         limits.
         """;
@@ -199,6 +203,27 @@ public static class GraftGuide
             Editing somebody else's words needs Maintainer; closing and reopening needs the author or a
             Maintainer. A merged merge request is final and cannot be reopened, because reopening it would
             propose work the target branch already contains.
+
+            ## Threads
+
+            A comment can answer another: pass `reply_to` to `graft_comment` with the id the reading tools
+            report. Threads are one level deep, so answering a reply joins the same thread. A thread can be
+            marked resolved by whoever could push or whoever started it; there is no tool for that, because
+            resolving is the reviewer's judgement that their point was met and the thing under review should
+            not be the one to say so. Resolving hides nothing.
+
+            ## Labels, milestones, assignees and due dates
+
+            A project's labels are its own vocabulary, read with `graft_list_labels`; a label that does not
+            exist is refused by name rather than created, so a typo is an error and not a new word. Milestones
+            come from `graft_list_milestones`. `graft_triage` puts labels, a milestone, assignees and a due
+            date on an issue or a merge request. The rule is that a Reporter files and a Developer organises:
+            triaging needs the permission to push, or to be the author of the thing being triaged. Assignees
+            must be members of the project.
+
+            A confidential issue is readable by members and its author only, however public the project is,
+            and is absent from a listing rather than marked. A merge request marked as a draft will not merge
+            until its author, or a Maintainer, marks it ready; `graft_merge` reports that refusal in words.
 
             `graft_merge` is where Graft is narrower than other forges, and the narrowness is visible rather
             than hidden. It merges in two ways. If the target branch is an ancestor of the source it

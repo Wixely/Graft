@@ -218,6 +218,7 @@ try
     await CheckCollaboration(address, aliceIdentity, bob.Username, "carol");
     await CheckProjectDeletion(address, aliceIdentity, administratorIdentity, bob.Username, alicePassword);
     await CheckReview(address, aliceIdentity, bob.Username, "carol");
+    await CheckPlanning(address, aliceIdentity, bob.Username, "carol");
     await CheckCompressedGitRequests(address, aliceIdentity);
     await CheckFetching(address, aliceIdentity, "carol");
     await CheckEmptyRepository(address, aliceIdentity, alicePassword);
@@ -3783,6 +3784,325 @@ async Task CheckReview(string address, AuthenticatedIdentity alice, string bobUs
 
     using (HttpResponseMessage reset = await ApiPut(address, prefix + "/approvals", aliceApi, new { approvals_before_merge = 0 }))
         Check(reset.StatusCode == HttpStatusCode.NoContent, "the approval rule can be removed again");
+}
+
+/// <summary>
+/// Planning: labels, milestones, assignees, due dates, confidential issues and boards, and the rule that a
+/// Reporter files while a Developer organises.
+/// </summary>
+async Task CheckPlanning(string address, AuthenticatedIdentity alice, string bobUsername, string reporterUsername)
+{
+    long projectId;
+    string aliceApi;
+    string developerApi;
+    string reporterApi;
+    string readApi;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        ProjectInfo created = await store.CreateProjectWithRepositoryAsync(alice, "plan", "Planning",
+            (project, cancellation) => { cancellation.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, project.StorageId)); return Task.CompletedTask; });
+        projectId = created.Id;
+        UserAccount bob = Required(await store.FindActiveUserAsync(bobUsername), "bob account");
+        UserAccount reporter = Required(await store.FindActiveUserAsync(reporterUsername), "reporter account");
+        await store.SetMembershipAsync(alice, projectId, bob.Id, ProjectRole.Developer);
+        await store.SetMembershipAsync(alice, projectId, reporter.Id, ProjectRole.Reporter);
+        aliceApi = (await store.CreateTokenAsync(alice, "plan-api", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        readApi = (await store.CreateTokenAsync(alice, "plan-read", TokenScope.ReadApi, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        developerApi = (await store.CreateTokenAsync(new(bob.Id, bob.Username, false, IdentityKind.BrowserSession), "plan-developer", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        reporterApi = (await store.CreateTokenAsync(new(reporter.Id, reporter.Username, false, IdentityKind.BrowserSession), "plan-reporter", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+    }
+    string prefix = "/api/v4/projects/" + projectId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    // Labels: a Developer's vocabulary, not a Reporter's.
+    using (HttpResponseMessage refused = await ApiPost(address, prefix + "/labels", reporterApi, new { name = "bug", color = "#d73a4a" }))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden, "a Reporter cannot create a label");
+    long bugId;
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/labels", developerApi, new { name = "bug", color = "#d73a4a", description = "Something is wrong" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStreamAsync());
+        bugId = json.RootElement.GetProperty("id").GetInt64();
+        Check(created.StatusCode == HttpStatusCode.Created && json.RootElement.GetProperty("name").GetString() == "bug" &&
+            json.RootElement.GetProperty("text_color").GetString() == "#ffffff",
+            "a Developer creates a label, and the text colour that reads against it is computed");
+    }
+    using (HttpResponseMessage duplicate = await ApiPost(address, prefix + "/labels", developerApi, new { name = "Bug", color = "#000000" }))
+        Check(duplicate.StatusCode == HttpStatusCode.Conflict, "label names are unique without regard to case");
+    using (HttpResponseMessage colour = await ApiPost(address, prefix + "/labels", developerApi, new { name = "odd", color = "red" }))
+        Check(colour.StatusCode == HttpStatusCode.BadRequest, "a colour is six hexadecimal digits and nothing else");
+    using (HttpResponseMessage comma = await ApiPost(address, prefix + "/labels", developerApi, new { name = "a,b", color = "#000000" }))
+        Check(comma.StatusCode == HttpStatusCode.BadRequest, "a label name cannot hold a comma, which separates labels in requests");
+    using (HttpResponseMessage renamed = await ApiPut(address, prefix + "/labels/bug", aliceApi, new { name = "defect", color = "#fff" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await renamed.Content.ReadAsStreamAsync());
+        Check(renamed.IsSuccessStatusCode && json.RootElement.GetProperty("name").GetString() == "defect" &&
+            json.RootElement.GetProperty("color").GetString() == "#ffffff" && json.RootElement.GetProperty("text_color").GetString() == "#1f2328",
+            "a label is addressed by name as well as id, and a short colour is expanded");
+    }
+    using (HttpResponseMessage urgent = await ApiPost(address, prefix + "/labels", developerApi, new { name = "urgent", color = "#e4a11b" }))
+        Check(urgent.StatusCode == HttpStatusCode.Created, "a second label is created");
+    using (HttpResponseMessage listing = await ApiGet(address, prefix + "/labels", readApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await listing.Content.ReadAsStreamAsync());
+        Check(listing.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 2, "a read_api token lists labels");
+    }
+
+    // Milestones.
+    long milestoneId;
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/milestones", developerApi, new { title = "v1", due_date = "2027-03-01" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStreamAsync());
+        milestoneId = json.RootElement.GetProperty("id").GetInt64();
+        Check(created.StatusCode == HttpStatusCode.Created && json.RootElement.GetProperty("iid").GetInt64() == 1 &&
+            json.RootElement.GetProperty("state").GetString() == "active" && json.RootElement.GetProperty("due_date").GetString() == "2027-03-01",
+            "a milestone is created, numbered from one, active, with a due date");
+    }
+    using (HttpResponseMessage backwards = await ApiPost(address, prefix + "/milestones", developerApi, new { title = "v2", start_date = "2027-06-01", due_date = "2027-03-01" }))
+        Check(backwards.StatusCode == HttpStatusCode.BadRequest, "a milestone cannot start after it is due");
+    using (HttpResponseMessage refused = await ApiPost(address, prefix + "/milestones", reporterApi, new { title = "mine" }))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden, "a Reporter cannot create a milestone");
+
+    // An issue with everything set at once.
+    long planned;
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/issues", aliceApi, new
+    {
+        title = "The lantern smokes", labels = "defect, urgent", milestone_id = milestoneId,
+        assignee_usernames = new[] { bobUsername }, due_date = "2027-02-01"
+    }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStreamAsync());
+        planned = json.RootElement.GetProperty("iid").GetInt64();
+        Check(created.StatusCode == HttpStatusCode.Created &&
+            json.RootElement.GetProperty("labels").GetArrayLength() == 2 &&
+            json.RootElement.GetProperty("label_details")[0].GetProperty("color").GetString()!.Length == 7 &&
+            json.RootElement.GetProperty("milestone").GetProperty("title").GetString() == "v1" &&
+            json.RootElement.GetProperty("assignees")[0].GetProperty("username").GetString() == bobUsername &&
+            json.RootElement.GetProperty("due_date").GetString() == "2027-02-01",
+            "an issue is opened with labels, a milestone, an assignee and a due date");
+    }
+    using (HttpResponseMessage unknown = await ApiPost(address, prefix + "/issues", aliceApi, new { title = "Mislabelled", labels = "nonsense" }))
+        Check(unknown.StatusCode == HttpStatusCode.BadRequest, "a label that does not exist is refused by name rather than created");
+    using (HttpResponseMessage outsider = await ApiPost(address, prefix + "/issues", aliceApi, new { title = "Assigned outside", assignee_usernames = new[] { "admin" } }))
+        Check(outsider.StatusCode == HttpStatusCode.BadRequest, "only a member of the project can be assigned");
+    using (HttpResponseMessage date = await ApiPost(address, prefix + "/issues", aliceApi, new { title = "Bad date", due_date = "tomorrow" }))
+        Check(date.StatusCode == HttpStatusCode.BadRequest, "a due date is YYYY-MM-DD");
+
+    using (HttpResponseMessage refused = await ApiPut(address, prefix + "/issues/" + planned, reporterApi, new { add_labels = "urgent" }))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden, "a Reporter cannot relabel somebody else's issue");
+    long reporters;
+    using (HttpResponseMessage own = await ApiPost(address, prefix + "/issues", reporterApi, new { title = "Filed by a Reporter", labels = "urgent" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await own.Content.ReadAsStreamAsync());
+        reporters = json.RootElement.GetProperty("iid").GetInt64();
+        Check(own.StatusCode == HttpStatusCode.Created && json.RootElement.GetProperty("labels")[0].GetString() == "urgent",
+            "a Reporter labels their own issue");
+    }
+    using (HttpResponseMessage triaged = await ApiPut(address, prefix + "/issues/" + planned, developerApi, new { remove_labels = "urgent", assignee_usernames = new[] { bobUsername, reporterUsername } }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await triaged.Content.ReadAsStreamAsync());
+        Check(triaged.IsSuccessStatusCode && json.RootElement.GetProperty("labels").GetArrayLength() == 1 &&
+            json.RootElement.GetProperty("labels")[0].GetString() == "defect" &&
+            json.RootElement.GetProperty("assignees").GetArrayLength() == 2,
+            "a Developer triages another author's issue: labels adjusted, people assigned");
+    }
+
+    using (HttpResponseMessage filtered = await ApiGet(address, prefix + "/issues?labels=urgent", readApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await filtered.Content.ReadAsStreamAsync());
+        Check(filtered.IsSuccessStatusCode && json.RootElement.GetProperty("total").GetInt64() == 1 &&
+            json.RootElement.GetProperty("issues")[0].GetProperty("iid").GetInt64() == reporters,
+            "issues are filtered by label");
+    }
+    using (HttpResponseMessage filtered = await ApiGet(address, prefix + "/issues?milestone_id=" + milestoneId + "&assignee_username=" + bobUsername, readApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await filtered.Content.ReadAsStreamAsync());
+        Check(filtered.IsSuccessStatusCode && json.RootElement.GetProperty("total").GetInt64() == 1 &&
+            json.RootElement.GetProperty("issues")[0].GetProperty("iid").GetInt64() == planned,
+            "issues are filtered by milestone and assignee together");
+    }
+    using (HttpResponseMessage filtered = await ApiGet(address, prefix + "/issues?milestone_id=None&search=reporter", readApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await filtered.Content.ReadAsStreamAsync());
+        Check(filtered.IsSuccessStatusCode && json.RootElement.GetProperty("total").GetInt64() == 1,
+            "issues with no milestone are filtered, and a search narrows by title");
+    }
+    using (HttpResponseMessage filtered = await ApiGet(address, prefix + "/issues?without_labels=defect,urgent", readApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await filtered.Content.ReadAsStreamAsync());
+        Check(filtered.IsSuccessStatusCode && json.RootElement.GetProperty("total").GetInt64() == 0,
+            "a board's first column asks for issues carrying none of its labels");
+    }
+    using (HttpResponseMessage milestone = await ApiGet(address, prefix + "/milestones/" + milestoneId, readApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await milestone.Content.ReadAsStreamAsync());
+        Check(milestone.IsSuccessStatusCode && json.RootElement.GetProperty("open_issues").GetInt64() == 1,
+            "a milestone counts the issues in it");
+    }
+    using (HttpResponseMessage cleared = await ApiPut(address, prefix + "/issues/" + planned, aliceApi, new { milestone_id = 0, due_date = "" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await cleared.Content.ReadAsStreamAsync());
+        Check(cleared.IsSuccessStatusCode && json.RootElement.GetProperty("milestone").ValueKind == JsonValueKind.Null &&
+            json.RootElement.GetProperty("due_date").ValueKind == JsonValueKind.Null,
+            "a milestone of zero and an empty due date clear them, GitLab's way");
+    }
+
+    // Confidential issues: members and the author, never the public grant.
+    long secret;
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/issues", aliceApi, new { title = "The safe combination", confidential = true }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStreamAsync());
+        secret = json.RootElement.GetProperty("iid").GetInt64();
+        Check(created.StatusCode == HttpStatusCode.Created && json.RootElement.GetProperty("confidential").GetBoolean(),
+            "a confidential issue is opened");
+    }
+    using (HttpResponseMessage member = await ApiGet(address, prefix + "/issues/" + secret, reporterApi))
+        Check(member.IsSuccessStatusCode, "a Reporter who is a member reads a confidential issue");
+    using (HttpResponseMessage refused = await ApiPut(address, prefix + "/issues/" + reporters, developerApi, new { confidential = true }))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden,
+            "making an issue confidential needs the author or a Maintainer, because it changes who may read it");
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+        await store.SetProjectVisibilityAsync(alice, projectId, ProjectVisibility.Public);
+    using (HttpResponseMessage anonymous = await ApiGet(address, prefix + "/issues?state=all", null))
+    {
+        using JsonDocument json = JsonDocument.Parse(await anonymous.Content.ReadAsStreamAsync());
+        Check(anonymous.IsSuccessStatusCode && json.RootElement.GetProperty("total").GetInt64() == 2 &&
+            json.RootElement.GetProperty("issues").EnumerateArray().All(issue => !issue.GetProperty("confidential").GetBoolean()),
+            "a public project's listing conceals its confidential issues from a stranger");
+    }
+    using (HttpResponseMessage hidden = await ApiGet(address, prefix + "/issues/" + secret, null))
+        Check(hidden.StatusCode == HttpStatusCode.NotFound, "a confidential issue read directly by a stranger does not exist");
+    using (HttpResponseMessage hidden = await ApiGet(address, prefix + "/issues/" + secret + "/notes", null))
+        Check(hidden.StatusCode == HttpStatusCode.NotFound, "and neither does its conversation");
+    using (HttpResponseMessage members = await ApiGet(address, prefix + "/users", reporterApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await members.Content.ReadAsStreamAsync());
+        Check(members.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 3,
+            "a member lists who can be assigned: the owner and every member");
+    }
+    using (HttpResponseMessage stranger = await ApiGet(address, prefix + "/users", null))
+        Check(stranger.StatusCode == HttpStatusCode.Unauthorized, "a stranger cannot list who can be assigned, even on a public project");
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+        await store.SetProjectVisibilityAsync(alice, projectId, ProjectVisibility.Private);
+    using (HttpResponseMessage revealed = await ApiPut(address, prefix + "/issues/" + secret, aliceApi, new { confidential = false }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await revealed.Content.ReadAsStreamAsync());
+        Check(revealed.IsSuccessStatusCode && !json.RootElement.GetProperty("confidential").GetBoolean(), "the author makes it visible again");
+    }
+
+    // Boards: lists bound to labels, over the project's issues.
+    long boardId;
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/boards", developerApi, new { name = "Flow" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStreamAsync());
+        boardId = json.RootElement.GetProperty("id").GetInt64();
+        Check(created.StatusCode == HttpStatusCode.Created && json.RootElement.GetProperty("lists").GetArrayLength() == 0, "a board is created with no lists");
+    }
+    using (HttpResponseMessage list = await ApiPost(address, prefix + "/boards/" + boardId + "/lists", developerApi, new { label_id = bugId }))
+        Check(list.StatusCode == HttpStatusCode.Created, "a list is added for a label by id");
+    long urgentList;
+    using (HttpResponseMessage list = await ApiPost(address, prefix + "/boards/" + boardId + "/lists", developerApi, new { label = "urgent" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await list.Content.ReadAsStreamAsync());
+        JsonElement lists = json.RootElement.GetProperty("lists");
+        urgentList = lists[1].GetProperty("id").GetInt64();
+        Check(list.StatusCode == HttpStatusCode.Created && lists.GetArrayLength() == 2 &&
+            lists[1].GetProperty("label").GetProperty("name").GetString() == "urgent" && lists[1].GetProperty("position").GetInt32() == 2,
+            "a list is added for a label by name, after the first");
+    }
+    using (HttpResponseMessage again = await ApiPost(address, prefix + "/boards/" + boardId + "/lists", developerApi, new { label = "urgent" }))
+        Check(again.StatusCode == HttpStatusCode.Conflict, "a label has one list per board");
+    using (HttpResponseMessage moved = await ApiPut(address, prefix + "/boards/" + boardId + "/lists/" + urgentList, developerApi, new { position = 1 }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await moved.Content.ReadAsStreamAsync());
+        Check(moved.IsSuccessStatusCode && json.RootElement.GetProperty("lists")[0].GetProperty("label").GetProperty("name").GetString() == "urgent",
+            "a list is moved to the front");
+    }
+    using (HttpResponseMessage refused = await ApiDelete(address, prefix + "/boards/" + boardId, reporterApi))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden, "a Reporter cannot delete a board");
+    using (HttpResponseMessage removed = await ApiDelete(address, prefix + "/boards/" + boardId + "/lists/" + urgentList, developerApi))
+        Check(removed.StatusCode == HttpStatusCode.NoContent, "a list is removed");
+    using (HttpResponseMessage boards = await ApiGet(address, prefix + "/boards", readApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await boards.Content.ReadAsStreamAsync());
+        Check(boards.IsSuccessStatusCode && json.RootElement[0].GetProperty("lists").GetArrayLength() == 1, "the board lists what remains");
+    }
+
+    // A proposal with reviewers and a draft flag.
+    string clone = Path.Combine(root, "plan-clone");
+    Directory.CreateDirectory(clone);
+    string pushUrl = AuthenticatedUrl(address, "alice", aliceApi, "alice/plan.git");
+    await Git(clone, ["init", "--initial-branch=main"]);
+    File.WriteAllText(Path.Combine(clone, "plan.txt"), "one\n");
+    await Git(clone, ["add", "."]);
+    await Git(clone, ["commit", "-m", "Base"]);
+    await Git(clone, ["remote", "add", "origin", pushUrl]);
+    await Git(clone, ["push", "origin", "main"]);
+    await Git(clone, ["checkout", "-b", "work"]);
+    File.WriteAllText(Path.Combine(clone, "work.txt"), "work\n");
+    await Git(clone, ["add", "."]);
+    await Git(clone, ["commit", "-m", "Work"]);
+    await Git(clone, ["push", "origin", "work"]);
+
+    long draft;
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/merge_requests", aliceApi, new
+    {
+        source_branch = "work", target_branch = "main", title = "Not ready", draft = true,
+        reviewer_usernames = new[] { bobUsername }, labels = "defect", milestone_id = milestoneId
+    }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStreamAsync());
+        draft = json.RootElement.GetProperty("iid").GetInt64();
+        Check(created.StatusCode == HttpStatusCode.Created && json.RootElement.GetProperty("draft").GetBoolean() &&
+            json.RootElement.GetProperty("reviewers")[0].GetProperty("username").GetString() == bobUsername &&
+            json.RootElement.GetProperty("labels")[0].GetString() == "defect" &&
+            json.RootElement.GetProperty("milestone").GetProperty("id").GetInt64() == milestoneId,
+            "a proposal is opened as a draft with a reviewer, a label and a milestone");
+    }
+    using (HttpResponseMessage blocked = await ApiPut(address, prefix + "/merge_requests/" + draft + "/merge", aliceApi, new { }))
+    {
+        string body = await blocked.Content.ReadAsStringAsync();
+        Check(blocked.StatusCode == HttpStatusCode.Conflict && body.Contains("draft", StringComparison.Ordinal),
+            "a draft cannot be merged, however mergeable its branches are");
+    }
+    using (HttpResponseMessage refused = await ApiPut(address, prefix + "/merge_requests/" + draft, developerApi, new { draft = false }))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden, "only the author or a Maintainer says a proposal is ready");
+    using (HttpResponseMessage filtered = await ApiGet(address, prefix + "/merge_requests?reviewer_username=" + bobUsername, readApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await filtered.Content.ReadAsStreamAsync());
+        Check(filtered.IsSuccessStatusCode && json.RootElement.GetProperty("total").GetInt64() == 1, "proposals are filtered by reviewer");
+    }
+    using (HttpResponseMessage ready = await ApiPut(address, prefix + "/merge_requests/" + draft, aliceApi, new { draft = false }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await ready.Content.ReadAsStreamAsync());
+        Check(ready.IsSuccessStatusCode && !json.RootElement.GetProperty("draft").GetBoolean(), "the author marks it ready");
+    }
+    using (HttpResponseMessage milestone = await ApiGet(address, prefix + "/milestones/" + milestoneId, readApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await milestone.Content.ReadAsStreamAsync());
+        Check(milestone.IsSuccessStatusCode && json.RootElement.GetProperty("merge_requests").GetInt64() == 1, "a milestone counts its proposals");
+    }
+
+    // Removing the vocabulary leaves the work.
+    using (HttpResponseMessage closed = await ApiPut(address, prefix + "/milestones/" + milestoneId, developerApi, new { state_event = "close" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await closed.Content.ReadAsStreamAsync());
+        Check(closed.IsSuccessStatusCode && json.RootElement.GetProperty("state").GetString() == "closed", "a milestone is closed");
+    }
+    using (HttpResponseMessage deleted = await ApiDelete(address, prefix + "/milestones/" + milestoneId, developerApi))
+        Check(deleted.StatusCode == HttpStatusCode.NoContent, "a milestone is deleted");
+    using (HttpResponseMessage after = await ApiGet(address, prefix + "/merge_requests/" + draft, readApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await after.Content.ReadAsStreamAsync());
+        Check(after.IsSuccessStatusCode && json.RootElement.GetProperty("milestone").ValueKind == JsonValueKind.Null,
+            "deleting a milestone leaves the proposal with none rather than deleting the proposal");
+    }
+    using (HttpResponseMessage deleted = await ApiDelete(address, prefix + "/labels/" + bugId, developerApi))
+        Check(deleted.StatusCode == HttpStatusCode.NoContent, "a label is deleted");
+    using (HttpResponseMessage after = await ApiGet(address, prefix + "/issues/" + planned, readApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await after.Content.ReadAsStreamAsync());
+        Check(after.IsSuccessStatusCode && json.RootElement.GetProperty("labels").GetArrayLength() == 0,
+            "deleting a label removes it from everything it was on");
+    }
 }
 
 /// <summary>

@@ -40,6 +40,10 @@ The collaboration depth list from the 2026-10-28 review, taken on as one piece o
   whoever started the thread, hiding nothing. [ADR 0019](decisions/0019-conversation.md).
 - **Editing a comment.** The author or a Maintainer, with the edit recorded. A first comment with replies
   cannot be deleted. Same record.
+- **Labels, milestones, assignees, due dates, boards and confidential issues.** A Reporter files and a
+  Developer organises; a label that does not exist is refused by name; a board stores no state of its own;
+  a confidential issue is for members and its author. [ADR 0020](decisions/0020-planning.md).
+- **Reviewers and draft state** on a merge request. Same record.
 
 ## Near, and small
 
