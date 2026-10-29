@@ -72,13 +72,10 @@ The collaboration depth list from the 2026-10-28 review, taken on as one piece o
 - **Deleting a file.** `DELETE` on the repository-files route, a button on the file view and an agent tool;
   a deletion that finds no file is refused, and a directory it empties disappears.
   [ADR 0029](decisions/0029-file-deletion.md).
+- **Token rotation.** The same row, a new secret; a button in the browser and GitLab's `rotate` routes with the
+  secret in the response. [ADR 0030](decisions/0030-token-rotation.md).
 
 ## Near, and small
-
-**Token rotation.** Regenerating a token in place, keeping its name, scopes and expiry while issuing a new
-secret. Offered when recoverable secrets were chosen instead in
-[ADR 0012](decisions/0012-recoverable-tokens.md); both could exist, and rotation is the one that helps on a
-server that keeps no secrets.
 
 **Icons are filled despite asking not to be.** The icon set is authored as stroke geometry with
 `fill="none"`, and a stylesheet rule sets `fill: currentColor`, which overrides the attribute. Every closed

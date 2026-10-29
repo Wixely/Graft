@@ -2,7 +2,7 @@
 
 Updated: 2026-10-29. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
 
-## Added on 2026-10-29, third entry: deleting a file
+## Added on 2026-10-29, third entry: deleting a file, and rotating a token
 
 The user asked for another feature that needed no decision of theirs. The backlog's "Near, and small" list
 is the user's own list of wanted things, so its first item was taken: deleting a file, which the API, the
@@ -17,14 +17,30 @@ browser and the agent surface could all write and none could remove. [ADR 0029](
   trees, and without it a deletion would have written a tree `git fsck` rejects.
 - Compatibility row GL-014d; GL-014b no longer says deletion is missing.
 
-Git suite 913 to 927; MCP suite 101 to 104. Not done, and recorded in the ADR: `last_commit_id`,
-`start_branch` and the author overrides; deleting a directory in one call. The browser button was compiled
-and wired to the same server function as the API route, and was not driven by a browser in a suite.
+Not done, and recorded in the ADR: `last_commit_id`, `start_branch` and the author overrides; deleting a
+directory in one call. The browser button was compiled and wired to the same server function as the API
+route, and was not driven by a browser in a suite.
+
+Then the second item of the same list, token rotation. [ADR 0030](decisions/0030-token-rotation.md).
+
+- The row keeps its id, name, scopes, creation time and expiry and gets a new secret digest, so whatever is
+  configured with the token's name still names it; the old secret stops at the commit. GitLab instead revokes
+  and creates with a one-week expiry; the deviation is in row GL-042.
+- `POST /api/tokens/:id/rotate` for the browser answers the one-time claim a new token answers, and the
+  tokens page has a Rotate button with a second click. `POST /api/v4/personal_access_tokens/self/rotate` and
+  `.../:id/rotate` answer GitLab's token shape with the secret in `token`, need the `api` scope, and only the
+  owner may rotate.
+- The cipher follows today's recoverable-secrets setting, so rotation is how an existing token becomes
+  recoverable after the switch is turned on. ADR 0012 carries a note.
+- Found while here: the GL-041 housekeeping row had landed on the first line of compatibility.md instead of in
+  the table. It is in the table now.
+
+Git suite 913 to 947; MCP suite 101 to 104. No migration: rotation changes columns that were already there.
 
 **Next action.** Unchanged from the entry below: operator, back up the repositories directory before
 deploying this build, because the Git engine entry's format conversion is still the deployment's first
-upgrade step. Agent: the remaining two "Near, and small" items, token rotation and the icon fill rule, need
-no decision either; then the NativeAOT publish with the Git suite against it.
+upgrade step. Agent: the last "Near, and small" item, the icon fill rule, needs no decision either; then the
+NativeAOT publish with the Git suite against it.
 
 
 ## Added on 2026-10-29, later the same day: the outside, the builds, and the Git engine
