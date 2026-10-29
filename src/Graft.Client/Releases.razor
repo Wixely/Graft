@@ -1,0 +1,373 @@
+@page "/{Namespace}/{Slug}/-/releases"
+@page "/{Namespace}/{Slug}/-/releases/{Tag}"
+@page "/projects/{Slug}/-/releases"
+@page "/projects/{Slug}/-/releases/{Tag}"
+@inject GraftApi Api
+@inject NavigationManager Navigation
+
+<PageTitle>@(Tag is null ? "Releases" : "Release " + Tag) &middot; Graft</PageTitle>
+
+@if (loading)
+{
+    <p role="status" class="secondary-text">Loading…</p>
+}
+else if (project is null)
+{
+    <div class="page-header"><div><h1>Unavailable</h1><p class="subtitle">@message</p></div></div>
+    <a class="button secondary" href="/"><Icon Name="chevron-left" />Back to projects</a>
+}
+else if (Tag is null)
+{
+    <div class="page-header">
+        <div>
+            <h1>Releases</h1>
+            <p class="subtitle"><a href="@ProjectUrl">@project.Namespace.Name / @project.Name</a></p>
+        </div>
+        <div class="page-header-actions">
+            @if (canPush && tags.Length > 0)
+            {
+                <button type="button" class="@(composing ? "secondary" : "")" @onclick="() => composing = !composing"><Icon Name="plus" />New release</button>
+            }
+        </div>
+    </div>
+
+    <Banner Message="@message" Kind="@messageKind" />
+
+    @if (canPush && tags.Length == 0)
+    {
+        <div class="banner info"><Icon Name="alert" /><span>A release sits on a tag, and this repository has none yet. Create a tag from the project's settings first.</span></div>
+    }
+
+    @if (composing)
+    {
+        <div class="panel">
+            <div class="panel-header"><h2>Create a release</h2></div>
+            <div class="panel-body">
+                <form class="form" @onsubmit="Create" @onsubmit:preventDefault>
+                    <label for="release-tag">Tag</label>
+                    <select id="release-tag" @bind="draftTag">
+                        @foreach (TagResponse tag in tags.Where(tag => releases.All(release => release.TagName != tag.Name)))
+                        {
+                            <option value="@tag.Name">@tag.Name</option>
+                        }
+                    </select>
+                    <label for="release-name">Name</label>
+                    <input id="release-name" @bind="draftName" maxlength="255" placeholder="The tag's name if left empty" autocomplete="off" />
+                    <label for="release-notes">Release notes</label>
+                    <textarea id="release-notes" @bind="draftNotes" rows="6" maxlength="50000"></textarea>
+                    <div class="form-actions">
+                        <button type="submit" disabled="@(busy || draftTag.Length == 0)">@(busy ? "Creating…" : "Create release")</button>
+                        <button type="button" class="secondary" @onclick="() => composing = false" disabled="@busy">Cancel</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    }
+
+    <div class="panel">
+        <div class="panel-header"><Icon Name="archive" /><h2>Releases</h2><span class="spacer"></span><span class="label">@releases.Length</span></div>
+        @if (releases.Length == 0) { <div class="panel-empty">Nothing released yet.</div> }
+        else
+        {
+            <div class="list">
+                @foreach (ReleaseResponse release in releases)
+                {
+                    <div class="list-item">
+                        <Icon Name="archive" />
+                        <span class="list-item-main">
+                            <strong><a href="@ReleaseUrl(release.TagName)">@release.Name</a></strong>
+                            <small>
+                                <code>@release.TagName</code> &middot; @release.ReleasedAt.ToLocalTime().ToString("yyyy-MM-dd") by @release.Author.Username
+                                &middot; @release.Assets.Files.Count @(release.Assets.Files.Count == 1 ? "file" : "files"), @release.Assets.Links.Count @(release.Assets.Links.Count == 1 ? "link" : "links")
+                            </small>
+                        </span>
+                        @if (!release.TagExists) { <span class="label danger">tag deleted</span> }
+                    </div>
+                }
+            </div>
+        }
+    </div>
+}
+else if (release is null)
+{
+    <div class="page-header"><div><h1>Release unavailable</h1><p class="subtitle">@message</p></div></div>
+    <a class="button secondary" href="@ReleasesUrl"><Icon Name="chevron-left" />Back to releases</a>
+}
+else
+{
+    <div class="page-header">
+        <div>
+            <h1>@release.Name</h1>
+            <p class="subtitle">
+                <code>@release.TagName</code> in <a href="@ProjectUrl">@project.Namespace.Name / @project.Name</a>
+                &middot; released @release.ReleasedAt.ToLocalTime().ToString("yyyy-MM-dd") by @release.Author.Username
+                @if (release.Commit is not null) { <span> &middot; <a href="@(ProjectUrl + "/-/commit/" + release.Commit.Id)"><code>@release.Commit.ShortId</code></a></span> }
+            </p>
+        </div>
+        @if (!release.TagExists) { <span class="label danger">tag deleted</span> }
+        <div class="page-header-actions">
+            <a class="button secondary" href="@ReleasesUrl"><Icon Name="chevron-left" />Releases</a>
+        </div>
+    </div>
+
+    <Banner Message="@message" Kind="@messageKind" />
+
+    @if (release.Description.Length > 0)
+    {
+        <div class="panel"><div class="panel-header"><h2>Release notes</h2></div><div class="panel-body"><pre class="commit-message">@release.Description</pre></div></div>
+    }
+
+    <div class="panel">
+        <div class="panel-header"><Icon Name="download" /><h2>Files</h2><span class="spacer"></span><span class="label">@release.Assets.Files.Count</span></div>
+        @if (release.Assets.Files.Count == 0 && release.Assets.Sources.Count == 0) { <div class="panel-empty">No files.</div> }
+        else
+        {
+            <div class="list">
+                @foreach (ReleaseFileResponse file in release.Assets.Files)
+                {
+                    <div class="list-item">
+                        <Icon Name="file" />
+                        <span class="list-item-main">
+                            <strong><a href="@BrowserFileUrl(file.FileName)" download>@file.FileName</a></strong>
+                            <small>@file.Size bytes &middot; sha256 <code>@file.Sha256[..12]</code> &middot; by @file.UploadedBy</small>
+                        </span>
+                        @if (canPush)
+                        {
+                            <button type="button" class="link danger-text" @onclick="() => DeleteFile(file)" disabled="@busy">Remove</button>
+                        }
+                    </div>
+                }
+                @foreach (ReleaseSourceResponse source in release.Assets.Sources)
+                {
+                    <div class="list-item">
+                        <Icon Name="archive" />
+                        <span class="list-item-main">
+                            <strong><a href="@BrowserArchiveUrl(source.Format)" download>Source code (@source.Format)</a></strong>
+                            <small>The tree at <code>@release.TagName</code>, built on request.</small>
+                        </span>
+                    </div>
+                }
+            </div>
+        }
+        @if (canPush)
+        {
+            <div class="panel-body">
+                <p class="secondary-text">Attach files to this release. Each is capped at 32 MiB, and a file of the same name replaces the earlier one.</p>
+                <UploadField Profile="release-asset" Id="release-files" OnCompleted="Attach" />
+            </div>
+        }
+    </div>
+
+    <div class="panel">
+        <div class="panel-header"><h2>Links</h2><span class="spacer"></span><span class="label">@release.Assets.Links.Count</span></div>
+        @if (release.Assets.Links.Count == 0) { <div class="panel-empty">No links.</div> }
+        else
+        {
+            <div class="list">
+                @foreach (ReleaseLinkResponse link in release.Assets.Links)
+                {
+                    <div class="list-item">
+                        <span class="list-item-main">
+                            <strong><a href="@link.Url" rel="noopener noreferrer nofollow" target="_blank">@link.Name</a></strong>
+                            <small>@link.Url</small>
+                        </span>
+                        <span class="label">@link.LinkType</span>
+                        @if (canPush)
+                        {
+                            <button type="button" class="link danger-text" @onclick="() => DeleteLink(link)" disabled="@busy">Remove</button>
+                        }
+                    </div>
+                }
+            </div>
+        }
+        @if (canPush)
+        {
+            <div class="panel-body">
+                <form class="form" @onsubmit="AddLink" @onsubmit:preventDefault>
+                    <label for="link-name">Link name</label>
+                    <input id="link-name" @bind="linkName" required maxlength="255" autocomplete="off" />
+                    <label for="link-url">Address</label>
+                    <input id="link-url" type="url" @bind="linkUrl" required maxlength="2048" placeholder="https://" />
+                    <label for="link-type">Kind</label>
+                    <select id="link-type" @bind="linkType">
+                        <option value="other">Other</option>
+                        <option value="runbook">Runbook</option>
+                        <option value="package">Package</option>
+                        <option value="image">Image</option>
+                    </select>
+                    <div class="form-actions"><button type="submit" disabled="@busy">Add link</button></div>
+                </form>
+            </div>
+        }
+    </div>
+
+    @if (canPush)
+    {
+        <div class="panel danger-zone">
+            <div class="panel-header"><h2>Delete this release</h2></div>
+            <div class="panel-body">
+                <p class="secondary-text">Removes the notes, links and files. The tag <code>@release.TagName</code> is kept.</p>
+                <div class="form-actions"><button type="button" class="danger" @onclick="Delete" disabled="@busy">Delete release</button></div>
+            </div>
+        </div>
+    }
+}
+
+@code {
+    [Parameter] public string Namespace { get; set; } = "";
+    [Parameter] public string Slug { get; set; } = "";
+    [Parameter] public string? Tag { get; set; }
+
+    private ProjectResponse? project;
+    private long projectId;
+    private bool canPush;
+    private ReleaseResponse[] releases = [];
+    private ReleaseResponse? release;
+    private TagResponse[] tags = [];
+    private bool loading = true;
+    private bool busy;
+    private bool composing;
+    private string draftTag = "";
+    private string draftName = "";
+    private string draftNotes = "";
+    private string linkName = "";
+    private string linkUrl = "";
+    private string linkType = "other";
+    private string message = "";
+    private string messageKind = "info";
+
+    private bool ViaSlug => Namespace.Length == 0;
+    private string ProjectUrl => ViaSlug
+        ? $"/projects/{Uri.EscapeDataString(Slug)}"
+        : $"/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
+    private string ReleasesUrl => ProjectUrl + "/-/releases";
+    private string ReleaseUrl(string tag) => $"{ReleasesUrl}/{Uri.EscapeDataString(tag)}";
+    private string TagPath => Uri.EscapeDataString(Tag ?? "");
+    private string BrowserFileUrl(string name) => $"/api/projects/{projectId}/releases/{TagPath}/assets/files/{Uri.EscapeDataString(name)}";
+    private string BrowserArchiveUrl(string format) => $"/api/projects/{projectId}/archive.{format}?sha={TagPath}";
+
+    protected override async Task OnParametersSetAsync()
+    {
+        loading = true;
+        message = "";
+        try
+        {
+            await Api.EnsureSessionAsync();
+            string path = ViaSlug
+                ? $"api/graft/slugs/{Uri.EscapeDataString(Slug)}"
+                : $"api/browser/projects/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
+            (bool reached, RepositoryPageResponse? page) = await Api.GetOptionalAsync(path, ApiJson.Default.RepositoryPageResponse);
+            if (!reached) { message = "Graft could not be reached."; return; }
+            if (page is null) { message = "That repository could not be found."; return; }
+            project = page.Project;
+            projectId = page.Project.Id;
+            canPush = page.CanPush;
+            if (Tag is null) await LoadList(); else await LoadOne();
+        }
+        finally { loading = false; }
+    }
+
+    private async Task LoadList()
+    {
+        releases = await Api.GetAsync($"api/projects/{projectId}/releases", ApiJson.Default.ReleaseResponseArray) ?? [];
+        tags = canPush ? await Api.GetAsync($"api/projects/{projectId}/tags", ApiJson.Default.TagResponseArray) ?? [] : [];
+        draftTag = tags.FirstOrDefault(tag => releases.All(release => release.TagName != tag.Name))?.Name ?? "";
+    }
+
+    private async Task LoadOne()
+    {
+        release = await Api.GetAsync($"api/projects/{projectId}/releases/{TagPath}", ApiJson.Default.ReleaseResponse);
+        if (release is null) message = "That release could not be found.";
+    }
+
+    private async Task Create()
+    {
+        if (busy || draftTag.Length == 0) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult<ReleaseResponse> result = await Api.SendAsync<ReleaseRequest, ReleaseResponse>(HttpMethod.Post,
+                $"api/projects/{projectId}/releases", new ReleaseRequest(draftTag, draftName.Length == 0 ? null : draftName, draftNotes, null),
+                ApiJson.Default.ReleaseRequest, ApiJson.Default.ReleaseResponse, "Release created.");
+            if (!result.Ok || result.Value is null) { Report(false, result.Message); return; }
+            composing = false;
+            Navigation.NavigateTo(ReleaseUrl(result.Value.TagName));
+        }
+        finally { busy = false; }
+    }
+
+    private async Task AddLink()
+    {
+        if (busy || release is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/projects/{projectId}/releases/{TagPath}/assets/links",
+                new ReleaseLinkRequest(linkName, linkUrl, linkType), ApiJson.Default.ReleaseLinkRequest, "Link added.");
+            Report(result.Ok, result.Message);
+            if (!result.Ok) return;
+            linkName = "";
+            linkUrl = "";
+            await LoadOne();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task DeleteLink(ReleaseLinkResponse link)
+    {
+        if (busy) return;
+        busy = true;
+        try
+        {
+            ApiResult result = await Api.DeleteAsync($"api/projects/{projectId}/releases/{TagPath}/assets/links/{link.Id}", "Link removed.");
+            Report(result.Ok, result.Message);
+            if (result.Ok) await LoadOne();
+        }
+        finally { busy = false; }
+    }
+
+    /// <summary>An upload finished in the browser; attach it. The server re-checks everything.</summary>
+    private async Task Attach(string uploadId)
+    {
+        if (release is null) return;
+        ApiResult result = await Api.PostAsync($"api/graft/projects/{projectId}/releases/{TagPath}/assets",
+            new ReleaseAssetIngestRequest(uploadId), ApiJson.Default.ReleaseAssetIngestRequest, "File attached.");
+        Report(result.Ok, result.Message);
+        if (result.Ok) await LoadOne();
+        StateHasChanged();
+    }
+
+    private async Task DeleteFile(ReleaseFileResponse file)
+    {
+        if (busy) return;
+        busy = true;
+        try
+        {
+            ApiResult result = await Api.DeleteAsync($"api/projects/{projectId}/releases/{TagPath}/assets/files/{Uri.EscapeDataString(file.FileName)}", "File removed.");
+            Report(result.Ok, result.Message);
+            if (result.Ok) await LoadOne();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task Delete()
+    {
+        if (busy || release is null) return;
+        busy = true;
+        try
+        {
+            ApiResult result = await Api.DeleteAsync($"api/projects/{projectId}/releases/{TagPath}", "Release deleted. The tag was kept.");
+            Report(result.Ok, result.Message);
+            if (result.Ok) Navigation.NavigateTo(ReleasesUrl);
+        }
+        finally { busy = false; }
+    }
+
+    private void Report(bool ok, string text)
+    {
+        message = text;
+        messageKind = ok ? "success" : "error";
+    }
+}

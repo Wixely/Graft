@@ -44,11 +44,17 @@ The collaboration depth list from the 2026-10-28 review, taken on as one piece o
   Developer organises; a label that does not exist is refused by name; a board stores no state of its own;
   a confidential issue is for members and its author. [ADR 0020](decisions/0020-planning.md).
 - **Reviewers and draft state** on a merge request. Same record.
+- **Squash, rebase and code owners.** A squash is a merge that forgets; a rebase is a forced push that
+  replays each commit and refuses by name; code owners come from the target branch and may be required.
+  [ADR 0021](decisions/0021-review-options.md).
+
+- **Releases.** Notes, links and files on a tag; a release outlives its tag; asset bytes in the database,
+  bounded. [ADR 0022](decisions/0022-releases.md).
+- **Wiki, snippets, time tracking.** Wiki pages in the database with every save kept; snippets as a
+  comment with a file; time as an estimate and an attributed ledger.
+  [ADR 0023](decisions/0023-wiki-snippets-time.md).
 
 ## Near, and small
-
-**Releases.** Tags exist; a release does not. No notes, no attachments, no marking a tag as a release, and
-no listing of them. The tag machinery is in place, so this is the notes-and-files half.
 
 **Deleting a file through the API.** Files can be created and updated over the API; `DELETE` on the same
 route is not implemented, and the browser cannot delete either. The object writer gained a whole-tree

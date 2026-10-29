@@ -166,7 +166,8 @@ public sealed partial class GraftStore
 
     private const string IssueSelect = """
         SELECT i.Id, i.ProjectId, i.Iid, i.AuthorUserId, u.Username AS AuthorUsername, i.Title, i.Description,
-               i.State, i.CreatedAtUtc, i.UpdatedAtUtc, i.ClosedAtUtc, i.DueDate, i.Confidential,
+               i.State, i.CreatedAtUtc, i.UpdatedAtUtc, i.ClosedAtUtc, i.DueDate, i.Confidential, i.TimeEstimateSeconds,
+               (SELECT COALESCE(SUM(t.Seconds), 0) FROM TimeEntries t WHERE t.SubjectType = 'issue' AND t.SubjectId = i.Id) AS TimeSpentSeconds,
                i.MilestoneId, ms.Iid AS MilestoneIid, ms.Title AS MilestoneTitle,
                (SELECT COUNT(*) FROM Comments c WHERE c.SubjectType = 'issue' AND c.SubjectId = i.Id) AS Comments
         FROM Issues i
@@ -414,7 +415,8 @@ public sealed partial class GraftStore
     private const string MergeSelect = """
         SELECT m.Id, m.ProjectId, m.Iid, m.AuthorUserId, a.Username AS AuthorUsername, m.Title, m.Description,
                m.SourceBranch, m.TargetBranch, m.State, m.MergeCommitSha, g.Username AS MergedByUsername,
-               m.CreatedAtUtc, m.UpdatedAtUtc, m.ClosedAtUtc, m.Draft,
+               m.CreatedAtUtc, m.UpdatedAtUtc, m.ClosedAtUtc, m.Draft, m.TimeEstimateSeconds,
+               (SELECT COALESCE(SUM(t.Seconds), 0) FROM TimeEntries t WHERE t.SubjectType = 'merge_request' AND t.SubjectId = m.Id) AS TimeSpentSeconds,
                m.MilestoneId, ms.Iid AS MilestoneIid, ms.Title AS MilestoneTitle,
                (SELECT COUNT(*) FROM Comments c WHERE c.SubjectType = 'merge_request' AND c.SubjectId = m.Id) AS Comments,
                p.ApprovalsRequired
@@ -714,6 +716,59 @@ public sealed partial class GraftStore
         return (int)await db.QuerySingleAsync<long>(
             "SELECT COALESCE((SELECT ApprovalsRequired FROM Projects WHERE Id = @Id), 0);",
             new IdParameters(projectId));
+    }
+
+    /// <summary>Whether this project requires a code owner's approval for every owned path a proposal changes.</summary>
+    public async Task<bool> GetRequireCodeOwnerApprovalAsync(long projectId, CancellationToken cancellationToken = default)
+    {
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        return await db.QuerySingleAsync<long>(
+            "SELECT COALESCE((SELECT RequireCodeOwnerApproval FROM Projects WHERE Id = @Id), 0);",
+            new IdParameters(projectId)) != 0;
+    }
+
+    /// <summary>
+    /// Turns the code owner rule on or off. Maintainer-equivalent access, like the approval count. With it
+    /// on, every changed path that the repository's CODEOWNERS file names needs a current approval from one
+    /// of the people it names; with no file, the rule requires nothing.
+    /// </summary>
+    public async Task SetRequireCodeOwnerApprovalAsync(
+        AuthenticatedIdentity actor,
+        long projectId,
+        bool required,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(actor);
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
+        PermissionDecision permission = await DecideAsync(db, transaction, actor, projectId,
+            ProjectAction.ManageProject, cancellationToken);
+        if (!permission.Allowed) throw new UnauthorizedAccessException(permission.Explanation);
+        string now = Now();
+        await db.ExecuteAsync("UPDATE Projects SET RequireCodeOwnerApproval = @Value WHERE Id = @Id;",
+            new ProjectFlagParameters(projectId, required ? 1 : 0), transaction);
+        await AuditAsync(db, transaction, actor.UserId, "set-code-owner-approval", "project",
+            projectId.ToString(CultureInfo.InvariantCulture),
+            required ? "Merge proposals now need a code owner's approval for every owned path." : "Code owner approval is no longer required.", now);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
+    /// <summary>The usernames whose approval stands against the given source tip. Read inside the merge path.</summary>
+    public async Task<IReadOnlyList<string>> CurrentApproversAsync(
+        long projectId,
+        long iid,
+        string sourceCommitSha,
+        CancellationToken cancellationToken = default)
+    {
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        IEnumerable<ApproverRow> rows = await db.QueryAsync<ApproverRow>("""
+            SELECT u.Username
+            FROM MergeRequestApprovals a
+            JOIN MergeRequests m ON m.Id = a.MergeRequestId
+            JOIN Users u ON u.Id = a.UserId
+            WHERE m.ProjectId = @ProjectId AND m.Iid = @Iid AND a.SourceCommitSha = @Sha;
+            """, new ApprovalCountParameters(projectId, iid, sourceCommitSha));
+        return [.. rows.Select(row => row.Username)];
     }
 
     /// <summary>
@@ -1199,7 +1254,8 @@ public sealed partial class GraftStore
         row.ClosedAtUtc is null ? null : Instant(row.ClosedAtUtc), row.Comments,
         Milestone: row.MilestoneId is null ? null : new MilestoneReference(row.MilestoneId.Value, row.MilestoneIid ?? 0, row.MilestoneTitle ?? ""),
         DueDate: ParseDay(row.DueDate),
-        Confidential: row.Confidential != 0);
+        Confidential: row.Confidential != 0,
+        TimeEstimateSeconds: row.TimeEstimateSeconds, TimeSpentSeconds: row.TimeSpentSeconds);
 
     private static MergeProposal ToProposal(MergeRow row) => new(
         row.Id, row.ProjectId, row.Iid, row.AuthorUserId, row.AuthorUsername, row.Title, row.Description,
@@ -1208,7 +1264,8 @@ public sealed partial class GraftStore
         row.ClosedAtUtc is null ? null : Instant(row.ClosedAtUtc), row.Comments,
         ApprovalsRequired: (int)row.ApprovalsRequired,
         Milestone: row.MilestoneId is null ? null : new MilestoneReference(row.MilestoneId.Value, row.MilestoneIid ?? 0, row.MilestoneTitle ?? ""),
-        Draft: row.Draft != 0);
+        Draft: row.Draft != 0,
+        TimeEstimateSeconds: row.TimeEstimateSeconds, TimeSpentSeconds: row.TimeSpentSeconds);
 }
 
 /// <summary>The issue, proposal or comment named does not exist in this project.</summary>
@@ -1300,6 +1357,8 @@ internal sealed class IssueRow
     public long? MilestoneId { get; set; }
     public long? MilestoneIid { get; set; }
     public string? MilestoneTitle { get; set; }
+    public long TimeEstimateSeconds { get; set; }
+    public long TimeSpentSeconds { get; set; }
 }
 
 internal sealed class MergeRow
@@ -1325,6 +1384,8 @@ internal sealed class MergeRow
     public long? MilestoneId { get; set; }
     public long? MilestoneIid { get; set; }
     public string? MilestoneTitle { get; set; }
+    public long TimeEstimateSeconds { get; set; }
+    public long TimeSpentSeconds { get; set; }
 }
 
 internal sealed class CommentRow
@@ -1351,6 +1412,8 @@ internal sealed class ApprovalRow
     public string SourceCommitSha { get; set; } = "";
     public string CreatedAtUtc { get; set; } = "";
 }
+
+internal sealed class ApproverRow { public string Username { get; set; } = ""; }
 
 internal sealed class ApprovalCountRow
 {

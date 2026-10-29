@@ -212,3 +212,66 @@ public readonly record struct Change<T>(bool Set, T? Value)
     public static Change<T> To(T? value) => new(true, value);
     public static Change<T> Unchanged => default;
 }
+
+/// <summary>
+/// A release: the notes, links and files that sit on a tag. The tag is named rather than referenced,
+/// because tags live in the repository; <see cref="TagExists"/> is filled in by whoever can see the
+/// repository, and a release whose tag has gone still exists and says so.
+/// </summary>
+public sealed record Release(
+    long Id,
+    long ProjectId,
+    string TagName,
+    string Name,
+    string Description,
+    long AuthorUserId,
+    string AuthorUsername,
+    DateTimeOffset CreatedAtUtc,
+    DateTimeOffset ReleasedAtUtc,
+    IReadOnlyList<ReleaseLink> Links,
+    IReadOnlyList<ReleaseAsset> Assets,
+    bool TagExists = true,
+    string? CommitId = null);
+
+public sealed record ReleaseLink(long Id, string Name, string Url, string LinkType);
+
+/// <summary>An uploaded file on a release: its metadata. The bytes are read separately, on download.</summary>
+public sealed record ReleaseAsset(long Id, string FileName, long Size, string Sha256, string UploadedByUsername, DateTimeOffset CreatedAtUtc);
+
+/// <summary>A wiki page as it stands. <see cref="Slug"/> is its address, derived from the title when made.</summary>
+public sealed record WikiPage(
+    long Id,
+    long ProjectId,
+    string Slug,
+    string Title,
+    string Content,
+    string CreatedByUsername,
+    string UpdatedByUsername,
+    DateTimeOffset CreatedAtUtc,
+    DateTimeOffset UpdatedAtUtc,
+    long Versions = 0);
+
+/// <summary>One saved state of a wiki page. The current state is also the newest version.</summary>
+public sealed record WikiPageVersion(
+    long Id,
+    string Title,
+    string Content,
+    string Message,
+    string AuthorUsername,
+    DateTimeOffset CreatedAtUtc);
+
+/// <summary>One file with a title, to paste and share. As visible as its project.</summary>
+public sealed record Snippet(
+    long Id,
+    long ProjectId,
+    string Title,
+    string FileName,
+    string Description,
+    string Content,
+    long AuthorUserId,
+    string AuthorUsername,
+    DateTimeOffset CreatedAtUtc,
+    DateTimeOffset UpdatedAtUtc);
+
+/// <summary>Time somebody spent on an issue or proposal, in seconds, on a day, with a word about what.</summary>
+public sealed record TimeEntry(long Id, long UserId, string Username, long Seconds, DateOnly SpentOn, string Summary, DateTimeOffset CreatedAtUtc);

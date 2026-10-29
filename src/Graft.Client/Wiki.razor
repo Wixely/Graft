@@ -1,0 +1,289 @@
+@page "/{Namespace}/{Slug}/-/wiki"
+@page "/{Namespace}/{Slug}/-/wiki/{PageSlug}"
+@page "/projects/{Slug}/-/wiki"
+@page "/projects/{Slug}/-/wiki/{PageSlug}"
+@inject GraftApi Api
+@inject NavigationManager Navigation
+
+<PageTitle>@(wikiPage?.Title ?? "Wiki") &middot; Graft</PageTitle>
+
+@if (loading)
+{
+    <p role="status" class="secondary-text">Loading…</p>
+}
+else if (project is null)
+{
+    <div class="page-header"><div><h1>Unavailable</h1><p class="subtitle">@message</p></div></div>
+    <a class="button secondary" href="/"><Icon Name="chevron-left" />Back to projects</a>
+}
+else
+{
+    <div class="page-header">
+        <div>
+            <h1>@(wikiPage?.Title ?? "Wiki")</h1>
+            <p class="subtitle">
+                <a href="@ProjectUrl">@project.Namespace.Name / @project.Name</a>
+                @if (wikiPage is not null) { <span> &middot; last saved by @wikiPage.UpdatedBy on @wikiPage.UpdatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm") &middot; @wikiPage.Versions @(wikiPage.Versions == 1 ? "version" : "versions")</span> }
+            </p>
+        </div>
+        <div class="page-header-actions">
+            @if (wikiPage is not null) { <a class="button secondary" href="@WikiUrl"><Icon Name="chevron-left" />All pages</a> }
+            @if (canPush && wikiPage is not null && !editing)
+            {
+                <button type="button" class="secondary" @onclick="StartEdit"><Icon Name="settings" />Edit</button>
+            }
+            @if (canPush && wikiPage is null)
+            {
+                <button type="button" class="@(composing ? "secondary" : "")" @onclick="() => composing = !composing"><Icon Name="plus" />New page</button>
+            }
+        </div>
+    </div>
+
+    <Banner Message="@message" Kind="@messageKind" />
+
+    @if (wikiPage is null)
+    {
+        @if (composing)
+        {
+            <div class="panel">
+                <div class="panel-header"><h2>New page</h2></div>
+                <div class="panel-body">
+                    <form class="form wide" @onsubmit="Create" @onsubmit:preventDefault>
+                        <label for="wiki-title">Title</label>
+                        <input id="wiki-title" @bind="draftTitle" required maxlength="255" autocomplete="off" />
+                        <label for="wiki-content">Content</label>
+                        <textarea id="wiki-content" class="mono" @bind="draftContent" rows="16"></textarea>
+                        <p class="field-hint">Markdown, rendered under the same rules as a README: no raw HTML, images become links.</p>
+                        <div class="form-actions">
+                            <button type="submit" disabled="@busy">@(busy ? "Saving…" : "Create page")</button>
+                            <button type="button" class="secondary" @onclick="() => composing = false" disabled="@busy">Cancel</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        }
+        <div class="panel">
+            <div class="panel-header"><Icon Name="file" /><h2>Pages</h2><span class="spacer"></span><span class="label">@pages.Length</span></div>
+            @if (pages.Length == 0) { <div class="panel-empty">No pages yet.</div> }
+            else
+            {
+                <div class="list">
+                    @foreach (WikiPageResponse entry in pages)
+                    {
+                        <a class="list-item" href="@PageUrl(entry.Slug)">
+                            <Icon Name="file" />
+                            <span class="list-item-main">
+                                <strong>@entry.Title</strong>
+                                <small>@entry.Slug &middot; saved by @entry.UpdatedBy on @entry.UpdatedAt.ToLocalTime().ToString("yyyy-MM-dd")</small>
+                            </span>
+                        </a>
+                    }
+                </div>
+            }
+        </div>
+    }
+    else if (editing)
+    {
+        <div class="panel">
+            <div class="panel-header"><h2>Edit @wikiPage.Title</h2></div>
+            <div class="panel-body">
+                <form class="form wide" @onsubmit="Save" @onsubmit:preventDefault>
+                    <label for="wiki-edit-title">Title</label>
+                    <input id="wiki-edit-title" @bind="draftTitle" required maxlength="255" />
+                    <p class="field-hint">The address <code>@wikiPage.Slug</code> stays the same, so links keep working.</p>
+                    <label for="wiki-edit-content">Content</label>
+                    <textarea id="wiki-edit-content" class="mono" @bind="draftContent" rows="20"></textarea>
+                    <label for="wiki-edit-message">What changed</label>
+                    <input id="wiki-edit-message" @bind="draftMessage" maxlength="255" placeholder="Optional, kept with the version" />
+                    <div class="form-actions">
+                        <button type="submit" disabled="@busy">@(busy ? "Saving…" : "Save")</button>
+                        <button type="button" class="secondary" @onclick="() => editing = false" disabled="@busy">Cancel</button>
+                        <button type="button" class="secondary danger-text" @onclick="Delete" disabled="@busy">Delete page</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    }
+    else
+    {
+        <div class="panel">
+            @if (wikiPage.Html is { Length: > 0 })
+            {
+                @* The server's renderer, the same one that renders a README, and never the page's own markup. *@
+                <div class="panel-body markdown">@((MarkupString)wikiPage.Html)</div>
+            }
+            else
+            {
+                <div class="panel-empty">This page is empty.</div>
+            }
+        </div>
+        <div class="panel">
+            <div class="panel-header"><h2>History</h2><span class="spacer"></span><span class="label">@versions.Length</span></div>
+            <div class="list">
+                @foreach (WikiVersionResponse version in versions)
+                {
+                    <div class="list-item">
+                        <span class="list-item-main">
+                            <strong>@(version.Message.Length > 0 ? version.Message : "Saved")</strong>
+                            <small>@version.Author &middot; @version.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm") &middot; @version.Title</small>
+                        </span>
+                        @if (viewing?.Id == version.Id) { <span class="label accent">shown below</span> }
+                        else { <button type="button" class="link" @onclick="() => View(version)" disabled="@busy">View</button> }
+                    </div>
+                }
+            </div>
+            @if (viewing is not null)
+            {
+                <div class="panel-body">
+                    <div class="banner info"><Icon Name="alert" /><span>Version from @viewing.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm") by @viewing.Author, shown as text.</span></div>
+                    <pre class="commit-message">@viewing.Content</pre>
+                    @if (canPush)
+                    {
+                        <div class="form-actions"><button type="button" class="secondary" @onclick="RestoreViewed" disabled="@busy">Restore this version</button></div>
+                    }
+                </div>
+            }
+        </div>
+    }
+}
+
+@code {
+    [Parameter] public string Namespace { get; set; } = "";
+    [Parameter] public string Slug { get; set; } = "";
+    [Parameter] public string? PageSlug { get; set; }
+
+    private ProjectResponse? project;
+    private long projectId;
+    private bool canPush;
+    private WikiPageResponse[] pages = [];
+    private WikiPageResponse? wikiPage;
+    private WikiVersionResponse[] versions = [];
+    private WikiVersionResponse? viewing;
+    private bool loading = true;
+    private bool busy;
+    private bool composing;
+    private bool editing;
+    private string draftTitle = "";
+    private string draftContent = "";
+    private string draftMessage = "";
+    private string message = "";
+    private string messageKind = "info";
+
+    private bool ViaSlug => Namespace.Length == 0;
+    private string ProjectUrl => ViaSlug
+        ? $"/projects/{Uri.EscapeDataString(Slug)}"
+        : $"/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
+    private string WikiUrl => ProjectUrl + "/-/wiki";
+    private string PageUrl(string slug) => $"{WikiUrl}/{Uri.EscapeDataString(slug)}";
+
+    protected override async Task OnParametersSetAsync()
+    {
+        loading = true;
+        message = "";
+        editing = false;
+        viewing = null;
+        try
+        {
+            await Api.EnsureSessionAsync();
+            string path = ViaSlug
+                ? $"api/graft/slugs/{Uri.EscapeDataString(Slug)}"
+                : $"api/browser/projects/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
+            (bool reached, RepositoryPageResponse? repo) = await Api.GetOptionalAsync(path, ApiJson.Default.RepositoryPageResponse);
+            if (!reached) { message = "Graft could not be reached."; return; }
+            if (repo is null) { message = "That repository could not be found."; return; }
+            project = repo.Project;
+            projectId = repo.Project.Id;
+            canPush = repo.CanPush;
+            if (PageSlug is null) pages = await Api.GetAsync($"api/projects/{projectId}/wikis", ApiJson.Default.WikiPageResponseArray) ?? [];
+            else await LoadPage();
+        }
+        finally { loading = false; }
+    }
+
+    private async Task LoadPage()
+    {
+        wikiPage = await Api.GetAsync($"api/projects/{projectId}/wikis/{Uri.EscapeDataString(PageSlug!)}", ApiJson.Default.WikiPageResponse);
+        if (wikiPage is null) { message = "That page could not be found."; return; }
+        versions = await Api.GetAsync($"api/projects/{projectId}/wikis/{Uri.EscapeDataString(PageSlug!)}/versions", ApiJson.Default.WikiVersionResponseArray) ?? [];
+    }
+
+    private void StartEdit()
+    {
+        if (wikiPage is null) return;
+        draftTitle = wikiPage.Title;
+        draftContent = wikiPage.Content;
+        draftMessage = "";
+        editing = true;
+    }
+
+    private async Task Create()
+    {
+        if (busy) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult<WikiPageResponse> result = await Api.SendAsync<WikiPageRequest, WikiPageResponse>(HttpMethod.Post,
+                $"api/projects/{projectId}/wikis", new WikiPageRequest(draftTitle, draftContent, "Created"),
+                ApiJson.Default.WikiPageRequest, ApiJson.Default.WikiPageResponse, "Page created.");
+            if (!result.Ok || result.Value is null) { Report(false, result.Message); return; }
+            composing = false;
+            Navigation.NavigateTo(PageUrl(result.Value.Slug));
+        }
+        finally { busy = false; }
+    }
+
+    private async Task Save()
+    {
+        if (busy || wikiPage is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/projects/{projectId}/wikis/{Uri.EscapeDataString(wikiPage.Slug)}",
+                new WikiPageRequest(draftTitle, draftContent, draftMessage), ApiJson.Default.WikiPageRequest, "Page saved.");
+            Report(result.Ok, result.Message);
+            if (!result.Ok) return;
+            editing = false;
+            await LoadPage();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task View(WikiVersionResponse version)
+    {
+        if (wikiPage is null) return;
+        WikiVersionResponse? full = await Api.GetAsync(
+            $"api/projects/{projectId}/wikis/{Uri.EscapeDataString(wikiPage.Slug)}?version={version.Id}", ApiJson.Default.WikiVersionResponse);
+        viewing = full;
+    }
+
+    private async Task RestoreViewed()
+    {
+        if (viewing is null || wikiPage is null) return;
+        draftTitle = viewing.Title;
+        draftContent = viewing.Content;
+        draftMessage = $"Restored the version from {viewing.CreatedAt.ToLocalTime():yyyy-MM-dd HH:mm}";
+        await Save();
+        viewing = null;
+    }
+
+    private async Task Delete()
+    {
+        if (busy || wikiPage is null) return;
+        busy = true;
+        try
+        {
+            ApiResult result = await Api.DeleteAsync($"api/projects/{projectId}/wikis/{Uri.EscapeDataString(wikiPage.Slug)}", "Page deleted.");
+            Report(result.Ok, result.Message);
+            if (result.Ok) Navigation.NavigateTo(WikiUrl);
+        }
+        finally { busy = false; }
+    }
+
+    private void Report(bool ok, string text)
+    {
+        message = text;
+        messageKind = ok ? "success" : "error";
+    }
+}

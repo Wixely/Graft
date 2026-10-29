@@ -73,6 +73,7 @@ public static class UploadLimits
     public const string ArchiveProfile = "archive";
     public const string AvatarProfile = "avatar";
     public const string RepositoryFileProfile = "repository-file";
+    public const string ReleaseAssetProfile = "release-asset";
 
     /// <summary>Total staged bytes admitted across all owners, including completed receipts until expiry.</summary>
     public const long ReservedBytes = 64L * 1024 * 1024 * 1024;
@@ -140,6 +141,28 @@ public static class UploadLimits
         ConcurrentFiles = 2,
         MaximumFiles = 20,
         MaximumFileBytes = Graft.Git.Limits.ObjectBytes,
+        Lifetime = TimeSpan.FromHours(6)
+    };
+
+    /// <summary>
+    /// Files attached to a release. Chunked, because a build artefact is the one upload here that a phone
+    /// might reasonably be asked to send while backgrounded, and capped at the store's own asset limit so
+    /// the ingest never has to refuse what the transport accepted.
+    /// </summary>
+    public static readonly UploadProfile ReleaseAsset = new()
+    {
+        Multiple = true,
+        Chunking = true,
+        ChunkBytes = 8 * 1024 * 1024,
+        Resume = true,
+        AutomaticRetry = true,
+        RetryLimit = 3,
+        PersistMetadata = true,
+        PersistFileBytes = 0,
+        DragAndDrop = true,
+        ConcurrentFiles = 1,
+        MaximumFiles = 10,
+        MaximumFileBytes = Graft.Storage.GraftStore.MaximumAssetBytes,
         Lifetime = TimeSpan.FromHours(6)
     };
 }

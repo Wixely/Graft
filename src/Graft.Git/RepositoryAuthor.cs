@@ -151,9 +151,16 @@ public static class RepositoryAuthor
     /// commit this file writes. Parent order is meaningful and preserved: the first is the branch being
     /// advanced, so <c>diff HEAD^</c> shows what the merge brought in.
     /// </summary>
-    internal static GitObject BuildCommit(string treeId, IReadOnlyList<string> parents, GitIdentity author, string message)
+    internal static GitObject BuildCommit(string treeId, IReadOnlyList<string> parents, GitIdentity author, string message) =>
+        BuildCommit(treeId, parents, author, author, message);
+
+    /// <summary>
+    /// The same with a separate committer, which is what a rebase needs: the author wrote the change and
+    /// stays its author; the person who moved it onto a new base is the committer, as Git itself records.
+    /// </summary>
+    internal static GitObject BuildCommit(string treeId, IReadOnlyList<string> parents, GitIdentity author,
+        GitIdentity committer, string message)
     {
-        string identity = FormatIdentity(author);
         StringBuilder headers = new();
         headers.Append("tree ").Append(treeId).Append('\n');
         foreach (string parent in parents)
@@ -161,8 +168,8 @@ public static class RepositoryAuthor
             Limits.Require(Limits.IsId(parent), "commit-parent");
             headers.Append("parent ").Append(parent).Append('\n');
         }
-        headers.Append("author ").Append(identity).Append('\n');
-        headers.Append("committer ").Append(identity).Append('\n');
+        headers.Append("author ").Append(FormatIdentity(author)).Append('\n');
+        headers.Append("committer ").Append(FormatIdentity(committer)).Append('\n');
         headers.Append('\n').Append(NormalizeMessage(message));
         return new(1, Encoding.UTF8.GetBytes(headers.ToString()));
     }

@@ -62,6 +62,34 @@
     {
         <div class="panel-footer">
             <button type="button" class="secondary" @onclick="() => editing = !editing" disabled="@Busy">@(editing ? "Cancel" : "Edit details")</button>
+            @if (OnTime.HasDelegate)
+            {
+                <button type="button" class="secondary" @onclick="() => timing = !timing" disabled="@Busy">@(timing ? "Cancel" : "Track time")</button>
+            }
+        </div>
+    }
+    else if (OnTime.HasDelegate && CanParticipate)
+    {
+        <div class="panel-footer">
+            <button type="button" class="secondary" @onclick="() => timing = !timing" disabled="@Busy">@(timing ? "Cancel" : "Track time")</button>
+        </div>
+    }
+    @if (timing)
+    {
+        <div class="panel-body">
+            <form class="form" @onsubmit="SubmitTime" @onsubmit:preventDefault>
+                @if (CanTriage)
+                {
+                    <label for="meta-estimate">Estimate</label>
+                    <input id="meta-estimate" @bind="estimateChoice" placeholder="e.g. 2d 4h" maxlength="40" />
+                }
+                <label for="meta-spent">Time spent</label>
+                <input id="meta-spent" @bind="spentChoice" placeholder="e.g. 1h 30m, or -30m to take time back" maxlength="40" />
+                <label for="meta-summary">What on</label>
+                <input id="meta-summary" @bind="summaryChoice" maxlength="255" />
+                <p class="field-hint">Durations like <code>1w 2d 3h 30m</code>; a day is eight hours, a week five days.</p>
+                <div class="form-actions"><button type="submit" disabled="@Busy">Record</button></div>
+            </form>
         </div>
     }
     @if (editing)
@@ -152,13 +180,32 @@
     [Parameter] public bool ShowDraft { get; set; }
     [Parameter] public TimeStatsResponse? TimeStats { get; set; }
     /// <summary>Whether the reader may change labels, milestone, people and date: the author or a Developer.</summary>
+    [Parameter] public bool CanParticipate { get; set; }
     [Parameter] public bool CanTriage { get; set; }
     /// <summary>Whether the reader may change confidentiality or readiness: the author or a Maintainer.</summary>
     [Parameter] public bool CanEditFlags { get; set; }
     [Parameter] public bool Busy { get; set; }
     [Parameter] public EventCallback<IssueUpdateRequest> OnSave { get; set; }
+    /// <summary>Raised with the action name and a duration: <c>time_estimate</c> or <c>add_spent_time</c>.</summary>
+    [Parameter] public EventCallback<(string Action, TimeRequest Request)> OnTime { get; set; }
 
     private bool editing;
+    private bool timing;
+    private string estimateChoice = "";
+    private string spentChoice = "";
+    private string summaryChoice = "";
+
+    private async Task SubmitTime()
+    {
+        if (CanTriage && estimateChoice.Trim().Length > 0)
+            await OnTime.InvokeAsync(("time_estimate", new TimeRequest(estimateChoice.Trim())));
+        if (spentChoice.Trim().Length > 0)
+            await OnTime.InvokeAsync(("add_spent_time", new TimeRequest(spentChoice.Trim(), null, summaryChoice)));
+        estimateChoice = "";
+        spentChoice = "";
+        summaryChoice = "";
+        timing = false;
+    }
     private HashSet<string> labelChoice = new(StringComparer.OrdinalIgnoreCase);
     private HashSet<string> assigneeChoice = new(StringComparer.OrdinalIgnoreCase);
     private HashSet<string> reviewerChoice = new(StringComparer.OrdinalIgnoreCase);

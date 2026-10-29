@@ -151,6 +151,7 @@ builder.Services.AddDnaXUploads(options =>
     options.Profiles[UploadLimits.ArchiveProfile] = UploadLimits.Archive;
     options.Profiles[UploadLimits.AvatarProfile] = UploadLimits.Avatar;
     options.Profiles[UploadLimits.RepositoryFileProfile] = UploadLimits.RepositoryFile;
+    options.Profiles[UploadLimits.ReleaseAssetProfile] = UploadLimits.ReleaseAsset;
 });
 builder.WebHost.ConfigureKestrel(options =>
 {
@@ -1191,7 +1192,8 @@ Func<HttpContext, ProjectDetails?, Task> browseProject = async (context, details
             await context.Response.WriteAsJsonAsync(new RepositoryPageResponse(bare, bareManage.Allowed,
                 barePush.Allowed, [], [], [], null, null, details.Project.PagePublished, settings.PublicBrowsing,
                 bareParticipate.Allowed,
-                bareManage.Allowed ? await store.GetApprovalsRequiredAsync(projectId, context.RequestAborted) : 0),
+                bareManage.Allowed ? await store.GetApprovalsRequiredAsync(projectId, context.RequestAborted) : 0,
+                bareManage.Allowed && await store.GetRequireCodeOwnerApprovalAsync(projectId, context.RequestAborted)),
                 ApiJson.Default.RepositoryPageResponse, null, context.RequestAborted);
             return;
         }
@@ -1223,7 +1225,7 @@ Func<HttpContext, ProjectDetails?, Task> browseProject = async (context, details
         int approvalsRequired = manage.Allowed ? await store.GetApprovalsRequiredAsync(projectId, context.RequestAborted) : 0;
         RepositoryPageResponse response = new(project, manage.Allowed, push.Allowed, branches, commits, entries,
             fileResponse, readme, details.Project.PagePublished, settings.PublicBrowsing, participate.Allowed,
-            approvalsRequired);
+            approvalsRequired, manage.Allowed && await store.GetRequireCodeOwnerApprovalAsync(projectId, context.RequestAborted));
         await context.Response.WriteAsJsonAsync(response, ApiJson.Default.RepositoryPageResponse, null, context.RequestAborted);
     });
 };
@@ -2529,7 +2531,7 @@ async Task CreateMergeRequest(HttpContext context, ProjectDetails project, Authe
         });
         context.Response.StatusCode = StatusCodes.Status201Created;
         await context.Response.WriteAsJsonAsync(
-            await MergeResponseFor(context, project, proposal, await AnalyseProposal(context, project, proposal)),
+            await FullMergeResponse(context, project, proposal),
             ApiJson.Default.MergeRequestResponse, null, context.RequestAborted);
     }
     catch (CollaborationConflictException error) { await ApiError(context, 409, error.Message); }
@@ -2542,8 +2544,7 @@ async Task ReadMergeRequest(HttpContext context, ProjectDetails project, Authent
     if (!await OnlyQuery(context)) return;
     MergeProposal? proposal = await store.FindMergeProposalAsync(identity, project.Project.Id, Number(context), null, context.RequestAborted);
     if (proposal is null) { await ApiError(context, 404, "404 Merge Request Not Found"); return; }
-    await context.Response.WriteAsJsonAsync(
-        await MergeResponseFor(context, project, proposal, await AnalyseProposal(context, project, proposal)),
+    await context.Response.WriteAsJsonAsync(await FullMergeResponse(context, project, proposal),
         ApiJson.Default.MergeRequestResponse, null, context.RequestAborted);
 }
 
@@ -2566,7 +2567,7 @@ async Task UpdateMergeRequest(HttpContext context, ProjectDetails project, Authe
         MergeProposal proposal = await store.UpdateMergeProposalAsync(identity, project.Project.Id, Number(context),
             request.Title, request.Description, state, changes.Any ? changes : null, context.RequestAborted);
         await context.Response.WriteAsJsonAsync(
-            await MergeResponseFor(context, project, proposal, await AnalyseProposal(context, project, proposal)),
+            await FullMergeResponse(context, project, proposal),
             ApiJson.Default.MergeRequestResponse, null, context.RequestAborted);
     }
     catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Merge Request Not Found"); }
@@ -2609,7 +2610,7 @@ async Task MergeRequestChanges(HttpContext context, ProjectDetails project, Auth
         [.. file.Hunks.Select(hunk => new DiffHunkResponse(HunkHeader(hunk),
             [.. hunk.Lines.Select(line => new DiffLineResponse(line.Kind.ToString(), line.Text, line.OldLine, line.NewLine, line.NoNewline))]))]))];
     await context.Response.WriteAsJsonAsync(new MergeRequestChangesResponse(
-        await MergeResponseFor(context, project, proposal, analysis),
+        await FullMergeResponse(context, project, proposal),
         analysis.BaseCommitId, analysis.SourceCommitId, analysis.TargetCommitId,
         response, truncated, response.Sum(file => file.Added), response.Sum(file => file.Removed)),
         ApiJson.Default.MergeRequestChangesResponse, null, context.RequestAborted);
@@ -2624,15 +2625,20 @@ async Task AcceptMergeRequest(HttpContext context, ProjectDetails project, Authe
     PermissionDecision push = await DecideFor(context, identity, project.Project.Id, ProjectAction.PushRepository);
     if (!push.Allowed) { await ApiError(context, 403, push.Explanation); return; }
 
-    // The body is optional: GitLab's merge route takes none, and the only thing Graft reads from one is
-    // whether to remove the source branch afterwards.
+    // The body is optional: GitLab's merge route takes none. Graft reads whether to remove the source
+    // branch afterwards, and whether to squash.
     bool removeSource = false;
+    bool squash = false;
+    string? squashMessage = null;
     if (context.Request.HasJsonContentType())
     {
         MergeAcceptRequest? body;
         try { body = await context.Request.ReadFromJsonAsync(ApiJson.Default.MergeAcceptRequest, context.RequestAborted); }
         catch (JsonException) { await ApiError(context, 400, "invalid JSON"); return; }
         removeSource = body?.ShouldRemoveSourceBranch == true;
+        squash = body?.Squash == true;
+        squashMessage = body?.SquashCommitMessage;
+        if (squashMessage is { Length: > 10_000 }) { await ApiError(context, 400, "squash_commit_message is too long"); return; }
     }
 
     MergeProposal? proposal = await store.FindMergeProposalAsync(identity, project.Project.Id, Number(context),
@@ -2657,7 +2663,15 @@ async Task AcceptMergeRequest(HttpContext context, ProjectDetails project, Authe
         return;
     }
 
-    string message = $"Merge branch '{proposal.SourceBranch}' into '{proposal.TargetBranch}'\n\n{proposal.Title}";
+    // The code owner gate, decided against the approvals that stand right now and the CODEOWNERS file on
+    // the target branch, which is the branch whose owners have the say.
+    bool ownersRequired = await store.GetRequireCodeOwnerApprovalAsync(project.Project.Id, context.RequestAborted);
+    IReadOnlyList<string> approvers = currentTip is null ? [] :
+        await store.CurrentApproversAsync(project.Project.Id, proposal.Iid, currentTip, context.RequestAborted);
+
+    string message = squash
+        ? (string.IsNullOrWhiteSpace(squashMessage) ? proposal.Title : squashMessage.Trim())
+        : $"Merge branch '{proposal.SourceBranch}' into '{proposal.TargetBranch}'\n\n{proposal.Title}";
     GitIdentity author = new(identity.Username, identity.Username + "@" + MergeAuthorHost, DateTimeOffset.UtcNow);
 
     RepositoryEndpoint endpoint = EndpointFor(project.Project);
@@ -2679,8 +2693,19 @@ async Task AcceptMergeRequest(HttpContext context, ProjectDetails project, Authe
             await ApiError(context, 409, reason);
             return;
         }
-        outcome = RepositoryMerge.Merge(endpoint.Repository, proposal.SourceBranch, proposal.TargetBranch,
-            author, message, context.RequestAborted);
+        if (ownersRequired)
+        {
+            (IReadOnlyList<DiffFile> changed, _) = RepositoryDiff.BetweenCommits(endpoint.Repository, analysis.BaseCommitId, analysis.SourceCommitId!);
+            List<string> missing = MissingOwnerApprovals(CodeOwnersFor(endpoint.Repository, analysis, changed.Select(file => file.Path)), approvers);
+            if (missing.Count > 0)
+            {
+                await ApiError(context, 409, "this project requires a code owner's approval, and none stands for: " + string.Join(", ", missing));
+                return;
+            }
+        }
+        outcome = squash
+            ? RepositoryMerge.Squash(endpoint.Repository, proposal.SourceBranch, proposal.TargetBranch, author, message, context.RequestAborted)
+            : RepositoryMerge.Merge(endpoint.Repository, proposal.SourceBranch, proposal.TargetBranch, author, message, context.RequestAborted);
 
         // Inside the same lock as the merge, so nothing can push to the source branch between the two and
         // have that push silently removed. Refused only when the source is the branch the project opens
@@ -2721,7 +2746,8 @@ async Task AcceptMergeRequest(HttpContext context, ProjectDetails project, Authe
     });
     await context.Response.WriteAsJsonAsync(new MergeResultResponse(
         await MergeResponseFor(context, project, merged, await AnalyseProposal(context, project, merged)),
-        outcome.Kind == MergeKind.FastForward ? "fast_forward" : "three_way", outcome.CommitId, sourceRemoved),
+        outcome.Kind switch { MergeKind.FastForward => "fast_forward", MergeKind.Squash => "squash", _ => "three_way" },
+        outcome.CommitId, sourceRemoved),
         ApiJson.Default.MergeResultResponse, null, context.RequestAborted);
 }
 
@@ -2982,7 +3008,7 @@ async Task SetApproval(HttpContext context, ProjectDetails project, Authenticate
         MergeProposal proposal = await store.SetApprovalAsync(identity, project.Project.Id, Number(context),
             approved, tip ?? "", context.RequestAborted);
         await context.Response.WriteAsJsonAsync(
-            await MergeResponseFor(context, project, proposal, await AnalyseProposal(context, project, proposal)),
+            await FullMergeResponse(context, project, proposal),
             ApiJson.Default.MergeRequestResponse, null, context.RequestAborted);
     }
     catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Merge Request Not Found"); }
@@ -2997,15 +3023,126 @@ async Task SetApprovalsRequired(HttpContext context, ProjectDetails project, Aut
     if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
     ApprovalsRequiredRequest? request = await context.Request.ReadFromJsonAsync(
         ApiJson.Default.ApprovalsRequiredRequest, context.RequestAborted);
-    if (request is null) { await ApiError(context, 400, "approvals_before_merge is required"); return; }
+    if (request is null || (request.ApprovalsBeforeMerge is null && request.RequireCodeOwnerApproval is null))
+    { await ApiError(context, 400, "approvals_before_merge or require_code_owner_approval is required"); return; }
     if (request.ApprovalsBeforeMerge is < 0 or > 10)
     { await ApiError(context, 400, "approvals_before_merge must be between 0 and 10"); return; }
     try
     {
-        await store.SetApprovalsRequiredAsync(identity, project.Project.Id, request.ApprovalsBeforeMerge, context.RequestAborted);
+        if (request.ApprovalsBeforeMerge is int count)
+            await store.SetApprovalsRequiredAsync(identity, project.Project.Id, count, context.RequestAborted);
+        if (request.RequireCodeOwnerApproval is bool owners)
+            await store.SetRequireCodeOwnerApprovalAsync(identity, project.Project.Id, owners, context.RequestAborted);
         context.Response.StatusCode = StatusCodes.Status204NoContent;
     }
     catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+}
+
+/// <summary>
+/// Who owns what a proposal changes, read from the CODEOWNERS file on the target branch, which is the
+/// branch the change would land on and whose owners therefore have the say. Paths the file does not name
+/// are left out: an unowned path needs nobody.
+/// </summary>
+static List<CodeOwnerResponse> CodeOwnersFor(Repository repository, MergeAnalysis analysis, IEnumerable<string> changedPaths)
+{
+    if (analysis.TargetCommitId is null) return [];
+    IReadOnlyList<CodeOwnerRule> rules = CodeOwners.Read(repository, analysis.TargetCommitId);
+    if (rules.Count == 0) return [];
+    List<CodeOwnerResponse> owners = [];
+    foreach (string path in changedPaths)
+    {
+        IReadOnlyList<string> who = CodeOwners.OwnersOf(rules, path);
+        if (who.Count > 0) owners.Add(new(path, who));
+    }
+    return owners;
+}
+
+/// <summary>The paths in <paramref name="owners"/> that no listed owner has currently approved.</summary>
+static List<string> MissingOwnerApprovals(IReadOnlyList<CodeOwnerResponse> owners, IReadOnlyList<string> approvers) =>
+    [.. owners.Where(entry => !entry.Owners.Any(owner => approvers.Contains(owner, StringComparer.OrdinalIgnoreCase)))
+        .Select(entry => entry.Path)];
+
+/// <summary>
+/// A proposal's full picture: analysis, changed paths and who owns them, with the code owner gate decided
+/// against the approvals that stand. Reads the repository under its gate; the store afterwards.
+/// </summary>
+async Task<MergeRequestResponse> FullMergeResponse(HttpContext context, ProjectDetails project, MergeProposal proposal)
+{
+    RepositoryEndpoint endpoint = EndpointFor(project.Project);
+    MergeAnalysis analysis;
+    List<CodeOwnerResponse> owners = [];
+    await endpoint.Gate.WaitAsync(context.RequestAborted);
+    try
+    {
+        analysis = RepositoryMerge.Analyse(endpoint.Repository, proposal.SourceBranch, proposal.TargetBranch, context.RequestAborted);
+        if (analysis.SourceCommitId is not null && proposal.State == CollaborationState.Opened)
+        {
+            try
+            {
+                (IReadOnlyList<DiffFile> files, _) = RepositoryDiff.BetweenCommits(endpoint.Repository, analysis.BaseCommitId, analysis.SourceCommitId);
+                owners = CodeOwnersFor(endpoint.Repository, analysis, files.Select(file => file.Path));
+            }
+            catch (GitInputException) { owners = []; }
+        }
+    }
+    finally { endpoint.Gate.Release(); }
+    bool required = await store.GetRequireCodeOwnerApprovalAsync(project.Project.Id, context.RequestAborted);
+    List<string> missing = required && owners.Count > 0 && analysis.SourceCommitId is not null
+        ? MissingOwnerApprovals(owners, await store.CurrentApproversAsync(project.Project.Id, proposal.Iid, analysis.SourceCommitId, context.RequestAborted))
+        : [];
+    return await MergeResponseFor(context, project, proposal, analysis) with
+    {
+        CodeOwners = owners,
+        CodeOwnerApprovalRequired = required,
+        CodeOwnerApprovalsMissing = missing
+    };
+}
+
+// A rebase rewrites the source branch onto the target's tip. It needs what a push needs, because it is a
+// forced push, and the response says plainly that approvals and line comments were about commits that are
+// no longer on the branch.
+async Task RebaseMergeRequest(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required to rebase"); return; }
+    PermissionDecision push = await DecideFor(context, identity, project.Project.Id, ProjectAction.PushRepository);
+    if (!push.Allowed) { await ApiError(context, 403, push.Explanation); return; }
+    MergeProposal? proposal = await store.FindMergeProposalAsync(identity, project.Project.Id, Number(context), null, context.RequestAborted);
+    if (proposal is null) { await ApiError(context, 404, "404 Merge Request Not Found"); return; }
+    if (proposal.State != CollaborationState.Opened) { await ApiError(context, 409, "the proposal is not open"); return; }
+
+    GitIdentity committer = new(identity.Username, identity.Username + "@" + MergeAuthorHost, DateTimeOffset.UtcNow);
+    RepositoryEndpoint endpoint = EndpointFor(project.Project);
+    RebaseOutcome outcome;
+    await endpoint.Gate.WaitAsync(context.RequestAborted);
+    try { outcome = RepositoryMerge.Rebase(endpoint.Repository, proposal.SourceBranch, proposal.TargetBranch, committer, context.RequestAborted); }
+    catch (GitInputException error)
+    {
+        await ApiError(context, 409, error.Message switch
+        {
+            "rebase-merge-commit" => "the branch contains a merge commit, which a rebase would have to flatten; rebase it locally",
+            "rebase-too-many" => "too many commits to rebase here; rebase it locally",
+            "merge-unresolved" => "a branch this proposal names no longer exists",
+            _ when error.Message.StartsWith("rebase-conflict:", StringComparison.Ordinal) =>
+                "both branches changed " + error.Message["rebase-conflict:".Length..] + "; rebase it locally, where the conflict can be seen",
+            _ => "rebase refused: " + error.Message
+        });
+        return;
+    }
+    finally { endpoint.Gate.Release(); }
+
+    if (outcome.Rewritten > 0)
+        await Notify(context, project.Project, WebhookEvent.Push, payload =>
+        {
+            payload["branch"] = proposal.SourceBranch;
+            payload["commit"] = outcome.NewTip;
+            payload["by"] = identity.Username;
+            payload["via"] = "rebase";
+            payload["forced"] = true;
+        });
+    MergeProposal refreshed = (await store.FindMergeProposalAsync(identity, project.Project.Id, proposal.Iid, null, context.RequestAborted))!;
+    await context.Response.WriteAsJsonAsync(new RebaseResultResponse(
+        await FullMergeResponse(context, project, refreshed), outcome.PreviousTip, outcome.NewTip, outcome.Rewritten),
+        ApiJson.Default.RebaseResultResponse, null, context.RequestAborted);
 }
 
 // Hooks are managed only where the operator allowed outbound requests. Absent rather than refused on a
@@ -3460,6 +3597,485 @@ async Task ListAssignable(HttpContext context, ProjectDetails project, Authentic
     catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
 }
 
+// ---------------------------------------------------------------------------------------------------
+// Releases: notes, links and files on a tag. Reading follows the repository; publishing needs a push.
+// ---------------------------------------------------------------------------------------------------
+
+async Task<ReleaseResponse> ReleaseResponseFor(HttpContext context, ProjectDetails project, Release release)
+{
+    RepositoryEndpoint endpoint = EndpointFor(project.Project);
+    CommitResponse? commit = null;
+    await endpoint.Gate.WaitAsync(context.RequestAborted);
+    try
+    {
+        if (endpoint.Repository.Refs.ContainsKey("refs/tags/" + release.TagName))
+        {
+            string? commitId = RepositoryView.ResolveCommit(endpoint.Repository, release.TagName);
+            if (commitId is not null) commit = CommitResponseFor(context, project, RepositoryView.ReadCommit(endpoint.Repository, commitId));
+        }
+    }
+    finally { endpoint.Gate.Release(); }
+    string tag = Uri.EscapeDataString(release.TagName);
+    string api = Origin(context) + "/api/v4/projects/" + project.Project.Id.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/releases/" + tag;
+    string browser = ProjectWebUrl(context, project) + "/-/releases/" + tag;
+    List<ReleaseSourceResponse> sources = commit is null ? [] :
+    [
+        new("tar.gz", Origin(context) + "/api/v4/projects/" + project.Project.Id.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/repository/archive.tar.gz?sha=" + tag),
+        new("zip", Origin(context) + "/api/v4/projects/" + project.Project.Id.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/repository/archive.zip?sha=" + tag)
+    ];
+    return new(release.TagName, release.Name, release.Description, release.CreatedAtUtc, release.ReleasedAtUtc,
+        await AuthorFor(context, release.AuthorUserId, release.AuthorUsername), commit, commit is not null,
+        new(release.Links.Count + release.Assets.Count + sources.Count, sources,
+            [.. release.Links.Select(link => new ReleaseLinkResponse(link.Id, link.Name, link.Url, link.LinkType))],
+            [.. release.Assets.Select(asset => new ReleaseFileResponse(asset.Id, asset.FileName, asset.Size, asset.Sha256,
+                api + "/assets/files/" + Uri.EscapeDataString(asset.FileName), asset.UploadedByUsername, asset.CreatedAtUtc))]),
+        browser);
+}
+
+string TagOf(HttpContext context)
+{
+    string tag = context.Request.RouteValues["tag"]?.ToString() ?? "";
+    try { return Uri.UnescapeDataString(tag); } catch (UriFormatException) { return tag; }
+}
+
+async Task ListReleases(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (!await OnlyQuery(context, "page", "per_page")) return;
+    try
+    {
+        IReadOnlyList<Release> releases = await store.ListReleasesAsync(identity, project.Project.Id, context.RequestAborted);
+        List<ReleaseResponse> response = [];
+        foreach (Release release in releases) response.Add(await ReleaseResponseFor(context, project, release));
+        await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.ReleaseResponseArray, null, context.RequestAborted);
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "project"); }
+}
+
+async Task ReadRelease(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (!await OnlyQuery(context)) return;
+    try
+    {
+        Release? release = await store.FindReleaseAsync(identity, project.Project.Id, TagOf(context), context.RequestAborted);
+        if (release is null) { await ApiError(context, 404, "404 Release Not Found"); return; }
+        await context.Response.WriteAsJsonAsync(await ReleaseResponseFor(context, project, release), ApiJson.Default.ReleaseResponse, null, context.RequestAborted);
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "project"); }
+}
+
+// A release needs its tag to exist when it is made. Afterwards the tag may go, and the release says so,
+// because deleting a tag and deleting what was said about it are different acts.
+async Task CreateRelease(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    ReleaseRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.ReleaseRequest, context.RequestAborted);
+    if (request?.TagName is not { Length: > 0 }) { await ApiError(context, 400, "tag_name is required"); return; }
+    RepositoryEndpoint endpoint = EndpointFor(project.Project);
+    await endpoint.Gate.WaitAsync(context.RequestAborted);
+    bool exists;
+    try { exists = endpoint.Repository.Refs.ContainsKey("refs/tags/" + request.TagName.Trim()); }
+    finally { endpoint.Gate.Release(); }
+    if (!exists) { await ApiError(context, 400, "tag_name does not name a tag in this repository; create the tag first"); return; }
+    try
+    {
+        Release release = await store.CreateReleaseAsync(identity, project.Project.Id, request.TagName, request.Name,
+            request.Description ?? "", request.ReleasedAt, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status201Created;
+        await context.Response.WriteAsJsonAsync(await ReleaseResponseFor(context, project, release), ApiJson.Default.ReleaseResponse, null, context.RequestAborted);
+    }
+    catch (CollaborationConflictException error) { await ApiError(context, 409, error.Message); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+}
+
+async Task UpdateRelease(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    ReleaseRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.ReleaseRequest, context.RequestAborted);
+    if (request is null || (request.Name is null && request.Description is null && request.ReleasedAt is null))
+    { await ApiError(context, 400, "nothing to change"); return; }
+    try
+    {
+        Release release = await store.UpdateReleaseAsync(identity, project.Project.Id, TagOf(context), request.Name,
+            request.Description, request.ReleasedAt, context.RequestAborted);
+        await context.Response.WriteAsJsonAsync(await ReleaseResponseFor(context, project, release), ApiJson.Default.ReleaseResponse, null, context.RequestAborted);
+    }
+    catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Release Not Found"); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+}
+
+async Task DeleteRelease(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    try
+    {
+        await store.DeleteReleaseAsync(identity, project.Project.Id, TagOf(context), context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Release Not Found"); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+}
+
+async Task AddReleaseLink(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    ReleaseLinkRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.ReleaseLinkRequest, context.RequestAborted);
+    if (request?.Name is not { Length: > 0 } || request.Url is not { Length: > 0 }) { await ApiError(context, 400, "name and url are required"); return; }
+    try
+    {
+        Release release = await store.AddReleaseLinkAsync(identity, project.Project.Id, TagOf(context), request.Name, request.Url,
+            request.LinkType ?? "other", context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status201Created;
+        await context.Response.WriteAsJsonAsync(await ReleaseResponseFor(context, project, release), ApiJson.Default.ReleaseResponse, null, context.RequestAborted);
+    }
+    catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Release Not Found"); }
+    catch (CollaborationConflictException error) { await ApiError(context, 409, error.Message); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+}
+
+async Task DeleteReleaseLink(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    long linkId = Convert.ToInt64(context.Request.RouteValues["linkId"], System.Globalization.CultureInfo.InvariantCulture);
+    try
+    {
+        Release release = await store.DeleteReleaseLinkAsync(identity, project.Project.Id, TagOf(context), linkId, context.RequestAborted);
+        await context.Response.WriteAsJsonAsync(await ReleaseResponseFor(context, project, release), ApiJson.Default.ReleaseResponse, null, context.RequestAborted);
+    }
+    catch (CollaborationNotFoundException error) { await ApiError(context, 404, error.Message); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+}
+
+string FileNameOf(HttpContext context)
+{
+    string name = context.Request.RouteValues["fileName"]?.ToString() ?? "";
+    try { return Uri.UnescapeDataString(name); } catch (UriFormatException) { return name; }
+}
+
+// The plain-HTTP half for an API client: the file is the request body, bounded before it is read. The
+// browser's half arrives as an upload receipt through the transport ADR 0005 chose for it.
+async Task PutReleaseAssetBytes(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    if (context.Request.ContentLength > GraftStore.MaximumAssetBytes) { await ApiError(context, 413, "the file exceeds the 32 MiB asset limit"); return; }
+    byte[] bytes;
+    using (MemoryStream buffer = new())
+    {
+        await context.Request.Body.CopyToAsync(buffer, context.RequestAborted);
+        if (buffer.Length > GraftStore.MaximumAssetBytes) { await ApiError(context, 413, "the file exceeds the 32 MiB asset limit"); return; }
+        bytes = buffer.ToArray();
+    }
+    await StoreReleaseAsset(context, project, identity, FileNameOf(context), bytes);
+}
+
+async Task StoreReleaseAsset(HttpContext context, ProjectDetails project, AuthenticatedIdentity identity, string fileName, byte[] bytes)
+{
+    try
+    {
+        Release release = await store.PutReleaseAssetAsync(identity, project.Project.Id, TagOf(context), fileName, bytes, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status201Created;
+        await context.Response.WriteAsJsonAsync(await ReleaseResponseFor(context, project, release), ApiJson.Default.ReleaseResponse, null, context.RequestAborted);
+    }
+    catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Release Not Found"); }
+    catch (CollaborationConflictException error) { await ApiError(context, 409, error.Message); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+}
+
+// Served exactly as a raw repository file is: an attachment of unknown type, with nosniff. An uploaded
+// asset is somebody else's bytes on the origin that holds the session, and ADR 0017's reasoning applies
+// without change.
+async Task DownloadReleaseAsset(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (!await OnlyQuery(context)) return;
+    try
+    {
+        (ReleaseAsset Asset, byte[] Bytes)? found = await store.ReadReleaseAssetAsync(identity, project.Project.Id, TagOf(context), FileNameOf(context), context.RequestAborted);
+        if (found is null) { await ApiError(context, 404, "404 File Not Found"); return; }
+        context.Response.Headers.ETag = "\"" + found.Value.Asset.Sha256 + "\"";
+        await WriteDownload(context, found.Value.Bytes, found.Value.Asset.FileName, "application/octet-stream");
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "project"); }
+}
+
+async Task DeleteReleaseAsset(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    try
+    {
+        Release release = await store.DeleteReleaseAssetAsync(identity, project.Project.Id, TagOf(context), FileNameOf(context), context.RequestAborted);
+        await context.Response.WriteAsJsonAsync(await ReleaseResponseFor(context, project, release), ApiJson.Default.ReleaseResponse, null, context.RequestAborted);
+    }
+    catch (CollaborationNotFoundException error) { await ApiError(context, 404, error.Message); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Wiki, snippets and time tracking.
+// ---------------------------------------------------------------------------------------------------
+
+// A wiki page is rendered by the README renderer under the README's rules: raw HTML disabled, every link
+// and image destination checked on the tree, output scanned before it is sent. Images cannot resolve to a
+// repository path from a wiki page, so every image is downgraded to a link.
+WikiPageResponse WikiResponseFor(HttpContext context, ProjectDetails project, WikiPage page, bool render)
+{
+    RenderedMarkdown? rendered = render && page.Content.Length > 0 ? MarkdownContent.Render(page.Content, _ => null) : null;
+    return new(page.Slug, page.Title, page.Content, "markdown", rendered?.Html, page.CreatedByUsername, page.UpdatedByUsername,
+        page.CreatedAtUtc, page.UpdatedAtUtc, page.Versions,
+        ProjectWebUrl(context, project) + "/-/wiki/" + Uri.EscapeDataString(page.Slug), rendered?.HasDiagrams ?? false);
+}
+
+string SlugOf(HttpContext context)
+{
+    string slug = context.Request.RouteValues["slug"]?.ToString() ?? "";
+    try { return Uri.UnescapeDataString(slug); } catch (UriFormatException) { return slug; }
+}
+
+async Task ListWiki(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (!await OnlyQuery(context, "with_content")) return;
+    IReadOnlyList<WikiPage> pages = await store.ListWikiPagesAsync(identity, project.Project.Id, context.RequestAborted);
+    await context.Response.WriteAsJsonAsync([.. pages.Select(page => WikiResponseFor(context, project, page, false))],
+        ApiJson.Default.WikiPageResponseArray, null, context.RequestAborted);
+}
+
+async Task ReadWiki(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (!await OnlyQuery(context, "render_html", "version")) return;
+    string version = context.Request.Query["version"].ToString();
+    if (version.Length > 0)
+    {
+        if (!long.TryParse(version, out long versionId)) { await ApiError(context, 400, "version is an id"); return; }
+        WikiPageVersion? old = await store.FindWikiVersionAsync(identity, project.Project.Id, SlugOf(context), versionId, context.RequestAborted);
+        if (old is null) { await ApiError(context, 404, "404 Wiki Page Not Found"); return; }
+        await context.Response.WriteAsJsonAsync(new WikiVersionResponse(old.Id, old.Title, old.Content, old.Message, old.AuthorUsername, old.CreatedAtUtc),
+            ApiJson.Default.WikiVersionResponse, null, context.RequestAborted);
+        return;
+    }
+    WikiPage? page = await store.FindWikiPageAsync(identity, project.Project.Id, SlugOf(context), context.RequestAborted);
+    if (page is null) { await ApiError(context, 404, "404 Wiki Page Not Found"); return; }
+    await context.Response.WriteAsJsonAsync(WikiResponseFor(context, project, page, true), ApiJson.Default.WikiPageResponse, null, context.RequestAborted);
+}
+
+async Task ListWikiVersions(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (!await OnlyQuery(context)) return;
+    IReadOnlyList<WikiPageVersion> versions = await store.ListWikiVersionsAsync(identity, project.Project.Id, SlugOf(context), context.RequestAborted);
+    await context.Response.WriteAsJsonAsync([.. versions.Select(version => new WikiVersionResponse(version.Id, version.Title, "", version.Message, version.AuthorUsername, version.CreatedAtUtc))],
+        ApiJson.Default.WikiVersionResponseArray, null, context.RequestAborted);
+}
+
+async Task CreateWiki(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    WikiPageRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.WikiPageRequest, context.RequestAborted);
+    if (request?.Title is not { Length: > 0 }) { await ApiError(context, 400, "title is required"); return; }
+    try
+    {
+        WikiPage page = await store.CreateWikiPageAsync(identity, project.Project.Id, request.Title, request.Content ?? "", request.Message ?? "", context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status201Created;
+        await context.Response.WriteAsJsonAsync(WikiResponseFor(context, project, page, true), ApiJson.Default.WikiPageResponse, null, context.RequestAborted);
+    }
+    catch (CollaborationConflictException error) { await ApiError(context, 409, error.Message); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+}
+
+async Task UpdateWiki(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    WikiPageRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.WikiPageRequest, context.RequestAborted);
+    if (request is null || (request.Title is null && request.Content is null)) { await ApiError(context, 400, "title or content is required"); return; }
+    try
+    {
+        WikiPage page = await store.UpdateWikiPageAsync(identity, project.Project.Id, SlugOf(context), request.Title, request.Content, request.Message ?? "", context.RequestAborted);
+        await context.Response.WriteAsJsonAsync(WikiResponseFor(context, project, page, true), ApiJson.Default.WikiPageResponse, null, context.RequestAborted);
+    }
+    catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Wiki Page Not Found"); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+}
+
+async Task DeleteWiki(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    try
+    {
+        await store.DeleteWikiPageAsync(identity, project.Project.Id, SlugOf(context), context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Wiki Page Not Found"); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+}
+
+async Task<SnippetResponse> SnippetResponseFor(HttpContext context, ProjectDetails project, Snippet snippet, bool withContent)
+{
+    string id = snippet.Id.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    return new(snippet.Id, snippet.Title, snippet.FileName, snippet.Description, withContent ? snippet.Content : null,
+        await AuthorFor(context, snippet.AuthorUserId, snippet.AuthorUsername), snippet.CreatedAtUtc, snippet.UpdatedAtUtc,
+        ProjectWebUrl(context, project) + "/-/snippets/" + id,
+        Origin(context) + "/api/v4/projects/" + project.Project.Id.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/snippets/" + id + "/raw");
+}
+
+long SnippetId(HttpContext context) => Convert.ToInt64(context.Request.RouteValues["snippetId"], System.Globalization.CultureInfo.InvariantCulture);
+
+async Task ListSnippets(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (!await OnlyQuery(context, "page", "per_page")) return;
+    IReadOnlyList<Snippet> snippets = await store.ListSnippetsAsync(identity, project.Project.Id, context.RequestAborted);
+    List<SnippetResponse> response = [];
+    foreach (Snippet snippet in snippets) response.Add(await SnippetResponseFor(context, project, snippet, false));
+    await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.SnippetResponseArray, null, context.RequestAborted);
+}
+
+async Task ReadSnippet(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity, bool raw)
+{
+    if (!await OnlyQuery(context)) return;
+    Snippet? snippet = await store.FindSnippetAsync(identity, project.Project.Id, SnippetId(context), context.RequestAborted);
+    if (snippet is null) { await ApiError(context, 404, "404 Snippet Not Found"); return; }
+    if (raw)
+    {
+        // The same rule as a raw repository file: bytes to save, never a document on this origin.
+        await WriteDownload(context, Encoding.UTF8.GetBytes(snippet.Content), snippet.FileName, "application/octet-stream");
+        return;
+    }
+    await context.Response.WriteAsJsonAsync(await SnippetResponseFor(context, project, snippet, true), ApiJson.Default.SnippetResponse, null, context.RequestAborted);
+}
+
+async Task CreateSnippet(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    SnippetRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.SnippetRequest, context.RequestAborted);
+    if (request?.Title is not { Length: > 0 } || request.FileName is not { Length: > 0 } || request.Content is null)
+    { await ApiError(context, 400, "title, file_name and content are required"); return; }
+    try
+    {
+        Snippet snippet = await store.CreateSnippetAsync(identity, project.Project.Id, request.Title, request.FileName, request.Content, request.Description ?? "", context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status201Created;
+        await context.Response.WriteAsJsonAsync(await SnippetResponseFor(context, project, snippet, true), ApiJson.Default.SnippetResponse, null, context.RequestAborted);
+    }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+}
+
+async Task UpdateSnippet(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    SnippetRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.SnippetRequest, context.RequestAborted);
+    if (request is null || (request.Title is null && request.FileName is null && request.Content is null && request.Description is null))
+    { await ApiError(context, 400, "nothing to change"); return; }
+    try
+    {
+        Snippet snippet = await store.UpdateSnippetAsync(identity, project.Project.Id, SnippetId(context), request.Title, request.FileName, request.Content, request.Description, context.RequestAborted);
+        await context.Response.WriteAsJsonAsync(await SnippetResponseFor(context, project, snippet, true), ApiJson.Default.SnippetResponse, null, context.RequestAborted);
+    }
+    catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Snippet Not Found"); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+}
+
+async Task DeleteSnippet(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    try
+    {
+        await store.DeleteSnippetAsync(identity, project.Project.Id, SnippetId(context), context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Snippet Not Found"); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+}
+
+// Time tracking, in GitLab's shape: four verbs on an issue or proposal and a stats read. A duration is
+// GitLab's own vocabulary, `3h 30m`, and a negative one on spent time takes time back.
+async Task<(long Estimate, long Spent)?> TimeTotals(ProjectDetails project, AuthenticatedIdentity? identity, CommentSubject subject, long iid, CancellationToken cancellationToken)
+{
+    if (subject == CommentSubject.Issue)
+    {
+        Issue? issue = await store.FindIssueAsync(identity, project.Project.Id, iid, cancellationToken);
+        return issue is null ? null : (issue.TimeEstimateSeconds, issue.TimeSpentSeconds);
+    }
+    MergeProposal? proposal = await store.FindMergeProposalAsync(identity, project.Project.Id, iid, null, cancellationToken);
+    return proposal is null ? null : (proposal.TimeEstimateSeconds, proposal.TimeSpentSeconds);
+}
+
+async Task WriteTimeStats(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity, CommentSubject subject)
+{
+    (long Estimate, long Spent)? totals = await TimeTotals(project, identity, subject, Number(context), context.RequestAborted);
+    if (totals is null) { await ApiError(context, 404, subject == CommentSubject.Issue ? "404 Issue Not Found" : "404 Merge Request Not Found"); return; }
+    await context.Response.WriteAsJsonAsync(TimeStatsFor(totals.Value.Estimate, totals.Value.Spent), ApiJson.Default.TimeStatsResponse, null, context.RequestAborted);
+}
+
+async Task TimeAction(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity, CommentSubject subject, string action)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    TimeRequest? request = null;
+    if (context.Request.HasJsonContentType())
+        request = await context.Request.ReadFromJsonAsync(ApiJson.Default.TimeRequest, context.RequestAborted);
+    long seconds = 0;
+    bool negative = false;
+    if (action is "time_estimate" or "add_spent_time")
+    {
+        string duration = (request?.Duration ?? context.Request.Query["duration"].ToString()).Trim();
+        if (duration.StartsWith('-')) { negative = true; duration = duration[1..]; }
+        if (!TimeTracking.TryParse(duration, out seconds)) { await ApiError(context, 400, "duration is like 3h 30m, 2d or 1w"); return; }
+    }
+    DateOnly? spentOn = null;
+    if (request?.SpentAt is { Length: > 0 } when)
+    {
+        if (!DateOnly.TryParseExact(when.Length >= 10 ? when[..10] : when, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.None, out DateOnly day)) { await ApiError(context, 400, "spent_at is YYYY-MM-DD"); return; }
+        spentOn = day;
+    }
+    try
+    {
+        switch (action)
+        {
+            case "time_estimate":
+                if (negative) { await ApiError(context, 400, "an estimate is not negative"); return; }
+                await store.SetTimeEstimateAsync(identity, project.Project.Id, subject, Number(context), seconds, context.RequestAborted);
+                break;
+            case "reset_time_estimate":
+                await store.SetTimeEstimateAsync(identity, project.Project.Id, subject, Number(context), 0, context.RequestAborted);
+                break;
+            case "add_spent_time":
+                await store.AddTimeSpentAsync(identity, project.Project.Id, subject, Number(context), negative ? -seconds : seconds, spentOn, request?.Summary ?? "", context.RequestAborted);
+                break;
+            case "reset_spent_time":
+                await store.ResetTimeSpentAsync(identity, project.Project.Id, subject, Number(context), context.RequestAborted);
+                break;
+        }
+        await WriteTimeStats(context, project, identity, subject);
+    }
+    catch (CollaborationNotFoundException error) { await ApiError(context, 404, error.Message); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    catch (ArgumentOutOfRangeException) { await ApiError(context, 400, "duration is out of range"); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+}
+
+async Task ListTime(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity, CommentSubject subject)
+{
+    if (!await OnlyQuery(context)) return;
+    try
+    {
+        IReadOnlyList<TimeEntry> entries = await store.ListTimeEntriesAsync(identity, project.Project.Id, subject, Number(context), context.RequestAborted);
+        await context.Response.WriteAsJsonAsync([.. entries.Select(entry => new TimeEntryResponse(entry.Id, entry.Username, entry.Seconds,
+            TimeTracking.Humanize(Math.Abs(entry.Seconds)) is { } human ? (entry.Seconds < 0 ? "-" + human : human) : null,
+            entry.SpentOn.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture), entry.Summary, entry.CreatedAtUtc))],
+            ApiJson.Default.TimeEntryResponseArray, null, context.RequestAborted);
+    }
+    catch (CollaborationNotFoundException error) { await ApiError(context, 404, error.Message); }
+}
+
 // The branch tip behind an anchored comment addressed by id alone, which the browser route does. Null when
 // the comment is not on a proposal or the branch is gone, both of which leave the anchor outdated.
 async Task<string?> SourceTipOfComment(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity, long commentId)
@@ -3603,6 +4219,20 @@ app.MapPost("/api/projects/{projectId:long}/merge-requests/{iid:long}/merge", as
     await AcceptMergeRequest(context, scope.Value.Details, scope.Value.Identity);
 });
 
+app.MapPost("/api/projects/{projectId:long}/merge-requests/{iid:long}/rebase", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: true);
+    if (scope is null) return;
+    await RebaseMergeRequest(context, scope.Value.Details, scope.Value.Identity);
+});
+
+app.MapMethods("/api/v4/projects/{projectId}/merge_requests/{iid:long}/rebase", ["PUT"], async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    await RebaseMergeRequest(context, scope.Value.Details, scope.Value.Identity);
+});
+
 app.MapPost("/api/projects/{projectId:long}/merge-requests/{iid:long}/approve", async context =>
 {
     var scope = await BrowserCollaboration(context, write: true);
@@ -3711,7 +4341,81 @@ foreach ((string root, bool browserFamily) in new[] { ("/api/projects/{projectId
     app.MapDelete(root + "/boards/{boardId:long}/lists/{listId:long}", async context => { var scope = await Scope(context, true); if (scope is not null) await DeleteBoardList(context, scope.Value.Details, scope.Value.Identity); });
 
     app.MapGet(root + "/users", async context => { var scope = await Scope(context, false); if (scope is not null) await ListAssignable(context, scope.Value.Details, scope.Value.Identity); });
+
+    app.MapGet(root + "/releases", async context => { var scope = await Scope(context, false); if (scope is not null) await ListReleases(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapPost(root + "/releases", async context => { var scope = await Scope(context, true); if (scope is not null) await CreateRelease(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapGet(root + "/releases/{tag}", async context => { var scope = await Scope(context, false); if (scope is not null) await ReadRelease(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapMethods(root + "/releases/{tag}", [browserFamily ? "POST" : "PUT"], async context => { var scope = await Scope(context, true); if (scope is not null) await UpdateRelease(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapDelete(root + "/releases/{tag}", async context => { var scope = await Scope(context, true); if (scope is not null) await DeleteRelease(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapPost(root + "/releases/{tag}/assets/links", async context => { var scope = await Scope(context, true); if (scope is not null) await AddReleaseLink(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapDelete(root + "/releases/{tag}/assets/links/{linkId:long}", async context => { var scope = await Scope(context, true); if (scope is not null) await DeleteReleaseLink(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapGet(root + "/releases/{tag}/assets/files/{fileName}", async context => { var scope = await Scope(context, false); if (scope is not null) await DownloadReleaseAsset(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapDelete(root + "/releases/{tag}/assets/files/{fileName}", async context => { var scope = await Scope(context, true); if (scope is not null) await DeleteReleaseAsset(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapGet(root + "/wikis", async context => { var scope = await Scope(context, false); if (scope is not null) await ListWiki(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapPost(root + "/wikis", async context => { var scope = await Scope(context, true); if (scope is not null) await CreateWiki(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapGet(root + "/wikis/{slug}", async context => { var scope = await Scope(context, false); if (scope is not null) await ReadWiki(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapGet(root + "/wikis/{slug}/versions", async context => { var scope = await Scope(context, false); if (scope is not null) await ListWikiVersions(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapMethods(root + "/wikis/{slug}", [browserFamily ? "POST" : "PUT"], async context => { var scope = await Scope(context, true); if (scope is not null) await UpdateWiki(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapDelete(root + "/wikis/{slug}", async context => { var scope = await Scope(context, true); if (scope is not null) await DeleteWiki(context, scope.Value.Details, scope.Value.Identity); });
+
+    app.MapGet(root + "/snippets", async context => { var scope = await Scope(context, false); if (scope is not null) await ListSnippets(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapPost(root + "/snippets", async context => { var scope = await Scope(context, true); if (scope is not null) await CreateSnippet(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapGet(root + "/snippets/{snippetId:long}", async context => { var scope = await Scope(context, false); if (scope is not null) await ReadSnippet(context, scope.Value.Details, scope.Value.Identity, raw: false); });
+    app.MapGet(root + "/snippets/{snippetId:long}/raw", async context => { var scope = await Scope(context, false); if (scope is not null) await ReadSnippet(context, scope.Value.Details, scope.Value.Identity, raw: true); });
+    app.MapMethods(root + "/snippets/{snippetId:long}", [browserFamily ? "POST" : "PUT"], async context => { var scope = await Scope(context, true); if (scope is not null) await UpdateSnippet(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapDelete(root + "/snippets/{snippetId:long}", async context => { var scope = await Scope(context, true); if (scope is not null) await DeleteSnippet(context, scope.Value.Details, scope.Value.Identity); });
+
+    foreach ((string segment, CommentSubject timeSubject) in new[] { (browserFamily ? "issues" : "issues", CommentSubject.Issue), (browserFamily ? "merge-requests" : "merge_requests", CommentSubject.MergeRequest) })
+    {
+        app.MapGet(root + "/" + segment + "/{iid:long}/time_stats", async context => { var scope = await Scope(context, false); if (scope is not null) await WriteTimeStats(context, scope.Value.Details, scope.Value.Identity, timeSubject); });
+        app.MapGet(root + "/" + segment + "/{iid:long}/time_entries", async context => { var scope = await Scope(context, false); if (scope is not null) await ListTime(context, scope.Value.Details, scope.Value.Identity, timeSubject); });
+        foreach (string action in new[] { "time_estimate", "reset_time_estimate", "add_spent_time", "reset_spent_time" })
+        {
+            string chosenAction = action;
+            app.MapPost(root + "/" + segment + "/{iid:long}/" + action, async context => { var scope = await Scope(context, true); if (scope is not null) await TimeAction(context, scope.Value.Details, scope.Value.Identity, timeSubject, chosenAction); });
+        }
+    }
+
+    if (!browserFamily)
+        app.MapMethods(root + "/releases/{tag}/assets/files/{fileName}", ["PUT"], async context =>
+        {
+            // The token route carries the bytes. Bounded on the declared length before anything is read.
+            var scope = await ApiCollaboration(context);
+            if (scope is null) return;
+            await PutReleaseAssetBytes(context, scope.Value.Details, scope.Value.Identity);
+        });
 }
+
+// The browser's half of a release file: an upload receipt, re-authenticated, re-authorized, and confirmed
+// to be the caller's own upload under the release-asset profile.
+app.MapPost("/api/graft/projects/{projectId:long}/releases/{tag}/assets", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: true);
+    if (scope is null || scope.Value.Identity is null) return;
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    ReleaseAssetIngestRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.ReleaseAssetIngestRequest, context.RequestAborted);
+    if (request is null || !Guid.TryParse(request.UploadId, out Guid uploadId)) { await ApiError(context, 400, "upload-id"); return; }
+    DiskUploadStore uploads = context.RequestServices.GetRequiredService<DiskUploadStore>();
+    string owner = GraftSessionAuthenticationHandler.Owner(scope.Value.Identity);
+    byte[] bytes = [];
+    string fileName;
+    try
+    {
+        UploadStatus status = uploads.Get(owner, uploadId);
+        if (!string.Equals(status.Profile, UploadLimits.ReleaseAssetProfile, StringComparison.Ordinal))
+        { await ApiError(context, 400, "upload was not created for release files"); return; }
+        if (status.Length > GraftStore.MaximumAssetBytes) { await ApiError(context, 413, "the file exceeds the 32 MiB asset limit"); return; }
+        fileName = Path.GetFileName(status.FileName);
+        await uploads.ReadCompletedAsync(owner, uploadId, async (source, cancellationToken) =>
+        {
+            using MemoryStream buffer = new();
+            await source.CopyToAsync(buffer, cancellationToken);
+            bytes = buffer.ToArray();
+        }, context.RequestAborted);
+    }
+    catch (UploadException error) { await ApiError(context, error.StatusCode, error.Message); return; }
+    await StoreReleaseAsset(context, scope.Value.Details, scope.Value.Identity, fileName, bytes);
+});
 
 foreach ((string segment, CommentSubject noteSubject) in new[] { ("issues", CommentSubject.Issue), ("merge_requests", CommentSubject.MergeRequest) })
 {

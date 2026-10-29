@@ -57,6 +57,10 @@ public static class GraftGuide
         shows them and graft_triage applies them, with a milestone, assignees and a due date. Triaging needs
         the permission to push, or to be the author.
 
+        Knowledge. A project has a wiki, read and written with graft_read_wiki and graft_write_wiki; every
+        save keeps the previous text as a version. graft_list_releases shows what a project has shipped and
+        where to download it.
+
         Ask graft_help for detail on: addressing, permissions, visibility, pages, writing, collaboration,
         limits.
         """;
@@ -236,6 +240,15 @@ public static class GraftGuide
             `graft_read_merge_request` reports `merge_method` before anything is merged, so you can tell
             which of those three a proposal is in without attempting it. A listing does not: deciding costs
             three tree walks per proposal, so a list reports `unchecked` and you read one to find out.
+
+            `graft_merge` with `squash` lands the branch as one commit on the target, with the title as its
+            message, and leaves the branch's own commits behind. There is no tool to rebase: a rebase
+            rewrites a branch other people may have fetched, and that is withheld for the reason deleting
+            a branch is. Ask a person to rebase, or propose from a fresh branch.
+
+            A project may name code owners in a CODEOWNERS file on the target branch, and may require an
+            owner's approval for every owned path a proposal changes. `graft_read_merge_request` reports the
+            owners and which paths still wait; a merge refused for that reason says which paths.
 
             ## Reviewing a line rather than a change
 

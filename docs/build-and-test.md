@@ -105,7 +105,7 @@ Mutating tools are refused unless `--allow-writes true`. There is no option to s
 verification; `--ca-certificate` names the certificate to trust.
 
 The shared tool code lives in `src/Graft.McpTools`, referenced by both, so the forge and the launcher cannot
-offer different tools. The set is eighteen tools; what an agent may do
+offer different tools. The set is thirty-five tools; what an agent may do
 through them is bounded by its token's scopes, the project permission, and the administrator's write switch.
 Account administration, token issue and the agent switches themselves are deliberately not among them; see
 [ADR 0011](decisions/0011-agent-parity.md).

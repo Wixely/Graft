@@ -268,7 +268,8 @@ public sealed record RepositoryPageResponse(
     /// <summary>How many approvals this project requires before a merge request may be merged. Carried here
     /// so the settings form starts on the stored value rather than on zero, which would quietly remove the
     /// gate the first time anybody saved the form.</summary>
-    [property: JsonPropertyName("approvals_required")] int ApprovalsRequired = 0);
+    [property: JsonPropertyName("approvals_required")] int ApprovalsRequired = 0,
+    [property: JsonPropertyName("require_code_owner_approval")] bool RequireCodeOwnerApproval = false);
 
 public sealed record VisibilityRequest(string? Visibility);
 public sealed record PagePublishRequest(bool Published);
@@ -496,7 +497,14 @@ public sealed record MergeRequestResponse(
     IReadOnlyList<UserResponse>? Reviewers = null,
     /// <summary>Marked as not ready. A draft cannot be merged however mergeable its branches are.</summary>
     bool Draft = false,
-    [property: JsonPropertyName("time_stats")] TimeStatsResponse? TimeStats = null);
+    [property: JsonPropertyName("time_stats")] TimeStatsResponse? TimeStats = null,
+    /// <summary>Who owns each changed path that the target's CODEOWNERS names. Null in a listing. Graft's
+    /// own field. Whether their approval is required is <c>code_owner_approval_required</c>.</summary>
+    [property: JsonPropertyName("code_owners")] IReadOnlyList<CodeOwnerResponse>? CodeOwners = null,
+    [property: JsonPropertyName("code_owner_approval_required")] bool CodeOwnerApprovalRequired = false,
+    /// <summary>The owned paths still waiting for an owner's current approval. Empty when the gate is
+    /// satisfied or off.</summary>
+    [property: JsonPropertyName("code_owner_approvals_missing")] IReadOnlyList<string>? CodeOwnerApprovalsMissing = null);
 
 public sealed record IssuePageResponse(IReadOnlyList<IssueResponse> Issues, long Total, int Page, int PerPage);
 public sealed record MergeRequestPageResponse(IReadOnlyList<MergeRequestResponse> MergeRequests, long Total, int Page, int PerPage);
@@ -547,9 +555,129 @@ public sealed record ApprovalResponse(
     bool Current,
     [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt);
 
-/// <summary>How many approvals a project requires before a merge. Zero removes the gate.</summary>
+/// <summary>How many approvals a project requires before a merge. Zero removes the gate. The code owner
+/// rule travels with it: absent leaves it alone.</summary>
 public sealed record ApprovalsRequiredRequest(
-    [property: JsonPropertyName("approvals_before_merge")] int ApprovalsBeforeMerge);
+    [property: JsonPropertyName("approvals_before_merge")] int? ApprovalsBeforeMerge,
+    [property: JsonPropertyName("require_code_owner_approval")] bool? RequireCodeOwnerApproval = null);
+
+/// <summary>
+/// A release, in GitLab's shape with Graft's files beside GitLab's links. <c>assets.sources</c> are the
+/// archives Graft can build of the tag; <c>assets.files</c> are what was uploaded.
+/// </summary>
+public sealed record ReleaseResponse(
+    [property: JsonPropertyName("tag_name")] string TagName,
+    string Name,
+    string Description,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt,
+    [property: JsonPropertyName("released_at")] DateTimeOffset ReleasedAt,
+    UserResponse Author,
+    /// <summary>The commit the tag resolves to, or null when the tag no longer exists.</summary>
+    CommitResponse? Commit,
+    [property: JsonPropertyName("tag_exists")] bool TagExists,
+    ReleaseAssetsResponse Assets,
+    [property: JsonPropertyName("web_url")] string WebUrl);
+
+public sealed record ReleaseAssetsResponse(
+    int Count,
+    IReadOnlyList<ReleaseSourceResponse> Sources,
+    IReadOnlyList<ReleaseLinkResponse> Links,
+    IReadOnlyList<ReleaseFileResponse> Files);
+
+public sealed record ReleaseSourceResponse(string Format, string Url);
+public sealed record ReleaseLinkResponse(long Id, string Name, string Url, [property: JsonPropertyName("link_type")] string LinkType);
+public sealed record ReleaseFileResponse(
+    long Id,
+    [property: JsonPropertyName("file_name")] string FileName,
+    long Size,
+    string Sha256,
+    string Url,
+    [property: JsonPropertyName("uploaded_by")] string UploadedBy,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt);
+
+/// <summary>Creates or edits a release. On a create <c>tag_name</c> is required and the tag must exist.</summary>
+public sealed record ReleaseRequest(
+    [property: JsonPropertyName("tag_name")] string? TagName,
+    string? Name,
+    string? Description,
+    [property: JsonPropertyName("released_at")] DateTimeOffset? ReleasedAt);
+
+public sealed record ReleaseLinkRequest(string? Name, string? Url, [property: JsonPropertyName("link_type")] string? LinkType);
+
+/// <summary>Attaches an upload the browser moved through the upload transport to a release.</summary>
+public sealed record ReleaseAssetIngestRequest([property: JsonPropertyName("upload_id")] string UploadId);
+
+/// <summary>A wiki page in GitLab's shape. <c>content</c> is empty in a listing. <c>html</c> is Graft's own:
+/// the content rendered by the same renderer and the same rules as a README.</summary>
+public sealed record WikiPageResponse(
+    string Slug,
+    string Title,
+    string Content,
+    string Format,
+    string? Html,
+    [property: JsonPropertyName("created_by")] string CreatedBy,
+    [property: JsonPropertyName("updated_by")] string UpdatedBy,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt,
+    [property: JsonPropertyName("updated_at")] DateTimeOffset UpdatedAt,
+    long Versions,
+    [property: JsonPropertyName("web_url")] string WebUrl,
+    [property: JsonPropertyName("has_diagrams")] bool HasDiagrams = false);
+
+public sealed record WikiVersionResponse(
+    long Id,
+    string Title,
+    string Content,
+    string Message,
+    string Author,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt);
+
+/// <summary>Creates or edits a page. <c>message</c> is a word about the change, kept with the version.</summary>
+public sealed record WikiPageRequest(string? Title, string? Content, string? Message);
+
+public sealed record SnippetResponse(
+    long Id,
+    string Title,
+    [property: JsonPropertyName("file_name")] string FileName,
+    string Description,
+    /// <summary>Empty in a listing.</summary>
+    string? Content,
+    UserResponse Author,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt,
+    [property: JsonPropertyName("updated_at")] DateTimeOffset UpdatedAt,
+    [property: JsonPropertyName("web_url")] string WebUrl,
+    [property: JsonPropertyName("raw_url")] string RawUrl);
+
+public sealed record SnippetRequest(
+    string? Title,
+    [property: JsonPropertyName("file_name")] string? FileName,
+    string? Description,
+    string? Content);
+
+/// <summary>A duration in GitLab's vocabulary, like <c>3h 30m</c>, and optionally when and what.</summary>
+public sealed record TimeRequest(
+    string? Duration,
+    [property: JsonPropertyName("spent_at")] string? SpentAt = null,
+    string? Summary = null);
+
+public sealed record TimeEntryResponse(
+    long Id,
+    string Username,
+    long Seconds,
+    [property: JsonPropertyName("human_time")] string? HumanTime,
+    [property: JsonPropertyName("spent_on")] string SpentOn,
+    string Summary,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt);
+
+/// <summary>Who owns one changed path, from the target branch's CODEOWNERS file.</summary>
+public sealed record CodeOwnerResponse(string Path, IReadOnlyList<string> Owners);
+
+/// <summary>What a rebase did. The branch now ends at <c>sha</c>; every approval and line comment on the
+/// proposal was about commits that are no longer on it.</summary>
+public sealed record RebaseResultResponse(
+    MergeRequestResponse MergeRequest,
+    [property: JsonPropertyName("previous_sha")] string PreviousSha,
+    string Sha,
+    [property: JsonPropertyName("rewritten_commits")] int RewrittenCommits);
 
 /// <summary>
 /// A registered webhook. The signing secret is never reported: it is written once when the hook is made
@@ -658,9 +786,13 @@ public sealed record TagResponse(
 /// <summary>Names a new tag and what it should point at. <c>Ref</c> takes a branch, a tag or a commit id.</summary>
 public sealed record TagCreateRequest([property: JsonPropertyName("tag_name")] string? TagName, string? Ref);
 
-/// <summary>Asks for a merge, and optionally for the source branch to go with it.</summary>
+/// <summary>Asks for a merge, and optionally for the source branch to go with it. <c>squash</c> merges as
+/// one commit on the target with <c>squash_commit_message</c> as its message, the proposal's title when
+/// none is given.</summary>
 public sealed record MergeAcceptRequest(
-    [property: JsonPropertyName("should_remove_source_branch")] bool ShouldRemoveSourceBranch = false);
+    [property: JsonPropertyName("should_remove_source_branch")] bool ShouldRemoveSourceBranch = false,
+    bool Squash = false,
+    [property: JsonPropertyName("squash_commit_message")] string? SquashCommitMessage = null);
 
 /// <summary>What a merge produced, or why it could not happen.</summary>
 public sealed record MergeResultResponse(
@@ -762,6 +894,25 @@ public sealed record MergeRequestChangesResponse(
 [JsonSerializable(typeof(TagResponse))]
 [JsonSerializable(typeof(TagResponse[]))]
 [JsonSerializable(typeof(ApprovalsRequiredRequest))]
+[JsonSerializable(typeof(CodeOwnerResponse))]
+[JsonSerializable(typeof(WikiPageResponse))]
+[JsonSerializable(typeof(WikiPageResponse[]))]
+[JsonSerializable(typeof(WikiVersionResponse))]
+[JsonSerializable(typeof(WikiVersionResponse[]))]
+[JsonSerializable(typeof(WikiPageRequest))]
+[JsonSerializable(typeof(SnippetResponse))]
+[JsonSerializable(typeof(SnippetResponse[]))]
+[JsonSerializable(typeof(SnippetRequest))]
+[JsonSerializable(typeof(TimeRequest))]
+[JsonSerializable(typeof(TimeStatsResponse))]
+[JsonSerializable(typeof(TimeEntryResponse))]
+[JsonSerializable(typeof(TimeEntryResponse[]))]
+[JsonSerializable(typeof(ReleaseResponse))]
+[JsonSerializable(typeof(ReleaseResponse[]))]
+[JsonSerializable(typeof(ReleaseRequest))]
+[JsonSerializable(typeof(ReleaseLinkRequest))]
+[JsonSerializable(typeof(ReleaseAssetIngestRequest))]
+[JsonSerializable(typeof(RebaseResultResponse))]
 [JsonSerializable(typeof(WebhookCreateRequest))]
 [JsonSerializable(typeof(WebhookResponse))]
 [JsonSerializable(typeof(WebhookResponse[]))]

@@ -4,7 +4,7 @@ namespace Graft.Storage;
 
 public static class GraftSchema
 {
-    public static DnaXMigrationManifest Manifest { get; } = new(13,
+    public static DnaXMigrationManifest Manifest { get; } = new(15,
     [
         DnaXMigration.Sql(1, "initial-identity-project-schema", "Create identity and private project schema", """
             CREATE TABLE Users (
@@ -413,6 +413,120 @@ public static class GraftSchema
             ALTER TABLE MergeRequests ADD COLUMN Draft INTEGER NOT NULL DEFAULT 0 CHECK (Draft IN (0, 1));
             ALTER TABLE Projects ADD COLUMN RequireCodeOwnerApproval INTEGER NOT NULL DEFAULT 0
                 CHECK (RequireCodeOwnerApproval IN (0, 1));
+            """),
+        // A release: notes and files that sit on a tag.
+        //
+        // The tag is named, not referenced, because tags live in the repository and the database cannot
+        // hold a foreign key into it. A release whose tag was deleted still exists and says so; deleting a
+        // release never touches the tag. One release per tag per project.
+        //
+        // Links point elsewhere and store only a name and an address. Assets are files uploaded to the
+        // forge, and their bytes live here in the database rather than on disk so a backup captures them
+        // atomically with the release they belong to and a restore cannot reinstate one without the other.
+        // Each asset is bounded in size by the server before it is stored, which is what keeps a row from
+        // becoming a storage concern; the bound is a release-asset policy, not a SQLite limit.
+        DnaXMigration.Sql(14, "releases", "Let a tag carry notes, links and files", """
+            CREATE TABLE Releases (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                TagName TEXT NOT NULL,
+                Name TEXT NOT NULL,
+                Description TEXT NOT NULL DEFAULT '',
+                AuthorUserId INTEGER NOT NULL REFERENCES Users(Id),
+                CreatedAtUtc TEXT NOT NULL,
+                ReleasedAtUtc TEXT NOT NULL,
+                UNIQUE (ProjectId, TagName)
+            );
+
+            CREATE TABLE ReleaseLinks (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                ReleaseId INTEGER NOT NULL REFERENCES Releases(Id) ON DELETE CASCADE,
+                Name TEXT NOT NULL,
+                Url TEXT NOT NULL,
+                LinkType TEXT NOT NULL CHECK (LinkType IN ('other', 'runbook', 'image', 'package')),
+                UNIQUE (ReleaseId, Name)
+            );
+
+            CREATE TABLE ReleaseAssets (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                ReleaseId INTEGER NOT NULL REFERENCES Releases(Id) ON DELETE CASCADE,
+                FileName TEXT NOT NULL,
+                Size INTEGER NOT NULL,
+                Sha256 TEXT NOT NULL,
+                Bytes BLOB NOT NULL,
+                UploadedByUserId INTEGER NOT NULL REFERENCES Users(Id),
+                CreatedAtUtc TEXT NOT NULL,
+                UNIQUE (ReleaseId, FileName)
+            );
+
+            CREATE INDEX IX_Releases_Project ON Releases(ProjectId, ReleasedAtUtc);
+            """),
+        // Wiki pages, snippets and time tracking.
+        //
+        // A wiki page is a document in the database rather than a file in a second repository, which is how
+        // GitLab keeps one. The repository is the project's code; a wiki is prose about it, edited in a
+        // browser by people who may never clone, and keeping it in the database puts it in the same backup
+        // and under the same permissions as everything else said about the project. Every save keeps the
+        // previous text as a version, so a page can be read as it was and a bad edit undone.
+        //
+        // A snippet is one file with a title: a thing to paste and share rather than to build. It belongs
+        // to a project and is as visible as the project.
+        //
+        // Time is two numbers on an issue or proposal: an estimate, set as a whole, and a ledger of time
+        // spent, each entry attributed and dated so the total can be explained. Both are seconds.
+        DnaXMigration.Sql(15, "wiki-snippets-time", "Wiki pages with history, snippets, and time tracking", """
+            CREATE TABLE WikiPages (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                Slug TEXT NOT NULL,
+                Title TEXT NOT NULL,
+                Content TEXT NOT NULL,
+                CreatedByUserId INTEGER NOT NULL REFERENCES Users(Id),
+                UpdatedByUserId INTEGER NOT NULL REFERENCES Users(Id),
+                CreatedAtUtc TEXT NOT NULL,
+                UpdatedAtUtc TEXT NOT NULL,
+                UNIQUE (ProjectId, Slug)
+            );
+
+            CREATE TABLE WikiPageVersions (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                PageId INTEGER NOT NULL REFERENCES WikiPages(Id) ON DELETE CASCADE,
+                Title TEXT NOT NULL,
+                Content TEXT NOT NULL,
+                Message TEXT NOT NULL DEFAULT '',
+                AuthorUserId INTEGER NOT NULL REFERENCES Users(Id),
+                CreatedAtUtc TEXT NOT NULL
+            );
+
+            CREATE TABLE Snippets (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                Title TEXT NOT NULL,
+                FileName TEXT NOT NULL,
+                Description TEXT NOT NULL DEFAULT '',
+                Content TEXT NOT NULL,
+                AuthorUserId INTEGER NOT NULL REFERENCES Users(Id),
+                CreatedAtUtc TEXT NOT NULL,
+                UpdatedAtUtc TEXT NOT NULL
+            );
+
+            CREATE TABLE TimeEntries (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                SubjectType TEXT NOT NULL CHECK (SubjectType IN ('issue', 'merge_request')),
+                SubjectId INTEGER NOT NULL,
+                UserId INTEGER NOT NULL REFERENCES Users(Id),
+                Seconds INTEGER NOT NULL,
+                SpentOn TEXT NOT NULL,
+                Summary TEXT NOT NULL DEFAULT '',
+                CreatedAtUtc TEXT NOT NULL
+            );
+
+            ALTER TABLE Issues ADD COLUMN TimeEstimateSeconds INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE MergeRequests ADD COLUMN TimeEstimateSeconds INTEGER NOT NULL DEFAULT 0;
+
+            CREATE INDEX IX_WikiPageVersions_Page ON WikiPageVersions(PageId, Id);
+            CREATE INDEX IX_Snippets_Project ON Snippets(ProjectId, UpdatedAtUtc);
+            CREATE INDEX IX_TimeEntries_Subject ON TimeEntries(SubjectType, SubjectId, Id);
             """)
     ]);
 }

@@ -15,8 +15,18 @@ public enum MergeKind
     ThreeWay = 3,
     /// <summary>Both branches changed the same file. Graft does not merge file contents; see
     /// <see cref="MergeAnalysis.Conflicts"/> for the paths and the remarks on this type for why.</summary>
-    Conflict = 4
+    Conflict = 4,
+    /// <summary>Merged as one commit with a single parent, the source's own history left behind. Only ever
+    /// an outcome, never an analysis: whether a squash is possible is the same question as a merge.</summary>
+    Squash = 5
 }
+
+/// <summary>What a rebase did: where the branch was, where it is now, and which commits became which.</summary>
+public sealed record RebaseOutcome(
+    string PreviousTip,
+    string NewTip,
+    int Rewritten,
+    IReadOnlyList<(string Original, string Rewritten)> Commits);
 
 /// <summary>
 /// What a merge would do, computed without writing anything.
@@ -179,6 +189,180 @@ public static class RepositoryMerge
         Limits.Require(refs.Count <= Limits.RefCount, "ref-count");
         repository.Apply(staged, refs, cancellationToken);
         return new(MergeKind.ThreeWay, commit.Id, targetBranch);
+    }
+
+    /// <summary>
+    /// Merges as one commit. The target gains a single commit whose tree is exactly what <see cref="Merge"/>
+    /// would have produced and whose only parent is the target's tip, so the source's own history is left
+    /// behind rather than brought in. Refuses exactly what <see cref="Merge"/> refuses.
+    ///
+    /// <para>
+    /// A squash is a merge that forgets. The source branch keeps its commits, so nothing is lost from the
+    /// repository; what the target records is that one change arrived, written by whoever squashed it, with
+    /// the message they gave it.
+    /// </para>
+    /// </summary>
+    public static MergeOutcome Squash(
+        Repository repository,
+        string sourceBranch,
+        string targetBranch,
+        GitIdentity author,
+        string message,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(repository);
+        ArgumentNullException.ThrowIfNull(author);
+        string targetReference = "refs/heads/" + targetBranch;
+        Limits.Require(Limits.IsRef("refs/heads/" + sourceBranch) && Limits.IsRef(targetReference), "branch");
+
+        MergeAnalysis analysis = Analyse(repository, sourceBranch, targetBranch, cancellationToken);
+        Limits.Require(analysis.CanMerge, analysis.Kind switch
+        {
+            MergeKind.AlreadyMerged => "already-merged",
+            MergeKind.Conflict => "merge-conflict",
+            _ => "merge-unresolved"
+        });
+        string source = analysis.SourceCommitId!;
+        string target = analysis.TargetCommitId!;
+
+        Dictionary<string, (string Mode, string Id)> merged = new(StringComparer.Ordinal);
+        if (analysis.Kind == MergeKind.FastForward)
+        {
+            // The source tree is the answer: the target has gained nothing since the branch left it.
+            foreach ((string path, (string id, string mode)) in RepositoryDiff.Flatten(repository, RepositoryView.ReadCommit(repository, source).TreeId, ""))
+                merged[path] = (mode, id);
+        }
+        else
+        {
+            Dictionary<string, (string Id, string Mode)> baseFiles = analysis.BaseCommitId is null
+                ? new(StringComparer.Ordinal)
+                : RepositoryDiff.Flatten(repository, RepositoryView.ReadCommit(repository, analysis.BaseCommitId).TreeId, "");
+            Dictionary<string, (string Id, string Mode)> sourceFiles =
+                RepositoryDiff.Flatten(repository, RepositoryView.ReadCommit(repository, source).TreeId, "");
+            Dictionary<string, (string Id, string Mode)> targetFiles =
+                RepositoryDiff.Flatten(repository, RepositoryView.ReadCommit(repository, target).TreeId, "");
+            foreach (string path in Paths(baseFiles, sourceFiles, targetFiles))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                (string Id, string Mode)? resolved = Resolve(path, baseFiles, sourceFiles, targetFiles);
+                Limits.Require(resolved is not null, "merge-conflict");
+                if (resolved is (string id, string mode)) merged[path] = (mode, id);
+            }
+        }
+
+        Dictionary<string, GitObject> written = new(StringComparer.Ordinal);
+        string treeId = RepositoryAuthor.WriteTree(merged, written, cancellationToken);
+        GitObject commit = RepositoryAuthor.BuildCommit(treeId, [target], author, message);
+        written[commit.Id] = commit;
+        Publish(repository, written, targetReference, commit.Id, target, cancellationToken);
+        return new(MergeKind.Squash, commit.Id, targetBranch);
+    }
+
+    /// <summary>
+    /// Rewrites the source branch so its commits sit on the target's tip, one by one, each replayed as a
+    /// three-way merge of its own change onto the branch as rebuilt so far. The authors and messages are
+    /// kept; the committer is whoever rebased. Refuses, naming the file, where a replayed change and the
+    /// target changed the same file, for the reason <see cref="Merge"/> refuses.
+    ///
+    /// <para>
+    /// A rebase moves a branch backwards from where it was, which is what a client calls a forced push, so
+    /// it needs the permission a push needs and the caller should know that every approval and every line
+    /// comment on the proposal is about commits that no longer exist on the branch. Merge commits on the
+    /// source are refused rather than flattened: replaying one would silently change what it merged.
+    /// </para>
+    /// </summary>
+    public static RebaseOutcome Rebase(
+        Repository repository,
+        string sourceBranch,
+        string targetBranch,
+        GitIdentity committer,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(repository);
+        ArgumentNullException.ThrowIfNull(committer);
+        string sourceReference = "refs/heads/" + sourceBranch;
+        Limits.Require(Limits.IsRef(sourceReference) && Limits.IsRef("refs/heads/" + targetBranch), "branch");
+
+        MergeAnalysis analysis = Analyse(repository, sourceBranch, targetBranch, cancellationToken);
+        Limits.Require(analysis.Kind != MergeKind.Unresolved, "merge-unresolved");
+        string source = analysis.SourceCommitId!;
+        string target = analysis.TargetCommitId!;
+        // Already on the target, or already in it: there is nothing to move.
+        if (analysis.Kind is MergeKind.FastForward or MergeKind.AlreadyMerged) return new(source, source, 0, []);
+
+        // The commits to replay: reachable from the source and not from the target, oldest first.
+        HashSet<string> inTarget = Graph.Ancestors(repository.Objects, target, cancellationToken);
+        List<string> order = [];
+        HashSet<string> seen = new(StringComparer.Ordinal);
+        void Visit(string id)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (inTarget.Contains(id) || !seen.Add(id)) return;
+            GitCommit commit = RepositoryView.ReadCommit(repository, id);
+            Limits.Require(commit.ParentIds.Count <= 1, "rebase-merge-commit");
+            foreach (string parent in commit.ParentIds) Visit(parent);
+            order.Add(id);
+        }
+        Visit(source);
+        Limits.Require(order.Count <= MaximumRebasedCommits, "rebase-too-many");
+
+        Dictionary<string, GitObject> written = new(StringComparer.Ordinal);
+        string tip = target;
+        Dictionary<string, (string Id, string Mode)> current =
+            RepositoryDiff.Flatten(repository, RepositoryView.ReadCommit(repository, target).TreeId, "");
+        List<(string Original, string Rewritten)> rewritten = [];
+        foreach (string id in order)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            GitCommit commit = RepositoryView.ReadCommit(repository, id);
+            Dictionary<string, (string Id, string Mode)> before = commit.ParentIds.Count == 0
+                ? new(StringComparer.Ordinal)
+                : RepositoryDiff.Flatten(repository, RepositoryView.ReadCommit(repository, commit.ParentIds[0]).TreeId, "");
+            Dictionary<string, (string Id, string Mode)> after = RepositoryDiff.Flatten(repository, commit.TreeId, "");
+
+            // Each commit is a cherry-pick: its own change (before to after) applied to the branch as rebuilt
+            // so far, with the same file-level rule the merge uses and the same refusal.
+            Dictionary<string, (string Mode, string Id)> next = new(StringComparer.Ordinal);
+            Dictionary<string, (string Id, string Mode)> nextFlat = new(StringComparer.Ordinal);
+            foreach (string path in Paths(before, after, current))
+            {
+                (string Id, string Mode)? resolved = Resolve(path, before, after, current);
+                Limits.Require(resolved is not null, "rebase-conflict:" + path);
+                if (resolved is (string blob, string mode)) { next[path] = (mode, blob); nextFlat[path] = (blob, mode); }
+            }
+            string treeId = RepositoryAuthor.WriteTree(next, written, cancellationToken);
+            GitObject replayed = RepositoryAuthor.BuildCommit(treeId, [tip], commit.Author, committer, commit.Message);
+            written[replayed.Id] = replayed;
+            rewritten.Add((id, replayed.Id));
+            tip = replayed.Id;
+            current = nextFlat;
+        }
+
+        Publish(repository, written, sourceReference, tip, null, cancellationToken);
+        return new(source, tip, rewritten.Count, rewritten);
+    }
+
+    private const int MaximumRebasedCommits = 200;
+
+    /// <summary>
+    /// Stages new objects beside the repository's own, applies the same checks a pushed batch gets, and
+    /// moves one reference. <paramref name="mustContain"/> names a commit the new tip has to reach, which
+    /// a merge or squash uses to insist the target advanced; a rebase passes null, because moving a branch
+    /// off its old tip is the whole point.
+    /// </summary>
+    private static void Publish(Repository repository, Dictionary<string, GitObject> written, string reference,
+        string tip, string? mustContain, CancellationToken cancellationToken)
+    {
+        Dictionary<string, GitObject> staged = new(repository.Objects, StringComparer.Ordinal);
+        foreach ((string id, GitObject value) in written) staged[id] = value;
+        Limits.Require(staged.Count <= Limits.ObjectCount, "repository-object-count");
+        Limits.Require(staged.Values.Sum(value => (long)value.Size) <= Limits.ExpandedBytes, "repository-budget");
+        Graph.Walk(staged, [tip], cancellationToken);
+        if (mustContain is not null)
+            Limits.Require(Graph.IsAncestor(staged, mustContain, tip, cancellationToken), "non-fast-forward");
+        Dictionary<string, string> refs = new(repository.Refs, StringComparer.Ordinal) { [reference] = tip };
+        Limits.Require(refs.Count <= Limits.RefCount, "ref-count");
+        repository.Apply(staged, refs, cancellationToken);
     }
 
     /// <summary>
