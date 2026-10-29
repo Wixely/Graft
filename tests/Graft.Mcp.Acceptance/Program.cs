@@ -150,7 +150,7 @@ async Task CheckForge(string address, string token, string password)
     using (HttpResponseMessage listing = await Post(client, token, Request(3, "tools/list", "{}")))
     {
         using JsonDocument body = Parse(await listing.Content.ReadAsStringAsync());
-        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 29,
+        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 32,
             "the forge's endpoint advertises every tool");
     }
 
@@ -498,7 +498,7 @@ async Task CheckStdio(string address, bool readOnly)
 
         using JsonDocument tools = await Exchange(client, Request(2, "tools/list", "{}"));
         int count = tools.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength();
-        Check(count == 29, label + " advertises every tool");
+        Check(count == 32, label + " advertises every tool");
 
         using JsonDocument read = await Exchange(client, Call(3, "graft_browse", """{"search":""}"""));
         Check(Text(read).Contains("admin/shared", StringComparison.Ordinal), label + " reads the public listing");
@@ -551,7 +551,7 @@ async Task CheckHttp(string address, string token)
     using (HttpResponseMessage listing = await Post(client, token, Request(3, "tools/list", "{}")))
     {
         using JsonDocument body = Parse(await listing.Content.ReadAsStringAsync());
-        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 29,
+        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 32,
             "the launcher's HTTP endpoint advertises every tool");
     }
 

@@ -1,0 +1,186 @@
+@page "/{Namespace}/{Slug}/-/labels"
+@page "/projects/{Slug}/-/labels"
+@inject GraftApi Api
+
+<PageTitle>Labels &middot; Graft</PageTitle>
+
+@if (loading)
+{
+    <p role="status" class="secondary-text">Loading…</p>
+}
+else if (project is null)
+{
+    <div class="page-header"><div><h1>Unavailable</h1><p class="subtitle">@message</p></div></div>
+    <a class="button secondary" href="/"><Icon Name="chevron-left" />Back to projects</a>
+}
+else
+{
+    <div class="page-header">
+        <div>
+            <h1>Labels</h1>
+            <p class="subtitle"><a href="@ProjectUrl">@project.Namespace.Name / @project.Name</a></p>
+        </div>
+        <div class="page-header-actions">
+            <a class="button secondary" href="@(ProjectUrl + "/-/issues")"><Icon Name="issue" />Issues</a>
+            <a class="button secondary" href="@(ProjectUrl + "/-/boards")"><Icon Name="folder" />Boards</a>
+            @if (canPush)
+            {
+                <button type="button" class="@(composing ? "secondary" : "")" @onclick="() => { composing = !composing; editingId = null; }"><Icon Name="plus" />New label</button>
+            }
+        </div>
+    </div>
+
+    <Banner Message="@message" Kind="@messageKind" />
+
+    @if (composing || editingId is not null)
+    {
+        <div class="panel">
+            <div class="panel-header"><h2>@(editingId is null ? "Create a label" : "Edit label")</h2></div>
+            <div class="panel-body">
+                <form class="form" @onsubmit="Save" @onsubmit:preventDefault>
+                    <label for="label-name">Name</label>
+                    <input id="label-name" @bind="draftName" required maxlength="255" autocomplete="off" />
+                    <label for="label-color">Colour</label>
+                    <input id="label-color" type="color" @bind="draftColor" />
+                    <label for="label-description">Description</label>
+                    <input id="label-description" @bind="draftDescription" maxlength="255" autocomplete="off" />
+                    <div class="form-actions">
+                        <button type="submit" disabled="@busy">@(busy ? "Saving…" : editingId is null ? "Create label" : "Save")</button>
+                        <button type="button" class="secondary" @onclick="Cancel" disabled="@busy">Cancel</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    }
+
+    <div class="panel">
+        <div class="panel-header"><h2>Labels</h2><span class="spacer"></span><span class="label">@labels.Length</span></div>
+        @if (labels.Length == 0)
+        {
+            <div class="panel-empty">No labels yet. @(canPush ? "Create one to start sorting issues." : "")</div>
+        }
+        else
+        {
+            <div class="list">
+                @foreach (LabelResponse label in labels)
+                {
+                    <div class="list-item">
+                        <LabelChip Label="label" />
+                        <span class="list-item-main">
+                            <small>@(label.Description.Length > 0 ? label.Description : "No description")</small>
+                        </span>
+                        <a class="link" href="@(ProjectUrl + "/-/issues?labels=" + Uri.EscapeDataString(label.Name))">Issues</a>
+                        @if (canPush)
+                        {
+                            <span class="list-item-actions">
+                                <button type="button" class="link" @onclick="() => StartEdit(label)" disabled="@busy">Edit</button>
+                                <button type="button" class="link danger-text" @onclick="() => Delete(label)" disabled="@busy">Delete</button>
+                            </span>
+                        }
+                    </div>
+                }
+            </div>
+        }
+    </div>
+}
+
+@code {
+    [Parameter] public string Namespace { get; set; } = "";
+    [Parameter] public string Slug { get; set; } = "";
+
+    private ProjectResponse? project;
+    private long projectId;
+    private bool canPush;
+    private LabelResponse[] labels = [];
+    private bool loading = true;
+    private bool busy;
+    private bool composing;
+    private long? editingId;
+    private string draftName = "";
+    private string draftColor = "#6e7781";
+    private string draftDescription = "";
+    private string message = "";
+    private string messageKind = "info";
+
+    private bool ViaSlug => Namespace.Length == 0;
+    private string ProjectUrl => ViaSlug
+        ? $"/projects/{Uri.EscapeDataString(Slug)}"
+        : $"/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
+
+    protected override async Task OnParametersSetAsync()
+    {
+        loading = true;
+        try
+        {
+            await Api.EnsureSessionAsync();
+            string path = ViaSlug
+                ? $"api/graft/slugs/{Uri.EscapeDataString(Slug)}"
+                : $"api/browser/projects/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
+            (bool reached, RepositoryPageResponse? page) = await Api.GetOptionalAsync(path, ApiJson.Default.RepositoryPageResponse);
+            if (!reached) { message = "Graft could not be reached."; return; }
+            if (page is null) { message = "That repository could not be found."; return; }
+            project = page.Project;
+            projectId = page.Project.Id;
+            canPush = page.CanPush;
+            await Load();
+        }
+        finally { loading = false; }
+    }
+
+    private async Task Load() =>
+        labels = await Api.GetAsync($"api/projects/{projectId}/labels", ApiJson.Default.LabelResponseArray) ?? [];
+
+    private void StartEdit(LabelResponse label)
+    {
+        composing = false;
+        editingId = label.Id;
+        draftName = label.Name;
+        draftColor = label.Color;
+        draftDescription = label.Description;
+    }
+
+    private void Cancel()
+    {
+        composing = false;
+        editingId = null;
+        draftName = "";
+        draftColor = "#6e7781";
+        draftDescription = "";
+    }
+
+    private async Task Save()
+    {
+        if (busy) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = editingId is null
+                ? await Api.PostAsync($"api/projects/{projectId}/labels", new LabelRequest(draftName, draftColor, draftDescription),
+                    ApiJson.Default.LabelRequest, "Label created.")
+                : await Api.PostAsync($"api/projects/{projectId}/labels/{editingId}", new LabelRequest(draftName, draftColor, draftDescription),
+                    ApiJson.Default.LabelRequest, "Label saved.");
+            message = result.Message;
+            messageKind = result.Ok ? "success" : "error";
+            if (!result.Ok) return;
+            Cancel();
+            await Load();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task Delete(LabelResponse label)
+    {
+        if (busy) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.DeleteAsync($"api/projects/{projectId}/labels/{label.Id}", $"{label.Name} deleted from the project and from everything it was on.");
+            message = result.Message;
+            messageKind = result.Ok ? "success" : "error";
+            if (result.Ok) await Load();
+        }
+        finally { busy = false; }
+    }
+}

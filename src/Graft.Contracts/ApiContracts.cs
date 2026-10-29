@@ -377,7 +377,76 @@ public sealed record IssueResponse(
     [property: JsonPropertyName("web_url")] string WebUrl,
     /// <summary>How many comments it has. Graft's own field, so a listing can show it without a second
     /// request for every row.</summary>
-    [property: JsonPropertyName("user_notes_count")] long UserNotesCount = 0);
+    [property: JsonPropertyName("user_notes_count")] long UserNotesCount = 0,
+    /// <summary>Label names, GitLab's shape. The colours are in <see cref="LabelDetails"/>.</summary>
+    IReadOnlyList<string>? Labels = null,
+    [property: JsonPropertyName("label_details")] IReadOnlyList<LabelResponse>? LabelDetails = null,
+    MilestoneReferenceResponse? Milestone = null,
+    IReadOnlyList<UserResponse>? Assignees = null,
+    /// <summary>A date with no time, as <c>YYYY-MM-DD</c>.</summary>
+    [property: JsonPropertyName("due_date")] string? DueDate = null,
+    bool Confidential = false,
+    [property: JsonPropertyName("time_stats")] TimeStatsResponse? TimeStats = null);
+
+/// <summary>A project label. <c>text_color</c> is what reads against <c>color</c>, computed here so every
+/// client paints it the same way.</summary>
+public sealed record LabelResponse(
+    long Id,
+    string Name,
+    string Color,
+    [property: JsonPropertyName("text_color")] string TextColor,
+    string Description);
+
+/// <summary>Creates or edits a label. On an edit every field is optional.</summary>
+public sealed record LabelRequest(string? Name, string? Color, string? Description);
+
+/// <summary>A milestone as an issue names it.</summary>
+public sealed record MilestoneReferenceResponse(long Id, long Iid, string Title);
+
+public sealed record MilestoneResponse(
+    long Id,
+    long Iid,
+    [property: JsonPropertyName("project_id")] long ProjectId,
+    string Title,
+    string Description,
+    /// <summary><c>active</c> or <c>closed</c>, GitLab's words.</summary>
+    string State,
+    [property: JsonPropertyName("due_date")] string? DueDate,
+    [property: JsonPropertyName("start_date")] string? StartDate,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt,
+    [property: JsonPropertyName("updated_at")] DateTimeOffset UpdatedAt,
+    [property: JsonPropertyName("web_url")] string WebUrl,
+    /// <summary>Graft's own counts, so a milestone page needs no second request.</summary>
+    [property: JsonPropertyName("open_issues")] long OpenIssues = 0,
+    [property: JsonPropertyName("closed_issues")] long ClosedIssues = 0,
+    [property: JsonPropertyName("merge_requests")] long MergeRequests = 0);
+
+/// <summary>Creates or edits a milestone. <c>state_event</c> takes <c>close</c> or <c>activate</c>. An empty
+/// date clears it; an absent one leaves it alone.</summary>
+public sealed record MilestoneRequest(
+    string? Title,
+    string? Description,
+    [property: JsonPropertyName("due_date")] string? DueDate,
+    [property: JsonPropertyName("start_date")] string? StartDate,
+    [property: JsonPropertyName("state_event")] string? StateEvent);
+
+public sealed record BoardResponse(
+    long Id,
+    string Name,
+    [property: JsonPropertyName("project_id")] long ProjectId,
+    IReadOnlyList<BoardListResponse> Lists);
+
+public sealed record BoardListResponse(long Id, LabelResponse Label, int Position);
+public sealed record BoardRequest(string? Name);
+/// <summary>Adds a list for a label, or moves one. GitLab takes <c>label_id</c>; Graft also takes the name.</summary>
+public sealed record BoardListRequest([property: JsonPropertyName("label_id")] long? LabelId, string? Label, int? Position);
+
+/// <summary>Time tracked on an issue or proposal, in GitLab's shape, with human-readable copies.</summary>
+public sealed record TimeStatsResponse(
+    [property: JsonPropertyName("time_estimate")] long TimeEstimate,
+    [property: JsonPropertyName("total_time_spent")] long TotalTimeSpent,
+    [property: JsonPropertyName("human_time_estimate")] string? HumanTimeEstimate,
+    [property: JsonPropertyName("human_total_time_spent")] string? HumanTotalTimeSpent);
 
 /// <summary>
 /// A merge proposal. GitLab calls this a merge request and so does the API surface; the Graft code calls
@@ -419,7 +488,15 @@ public sealed record MergeRequestResponse(
     [property: JsonPropertyName("approvals_left")] int ApprovalsLeft = 0,
     /// <summary>Everyone who has approved, stale approvals included. Null in a listing, which does not
     /// load them, exactly as it does not decide mergeability.</summary>
-    [property: JsonPropertyName("approved_by")] IReadOnlyList<ApprovalResponse>? ApprovedBy = null);
+    [property: JsonPropertyName("approved_by")] IReadOnlyList<ApprovalResponse>? ApprovedBy = null,
+    IReadOnlyList<string>? Labels = null,
+    [property: JsonPropertyName("label_details")] IReadOnlyList<LabelResponse>? LabelDetails = null,
+    MilestoneReferenceResponse? Milestone = null,
+    IReadOnlyList<UserResponse>? Assignees = null,
+    IReadOnlyList<UserResponse>? Reviewers = null,
+    /// <summary>Marked as not ready. A draft cannot be merged however mergeable its branches are.</summary>
+    bool Draft = false,
+    [property: JsonPropertyName("time_stats")] TimeStatsResponse? TimeStats = null);
 
 public sealed record IssuePageResponse(IReadOnlyList<IssueResponse> Issues, long Total, int Page, int PerPage);
 public sealed record MergeRequestPageResponse(IReadOnlyList<MergeRequestResponse> MergeRequests, long Total, int Page, int PerPage);
@@ -498,16 +575,44 @@ public sealed record WebhookResponse(
 /// </summary>
 public sealed record WebhookCreateRequest(string? Url, string? Secret, string[]? Events);
 
-public sealed record IssueCreateRequest(string? Title, string? Description);
+/// <summary>
+/// Opens an issue. <c>labels</c> is GitLab's comma-separated string of names; every name must already exist.
+/// <c>milestone_id</c> is a milestone's id. People are named by username, which is Graft's convention
+/// everywhere people are named; GitLab takes ids here. <c>due_date</c> is <c>YYYY-MM-DD</c>.
+/// </summary>
+public sealed record IssueCreateRequest(
+    string? Title,
+    string? Description,
+    string? Labels = null,
+    [property: JsonPropertyName("milestone_id")] long? MilestoneId = null,
+    [property: JsonPropertyName("assignee_usernames")] string[]? AssigneeUsernames = null,
+    [property: JsonPropertyName("due_date")] string? DueDate = null,
+    bool? Confidential = null);
 
 /// <summary>
 /// Edits an issue or a proposal. <c>state_event</c> is GitLab's spelling and takes <c>close</c> or
 /// <c>reopen</c>, so a state is changed by naming the act rather than by asserting the result.
+///
+/// <para>
+/// Planning fields follow GitLab's conventions for "unchanged" against "cleared": an absent field changes
+/// nothing, <c>milestone_id</c> of zero clears the milestone, an empty <c>due_date</c> clears the date, an
+/// empty <c>labels</c> or people list clears the set. <c>add_labels</c> and <c>remove_labels</c> adjust the
+/// set instead of replacing it.
+/// </para>
 /// </summary>
 public sealed record IssueUpdateRequest(
     string? Title,
     string? Description,
-    [property: JsonPropertyName("state_event")] string? StateEvent);
+    [property: JsonPropertyName("state_event")] string? StateEvent,
+    string? Labels = null,
+    [property: JsonPropertyName("add_labels")] string? AddLabels = null,
+    [property: JsonPropertyName("remove_labels")] string? RemoveLabels = null,
+    [property: JsonPropertyName("milestone_id")] long? MilestoneId = null,
+    [property: JsonPropertyName("assignee_usernames")] string[]? AssigneeUsernames = null,
+    [property: JsonPropertyName("reviewer_usernames")] string[]? ReviewerUsernames = null,
+    [property: JsonPropertyName("due_date")] string? DueDate = null,
+    bool? Confidential = null,
+    bool? Draft = null);
 
 /// <summary>
 /// Adds a comment. The three position fields are given together or not at all; together they anchor the
@@ -527,7 +632,12 @@ public sealed record MergeRequestCreateRequest(
     [property: JsonPropertyName("source_branch")] string? SourceBranch,
     [property: JsonPropertyName("target_branch")] string? TargetBranch,
     string? Title,
-    string? Description);
+    string? Description,
+    string? Labels = null,
+    [property: JsonPropertyName("milestone_id")] long? MilestoneId = null,
+    [property: JsonPropertyName("assignee_usernames")] string[]? AssigneeUsernames = null,
+    [property: JsonPropertyName("reviewer_usernames")] string[]? ReviewerUsernames = null,
+    bool? Draft = null);
 
 /// <summary>
 /// Names a new branch and what it should point at. <c>Ref</c> is GitLab's spelling and takes a branch
@@ -634,6 +744,18 @@ public sealed record MergeRequestChangesResponse(
 [JsonSerializable(typeof(IssueUpdateRequest))]
 [JsonSerializable(typeof(NoteCreateRequest))]
 [JsonSerializable(typeof(NoteUpdateRequest))]
+[JsonSerializable(typeof(LabelResponse))]
+[JsonSerializable(typeof(LabelResponse[]))]
+[JsonSerializable(typeof(LabelRequest))]
+[JsonSerializable(typeof(MilestoneResponse))]
+[JsonSerializable(typeof(MilestoneResponse[]))]
+[JsonSerializable(typeof(MilestoneRequest))]
+[JsonSerializable(typeof(BoardResponse))]
+[JsonSerializable(typeof(BoardResponse[]))]
+[JsonSerializable(typeof(BoardRequest))]
+[JsonSerializable(typeof(BoardListResponse))]
+[JsonSerializable(typeof(BoardListRequest))]
+[JsonSerializable(typeof(UserResponse[]))]
 [JsonSerializable(typeof(MergeRequestCreateRequest))]
 [JsonSerializable(typeof(BranchCreateRequest))]
 [JsonSerializable(typeof(TagCreateRequest))]

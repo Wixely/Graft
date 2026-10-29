@@ -1,0 +1,27 @@
+@* One label, painted in its own colour.
+
+   The colour is applied from script after render rather than as a style attribute, because the page's
+   content security policy forbids style attributes and that policy is worth more than a shortcut. The
+   colour and text colour arrive from the server, which validated the colour as six hexadecimal digits when
+   it was stored and computed the text colour from it; the script checks the same thing again. The name is
+   bound as text. *@
+@inject IJSRuntime JS
+
+<span @ref="element" class="label chip" title="@Label.Description">@Label.Name</span>
+
+@code {
+    [Parameter, EditorRequired] public LabelResponse Label { get; set; } = default!;
+
+    private ElementReference element;
+    private string painted = "";
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        string wanted = Label.Color + Label.TextColor;
+        if (wanted == painted) return;
+        painted = wanted;
+        try { await JS.InvokeVoidAsync("graftLabels.paint", element, Label.Color, Label.TextColor); }
+        catch (JSException) { }
+        catch (JSDisconnectedException) { }
+    }
+}

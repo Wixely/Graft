@@ -39,6 +39,8 @@ else
         <button type="button" class="@(tab == "commits" ? "active" : "")" @onclick='() => tab = "commits"'>Commits</button>
         <a href="@(ProjectBase + "/-/issues")">Issues</a>
         <a href="@(ProjectBase + "/-/merge-requests")">Merge requests</a>
+        <a href="@(ProjectBase + "/-/boards")">Boards</a>
+        <a href="@(ProjectBase + "/-/milestones")">Milestones</a>
         @if (repo.CanPush)
         {
             <button type="button" class="@(tab == "upload" ? "active" : "")" @onclick='() => tab = "upload"'>Add files</button>

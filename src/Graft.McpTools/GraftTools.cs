@@ -553,6 +553,11 @@ public sealed class GraftTools
                 ["state"] = issue.State,
                 ["author"] = issue.Author.Username,
                 ["comments"] = issue.UserNotesCount,
+                ["labels"] = Texts(issue.Labels ?? []),
+                ["milestone"] = issue.Milestone?.Title,
+                ["assignees"] = Texts([.. (issue.Assignees ?? []).Select(person => person.Username)]),
+                ["due_date"] = issue.DueDate,
+                ["confidential"] = issue.Confidential,
                 ["updated_at"] = issue.UpdatedAt.ToString("O", CultureInfo.InvariantCulture),
                 ["web_url"] = issue.WebUrl
             })
@@ -581,6 +586,11 @@ public sealed class GraftTools
             ["author"] = issue.Author.Username,
             ["created_at"] = issue.CreatedAt.ToString("O", CultureInfo.InvariantCulture),
             ["description"] = issue.Description,
+            ["labels"] = Texts(issue.Labels ?? []),
+            ["milestone"] = issue.Milestone?.Title,
+            ["assignees"] = Texts([.. (issue.Assignees ?? []).Select(person => person.Username)]),
+            ["due_date"] = issue.DueDate,
+            ["confidential"] = issue.Confidential,
             ["web_url"] = issue.WebUrl,
             ["comments"] = notesError is not null || notes is null
                 ? null
@@ -776,6 +786,11 @@ public sealed class GraftTools
             ["source_branch"] = request.SourceBranch,
             ["target_branch"] = request.TargetBranch,
             ["can_be_merged"] = request.MergeStatus == "can_be_merged",
+            ["draft"] = request.Draft,
+            ["labels"] = Texts(request.Labels ?? []),
+            ["milestone"] = request.Milestone?.Title,
+            ["assignees"] = Texts([.. (request.Assignees ?? []).Select(person => person.Username)]),
+            ["reviewers"] = Texts([.. (request.Reviewers ?? []).Select(person => person.Username)]),
             ["merge_method"] = request.MergeMethod,
             ["conflicts"] = request.Conflicts is null ? null : Texts(request.Conflicts),
             ["changed_files"] = Array(changes.Files, file => new JsonObject
@@ -858,6 +873,112 @@ public sealed class GraftTools
             ["commit"] = result.MergeCommitSha,
             ["target_branch"] = result.MergeRequest.TargetBranch
         });
+    }
+
+    [McpServerTool(Name = "graft_list_labels")]
+    [Description("Lists a project's labels: the words it sorts its issues and merge requests with. Every label an issue or merge request may carry has to be one of these.")]
+    public static async Task<string> ListLabels(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        CancellationToken cancellationToken)
+    {
+        (LabelResponse[]? labels, string? error) = await graft.GetAsync(
+            "api/v4/projects/" + Encode(project) + "/labels", ApiJson.Default.LabelResponseArray, cancellationToken);
+        if (error is not null) return Failure(error);
+        return new JsonObject
+        {
+            ["labels"] = Array(labels!, label => new JsonObject
+            {
+                ["name"] = label.Name,
+                ["color"] = label.Color,
+                ["description"] = label.Description
+            })
+        }.ToJsonString();
+    }
+
+    [McpServerTool(Name = "graft_list_milestones")]
+    [Description("Lists a project's milestones with how many issues each has open and closed. State may be active, closed or all.")]
+    public static async Task<string> ListMilestones(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("One of active, closed or all. Empty means active.")] string state,
+        CancellationToken cancellationToken)
+    {
+        string chosen = (state ?? "").Trim();
+        if (chosen is not ("" or "active" or "closed" or "all")) return Failure("state must be active, closed or all.");
+        (MilestoneResponse[]? milestones, string? error) = await graft.GetAsync(
+            "api/v4/projects/" + Encode(project) + "/milestones" + (chosen.Length == 0 ? "" : "?state=" + chosen),
+            ApiJson.Default.MilestoneResponseArray, cancellationToken);
+        if (error is not null) return Failure(error);
+        return new JsonObject
+        {
+            ["milestones"] = Array(milestones!, milestone => new JsonObject
+            {
+                ["id"] = milestone.Id,
+                ["number"] = milestone.Iid,
+                ["title"] = milestone.Title,
+                ["state"] = milestone.State,
+                ["due_date"] = milestone.DueDate,
+                ["open_issues"] = milestone.OpenIssues,
+                ["closed_issues"] = milestone.ClosedIssues,
+                ["web_url"] = milestone.WebUrl
+            })
+        }.ToJsonString();
+    }
+
+    [McpServerTool(Name = "graft_triage")]
+    [Description("Sets the labels, milestone, assignees or due date of an issue or a merge request. Each argument left empty is left alone. Needs to be the author or able to push. Labels must already exist in the project; graft_list_labels shows them. Refused unless writes are allowed on this server.")]
+    public static async Task<string> Triage(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("Either issue or merge_request.")] string subject,
+        [Description("The number of the issue or merge request, as shown in the project.")] long number,
+        [Description("Optional: the labels to add, comma-separated. Empty adds none.")] string add_labels,
+        [Description("Optional: the labels to remove, comma-separated. Empty removes none.")] string remove_labels,
+        [Description("Optional: a milestone id from graft_list_milestones, or -1 to clear the milestone. Zero leaves it alone.")] long milestone_id,
+        [Description("Optional: the usernames to assign, comma-separated, replacing the current assignees. Each must be a member of the project. Empty leaves them alone; the word none clears them.")] string assignees,
+        [Description("Optional, issues only: a due date as YYYY-MM-DD, or the word none to clear it. Empty leaves it alone.")] string due_date,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowWrites) return Refused(graft, "triaging");
+        if (subject is not ("issue" or "merge_request")) return Failure("subject must be issue or merge_request.");
+        if (subject == "merge_request" && !string.IsNullOrWhiteSpace(due_date)) return Failure("A merge request has no due date.");
+
+        JsonObject body = new();
+        if (!string.IsNullOrWhiteSpace(add_labels)) body["add_labels"] = add_labels.Trim();
+        if (!string.IsNullOrWhiteSpace(remove_labels)) body["remove_labels"] = remove_labels.Trim();
+        if (milestone_id != 0) body["milestone_id"] = milestone_id < 0 ? 0 : milestone_id;
+        if (!string.IsNullOrWhiteSpace(assignees))
+        {
+            JsonArray names = [];
+            if (!string.Equals(assignees.Trim(), "none", StringComparison.OrdinalIgnoreCase))
+                foreach (string name in assignees.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
+                    names.Add((JsonNode)JsonValue.Create(name));
+            body["assignee_usernames"] = names;
+        }
+        if (!string.IsNullOrWhiteSpace(due_date))
+            body["due_date"] = string.Equals(due_date.Trim(), "none", StringComparison.OrdinalIgnoreCase) ? "" : due_date.Trim();
+        if (body.Count == 0) return Failure("Nothing to change: give at least one of the optional arguments.");
+
+        string path = "api/v4/projects/" + Encode(project) + (subject == "issue" ? "/issues/" : "/merge_requests/") + Number(number);
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Put, path, body, cancellationToken);
+        if (!ok) return Failure(GraftClient.Describe(status, response));
+        return subject == "issue"
+            ? Created(response, ApiJson.Default.IssueResponse, issue => new JsonObject
+            {
+                ["number"] = issue.Iid,
+                ["labels"] = Texts(issue.Labels ?? []),
+                ["milestone"] = issue.Milestone?.Title,
+                ["assignees"] = Texts([.. (issue.Assignees ?? []).Select(person => person.Username)]),
+                ["due_date"] = issue.DueDate
+            })
+            : Created(response, ApiJson.Default.MergeRequestResponse, request => new JsonObject
+            {
+                ["number"] = request.Iid,
+                ["labels"] = Texts(request.Labels ?? []),
+                ["milestone"] = request.Milestone?.Title,
+                ["assignees"] = Texts([.. (request.Assignees ?? []).Select(person => person.Username)])
+            });
     }
 
     /// <summary>

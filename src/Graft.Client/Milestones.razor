@@ -1,0 +1,304 @@
+@page "/{Namespace}/{Slug}/-/milestones"
+@page "/{Namespace}/{Slug}/-/milestones/{Id:long}"
+@page "/projects/{Slug}/-/milestones"
+@page "/projects/{Slug}/-/milestones/{Id:long}"
+@inject GraftApi Api
+@inject NavigationManager Navigation
+
+<PageTitle>@(Id is null ? "Milestones" : "Milestone") &middot; Graft</PageTitle>
+
+@if (loading)
+{
+    <p role="status" class="secondary-text">Loading…</p>
+}
+else if (project is null)
+{
+    <div class="page-header"><div><h1>Unavailable</h1><p class="subtitle">@message</p></div></div>
+    <a class="button secondary" href="/"><Icon Name="chevron-left" />Back to projects</a>
+}
+else if (Id is null)
+{
+    <div class="page-header">
+        <div>
+            <h1>Milestones</h1>
+            <p class="subtitle"><a href="@ProjectUrl">@project.Namespace.Name / @project.Name</a></p>
+        </div>
+        <div class="page-header-actions">
+            <a class="button secondary" href="@(ProjectUrl + "/-/issues")"><Icon Name="issue" />Issues</a>
+            @if (canPush)
+            {
+                <button type="button" class="@(composing ? "secondary" : "")" @onclick="() => composing = !composing"><Icon Name="plus" />New milestone</button>
+            }
+        </div>
+    </div>
+
+    <Banner Message="@message" Kind="@messageKind" />
+
+    @if (composing)
+    {
+        <div class="panel">
+            <div class="panel-header"><h2>Create a milestone</h2></div>
+            <div class="panel-body">
+                <form class="form" @onsubmit="Create" @onsubmit:preventDefault>
+                    <label for="ms-title">Title</label>
+                    <input id="ms-title" @bind="draftTitle" required maxlength="255" autocomplete="off" />
+                    <label for="ms-description">Description</label>
+                    <textarea id="ms-description" @bind="draftDescription" rows="3" maxlength="50000"></textarea>
+                    <label for="ms-start">Starts</label>
+                    <input id="ms-start" type="date" @bind="draftStart" />
+                    <label for="ms-due">Due</label>
+                    <input id="ms-due" type="date" @bind="draftDue" />
+                    <div class="form-actions">
+                        <button type="submit" disabled="@busy">@(busy ? "Creating…" : "Create milestone")</button>
+                        <button type="button" class="secondary" @onclick="() => composing = false" disabled="@busy">Cancel</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    }
+
+    <div class="tabs">
+        <button type="button" class="@(state == "active" ? "active" : "")" @onclick='() => Filter("active")'>Active</button>
+        <button type="button" class="@(state == "closed" ? "active" : "")" @onclick='() => Filter("closed")'>Closed</button>
+        <button type="button" class="@(state == "all" ? "active" : "")" @onclick='() => Filter("all")'>All</button>
+    </div>
+
+    <div class="panel">
+        <div class="panel-header"><h2>Milestones</h2><span class="spacer"></span><span class="label">@milestones.Length</span></div>
+        @if (milestones.Length == 0)
+        {
+            <div class="panel-empty">Nothing here.</div>
+        }
+        else
+        {
+            <div class="list">
+                @foreach (MilestoneResponse milestone in milestones)
+                {
+                    <div class="list-item">
+                        <span class="list-item-main">
+                            <strong><a href="@MilestoneUrl(milestone.Id)">@milestone.Title</a></strong>
+                            <small>
+                                %@milestone.Iid
+                                @if (milestone.DueDate is not null) { <span> &middot; due @milestone.DueDate</span> }
+                                &middot; @milestone.OpenIssues open, @milestone.ClosedIssues closed
+                            </small>
+                        </span>
+                        <progress class="progress" max="100" value="@Percent(milestone)" title="@Percent(milestone)% complete"></progress>
+                        <span class="label @(milestone.State == "active" ? "success" : "")">@milestone.State</span>
+                    </div>
+                }
+            </div>
+        }
+    </div>
+}
+else if (milestone is null)
+{
+    <div class="page-header"><div><h1>Milestone unavailable</h1><p class="subtitle">@message</p></div></div>
+    <a class="button secondary" href="@MilestonesUrl"><Icon Name="chevron-left" />Back to milestones</a>
+}
+else
+{
+    <div class="page-header">
+        <div>
+            <h1>@milestone.Title</h1>
+            <p class="subtitle">
+                %@milestone.Iid in <a href="@ProjectUrl">@project.Namespace.Name / @project.Name</a>
+                @if (milestone.StartDate is not null) { <span> &middot; from @milestone.StartDate</span> }
+                @if (milestone.DueDate is not null) { <span> &middot; due @milestone.DueDate</span> }
+            </p>
+        </div>
+        <span class="label @(milestone.State == "active" ? "success" : "")">@milestone.State</span>
+        <div class="page-header-actions">
+            <a class="button secondary" href="@MilestonesUrl"><Icon Name="chevron-left" />Milestones</a>
+        </div>
+    </div>
+
+    <Banner Message="@message" Kind="@messageKind" />
+
+    @if (milestone.Description.Length > 0)
+    {
+        <div class="panel"><div class="panel-body"><pre class="commit-message">@milestone.Description</pre></div></div>
+    }
+
+    <div class="panel">
+        <div class="panel-header">
+            <h2>Progress</h2><span class="spacer"></span>
+            <span class="label">@milestone.ClosedIssues of @(milestone.OpenIssues + milestone.ClosedIssues) issues closed</span>
+        </div>
+        <div class="panel-body">
+            <progress class="progress wide" max="100" value="@Percent(milestone)"></progress>
+            @if (canPush)
+            {
+                <div class="form-actions">
+                    <button type="button" class="secondary" @onclick="ToggleState" disabled="@busy">@(milestone.State == "closed" ? "Reactivate" : "Close milestone")</button>
+                    <button type="button" class="secondary danger-text" @onclick="Delete" disabled="@busy">Delete milestone</button>
+                </div>
+                <p class="field-hint">Deleting a milestone keeps its issues and merge requests; they are left with none.</p>
+            }
+        </div>
+    </div>
+
+    <div class="panel">
+        <div class="panel-header"><Icon Name="issue" /><h2>Issues</h2><span class="spacer"></span><span class="label">@issues.Length</span></div>
+        @if (issues.Length == 0) { <div class="panel-empty">No issues in this milestone.</div> }
+        else
+        {
+            <div class="list">
+                @foreach (IssueResponse issue in issues)
+                {
+                    <div class="list-item">
+                        <Icon Name="issue" Class="@(issue.State == "closed" ? "icon muted" : "icon")" />
+                        <span class="list-item-main">
+                            <strong><a href="@(ProjectUrl + "/-/issues/" + issue.Iid)">@issue.Title</a></strong>
+                            <small>#@issue.Iid &middot; @issue.State</small>
+                        </span>
+                        @foreach (LabelResponse label in issue.LabelDetails ?? []) { <LabelChip Label="label" /> }
+                    </div>
+                }
+            </div>
+        }
+    </div>
+
+    <div class="panel">
+        <div class="panel-header"><Icon Name="merge" /><h2>Merge requests</h2><span class="spacer"></span><span class="label">@proposals.Length</span></div>
+        @if (proposals.Length == 0) { <div class="panel-empty">No merge requests in this milestone.</div> }
+        else
+        {
+            <div class="list">
+                @foreach (MergeRequestResponse proposal in proposals)
+                {
+                    <div class="list-item">
+                        <Icon Name="merge" Class="@(proposal.State == "opened" ? "icon" : "icon muted")" />
+                        <span class="list-item-main">
+                            <strong><a href="@(ProjectUrl + "/-/merge-requests/" + proposal.Iid)">@proposal.Title</a></strong>
+                            <small>!@proposal.Iid &middot; @proposal.State</small>
+                        </span>
+                    </div>
+                }
+            </div>
+        }
+    </div>
+}
+
+@code {
+    [Parameter] public string Namespace { get; set; } = "";
+    [Parameter] public string Slug { get; set; } = "";
+    [Parameter] public long? Id { get; set; }
+
+    private ProjectResponse? project;
+    private long projectId;
+    private bool canPush;
+    private MilestoneResponse[] milestones = [];
+    private MilestoneResponse? milestone;
+    private IssueResponse[] issues = [];
+    private MergeRequestResponse[] proposals = [];
+    private string state = "active";
+    private bool loading = true;
+    private bool busy;
+    private bool composing;
+    private string draftTitle = "";
+    private string draftDescription = "";
+    private DateOnly? draftStart;
+    private DateOnly? draftDue;
+
+    private static string? Day(DateOnly? value) => value?.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture);
+    private string message = "";
+    private string messageKind = "info";
+
+    private bool ViaSlug => Namespace.Length == 0;
+    private string ProjectUrl => ViaSlug
+        ? $"/projects/{Uri.EscapeDataString(Slug)}"
+        : $"/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
+    private string MilestonesUrl => ProjectUrl + "/-/milestones";
+    private string MilestoneUrl(long id) => $"{MilestonesUrl}/{id}";
+
+    private static int Percent(MilestoneResponse milestone)
+    {
+        long total = milestone.OpenIssues + milestone.ClosedIssues;
+        return total == 0 ? 0 : (int)(100 * milestone.ClosedIssues / total);
+    }
+
+    protected override async Task OnParametersSetAsync()
+    {
+        loading = true;
+        message = "";
+        try
+        {
+            await Api.EnsureSessionAsync();
+            string path = ViaSlug
+                ? $"api/graft/slugs/{Uri.EscapeDataString(Slug)}"
+                : $"api/browser/projects/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
+            (bool reached, RepositoryPageResponse? page) = await Api.GetOptionalAsync(path, ApiJson.Default.RepositoryPageResponse);
+            if (!reached) { message = "Graft could not be reached."; return; }
+            if (page is null) { message = "That repository could not be found."; return; }
+            project = page.Project;
+            projectId = page.Project.Id;
+            canPush = page.CanPush;
+            if (Id is null) await LoadList(); else await LoadOne();
+        }
+        finally { loading = false; }
+    }
+
+    private async Task Filter(string next) { state = next; await LoadList(); }
+
+    private async Task LoadList() =>
+        milestones = await Api.GetAsync($"api/projects/{projectId}/milestones?state={state}", ApiJson.Default.MilestoneResponseArray) ?? [];
+
+    private async Task LoadOne()
+    {
+        milestone = await Api.GetAsync($"api/projects/{projectId}/milestones/{Id}", ApiJson.Default.MilestoneResponse);
+        if (milestone is null) { message = "That milestone could not be found."; return; }
+        IssuePageResponse? issuePage = await Api.GetAsync($"api/projects/{projectId}/issues?state=all&milestone_id={Id}&per_page=100", ApiJson.Default.IssuePageResponse);
+        issues = issuePage is null ? [] : [.. issuePage.Issues];
+        MergeRequestPageResponse? proposalPage = await Api.GetAsync($"api/projects/{projectId}/merge-requests?state=all&milestone_id={Id}&per_page=100", ApiJson.Default.MergeRequestPageResponse);
+        proposals = proposalPage is null ? [] : [.. proposalPage.MergeRequests];
+    }
+
+    private async Task Create()
+    {
+        if (busy) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult<MilestoneResponse> result = await Api.SendAsync<MilestoneRequest, MilestoneResponse>(HttpMethod.Post,
+                $"api/projects/{projectId}/milestones", new MilestoneRequest(draftTitle, draftDescription, Day(draftDue), Day(draftStart), null),
+                ApiJson.Default.MilestoneRequest, ApiJson.Default.MilestoneResponse, "Milestone created.");
+            if (!result.Ok || result.Value is null) { message = result.Message; messageKind = "error"; return; }
+            composing = false;
+            Navigation.NavigateTo(MilestoneUrl(result.Value.Id));
+        }
+        finally { busy = false; }
+    }
+
+    private async Task ToggleState()
+    {
+        if (busy || milestone is null) return;
+        busy = true;
+        try
+        {
+            string stateEvent = milestone.State == "closed" ? "activate" : "close";
+            ApiResult result = await Api.PostAsync($"api/projects/{projectId}/milestones/{milestone.Id}",
+                new MilestoneRequest(null, null, null, null, stateEvent), ApiJson.Default.MilestoneRequest,
+                stateEvent == "close" ? "Milestone closed." : "Milestone reactivated.");
+            message = result.Message;
+            messageKind = result.Ok ? "success" : "error";
+            if (result.Ok) await LoadOne();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task Delete()
+    {
+        if (busy || milestone is null) return;
+        busy = true;
+        try
+        {
+            ApiResult result = await Api.DeleteAsync($"api/projects/{projectId}/milestones/{milestone.Id}", "Milestone deleted.");
+            message = result.Message;
+            messageKind = result.Ok ? "success" : "error";
+            if (result.Ok) Navigation.NavigateTo(MilestonesUrl);
+        }
+        finally { busy = false; }
+    }
+}

@@ -1,0 +1,325 @@
+@page "/{Namespace}/{Slug}/-/boards"
+@page "/{Namespace}/{Slug}/-/boards/{Id:long}"
+@page "/projects/{Slug}/-/boards"
+@page "/projects/{Slug}/-/boards/{Id:long}"
+@inject GraftApi Api
+@inject NavigationManager Navigation
+
+<PageTitle>Boards &middot; Graft</PageTitle>
+
+@if (loading)
+{
+    <p role="status" class="secondary-text">Loading…</p>
+}
+else if (project is null)
+{
+    <div class="page-header"><div><h1>Unavailable</h1><p class="subtitle">@message</p></div></div>
+    <a class="button secondary" href="/"><Icon Name="chevron-left" />Back to projects</a>
+}
+else
+{
+    <div class="page-header">
+        <div>
+            <h1>@(board?.Name ?? "Boards")</h1>
+            <p class="subtitle"><a href="@ProjectUrl">@project.Namespace.Name / @project.Name</a></p>
+        </div>
+        <div class="page-header-actions">
+            @if (boards.Length > 1)
+            {
+                <select aria-label="Board" @onchange="ChooseBoard">
+                    @foreach (BoardResponse option in boards)
+                    {
+                        <option value="@option.Id" selected="@(option.Id == board?.Id)">@option.Name</option>
+                    }
+                </select>
+            }
+            <a class="button secondary" href="@(ProjectUrl + "/-/issues")"><Icon Name="issue" />Issues</a>
+            <a class="button secondary" href="@(ProjectUrl + "/-/labels")"><Icon Name="folder" />Labels</a>
+            @if (canPush)
+            {
+                <button type="button" class="secondary" @onclick="() => composing = !composing"><Icon Name="plus" />New board</button>
+            }
+        </div>
+    </div>
+
+    <Banner Message="@message" Kind="@messageKind" />
+
+    @if (composing)
+    {
+        <div class="panel">
+            <div class="panel-header"><h2>Create a board</h2></div>
+            <div class="panel-body">
+                <form class="form" @onsubmit="CreateBoard" @onsubmit:preventDefault>
+                    <label for="board-name">Name</label>
+                    <input id="board-name" @bind="draftName" required maxlength="255" autocomplete="off" />
+                    <div class="form-actions">
+                        <button type="submit" disabled="@busy">@(busy ? "Creating…" : "Create board")</button>
+                        <button type="button" class="secondary" @onclick="() => composing = false" disabled="@busy">Cancel</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    }
+
+    @if (board is null)
+    {
+        <div class="panel"><div class="panel-empty">
+            @(boards.Length == 0 ? "No boards yet. A board shows open issues in columns, one per label." : "Choose a board.")
+        </div></div>
+    }
+    else
+    {
+        @if (canPush)
+        {
+            <div class="panel">
+                <div class="panel-body board-tools">
+                    <form class="form inline" @onsubmit="AddList" @onsubmit:preventDefault>
+                        <label for="board-add-list">Add a column for a label</label>
+                        <div class="form-row">
+                            <select id="board-add-list" @bind="addLabelId">
+                                <option value="0">Choose a label</option>
+                                @foreach (LabelResponse label in labels.Where(label => board.Lists.All(list => list.Label.Id != label.Id)))
+                                {
+                                    <option value="@label.Id">@label.Name</option>
+                                }
+                            </select>
+                            <button type="submit" disabled="@(busy || addLabelId == "0")">Add column</button>
+                            <button type="button" class="secondary danger-text" @onclick="DeleteBoard" disabled="@busy">Delete board</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        }
+
+        <div class="board">
+            <div class="board-column">
+                <div class="board-column-header"><strong>Open</strong><span class="label">@unlisted.Length</span></div>
+                <p class="field-hint">Open issues in none of this board's columns.</p>
+                @foreach (IssueResponse issue in unlisted) { @Card(issue, null) }
+            </div>
+            @foreach (BoardListResponse list in board.Lists)
+            {
+                <div class="board-column">
+                    <div class="board-column-header">
+                        <LabelChip Label="list.Label" />
+                        <span class="label">@(columns.GetValueOrDefault(list.Id)?.Length ?? 0)</span>
+                        @if (canPush)
+                        {
+                            <span class="spacer"></span>
+                            @if (list.Position > 1)
+                            {
+                                <button type="button" class="quiet icon-button" title="Move left" @onclick="() => MoveList(list, list.Position - 1)" disabled="@busy"><Icon Name="chevron-left" /></button>
+                            }
+                            @if (list.Position < board.Lists.Count)
+                            {
+                                <button type="button" class="quiet icon-button" title="Move right" @onclick="() => MoveList(list, list.Position + 1)" disabled="@busy"><Icon Name="chevron-right" /></button>
+                            }
+                            <button type="button" class="quiet icon-button" title="Remove column" @onclick="() => RemoveList(list)" disabled="@busy"><Icon Name="close" /></button>
+                        }
+                    </div>
+                    @foreach (IssueResponse issue in columns.GetValueOrDefault(list.Id) ?? []) { @Card(issue, list) }
+                </div>
+            }
+            <div class="board-column">
+                <div class="board-column-header"><strong>Closed</strong><span class="label">@closed.Length</span></div>
+                @foreach (IssueResponse issue in closed) { @Card(issue, null) }
+            </div>
+        </div>
+    }
+}
+
+@code {
+    [Parameter] public string Namespace { get; set; } = "";
+    [Parameter] public string Slug { get; set; } = "";
+    [Parameter] public long? Id { get; set; }
+
+    private ProjectResponse? project;
+    private long projectId;
+    private bool canPush;
+    private bool canParticipate;
+    private BoardResponse[] boards = [];
+    private BoardResponse? board;
+    private LabelResponse[] labels = [];
+    private IssueResponse[] unlisted = [];
+    private IssueResponse[] closed = [];
+    private Dictionary<long, IssueResponse[]> columns = new();
+    private bool loading = true;
+    private bool busy;
+    private bool composing;
+    private string draftName = "";
+    private string addLabelId = "0";
+    private string message = "";
+    private string messageKind = "info";
+
+    private bool ViaSlug => Namespace.Length == 0;
+    private string ProjectUrl => ViaSlug
+        ? $"/projects/{Uri.EscapeDataString(Slug)}"
+        : $"/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
+    private string BoardUrl(long id) => $"{ProjectUrl}/-/boards/{id}";
+
+    private void ChooseBoard(ChangeEventArgs e)
+    {
+        if (long.TryParse(e.Value?.ToString(), out long id)) Navigation.NavigateTo(BoardUrl(id));
+    }
+
+    /// <summary>
+    /// A card. Moving one to another column swaps labels: the column it leaves is removed and the column
+    /// it joins is added, which is exactly what the board means and nothing the issue list would not show.
+    /// </summary>
+    private RenderFragment Card(IssueResponse issue, BoardListResponse? from) => __builder =>
+    {
+        <div class="board-card">
+            <a href="@(ProjectUrl + "/-/issues/" + issue.Iid)"><strong>@issue.Title</strong></a>
+            <small>#@issue.Iid @(issue.Assignees is { Count: > 0 } ? "· " + string.Join(", ", issue.Assignees.Select(person => person.Username)) : "")</small>
+            <span class="board-card-labels">
+                @foreach (LabelResponse label in issue.LabelDetails ?? []) { <LabelChip Label="label" /> }
+            </span>
+            @if (canParticipate && board is not null && issue.State == "opened" && board.Lists.Count > 0)
+            {
+                <select aria-label="Move to column" @onchange="e => Move(issue, from, e.Value?.ToString())" disabled="@busy">
+                    <option value="">Move to…</option>
+                    @if (from is not null) { <option value="open">Open (no column)</option> }
+                    @foreach (BoardListResponse list in board.Lists.Where(list => list.Id != from?.Id))
+                    {
+                        <option value="@list.Id">@list.Label.Name</option>
+                    }
+                </select>
+            }
+        </div>
+    };
+
+    protected override async Task OnParametersSetAsync()
+    {
+        loading = true;
+        message = "";
+        try
+        {
+            await Api.EnsureSessionAsync();
+            string path = ViaSlug
+                ? $"api/graft/slugs/{Uri.EscapeDataString(Slug)}"
+                : $"api/browser/projects/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
+            (bool reached, RepositoryPageResponse? page) = await Api.GetOptionalAsync(path, ApiJson.Default.RepositoryPageResponse);
+            if (!reached) { message = "Graft could not be reached."; return; }
+            if (page is null) { message = "That repository could not be found."; return; }
+            project = page.Project;
+            projectId = page.Project.Id;
+            canPush = page.CanPush;
+            canParticipate = page.CanParticipate;
+            await Load();
+        }
+        finally { loading = false; }
+    }
+
+    private async Task Load()
+    {
+        boards = await Api.GetAsync($"api/projects/{projectId}/boards", ApiJson.Default.BoardResponseArray) ?? [];
+        labels = await Api.GetAsync($"api/projects/{projectId}/labels", ApiJson.Default.LabelResponseArray) ?? [];
+        board = Id is null ? boards.FirstOrDefault() : boards.FirstOrDefault(candidate => candidate.Id == Id);
+        if (board is null) return;
+        string listLabels = string.Join(",", board.Lists.Select(list => list.Label.Name));
+        IssuePageResponse? open = await Api.GetAsync(
+            $"api/projects/{projectId}/issues?state=opened&per_page=100&without_labels={Uri.EscapeDataString(listLabels)}", ApiJson.Default.IssuePageResponse);
+        unlisted = open is null ? [] : [.. open.Issues];
+        IssuePageResponse? done = await Api.GetAsync($"api/projects/{projectId}/issues?state=closed&per_page=100", ApiJson.Default.IssuePageResponse);
+        closed = done is null ? [] : [.. done.Issues];
+        columns = new();
+        foreach (BoardListResponse list in board.Lists)
+        {
+            IssuePageResponse? column = await Api.GetAsync(
+                $"api/projects/{projectId}/issues?state=opened&per_page=100&labels={Uri.EscapeDataString(list.Label.Name)}", ApiJson.Default.IssuePageResponse);
+            columns[list.Id] = column is null ? [] : [.. column.Issues];
+        }
+    }
+
+    private async Task Move(IssueResponse issue, BoardListResponse? from, string? target)
+    {
+        if (busy || string.IsNullOrEmpty(target) || board is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            BoardListResponse? to = target == "open" ? null : board.Lists.FirstOrDefault(list => list.Id.ToString() == target);
+            ApiResult result = await Api.PostAsync($"api/projects/{projectId}/issues/{issue.Iid}",
+                new IssueUpdateRequest(null, null, null, AddLabels: to?.Label.Name, RemoveLabels: from?.Label.Name),
+                ApiJson.Default.IssueUpdateRequest, $"#{issue.Iid} moved.");
+            message = result.Message;
+            messageKind = result.Ok ? "success" : "error";
+            await Load();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task CreateBoard()
+    {
+        if (busy) return;
+        busy = true;
+        try
+        {
+            ApiResult<BoardResponse> result = await Api.SendAsync<BoardRequest, BoardResponse>(HttpMethod.Post,
+                $"api/projects/{projectId}/boards", new BoardRequest(draftName), ApiJson.Default.BoardRequest, ApiJson.Default.BoardResponse, "Board created.");
+            if (!result.Ok || result.Value is null) { message = result.Message; messageKind = "error"; return; }
+            composing = false;
+            draftName = "";
+            Navigation.NavigateTo(BoardUrl(result.Value.Id));
+        }
+        finally { busy = false; }
+    }
+
+    private async Task DeleteBoard()
+    {
+        if (busy || board is null) return;
+        busy = true;
+        try
+        {
+            ApiResult result = await Api.DeleteAsync($"api/projects/{projectId}/boards/{board.Id}", "Board deleted.");
+            message = result.Message;
+            messageKind = result.Ok ? "success" : "error";
+            if (result.Ok) Navigation.NavigateTo(ProjectUrl + "/-/boards");
+        }
+        finally { busy = false; }
+    }
+
+    private async Task AddList()
+    {
+        if (busy || board is null || addLabelId == "0") return;
+        busy = true;
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/projects/{projectId}/boards/{board.Id}/lists",
+                new BoardListRequest(long.Parse(addLabelId), null, null), ApiJson.Default.BoardListRequest, "Column added.");
+            message = result.Message;
+            messageKind = result.Ok ? "success" : "error";
+            addLabelId = "0";
+            await Load();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task MoveList(BoardListResponse list, int position)
+    {
+        if (busy || board is null) return;
+        busy = true;
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/projects/{projectId}/boards/{board.Id}/lists/{list.Id}",
+                new BoardListRequest(null, null, position), ApiJson.Default.BoardListRequest, "Column moved.");
+            if (!result.Ok) { message = result.Message; messageKind = "error"; }
+            await Load();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task RemoveList(BoardListResponse list)
+    {
+        if (busy || board is null) return;
+        busy = true;
+        try
+        {
+            ApiResult result = await Api.DeleteAsync($"api/projects/{projectId}/boards/{board.Id}/lists/{list.Id}", "Column removed. The label stays on its issues.");
+            message = result.Message;
+            messageKind = result.Ok ? "success" : "error";
+            await Load();
+        }
+        finally { busy = false; }
+    }
+}

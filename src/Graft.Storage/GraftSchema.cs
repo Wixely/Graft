@@ -4,7 +4,7 @@ namespace Graft.Storage;
 
 public static class GraftSchema
 {
-    public static DnaXMigrationManifest Manifest { get; } = new(12,
+    public static DnaXMigrationManifest Manifest { get; } = new(13,
     [
         DnaXMigration.Sql(1, "initial-identity-project-schema", "Create identity and private project schema", """
             CREATE TABLE Users (
@@ -398,6 +398,21 @@ public static class GraftSchema
             CREATE INDEX IX_SubjectPeople_User ON SubjectPeople(UserId);
             CREATE INDEX IX_Issues_Milestone ON Issues(MilestoneId);
             CREATE INDEX IX_Boards_Project ON Boards(ProjectId);
+            """),
+        // Review, the second half.
+        //
+        // Draft is a flag rather than a title prefix. GitLab reads "Draft:" off the front of the title, which
+        // means a proposal's readiness changes when somebody edits its wording; a stored flag changes only
+        // when somebody changes it. A draft cannot be merged however mergeable its branches are.
+        //
+        // RequireCodeOwnerApproval is a project rule, off by default so no project gains a gate from an
+        // upgrade. With it on, every changed path that a CODEOWNERS file names needs a current approval
+        // from one of the people it names before the proposal merges. The file itself lives in the
+        // repository, where the people it names can review changes to it.
+        DnaXMigration.Sql(13, "review-options", "Draft proposals and a code owner approval rule", """
+            ALTER TABLE MergeRequests ADD COLUMN Draft INTEGER NOT NULL DEFAULT 0 CHECK (Draft IN (0, 1));
+            ALTER TABLE Projects ADD COLUMN RequireCodeOwnerApproval INTEGER NOT NULL DEFAULT 0
+                CHECK (RequireCodeOwnerApproval IN (0, 1));
             """)
     ]);
 }

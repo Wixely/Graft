@@ -24,3 +24,4 @@ Open architecture choices are in [architecture.md](../architecture.md); they are
 
 - [0018: Four GiB repositories](0018-repository-capacity.md) — implemented; disk-backed objects, pack transfers and archives replace the feasibility size budgets
 - [0019: A comment becomes a conversation](0019-conversation.md) — accepted and implemented; threads one level deep, resolving needs the standing to push or to have started the thread, edits recorded, a first comment with replies kept
+- [0020: Planning, and the rule that a Reporter files while a Developer organises](0020-planning.md) — accepted and implemented; labels as a project's own vocabulary, milestones that keep their work when deleted, boards with no state of their own, confidential issues for members and the author, drafts that do not merge
