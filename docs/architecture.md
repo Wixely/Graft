@@ -31,7 +31,7 @@ Use C#/.NET 10 and Dapper.AOT. Preserve the demonstrated static-musl NativeAOT p
 | --- | --- |
 | Browser UI and NativeAOT | Check current .NET 10 support. Blazor default remains relevant; server-side rendering/hosting must not be assumed compatible because minimal HTTP endpoints passed. Compare options and document tradeoffs. |
 | Static native libraries | Keep full globalization; audit OpenSSL providers, certificate trust, DNS and library updates. The probe's embedded ICU fix is essential. |
-| Database manifests | DnaX 10.0.0-alpha.7 passed the migration/AOT experiment. Adoption waits for a reproducible approved package feed and target-host execution. The application owns ordered migrations, preservation fixtures and restore policy. |
+| Database manifests | DnaX 10.0.0-alpha.13 (pinned 2026-10-29; alpha.7 passed the original migration/AOT experiment) carries the NativeAOT generator fixes and is published by DnaX's CI to GitHub Packages. Graft still restores it from a local feed; a clean external restore waits on that source being adopted, and target-host execution is still unproven. The application owns ordered migrations, preservation fixtures and restore policy. |
 | Git backend | Compare correctness, licenses, footprint, old-kernel compatibility and standalone packaging; external Git is not yet authorized as a product dependency. |
 | HTTP/API serialization | Confirm source-generated serializers and endpoint patterns work in a published binary. Do not disable warnings globally. |
 | Authentication and permissions | Map GitLab token/membership semantics into a simple explainable model without broadening access. Avoid separate inconsistent auth implementations. |

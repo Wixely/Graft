@@ -49,16 +49,24 @@ The forge as of this entry publishes native with zero ILC warnings, starts as `M
 **947 of 947** Git and **104 of 104** MCP assertions as a native binary, the same counts as managed. The
 publish found one defect in the day's work: the token rotation route was mapped through a delegate variable,
 which the compile-time endpoint generator cannot see, so the native build refused it; it is a lambda now,
-and the managed suite could never have caught it. Two caveats carried from before: `DnaX.Uploads` is still
-pinned at `10.0.0-alpha.7`, so the run used a package packed from the unreleased DnaX fix branch and the pin
-was reverted afterwards; and the publish's own restore lacked the `win-x64` target, so restore first and
-publish with `--no-restore`, as build-and-test.md now says.
+and the managed suite could never have caught it. The publish's own restore lacked the `win-x64` target, so
+restore first and publish with `--no-restore`, as build-and-test.md now says.
+
+**And then DnaX released the fix.** The user merged the fix branch and bumped DnaX to `10.0.0-alpha.13`
+later the same day, and Graft now pins it for `DnaX.Uploads` and `DnaX.Data.Migrations.Sqlite`, six
+prerelease versions on from the alpha.7 the forge had carried since ADR 0005. The three packages were
+packed from the DnaX commit its CI published and put in the local feed Graft restores from. The managed
+server on the new packages passes both suites, and the native forge built against them passes both suites
+again, 947 and 104, with zero ILC warnings. The native forge is no longer blocked by a dependency. The
+2026-10-16 entry below that said it was carries a note. What a release still lacks is a durable source in
+this repository: DnaX's CI publishes to GitHub Packages under Wixely, which needs an authenticated feed in
+`nuget.config`, and adding one is the user's decision.
 
 **Next action.** Operator: back up the repositories directory before deploying this build, because the Git
-engine entry's format conversion is still the deployment's first upgrade step; and decide whether to merge
-and release the DnaX fix branch, which is what stands between this repository as pinned and a native forge.
-Agent: the "Near, and small" list is empty and the native build is verified; everything left in the backlog
-needs a decision from the user first.
+engine entry's format conversion is still the deployment's first upgrade step; and decide whether to add
+the Wixely GitHub Packages feed to `nuget.config`, which is what a clean external restore now waits on.
+Agent: the "Near, and small" list is empty, the native build is verified on the released packages, and
+everything left in the backlog needs a decision from the user first.
 
 
 ## Added on 2026-10-29, later the same day: the outside, the builds, and the Git engine
@@ -502,7 +510,8 @@ starts, serves, and **passes all 82 MCP and all 389 Git assertions as a native b
 `OptionsBuilder.Bind`, cleared by `EnableConfigurationBindingGenerator`. **Next action, owner: implementation
 agent once that issue is resolved:** move Graft's pin to the released version and publish the forge native.
 Nothing in Graft needs to change. Until then Graft pins `10.0.0-alpha.7` and the native forge cannot start,
-which is a published-dependency problem rather than a Graft one.
+which is a published-dependency problem rather than a Graft one. *Resolved 2026-10-29: DnaX merged the fix
+and bumped to `10.0.0-alpha.13`; Graft pins it, and the native forge starts. See the entry at the top.*
 
 **The client gained an admin page**, `/-/admin/agents`, shown only when the session reports
 `mcp_available`, and the session response carries that flag beside `public_browsing`.

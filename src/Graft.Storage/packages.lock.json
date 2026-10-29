@@ -16,11 +16,11 @@
       },
       "DnaX.Data.Migrations.Sqlite": {
         "type": "Direct",
-        "requested": "[10.0.0-alpha.7, )",
-        "resolved": "10.0.0-alpha.7",
-        "contentHash": "Q0X6mkGYxwTZPNYrLWJxvoMAwENZHRyA07Pb25i82P4JtFYgSb5dHZXXwDht5JgKZxWtTud9qHPeNSAE6HoELg==",
+        "requested": "[10.0.0-alpha.13, )",
+        "resolved": "10.0.0-alpha.13",
+        "contentHash": "nq9eolfUEGlbChh9h7usp3JbhbXy0dPvIeVMemCYFp8RAa8PbxTPkAbQThrlcYfx24vaMUOqMsAkpbwhzH5A6g==",
         "dependencies": {
-          "DnaX.Data.Migrations": "10.0.0-alpha.7",
+          "DnaX.Data.Migrations": "10.0.0-alpha.13",
           "Microsoft.Data.Sqlite": "10.0.11"
         }
       },
@@ -63,8 +63,8 @@
       },
       "DnaX.Data.Migrations": {
         "type": "Transitive",
-        "resolved": "10.0.0-alpha.7",
-        "contentHash": "zzsP/SjAm7AHykp7FSDLwQOcdT1Ir6g66VTLJu+CXSBtRgW8nzT3u/zRoGsm8wan/PXtNkGrx9kCOP+Z/jbCfw==",
+        "resolved": "10.0.0-alpha.13",
+        "contentHash": "+ZtKjMD10ofXvsIsleWbriNkFZxB67hRyN39ukVP1SLQWcqet7UXqgJsjGnc11Gouu6c1zhiUjdfplOUqX+OOg==",
         "dependencies": {
           "Microsoft.Extensions.DependencyInjection.Abstractions": "10.0.5",
           "Microsoft.Extensions.Hosting.Abstractions": "10.0.5",
@@ -172,6 +172,13 @@
       },
       "graft.core": {
         "type": "Project"
+      }
+    },
+    "net10.0/win-x64": {
+      "SQLitePCLRaw.lib.e_sqlite3": {
+        "type": "Transitive",
+        "resolved": "2.1.12",
+        "contentHash": "fWi8Dbknuhgg72fWinIdjXVaqO1hHL4YBBwVLnr7e1c9TAZwJ0QE38j9syW1hwx6HaqEVTwI+O07WPdZn8Rp0w=="
       }
     }
   }
