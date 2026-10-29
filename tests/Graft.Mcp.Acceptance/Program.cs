@@ -150,7 +150,7 @@ async Task CheckForge(string address, string token, string password)
     using (HttpResponseMessage listing = await Post(client, token, Request(3, "tools/list", "{}")))
     {
         using JsonDocument body = Parse(await listing.Content.ReadAsStringAsync());
-        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 37,
+        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 38,
             "the forge's endpoint advertises every tool");
     }
 
@@ -310,6 +310,26 @@ async Task CheckForge(string address, string token, string password)
         using JsonDocument body = Parse(await readBack.Content.ReadAsStringAsync());
         Check(Text(body).Contains("Written by an agent", StringComparison.Ordinal),
             "and reads back exactly what it wrote, through the tool that was already there");
+    }
+    // Deleting what it wrote, which is the other half of changing a tree. The file goes from the branch tip
+    // and from nowhere else; the read tool is what confirms it rather than the delete tool's own report.
+    using (HttpResponseMessage deleted = await Post(client, token, Call(34, "graft_delete_file",
+        """{"project":"admin/shared","file":"docs/agent.md","branch":"agent-work","message":"Remove the note"}""")))
+    {
+        using JsonDocument body = Parse(await deleted.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("\"deleted\":true", StringComparison.Ordinal), "an agent deletes a file it wrote");
+    }
+    using (HttpResponseMessage gone = await Post(client, token, Call(35, "graft_read_file",
+        """{"project":"admin/shared","file":"docs/agent.md","reference":"agent-work"}""")))
+    {
+        using JsonDocument body = Parse(await gone.Content.ReadAsStringAsync());
+        Check(!Text(body).Contains("Written by an agent", StringComparison.Ordinal), "and the file is no longer on the branch");
+    }
+    using (HttpResponseMessage twice = await Post(client, token, Call(36, "graft_delete_file",
+        """{"project":"admin/shared","file":"docs/agent.md","branch":"agent-work","message":"Remove it again"}""")))
+    {
+        using JsonDocument body = Parse(await twice.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("error", StringComparison.Ordinal), "deleting a file that is not there is refused rather than committed");
     }
 
     // Membership, which an agent could previously neither read nor change.
@@ -498,7 +518,7 @@ async Task CheckStdio(string address, bool readOnly)
 
         using JsonDocument tools = await Exchange(client, Request(2, "tools/list", "{}"));
         int count = tools.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength();
-        Check(count == 37, label + " advertises every tool");
+        Check(count == 38, label + " advertises every tool");
 
         using JsonDocument read = await Exchange(client, Call(3, "graft_browse", """{"search":""}"""));
         Check(Text(read).Contains("admin/shared", StringComparison.Ordinal), label + " reads the public listing");
@@ -551,7 +571,7 @@ async Task CheckHttp(string address, string token)
     using (HttpResponseMessage listing = await Post(client, token, Request(3, "tools/list", "{}")))
     {
         using JsonDocument body = Parse(await listing.Content.ReadAsStringAsync());
-        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 37,
+        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 38,
             "the launcher's HTTP endpoint advertises every tool");
     }
 

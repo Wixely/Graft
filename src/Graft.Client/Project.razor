@@ -184,6 +184,15 @@ git push -u origin main</pre>
                     <a class="button secondary" href="@RawUrl(repo.File.FilePath)" download>
                         <Icon Name="download" />Download
                     </a>
+                    @if (repo.CanPush && Branch.Length > 0)
+                    {
+                        @* Two clicks, like deleting a branch or a tag. The commit keeps the file in the history;
+                           what goes is the file on this branch's tip. *@
+                        <button type="button" class="@(pendingFile == repo.File.FilePath ? "danger" : "secondary")"
+                                @onclick="() => DeleteFile(repo.File.FilePath)" disabled="@busy">
+                            @(pendingFile == repo.File.FilePath ? "Confirm delete" : "Delete")
+                        </button>
+                    }
                 </div>
                 @if (fileText is null)
                 {
@@ -703,6 +712,7 @@ git push -u origin main</pre>
     private string newBranch = "";
     private string newBranchFrom = "";
     private string? pendingBranch;
+    private string? pendingFile;
     private TagResponse[] tags = [];
     private string newTag = "";
     private string newTagFrom = "";
@@ -1088,6 +1098,36 @@ git push -u origin main</pre>
             Report(result);
             pendingBranch = null;
             if (result.Ok) await LoadRepository();
+        }
+        finally { busy = false; }
+    }
+
+    /// <summary>Deleting a file is a commit on the branch being viewed. The second click is the confirmation;
+    /// the message names the file, because the dialog this replaces would have asked for nothing more.</summary>
+    private async Task DeleteFile(string file)
+    {
+        if (busy || repo is null) return;
+        if (pendingFile != file)
+        {
+            pendingFile = file;
+            Report(ApiResult.Refused($"Select Confirm delete to remove {file} from {Branch}. The history keeps it."));
+            return;
+        }
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.DeleteAsync(
+                $"api/projects/{repo.Project.Id}/repository/files/{Uri.EscapeDataString(file)}" +
+                $"?branch={Uri.EscapeDataString(Branch)}&commit_message={Uri.EscapeDataString("Delete " + file)}",
+                $"{file} deleted from {Branch}.");
+            Report(result);
+            pendingFile = null;
+            if (result.Ok)
+            {
+                filePath = "";
+                await Load();
+            }
         }
         finally { busy = false; }
     }

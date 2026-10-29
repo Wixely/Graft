@@ -652,6 +652,68 @@ async Task CheckApiFileWrites(string address, AuthenticatedIdentity alice, long 
         Check(refused.StatusCode == System.Net.HttpStatusCode.NotFound,
             "a token that may not push cannot write a file either");
 
+    // Deleting a file, which the write route could not express: a commit whose tree lacks the path. The
+    // branch and message travel in a JSON body first, as GitLab documents, then on the query string, which is
+    // the form for a client whose DELETE carries no body.
+    using (HttpResponseMessage denied = await ApiDeleteJson(address, "/api/v4/projects/" + projectId + "/repository/files/" +
+        Uri.EscapeDataString("docs/written-by-api.md"), readApiToken, new { branch = "api-writes", commit_message = "Should not happen" }))
+        Check(denied.StatusCode == System.Net.HttpStatusCode.NotFound, "a token that may not push cannot delete a file");
+    using (HttpResponseMessage deleted = await ApiDeleteJson(address, "/api/v4/projects/" + projectId + "/repository/files/" +
+        Uri.EscapeDataString("docs/written-by-api.md"), apiToken, new { branch = "api-writes", commit_message = "Delete a file through the API" }))
+        Check(deleted.StatusCode == System.Net.HttpStatusCode.NoContent,
+            "a file can be deleted through the API (got " + (int)deleted.StatusCode + ": " + Redact(await deleted.Content.ReadAsStringAsync()) + ")");
+    using (HttpResponseMessage gone = await ApiGet(address, "/api/v4/projects/" + projectId + "/repository/files/" +
+        Uri.EscapeDataString("docs/written-by-api.md") + "?ref=api-writes", apiToken))
+        Check(gone.StatusCode == System.Net.HttpStatusCode.NotFound, "and it is no longer on the branch");
+    using (HttpResponseMessage kept = await ApiGet(address, "/api/v4/projects/" + projectId + "/repository/files/" +
+        Uri.EscapeDataString("docs/encoded.txt") + "?ref=api-writes", apiToken))
+        Check(kept.IsSuccessStatusCode, "while the other file in the same directory is still there");
+    using (HttpResponseMessage again = await ApiDeleteJson(address, "/api/v4/projects/" + projectId + "/repository/files/" +
+        Uri.EscapeDataString("docs/written-by-api.md"), apiToken, new { branch = "api-writes", commit_message = "Delete it again" }))
+        Check(again.StatusCode == System.Net.HttpStatusCode.NotFound, "deleting a file that is not there is refused, and no commit is made");
+    using (HttpResponseMessage directory = await ApiDeleteJson(address, "/api/v4/projects/" + projectId + "/repository/files/docs",
+        apiToken, new { branch = "api-writes", commit_message = "Delete a directory" }))
+        Check(directory.StatusCode == System.Net.HttpStatusCode.BadRequest, "a directory is not a file, and is refused by name");
+    using (HttpResponseMessage noBranch = await ApiDeleteJson(address, "/api/v4/projects/" + projectId + "/repository/files/" +
+        Uri.EscapeDataString("docs/encoded.txt"), apiToken, new { branch = "never-made", commit_message = "Delete on a branch that is not there" }))
+        Check(noBranch.StatusCode == System.Net.HttpStatusCode.BadRequest, "and a branch that does not exist cannot have a file deleted from it");
+    using (HttpResponseMessage missing = await ApiDelete(address, "/api/v4/projects/" + projectId + "/repository/files/" +
+        Uri.EscapeDataString("docs/encoded.txt"), apiToken))
+        Check(missing.StatusCode == System.Net.HttpStatusCode.BadRequest, "a deletion without a branch is refused before anything is read");
+
+    // The last file in the directory, by query string. Git has no empty trees, so the directory must go with
+    // it, and the result must be a tree Git itself accepts.
+    using (HttpResponseMessage last = await ApiDelete(address, "/api/v4/projects/" + projectId + "/repository/files/" +
+        Uri.EscapeDataString("docs/encoded.txt") + "?branch=api-writes&commit_message=" + Uri.EscapeDataString("Delete the last file in docs"), apiToken))
+        Check(last.StatusCode == System.Net.HttpStatusCode.NoContent, "the branch and message may travel on the query string instead");
+    using (HttpResponseMessage tree = await ApiGet(address, "/api/v4/projects/" + projectId + "/repository/tree?ref=api-writes", apiToken))
+    {
+        Check(tree.IsSuccessStatusCode, "the tree of the branch still lists");
+        using JsonDocument json = JsonDocument.Parse(await tree.Content.ReadAsStreamAsync());
+        Check(!json.RootElement.EnumerateArray().Any(entry => entry.GetProperty("name").GetString() == "docs"),
+            "and the directory emptied by the deletion is gone with its last file");
+    }
+    string deletionClone = Path.Combine(root, "deletion-clone");
+    await Git(root, ["clone", "--quiet", "--branch", "api-writes", AuthenticatedUrl(address, "alice", apiToken, "alice/durable.git"), deletionClone]);
+    Check(!Directory.Exists(Path.Combine(deletionClone, "docs")), "a clone of the branch has no docs directory");
+    (int fsck, _, string fsckErrors) = await RunGit(deletionClone, ["fsck", "--full", "--strict"]);
+    Check(fsck == 0, "and Git accepts every object the deletions wrote (" + fsckErrors.Trim() + ")");
+    string log = await Git(deletionClone, ["log", "--format=%s", "--diff-filter=D", "--name-only", "api-writes"]);
+    Check(log.Contains("docs/written-by-api.md", StringComparison.Ordinal) && log.Contains("docs/encoded.txt", StringComparison.Ordinal),
+        "and Git reads both deletions as deletions in the history");
+}
+
+async Task<HttpResponseMessage> ApiDeleteJson(string address, string path, string? token, object body)
+{
+    HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false };
+    HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
+    HttpRequestMessage request = new(HttpMethod.Delete, path) { Content = JsonContent.Create(body) };
+    if (token is not null) request.Headers.Add("PRIVATE-TOKEN", token);
+    HttpResponseMessage response = await client.SendAsync(request);
+    request.Dispose();
+    client.Dispose();
+    handler.Dispose();
+    return response;
 }
 
 /// <summary>

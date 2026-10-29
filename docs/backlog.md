@@ -67,11 +67,13 @@ The collaboration depth list from the 2026-10-28 review, taken on as one piece o
   only what the client lacks, and protocol version 2. SHA-1 only, and no shallow or partial clones, by
   decision. [ADR 0028](decisions/0028-git-engine.md).
 
-## Near, and small
+## Closed on 2026-10-29, later the same day
 
-**Deleting a file through the API.** Files can be created and updated over the API; `DELETE` on the same
-route is not implemented, and the browser cannot delete either. The object writer gained a whole-tree
-writer for merges, which is most of what a deletion needs.
+- **Deleting a file.** `DELETE` on the repository-files route, a button on the file view and an agent tool;
+  a deletion that finds no file is refused, and a directory it empties disappears.
+  [ADR 0029](decisions/0029-file-deletion.md).
+
+## Near, and small
 
 **Token rotation.** Regenerating a token in place, keeping its name, scopes and expiry while issuing a new
 secret. Offered when recoverable secrets were chosen instead in
