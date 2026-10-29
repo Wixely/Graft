@@ -315,6 +315,19 @@ To stay in one shell instead, call `vcvars64.bat` first. It lives under the Visu
 Recorded 2026-10-16, when this is how the forge with its MCP transport and the `Graft.Mcp` launcher were both
 published native for the first time; see [MCP evidence](validation/2026-10-16-mcp-in-the-forge.md).
 
+If the publish stops with NETSDK1047, saying the assets file has no `net10.0/win-x64` target, restore for the
+runtime first and tell the publish not to restore again:
+
+```bat
+dotnet restore src\Graft.Server\Graft.Server.csproj -r win-x64 -p:GraftServerAot=true
+set Platform= && dotnet publish src\Graft.Server\Graft.Server.csproj -c Release -r win-x64 --self-contained true -p:GraftServerAot=true -p:IlcUseEnvironmentalTools=true --no-restore -o artifacts\mvp08\server-win-x64
+```
+
+Seen on 2026-10-29; the cause was not run down. That run is recorded in
+[the native forge evidence](validation/2026-10-29-nativeaot-forge.md), with the one defect it found that
+the managed suites could not have: a route mapped through a delegate variable, which the compile-time
+endpoint generator cannot see. Map routes through lambdas or method groups.
+
 Build the integrated static Linux server and admin tool with the existing isolated WSL toolchain:
 
 ```powershell
