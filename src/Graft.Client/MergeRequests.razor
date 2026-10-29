@@ -207,6 +207,41 @@ else
                     <span>@ApprovalExplanation</span>
                 </div>
             }
+            @if (proposal.CodeOwners is { Count: > 0 })
+            {
+                <div class="banner @(OwnersMissing ? "warning" : "info")">
+                    <Icon Name="@(OwnersMissing ? "alert" : "user")" />
+                    <span>
+                        @if (!proposal.CodeOwnerApprovalRequired)
+                        {
+                            @("The target branch's CODEOWNERS file names owners for some of these paths. This project does not require their approval.")
+                        }
+                        else if (OwnersMissing)
+                        {
+                            @($"This project requires a code owner's approval. Still waiting on: {string.Join(", ", proposal.CodeOwnerApprovalsMissing!)}.")
+                        }
+                        else
+                        {
+                            @("Every owned path has a code owner's approval.")
+                        }
+                    </span>
+                </div>
+                <div class="list">
+                    @foreach (CodeOwnerResponse owned in proposal.CodeOwners)
+                    {
+                        <div class="list-item">
+                            <span class="list-item-main"><code>@owned.Path</code></span>
+                            <small>@string.Join(", ", owned.Owners)</small>
+                            @if (proposal.CodeOwnerApprovalRequired)
+                            {
+                                <span class="label @(proposal.CodeOwnerApprovalsMissing?.Contains(owned.Path) == true ? "" : "success")">
+                                    @(proposal.CodeOwnerApprovalsMissing?.Contains(owned.Path) == true ? "waiting" : "approved")
+                                </span>
+                            }
+                        </div>
+                    }
+                </div>
+            }
             @if (proposal.ApprovedBy is { Count: > 0 })
             {
                 <div class="list">
@@ -229,10 +264,16 @@ else
                 </div>
             }
             <div class="form-actions">
-                @if (canPush && proposal.State == "opened" && proposal.MergeStatus == "can_be_merged" && proposal.ApprovalsLeft == 0 && !proposal.Draft)
+                @if (CanMergeNow)
                 {
                     <button type="button" @onclick="Merge" disabled="@busy">
-                        @(busy ? "Merging…" : proposal.MergeMethod == "fast_forward" ? "Fast-forward" : "Merge")
+                        @(busy ? "Merging…" : squashOnMerge ? "Squash and merge" : proposal.MergeMethod == "fast_forward" ? "Fast-forward" : "Merge")
+                    </button>
+                }
+                @if (canPush && proposal.State == "opened" && proposal.MergeMethod is "three_way" or "conflict")
+                {
+                    <button type="button" class="secondary" @onclick="Rebase" disabled="@busy" title="Rewrite the source branch onto the target's tip. Approvals and line comments will be superseded.">
+                        Rebase onto @proposal.TargetBranch
                     </button>
                 }
                 @if (proposal.State == "opened" && proposal.Draft && CanChangeState)
@@ -253,12 +294,21 @@ else
                     </button>
                 }
             </div>
-            @if (canPush && proposal.State == "opened" && proposal.MergeStatus == "can_be_merged" && proposal.ApprovalsLeft == 0 && !proposal.Draft)
+            @if (CanMergeNow)
             {
                 <label class="checkbox">
                     <input type="checkbox" @bind="removeSourceOnMerge" />
                     Delete <code>@proposal.SourceBranch</code> after merging
                 </label>
+                <label class="checkbox">
+                    <input type="checkbox" @bind="squashOnMerge" />
+                    Squash into one commit on <code>@proposal.TargetBranch</code>, leaving the branch's own history behind
+                </label>
+                @if (squashOnMerge)
+                {
+                    <label for="squash-message">Commit message</label>
+                    <input id="squash-message" @bind="squashMessage" maxlength="10000" placeholder="@proposal.Title" />
+                }
             }
             @if (canPush && proposal.State == "opened" && IsAuthor && proposal.ApprovalsRequired > 0)
             {
@@ -492,7 +542,7 @@ else
               SelectedLabels="@([.. proposal.LabelDetails ?? []])" Milestone="proposal.Milestone"
               Assignees="@(proposal.Assignees ?? [])" Reviewers="@(proposal.Reviewers ?? [])"
               Draft="proposal.Draft" ShowDraft="@(proposal.State == "opened")" TimeStats="proposal.TimeStats"
-              CanTriage="@(canParticipate && proposal.State != "merged" && (canPush || IsAuthor))" CanEditFlags="@CanChangeState" Busy="busy" OnSave="SaveMeta" />
+              CanTriage="@(canParticipate && proposal.State != "merged" && (canPush || IsAuthor))" CanEditFlags="@CanChangeState" CanParticipate="canParticipate" Busy="busy" OnSave="SaveMeta" OnTime="RecordTime" />
     </div>
 }
 
@@ -514,6 +564,12 @@ else
     private long total;
     private bool truncated;
     private bool removeSourceOnMerge;
+    private bool squashOnMerge;
+    private string squashMessage = "";
+
+    private bool OwnersMissing => proposal?.CodeOwnerApprovalsMissing is { Count: > 0 };
+
+    private bool CanMergeNow => canPush && proposal is { State: "opened", MergeStatus: "can_be_merged", ApprovalsLeft: 0, Draft: false } && !OwnersMissing;
     private string? commentingPath;
     private int? commentingLine;
     private string? commentingSide;
@@ -752,6 +808,21 @@ else
 
     private Task SetDraft(bool draft) => SaveMeta(new IssueUpdateRequest(null, null, null, Draft: draft));
 
+    private async Task RecordTime((string Action, TimeRequest Request) time)
+    {
+        if (busy || proposal is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/projects/{projectId}/merge-requests/{proposal.Iid}/{time.Action}", time.Request,
+                ApiJson.Default.TimeRequest, time.Action == "time_estimate" ? "Estimate saved." : "Time recorded.");
+            Report(result.Ok, result.Message);
+            if (result.Ok) await LoadOne();
+        }
+        finally { busy = false; }
+    }
+
     private async Task<bool> ResolveProject()
     {
         string path = ViaSlug
@@ -882,7 +953,25 @@ else
         {
             ApiResult result = await Api.PostAsync(
                 $"api/projects/{projectId}/merge-requests/{proposal.Iid}/merge",
-                new MergeAcceptRequest(removeSourceOnMerge), ApiJson.Default.MergeAcceptRequest, "Merged.");
+                new MergeAcceptRequest(removeSourceOnMerge, squashOnMerge, squashOnMerge && squashMessage.Trim().Length > 0 ? squashMessage : null),
+                ApiJson.Default.MergeAcceptRequest, squashOnMerge ? "Squashed and merged." : "Merged.");
+            Report(result.Ok, result.Message);
+            if (!result.Ok) return;
+            await ResolveProject();
+            await LoadOne();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task Rebase()
+    {
+        if (busy || proposal is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/projects/{projectId}/merge-requests/{proposal.Iid}/rebase",
+                $"Rebased onto {proposal.TargetBranch}. Approvals and line comments from before the rebase are superseded.");
             Report(result.Ok, result.Message);
             if (!result.Ok) return;
             await ResolveProject();

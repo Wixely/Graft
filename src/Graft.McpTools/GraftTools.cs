@@ -859,12 +859,14 @@ public sealed class GraftTools
         GraftClient graft,
         [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
         [Description("The merge request number as shown in the project.")] long number,
+        [Description("Optional: true to squash the branch into one commit on the target, with the merge request's title as its message. The branch's own commits are left behind.")] bool squash,
         CancellationToken cancellationToken)
     {
         if (!graft.AllowWrites) return Refused(graft, "merging");
 
         (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Put,
-            "api/v4/projects/" + Encode(project) + "/merge_requests/" + Number(number) + "/merge", null, cancellationToken);
+            "api/v4/projects/" + Encode(project) + "/merge_requests/" + Number(number) + "/merge",
+            squash ? new JsonObject { ["squash"] = true } : null, cancellationToken);
         if (!ok) return Failure(GraftClient.Describe(status, response));
         return Created(response, ApiJson.Default.MergeResultResponse, result => new JsonObject
         {
@@ -924,6 +926,122 @@ public sealed class GraftTools
                 ["web_url"] = milestone.WebUrl
             })
         }.ToJsonString();
+    }
+
+    [McpServerTool(Name = "graft_list_releases")]
+    [Description("Lists a project's releases, newest first: the tag each sits on, its notes, the files attached and the links it carries, with download addresses.")]
+    public static async Task<string> ListReleases(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        CancellationToken cancellationToken)
+    {
+        (ReleaseResponse[]? releases, string? error) = await graft.GetAsync(
+            "api/v4/projects/" + Encode(project) + "/releases", ApiJson.Default.ReleaseResponseArray, cancellationToken);
+        if (error is not null) return Failure(error);
+        return new JsonObject
+        {
+            ["releases"] = Array(releases!, release => new JsonObject
+            {
+                ["tag"] = release.TagName,
+                ["name"] = release.Name,
+                ["released_at"] = release.ReleasedAt.ToString("O", CultureInfo.InvariantCulture),
+                ["author"] = release.Author.Username,
+                ["tag_exists"] = release.TagExists,
+                ["commit"] = release.Commit?.Id,
+                ["notes"] = release.Description,
+                ["files"] = Array(release.Assets.Files, file => new JsonObject
+                {
+                    ["name"] = file.FileName,
+                    ["size"] = file.Size,
+                    ["sha256"] = file.Sha256,
+                    ["url"] = file.Url
+                }),
+                ["links"] = Array(release.Assets.Links, link => new JsonObject
+                {
+                    ["name"] = link.Name,
+                    ["url"] = link.Url,
+                    ["kind"] = link.LinkType
+                }),
+                ["web_url"] = release.WebUrl
+            })
+        }.ToJsonString();
+    }
+
+    [McpServerTool(Name = "graft_read_wiki")]
+    [Description("Reads a project's wiki: with no page, lists the pages; with a page's slug, returns that page's markdown source and its history.")]
+    public static async Task<string> ReadWiki(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("Optional: the page's slug, as the listing reports it. Empty lists the pages.")] string page,
+        CancellationToken cancellationToken)
+    {
+        string prefix = "api/v4/projects/" + Encode(project) + "/wikis";
+        if (string.IsNullOrWhiteSpace(page))
+        {
+            (WikiPageResponse[]? pages, string? listError) = await graft.GetAsync(prefix, ApiJson.Default.WikiPageResponseArray, cancellationToken);
+            if (listError is not null) return Failure(listError);
+            return new JsonObject
+            {
+                ["pages"] = Array(pages!, entry => new JsonObject
+                {
+                    ["slug"] = entry.Slug,
+                    ["title"] = entry.Title,
+                    ["updated_by"] = entry.UpdatedBy,
+                    ["updated_at"] = entry.UpdatedAt.ToString("O", CultureInfo.InvariantCulture),
+                    ["web_url"] = entry.WebUrl
+                })
+            }.ToJsonString();
+        }
+        (WikiPageResponse? found, string? error) = await graft.GetAsync(prefix + "/" + Uri.EscapeDataString(page.Trim()), ApiJson.Default.WikiPageResponse, cancellationToken);
+        if (error is not null) return Failure(error);
+        (WikiVersionResponse[]? versions, _) = await graft.GetAsync(prefix + "/" + Uri.EscapeDataString(page.Trim()) + "/versions", ApiJson.Default.WikiVersionResponseArray, cancellationToken);
+        return new JsonObject
+        {
+            ["slug"] = found!.Slug,
+            ["title"] = found.Title,
+            ["content"] = found.Content,
+            ["updated_by"] = found.UpdatedBy,
+            ["updated_at"] = found.UpdatedAt.ToString("O", CultureInfo.InvariantCulture),
+            ["versions"] = versions is null ? null : Array(versions, version => new JsonObject
+            {
+                ["id"] = version.Id,
+                ["message"] = version.Message,
+                ["author"] = version.Author,
+                ["created_at"] = version.CreatedAt.ToString("O", CultureInfo.InvariantCulture)
+            }),
+            ["web_url"] = found.WebUrl
+        }.ToJsonString();
+    }
+
+    [McpServerTool(Name = "graft_write_wiki")]
+    [Description("Creates a wiki page, or replaces an existing page's content. Markdown. The previous text is kept as a version, so nothing is lost; read the page first unless you mean to replace it. Needs the permission to push. Refused unless writes are allowed on this server.")]
+    public static async Task<string> WriteWiki(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("The page's title. For an existing page, pass its slug as page and this may be empty to keep the title.")] string title,
+        [Description("Optional: the slug of an existing page to update. Empty creates a new page from the title.")] string page,
+        [Description("The whole markdown content of the page.")] string content,
+        [Description("Optional: a word about the change, kept with the version.")] string message,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowWrites) return Refused(graft, "writing the wiki");
+        if (content is null) return Failure("content is required.");
+        JsonObject body = new() { ["content"] = content };
+        if (!string.IsNullOrWhiteSpace(title)) body["title"] = title.Trim();
+        if (!string.IsNullOrWhiteSpace(message)) body["message"] = message.Trim();
+        bool creating = string.IsNullOrWhiteSpace(page);
+        if (creating && string.IsNullOrWhiteSpace(title)) return Failure("title is required for a new page.");
+        string path = "api/v4/projects/" + Encode(project) + "/wikis" + (creating ? "" : "/" + Uri.EscapeDataString(page.Trim()));
+        (bool ok, string response, int status) = await graft.SendAsync(creating ? HttpMethod.Post : HttpMethod.Put, path, body, cancellationToken);
+        if (!ok) return Failure(GraftClient.Describe(status, response));
+        return Created(response, ApiJson.Default.WikiPageResponse, saved => new JsonObject
+        {
+            ["saved"] = true,
+            ["slug"] = saved.Slug,
+            ["title"] = saved.Title,
+            ["versions"] = saved.Versions,
+            ["web_url"] = saved.WebUrl
+        });
     }
 
     [McpServerTool(Name = "graft_triage")]

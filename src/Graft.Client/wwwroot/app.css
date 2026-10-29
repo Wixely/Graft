@@ -803,3 +803,7 @@ progress.progress::-moz-progress-bar { background: var(--success); }
 .board-card small { color: var(--text-secondary); font-size: 12px; }
 .board-card-labels { display: flex; flex-wrap: wrap; gap: var(--space-1); }
 .board-card select { font-size: 12px; padding: 3px var(--space-2); }
+
+/* Wide forms for prose: the wiki editor and a snippet's content. */
+form.form.wide { max-width: none; }
+form.form.wide textarea.mono { font-family: var(--font-mono); font-size: 12px; }

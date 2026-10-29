@@ -1,6 +1,49 @@
 # Next-agent handoff
 
-Updated: 2026-10-25. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
+Updated: 2026-10-29. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
+
+## Added on 2026-10-29: the collaboration depth list, built out
+
+The user asked for the collaboration gaps from the 2026-10-28 review to be built, as one piece of work.
+Five decision records cover it, and each says what was decided against the obvious alternative:
+
+- **[ADR 0019](decisions/0019-conversation.md)**: replies, one level deep; resolving a thread by whoever
+  could push or whoever started it, hiding nothing; edits recorded; a first comment with replies kept.
+- **[ADR 0020](decisions/0020-planning.md)**: labels, milestones, assignees, due dates, boards,
+  confidential issues, reviewers and drafts. The rule is that a Reporter files and a Developer organises.
+  A label that does not exist is refused by name. A board stores no state of its own. A confidential
+  issue is for members and its author however public the project. A draft does not merge.
+- **[ADR 0021](decisions/0021-review-options.md)**: squash, which is a merge that forgets; rebase, which is
+  a forced push that replays each commit and refuses by name, superseding approvals and line comments;
+  code owners read from the target branch, with a project switch to require their approval.
+- **[ADR 0022](decisions/0022-releases.md)**: releases on a tag that outlive it, with links and uploaded
+  files kept in the database at 32 MiB each and served as downloads.
+- **[ADR 0023](decisions/0023-wiki-snippets-time.md)**: a wiki in the database with every save kept and
+  slugs that never change; snippets as a comment with a file; time as an estimate and an attributed ledger.
+
+Migrations 11 to 15; manifest version 15. The agent surface went from 29 to 35 tools: `graft_comment`
+replies, `graft_merge` squashes, and `graft_list_labels`, `graft_list_milestones`, `graft_triage`,
+`graft_list_releases`, `graft_read_wiki` and `graft_write_wiki` are new. Deliberately withheld: resolving
+a thread, editing or deleting a comment, creating labels or milestones, marking confidential or ready,
+rebasing, publishing a release, and recording time.
+
+**Two things found by building rather than by reading.** The page's content security policy forbids style
+attributes, so a label's colour is painted from script after render (`graft-labels.js`) and a milestone's
+progress is a native `progress` element; anything that needs an inline style will need the same treatment.
+And Dapper's generator expands a `byte[]` parameter as an IN list, so the one blob insert, a release
+asset, binds its parameter through the provider directly; any future blob write has to do the same.
+
+Git suite 653 to 795; MCP suite 101. Browser pages for labels, milestones, boards, releases, wiki and
+snippets, and the details sidebar on issues and proposals, were driven against the fixture in Chrome.
+Each new browser page is reached from the project's tab row.
+
+**Not done, and worth saying.** Webhooks do not report label, milestone, release or wiki events. The
+NativeAOT publish was not re-run for this work; the suite ran against the managed server. The
+compatibility matrix carries each new row with its deviations.
+
+**Next action.** Operator: rebuild the deployment and run the migration by starting the server. Agent: a
+NativeAOT publish and the Git suite against it, then the three browser-page items in the backlog that
+this work left open.
 
 ## Fixed on 2026-10-25: a pull that failed once histories diverged
 

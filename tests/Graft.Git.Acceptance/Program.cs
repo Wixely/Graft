@@ -219,6 +219,9 @@ try
     await CheckProjectDeletion(address, aliceIdentity, administratorIdentity, bob.Username, alicePassword);
     await CheckReview(address, aliceIdentity, bob.Username, "carol");
     await CheckPlanning(address, aliceIdentity, bob.Username, "carol");
+    await CheckReviewOptions(address, aliceIdentity, bob.Username, "carol");
+    await CheckReleases(address, aliceIdentity, "carol");
+    await CheckKnowledge(address, aliceIdentity, bob.Username, "carol");
     await CheckCompressedGitRequests(address, aliceIdentity);
     await CheckFetching(address, aliceIdentity, "carol");
     await CheckEmptyRepository(address, aliceIdentity, alicePassword);
@@ -4102,6 +4105,483 @@ async Task CheckPlanning(string address, AuthenticatedIdentity alice, string bob
         using JsonDocument json = JsonDocument.Parse(await after.Content.ReadAsStreamAsync());
         Check(after.IsSuccessStatusCode && json.RootElement.GetProperty("labels").GetArrayLength() == 0,
             "deleting a label removes it from everything it was on");
+    }
+}
+
+/// <summary>
+/// Code owners, the approval rule built on them, rebasing a proposal, and squashing a merge.
+/// </summary>
+async Task CheckReviewOptions(string address, AuthenticatedIdentity alice, string bobUsername, string reporterUsername)
+{
+    long projectId;
+    string aliceApi;
+    string bobApi;
+    string reporterApi;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        ProjectInfo created = await store.CreateProjectWithRepositoryAsync(alice, "options", "Review options",
+            (project, cancellation) => { cancellation.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, project.StorageId)); return Task.CompletedTask; });
+        projectId = created.Id;
+        UserAccount bob = Required(await store.FindActiveUserAsync(bobUsername), "bob account");
+        UserAccount reporter = Required(await store.FindActiveUserAsync(reporterUsername), "reporter account");
+        await store.SetMembershipAsync(alice, projectId, bob.Id, ProjectRole.Developer);
+        await store.SetMembershipAsync(alice, projectId, reporter.Id, ProjectRole.Reporter);
+        aliceApi = (await store.CreateTokenAsync(alice, "options-api", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        bobApi = (await store.CreateTokenAsync(new(bob.Id, bob.Username, false, IdentityKind.BrowserSession), "options-developer", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        reporterApi = (await store.CreateTokenAsync(new(reporter.Id, reporter.Username, false, IdentityKind.BrowserSession), "options-reporter", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+    }
+    string prefix = "/api/v4/projects/" + projectId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    string clone = Path.Combine(root, "options-clone");
+    Directory.CreateDirectory(clone);
+    string pushUrl = AuthenticatedUrl(address, "alice", aliceApi, "alice/options.git");
+    await Git(clone, ["init", "--initial-branch=main"]);
+    Directory.CreateDirectory(Path.Combine(clone, "docs"));
+    File.WriteAllText(Path.Combine(clone, "CODEOWNERS"), "# who looks after what\ndocs/ @" + bobUsername + "\n*.cs @alice\n");
+    File.WriteAllText(Path.Combine(clone, "docs", "guide.md"), "guide\n");
+    File.WriteAllText(Path.Combine(clone, "other.txt"), "other\n");
+    await Git(clone, ["add", "."]);
+    await Git(clone, ["commit", "-m", "Base"]);
+    await Git(clone, ["remote", "add", "origin", pushUrl]);
+    await Git(clone, ["push", "origin", "main"]);
+    // The proposal: two commits, one owned path and one not.
+    await Git(clone, ["checkout", "-b", "feature"]);
+    File.WriteAllText(Path.Combine(clone, "docs", "guide.md"), "guide, revised\n");
+    await Git(clone, ["commit", "-am", "Revise the guide"]);
+    File.WriteAllText(Path.Combine(clone, "other.txt"), "other, revised\n");
+    await Git(clone, ["commit", "-am", "Revise the other file"]);
+    await Git(clone, ["push", "origin", "feature"]);
+    // main moves, so the proposal is a three-way merge and a rebase has something to do.
+    await Git(clone, ["checkout", "main"]);
+    File.WriteAllText(Path.Combine(clone, "main-only.txt"), "ahead\n");
+    await Git(clone, ["add", "."]);
+    await Git(clone, ["commit", "-m", "Move main"]);
+    await Git(clone, ["push", "origin", "main"]);
+
+    long iid;
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/merge_requests", aliceApi,
+        new { source_branch = "feature", target_branch = "main", title = "Revise things" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStreamAsync());
+        iid = json.RootElement.GetProperty("iid").GetInt64();
+        JsonElement owners = json.RootElement.GetProperty("code_owners");
+        Check(created.StatusCode == HttpStatusCode.Created && owners.GetArrayLength() == 1 &&
+            owners[0].GetProperty("path").GetString() == "docs/guide.md" &&
+            owners[0].GetProperty("owners")[0].GetString() == bobUsername &&
+            !json.RootElement.GetProperty("code_owner_approval_required").GetBoolean(),
+            "a proposal reports who owns each changed path the target's CODEOWNERS names, and nothing for unowned paths");
+    }
+    using (HttpResponseMessage rule = await ApiPut(address, prefix + "/approvals", aliceApi, new { require_code_owner_approval = true }))
+        Check(rule.StatusCode == HttpStatusCode.NoContent, "a Maintainer turns the code owner rule on");
+    using (HttpResponseMessage refused = await ApiPut(address, prefix + "/approvals", bobApi, new { require_code_owner_approval = false }))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden, "a Developer cannot turn it off");
+    using (HttpResponseMessage blocked = await ApiPut(address, prefix + "/merge_requests/" + iid + "/merge", aliceApi, new { }))
+    {
+        string body = await blocked.Content.ReadAsStringAsync();
+        Check(blocked.StatusCode == HttpStatusCode.Conflict && body.Contains("docs/guide.md", StringComparison.Ordinal),
+            "a merge is refused while an owned path lacks its owner's approval, and names the path");
+    }
+    using (HttpResponseMessage reporter = await ApiPost(address, prefix + "/merge_requests/" + iid + "/approve", reporterApi, new { }))
+        Check(reporter.StatusCode == HttpStatusCode.Forbidden, "a Reporter still cannot approve, owner or not");
+    using (HttpResponseMessage owner = await ApiPost(address, prefix + "/merge_requests/" + iid + "/approve", bobApi, new { }))
+        Check(owner.IsSuccessStatusCode, "the owner approves");
+    using (HttpResponseMessage read = await ApiGet(address, prefix + "/merge_requests/" + iid, aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await read.Content.ReadAsStreamAsync());
+        Check(read.IsSuccessStatusCode && json.RootElement.GetProperty("code_owner_approval_required").GetBoolean() &&
+            json.RootElement.GetProperty("code_owner_approvals_missing").GetArrayLength() == 0 &&
+            json.RootElement.GetProperty("merge_method").GetString() == "three_way",
+            "with the owner's approval nothing is missing, and the proposal still merges three ways");
+    }
+
+    // Rebase: the branch is rewritten onto main, which supersedes the approval, because it is about
+    // commits that are no longer on the branch.
+    using (HttpResponseMessage refused = await ApiPut(address, prefix + "/merge_requests/" + iid + "/rebase", reporterApi, new { }))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden, "rebasing needs the permission a push needs");
+    string rebasedTip;
+    using (HttpResponseMessage rebased = await ApiPut(address, prefix + "/merge_requests/" + iid + "/rebase", bobApi, new { }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await rebased.Content.ReadAsStreamAsync());
+        rebasedTip = json.RootElement.GetProperty("sha").GetString()!;
+        JsonElement request = json.RootElement.GetProperty("merge_request");
+        Check(rebased.IsSuccessStatusCode && json.RootElement.GetProperty("rewritten_commits").GetInt32() == 2 &&
+            rebasedTip != json.RootElement.GetProperty("previous_sha").GetString() &&
+            request.GetProperty("merge_method").GetString() == "fast_forward" &&
+            !request.GetProperty("approved_by")[0].GetProperty("current").GetBoolean() &&
+            request.GetProperty("code_owner_approvals_missing").GetArrayLength() == 1,
+            "a rebase rewrites both commits onto main, makes the proposal a fast-forward, and supersedes the approval");
+    }
+    await Git(clone, ["fetch", "origin"]);
+    Check((await Git(clone, ["rev-parse", "origin/feature"])).Trim() == rebasedTip, "real Git sees the rebased branch where the API said it was");
+    Check((await Git(clone, ["log", "--format=%s", "origin/main..origin/feature"])).Trim().Split('\n').Length == 2 &&
+        (await Git(clone, ["log", "-1", "--format=%an", "origin/feature"])).Trim().Length > 0,
+        "the rebased branch carries both original commits, with their messages, on top of main");
+    using (HttpResponseMessage again = await ApiPut(address, prefix + "/merge_requests/" + iid + "/rebase", bobApi, new { }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await again.Content.ReadAsStreamAsync());
+        Check(again.IsSuccessStatusCode && json.RootElement.GetProperty("rewritten_commits").GetInt32() == 0,
+            "rebasing a branch already on the target rewrites nothing");
+    }
+    using (HttpResponseMessage owner = await ApiPost(address, prefix + "/merge_requests/" + iid + "/approve", bobApi, new { }))
+        Check(owner.IsSuccessStatusCode, "the owner approves the rebased branch");
+
+    // Squash: one commit lands on main, and the branch's two stay behind.
+    using (HttpResponseMessage merged = await ApiPut(address, prefix + "/merge_requests/" + iid + "/merge", aliceApi,
+        new { squash = true, squash_commit_message = "Revise things, squashed" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await merged.Content.ReadAsStreamAsync());
+        Check(merged.IsSuccessStatusCode && json.RootElement.GetProperty("method").GetString() == "squash" &&
+            json.RootElement.GetProperty("merge_commit_sha").GetString()!.Length == 40,
+            "a squash merge lands as one commit");
+    }
+    await Git(clone, ["fetch", "origin"]);
+    string squashed = (await Git(clone, ["rev-parse", "origin/main"])).Trim();
+    Check((await Git(clone, ["rev-list", "--parents", "-n", "1", squashed])).Trim().Split(' ').Length == 2 &&
+        (await Git(clone, ["log", "-1", "--format=%s", squashed])).Trim() == "Revise things, squashed",
+        "the squash commit has one parent and the message it was given");
+    await Git(clone, ["checkout", "-B", "verify", "origin/main"]);
+    Check(File.ReadAllText(Path.Combine(clone, "docs", "guide.md")).Contains("revised", StringComparison.Ordinal) &&
+        File.ReadAllText(Path.Combine(clone, "other.txt")).Contains("revised", StringComparison.Ordinal) &&
+        File.Exists(Path.Combine(clone, "main-only.txt")),
+        "the squashed tree carries both branches' changes");
+    Check((await RunGit(clone, ["merge-base", "--is-ancestor", rebasedTip, squashed])).ExitCode != 0,
+        "the branch's own commits are not on main: a squash forgets them on purpose");
+    Check((await RunGit(clone, ["fsck", "--strict", "--no-progress"])).ExitCode == 0, "the squashed objects pass git fsck");
+
+    // What a rebase refuses, by name.
+    await Git(clone, ["checkout", "-b", "clash", "origin/main"]);
+    File.WriteAllText(Path.Combine(clone, "other.txt"), "clash\n");
+    await Git(clone, ["commit", "-am", "Clash"]);
+    await Git(clone, ["push", "origin", "clash"]);
+    await Git(clone, ["checkout", "-B", "main", "origin/main"]);
+    File.WriteAllText(Path.Combine(clone, "other.txt"), "main again\n");
+    await Git(clone, ["commit", "-am", "Main changes other"]);
+    await Git(clone, ["push", "origin", "main"]);
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/merge_requests", aliceApi,
+        new { source_branch = "clash", target_branch = "main", title = "Clash" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStreamAsync());
+        long clash = json.RootElement.GetProperty("iid").GetInt64();
+        using HttpResponseMessage refused = await ApiPut(address, prefix + "/merge_requests/" + clash + "/rebase", aliceApi, new { });
+        string body = await refused.Content.ReadAsStringAsync();
+        Check(refused.StatusCode == HttpStatusCode.Conflict && body.Contains("other.txt", StringComparison.Ordinal),
+            "a rebase that would have to merge a file is refused and names the file");
+    }
+    await Git(clone, ["checkout", "-b", "side", "origin/main"]);
+    File.WriteAllText(Path.Combine(clone, "side.txt"), "side\n");
+    await Git(clone, ["add", "."]);
+    await Git(clone, ["commit", "-m", "Side"]);
+    await Git(clone, ["checkout", "-b", "merged", "origin/main"]);
+    File.WriteAllText(Path.Combine(clone, "merged.txt"), "merged\n");
+    await Git(clone, ["add", "."]);
+    await Git(clone, ["commit", "-m", "Merged work"]);
+    await Git(clone, ["merge", "--no-ff", "-m", "Merge side", "side"]);
+    await Git(clone, ["push", "origin", "merged"]);
+    await Git(clone, ["checkout", "-B", "main", "origin/main"]);
+    File.WriteAllText(Path.Combine(clone, "main-only.txt"), "ahead again\n");
+    await Git(clone, ["commit", "-am", "Main moves again"]);
+    await Git(clone, ["push", "origin", "main"]);
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/merge_requests", aliceApi,
+        new { source_branch = "merged", target_branch = "main", title = "With a merge commit" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStreamAsync());
+        long withMerge = json.RootElement.GetProperty("iid").GetInt64();
+        using HttpResponseMessage refused = await ApiPut(address, prefix + "/merge_requests/" + withMerge + "/rebase", aliceApi, new { });
+        string body = await refused.Content.ReadAsStringAsync();
+        Check(refused.StatusCode == HttpStatusCode.Conflict && body.Contains("merge commit", StringComparison.Ordinal),
+            "a branch holding a merge commit is not rebased here, and the refusal says why");
+    }
+    using (HttpResponseMessage rule = await ApiPut(address, prefix + "/approvals", aliceApi, new { require_code_owner_approval = false }))
+        Check(rule.StatusCode == HttpStatusCode.NoContent, "the code owner rule can be turned off again");
+}
+
+/// <summary>
+/// Releases: notes, links and files on a tag, readable wherever the repository is and published by
+/// whoever could push.
+/// </summary>
+async Task CheckReleases(string address, AuthenticatedIdentity alice, string reporterUsername)
+{
+    long projectId;
+    string aliceApi;
+    string readApi;
+    string reporterApi;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        ProjectInfo created = await store.CreateProjectWithRepositoryAsync(alice, "ship", "Shipping",
+            (project, cancellation) => { cancellation.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, project.StorageId)); return Task.CompletedTask; });
+        projectId = created.Id;
+        UserAccount reporter = Required(await store.FindActiveUserAsync(reporterUsername), "reporter account");
+        await store.SetMembershipAsync(alice, projectId, reporter.Id, ProjectRole.Reporter);
+        aliceApi = (await store.CreateTokenAsync(alice, "ship-api", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        readApi = (await store.CreateTokenAsync(alice, "ship-read", TokenScope.ReadApi, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        reporterApi = (await store.CreateTokenAsync(new(reporter.Id, reporter.Username, false, IdentityKind.BrowserSession), "ship-reporter", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+    }
+    string prefix = "/api/v4/projects/" + projectId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    string clone = Path.Combine(root, "ship-clone");
+    Directory.CreateDirectory(clone);
+    await Git(clone, ["init", "--initial-branch=main"]);
+    File.WriteAllText(Path.Combine(clone, "ship.txt"), "ready\n");
+    await Git(clone, ["add", "."]);
+    await Git(clone, ["commit", "-m", "Ready"]);
+    await Git(clone, ["remote", "add", "origin", AuthenticatedUrl(address, "alice", aliceApi, "alice/ship.git")]);
+    await Git(clone, ["push", "origin", "main"]);
+    using (HttpResponseMessage tagged = await ApiPost(address, prefix + "/repository/tags", aliceApi, new { tag_name = "v1.0", @ref = "main" }))
+        Check(tagged.StatusCode == HttpStatusCode.Created, "a tag is created to release");
+
+    using (HttpResponseMessage refused = await ApiPost(address, prefix + "/releases", reporterApi, new { tag_name = "v1.0", name = "First" }))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden, "publishing a release needs the permission to push");
+    using (HttpResponseMessage missing = await ApiPost(address, prefix + "/releases", aliceApi, new { tag_name = "v9.9", name = "Nothing" }))
+        Check(missing.StatusCode == HttpStatusCode.BadRequest, "a release needs a tag that exists");
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/releases", aliceApi,
+        new { tag_name = "v1.0", name = "First light", description = "The first release." }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStreamAsync());
+        Check(created.StatusCode == HttpStatusCode.Created && json.RootElement.GetProperty("name").GetString() == "First light" &&
+            json.RootElement.GetProperty("tag_exists").GetBoolean() &&
+            json.RootElement.GetProperty("commit").GetProperty("id").GetString()!.Length == 40 &&
+            json.RootElement.GetProperty("assets").GetProperty("sources").GetArrayLength() == 2,
+            "a release is created on a tag, with the commit it names and the two archives of it");
+    }
+    using (HttpResponseMessage duplicate = await ApiPost(address, prefix + "/releases", aliceApi, new { tag_name = "v1.0", name = "Again" }))
+        Check(duplicate.StatusCode == HttpStatusCode.Conflict, "one release per tag");
+    using (HttpResponseMessage hidden = await ApiGet(address, prefix + "/releases", null))
+        Check(hidden.StatusCode == HttpStatusCode.NotFound, "a private project's releases are concealed from a stranger");
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+        await store.SetProjectVisibilityAsync(alice, projectId, ProjectVisibility.Public);
+    using (HttpResponseMessage open = await ApiGet(address, prefix + "/releases", null))
+    {
+        using JsonDocument json = JsonDocument.Parse(await open.Content.ReadAsStreamAsync());
+        Check(open.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 1, "a public project's releases are readable with no credential");
+    }
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+        await store.SetProjectVisibilityAsync(alice, projectId, ProjectVisibility.Private);
+
+    string release = prefix + "/releases/v1.0";
+    using (HttpResponseMessage link = await ApiPost(address, release + "/assets/links", aliceApi, new { name = "Runbook", url = "https://example.invalid/runbook", link_type = "runbook" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await link.Content.ReadAsStreamAsync());
+        Check(link.StatusCode == HttpStatusCode.Created && json.RootElement.GetProperty("assets").GetProperty("links")[0].GetProperty("link_type").GetString() == "runbook",
+            "a link is added to a release");
+    }
+    using (HttpResponseMessage bad = await ApiPost(address, release + "/assets/links", aliceApi, new { name = "Odd", url = "ftp://example.invalid/x" }))
+        Check(bad.StatusCode == HttpStatusCode.BadRequest, "a link is an http or https address");
+    using (HttpResponseMessage again = await ApiPost(address, release + "/assets/links", aliceApi, new { name = "Runbook", url = "https://example.invalid/other" }))
+        Check(again.StatusCode == HttpStatusCode.Conflict, "link names are unique on a release");
+
+    byte[] build = Encoding.UTF8.GetBytes("pretend this is a build\n");
+    string sha = Convert.ToHexStringLower(SHA256.HashData(build));
+    using (HttpResponseMessage refused = await ApiPutBytes(address, release + "/assets/files/build.bin", reporterApi, build, "application/octet-stream"))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden, "a Reporter cannot attach a file");
+    using (HttpResponseMessage stored = await ApiPutBytes(address, release + "/assets/files/build.bin", aliceApi, build, "application/octet-stream"))
+    {
+        string storedBody = await stored.Content.ReadAsStringAsync();
+        Check(stored.StatusCode == HttpStatusCode.Created, "attaching a file answers 201 rather than " + ((int)stored.StatusCode) + ": " + storedBody);
+        using JsonDocument json = JsonDocument.Parse(storedBody);
+        JsonElement files = json.RootElement.GetProperty("assets").GetProperty("files");
+        Check(stored.StatusCode == HttpStatusCode.Created && files.GetArrayLength() == 1 &&
+            files[0].GetProperty("sha256").GetString() == sha && files[0].GetProperty("size").GetInt64() == build.Length,
+            "a file is attached as the request body, hashed and measured");
+    }
+    using (HttpResponseMessage download = await ApiGet(address, release + "/assets/files/build.bin", readApi))
+    {
+        byte[] bytes = await download.Content.ReadAsByteArrayAsync();
+        Check(download.IsSuccessStatusCode && bytes.AsSpan().SequenceEqual(build) &&
+            download.Content.Headers.ContentType?.MediaType == "application/octet-stream" &&
+            download.Content.Headers.ContentDisposition?.DispositionType == "attachment" &&
+            download.Headers.TryGetValues("X-Content-Type-Options", out IEnumerable<string>? sniff) && sniff.Contains("nosniff"),
+            "the file downloads byte for byte, as an attachment of unknown type");
+    }
+    byte[] rebuilt = Encoding.UTF8.GetBytes("a newer build\n");
+    using (HttpResponseMessage replaced = await ApiPutBytes(address, release + "/assets/files/build.bin", aliceApi, rebuilt, "application/octet-stream"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await replaced.Content.ReadAsStreamAsync());
+        JsonElement files = json.RootElement.GetProperty("assets").GetProperty("files");
+        Check(replaced.StatusCode == HttpStatusCode.Created && files.GetArrayLength() == 1 &&
+            files[0].GetProperty("size").GetInt64() == rebuilt.Length, "re-uploading a file of the same name replaces it");
+    }
+    using (HttpResponseMessage removed = await ApiDelete(address, release + "/assets/files/build.bin", aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await removed.Content.ReadAsStreamAsync());
+        Check(removed.IsSuccessStatusCode && json.RootElement.GetProperty("assets").GetProperty("files").GetArrayLength() == 0, "a file is removed");
+    }
+    using (HttpResponseMessage renamed = await ApiPut(address, release, aliceApi, new { name = "First light, revised" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await renamed.Content.ReadAsStreamAsync());
+        Check(renamed.IsSuccessStatusCode && json.RootElement.GetProperty("name").GetString() == "First light, revised", "a release is edited");
+    }
+
+    // The tag goes; the release stays and says so.
+    using (HttpResponseMessage untagged = await ApiDelete(address, prefix + "/repository/tags/v1.0", aliceApi))
+        Check(untagged.StatusCode == HttpStatusCode.NoContent, "the tag is deleted");
+    using (HttpResponseMessage after = await ApiGet(address, release, readApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await after.Content.ReadAsStreamAsync());
+        Check(after.IsSuccessStatusCode && !json.RootElement.GetProperty("tag_exists").GetBoolean() &&
+            json.RootElement.GetProperty("commit").ValueKind == JsonValueKind.Null &&
+            json.RootElement.GetProperty("assets").GetProperty("sources").GetArrayLength() == 0,
+            "a release outlives its tag and reports that the tag is gone");
+    }
+    using (HttpResponseMessage deleted = await ApiDelete(address, release, aliceApi))
+        Check(deleted.StatusCode == HttpStatusCode.NoContent, "a release is deleted");
+    using (HttpResponseMessage gone = await ApiGet(address, release, readApi))
+        Check(gone.StatusCode == HttpStatusCode.NotFound, "and is gone");
+}
+
+/// <summary>
+/// The wiki with its history, snippets, and time tracking on an issue.
+/// </summary>
+async Task CheckKnowledge(string address, AuthenticatedIdentity alice, string bobUsername, string reporterUsername)
+{
+    long projectId;
+    string aliceApi;
+    string developerApi;
+    string reporterApi;
+    string readApi;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        ProjectInfo created = await store.CreateProjectWithRepositoryAsync(alice, "lore", "Knowledge",
+            (project, cancellation) => { cancellation.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, project.StorageId)); return Task.CompletedTask; });
+        projectId = created.Id;
+        UserAccount bob = Required(await store.FindActiveUserAsync(bobUsername), "bob account");
+        UserAccount reporter = Required(await store.FindActiveUserAsync(reporterUsername), "reporter account");
+        await store.SetMembershipAsync(alice, projectId, bob.Id, ProjectRole.Developer);
+        await store.SetMembershipAsync(alice, projectId, reporter.Id, ProjectRole.Reporter);
+        aliceApi = (await store.CreateTokenAsync(alice, "lore-api", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        readApi = (await store.CreateTokenAsync(alice, "lore-read", TokenScope.ReadApi, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        developerApi = (await store.CreateTokenAsync(new(bob.Id, bob.Username, false, IdentityKind.BrowserSession), "lore-developer", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        reporterApi = (await store.CreateTokenAsync(new(reporter.Id, reporter.Username, false, IdentityKind.BrowserSession), "lore-reporter", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+    }
+    string prefix = "/api/v4/projects/" + projectId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    // Wiki.
+    using (HttpResponseMessage refused = await ApiPost(address, prefix + "/wikis", reporterApi, new { title = "Home", content = "hello" }))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden, "writing the wiki needs the permission to push");
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/wikis", developerApi,
+        new { title = "Getting Started!", content = "# Welcome\n\nSome *prose* and <script>alert(1)</script>.", message = "First draft" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStreamAsync());
+        string html = json.RootElement.GetProperty("html").GetString()!;
+        Check(created.StatusCode == HttpStatusCode.Created && json.RootElement.GetProperty("slug").GetString() == "getting-started" &&
+            html.Contains("<h1", StringComparison.Ordinal) && html.Contains("<em>prose</em>", StringComparison.Ordinal) &&
+            !html.Contains("<script", StringComparison.Ordinal) && json.RootElement.GetProperty("versions").GetInt64() == 1,
+            "a page is created with an address from its title, rendered under the README's rules");
+    }
+    using (HttpResponseMessage clash = await ApiPost(address, prefix + "/wikis", developerApi, new { title = "getting started", content = "again" }))
+        Check(clash.StatusCode == HttpStatusCode.Conflict, "two titles that make one address are refused");
+    using (HttpResponseMessage edited = await ApiPut(address, prefix + "/wikis/getting-started", developerApi, new { content = "# Welcome\n\nRevised.", message = "Second draft" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await edited.Content.ReadAsStreamAsync());
+        Check(edited.IsSuccessStatusCode && json.RootElement.GetProperty("versions").GetInt64() == 2 &&
+            json.RootElement.GetProperty("updated_by").GetString() == bobUsername, "an edit keeps the previous text as a version");
+    }
+    long firstVersion;
+    using (HttpResponseMessage versions = await ApiGet(address, prefix + "/wikis/getting-started/versions", readApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await versions.Content.ReadAsStreamAsync());
+        firstVersion = json.RootElement[1].GetProperty("id").GetInt64();
+        Check(versions.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 2 &&
+            json.RootElement[0].GetProperty("message").GetString() == "Second draft", "versions list newest first with their messages");
+    }
+    using (HttpResponseMessage old = await ApiGet(address, prefix + "/wikis/getting-started?version=" + firstVersion, readApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await old.Content.ReadAsStreamAsync());
+        Check(old.IsSuccessStatusCode && json.RootElement.GetProperty("content").GetString()!.Contains("prose", StringComparison.Ordinal),
+            "an earlier version is read back as it was");
+    }
+    using (HttpResponseMessage listing = await ApiGet(address, prefix + "/wikis", readApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await listing.Content.ReadAsStreamAsync());
+        Check(listing.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 1 && json.RootElement[0].GetProperty("content").GetString() == "",
+            "a listing names the pages without their content");
+    }
+    using (HttpResponseMessage hidden = await ApiGet(address, prefix + "/wikis", null))
+        Check(hidden.StatusCode == HttpStatusCode.NotFound, "a private project's wiki is concealed from a stranger");
+    using (HttpResponseMessage deleted = await ApiDelete(address, prefix + "/wikis/getting-started", developerApi))
+        Check(deleted.StatusCode == HttpStatusCode.NoContent, "a page is deleted with its history");
+
+    // Snippets.
+    long snippetId;
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/snippets", reporterApi,
+        new { title = "Handy query", file_name = "query.sql", content = "SELECT 1;\n", description = "For later." }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStreamAsync());
+        snippetId = json.RootElement.GetProperty("id").GetInt64();
+        Check(created.StatusCode == HttpStatusCode.Created && json.RootElement.GetProperty("file_name").GetString() == "query.sql" &&
+            json.RootElement.GetProperty("author").GetProperty("username").GetString() == reporterUsername,
+            "a Reporter creates a snippet, like a comment with a file");
+    }
+    using (HttpResponseMessage slash = await ApiPost(address, prefix + "/snippets", reporterApi, new { title = "Bad", file_name = "a/b.txt", content = "x" }))
+        Check(slash.StatusCode == HttpStatusCode.BadRequest, "a snippet's file name is one path segment");
+    using (HttpResponseMessage refused = await ApiPut(address, prefix + "/snippets/" + snippetId, developerApi, new { title = "Rewritten" }))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden, "a Developer cannot rewrite another author's snippet");
+    using (HttpResponseMessage edited = await ApiPut(address, prefix + "/snippets/" + snippetId, aliceApi, new { content = "SELECT 2;\n" }))
+        Check(edited.IsSuccessStatusCode, "a Maintainer can");
+    using (HttpResponseMessage raw = await ApiGet(address, prefix + "/snippets/" + snippetId + "/raw", readApi))
+    {
+        string body = await raw.Content.ReadAsStringAsync();
+        Check(raw.IsSuccessStatusCode && body == "SELECT 2;\n" && raw.Content.Headers.ContentType?.MediaType == "application/octet-stream" &&
+            raw.Content.Headers.ContentDisposition?.FileName?.Trim('"') == "query.sql",
+            "the raw snippet is served as a download named for its file");
+    }
+    using (HttpResponseMessage listing = await ApiGet(address, prefix + "/snippets", readApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await listing.Content.ReadAsStreamAsync());
+        Check(listing.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 1 && json.RootElement[0].GetProperty("content").ValueKind == JsonValueKind.Null,
+            "a listing names the snippets without their content");
+    }
+    using (HttpResponseMessage deleted = await ApiDelete(address, prefix + "/snippets/" + snippetId, reporterApi))
+        Check(deleted.StatusCode == HttpStatusCode.NoContent, "the author deletes their snippet");
+
+    // Time tracking.
+    long issue;
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/issues", reporterApi, new { title = "Takes a while" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStreamAsync());
+        issue = json.RootElement.GetProperty("iid").GetInt64();
+    }
+    string time = prefix + "/issues/" + issue;
+    using (HttpResponseMessage estimated = await ApiPost(address, time + "/time_estimate", reporterApi, new { duration = "1d 2h" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await estimated.Content.ReadAsStreamAsync());
+        Check(estimated.IsSuccessStatusCode && json.RootElement.GetProperty("time_estimate").GetInt64() == 10 * 3600 &&
+            json.RootElement.GetProperty("human_time_estimate").GetString() == "1d 2h",
+            "the author estimates their issue in GitLab's vocabulary, a day being eight hours");
+    }
+    using (HttpResponseMessage bad = await ApiPost(address, time + "/time_estimate", reporterApi, new { duration = "soonish" }))
+        Check(bad.StatusCode == HttpStatusCode.BadRequest, "a duration that is not one is refused");
+    using (HttpResponseMessage spent = await ApiPost(address, time + "/add_spent_time", developerApi, new { duration = "3h 30m", summary = "Dug in" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await spent.Content.ReadAsStreamAsync());
+        Check(spent.IsSuccessStatusCode && json.RootElement.GetProperty("total_time_spent").GetInt64() == 12600 &&
+            json.RootElement.GetProperty("human_total_time_spent").GetString() == "3h 30m", "a member records time spent");
+    }
+    using (HttpResponseMessage back = await ApiPost(address, time + "/add_spent_time", developerApi, new { duration = "-30m" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await back.Content.ReadAsStreamAsync());
+        Check(back.IsSuccessStatusCode && json.RootElement.GetProperty("total_time_spent").GetInt64() == 10800, "a negative duration takes time back");
+    }
+    using (HttpResponseMessage below = await ApiPost(address, time + "/add_spent_time", developerApi, new { duration = "-5h" }))
+        Check(below.StatusCode == HttpStatusCode.BadRequest, "but not below zero");
+    using (HttpResponseMessage entries = await ApiGet(address, time + "/time_entries", readApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await entries.Content.ReadAsStreamAsync());
+        Check(entries.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 2 &&
+            json.RootElement[1].GetProperty("summary").GetString() == "Dug in" && json.RootElement[1].GetProperty("username").GetString() == bobUsername,
+            "the ledger says who spent what and why");
+    }
+    using (HttpResponseMessage onIssue = await ApiGet(address, time, readApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await onIssue.Content.ReadAsStreamAsync());
+        Check(onIssue.IsSuccessStatusCode && json.RootElement.GetProperty("time_stats").GetProperty("total_time_spent").GetInt64() == 10800,
+            "the issue carries its time totals");
+    }
+    using (HttpResponseMessage refused = await ApiPost(address, time + "/reset_spent_time", developerApi, new { }))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden, "clearing everybody's time needs the author or a Maintainer");
+    using (HttpResponseMessage reset = await ApiPost(address, time + "/reset_spent_time", aliceApi, new { }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await reset.Content.ReadAsStreamAsync());
+        Check(reset.IsSuccessStatusCode && json.RootElement.GetProperty("total_time_spent").GetInt64() == 0, "a Maintainer clears it");
     }
 }
 

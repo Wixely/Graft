@@ -1,0 +1,256 @@
+@page "/{Namespace}/{Slug}/-/snippets"
+@page "/{Namespace}/{Slug}/-/snippets/{Id:long}"
+@page "/projects/{Slug}/-/snippets"
+@page "/projects/{Slug}/-/snippets/{Id:long}"
+@inject GraftApi Api
+@inject NavigationManager Navigation
+
+<PageTitle>@(snippet?.Title ?? "Snippets") &middot; Graft</PageTitle>
+
+@if (loading)
+{
+    <p role="status" class="secondary-text">Loading…</p>
+}
+else if (project is null)
+{
+    <div class="page-header"><div><h1>Unavailable</h1><p class="subtitle">@message</p></div></div>
+    <a class="button secondary" href="/"><Icon Name="chevron-left" />Back to projects</a>
+}
+else if (Id is null)
+{
+    <div class="page-header">
+        <div><h1>Snippets</h1><p class="subtitle"><a href="@ProjectUrl">@project.Namespace.Name / @project.Name</a></p></div>
+        <div class="page-header-actions">
+            @if (canParticipate)
+            {
+                <button type="button" class="@(composing ? "secondary" : "")" @onclick="() => composing = !composing"><Icon Name="plus" />New snippet</button>
+            }
+        </div>
+    </div>
+
+    <Banner Message="@message" Kind="@messageKind" />
+
+    @if (composing)
+    {
+        <div class="panel">
+            <div class="panel-header"><h2>New snippet</h2></div>
+            <div class="panel-body">
+                <form class="form wide" @onsubmit="Create" @onsubmit:preventDefault>
+                    <label for="snippet-title">Title</label>
+                    <input id="snippet-title" @bind="draftTitle" required maxlength="255" autocomplete="off" />
+                    <label for="snippet-file">File name</label>
+                    <input id="snippet-file" @bind="draftFile" required maxlength="255" placeholder="example.sh" autocomplete="off" />
+                    <label for="snippet-description">Description</label>
+                    <input id="snippet-description" @bind="draftDescription" maxlength="50000" />
+                    <label for="snippet-content">Content</label>
+                    <textarea id="snippet-content" class="mono" @bind="draftContent" rows="14" required></textarea>
+                    <div class="form-actions">
+                        <button type="submit" disabled="@busy">@(busy ? "Saving…" : "Create snippet")</button>
+                        <button type="button" class="secondary" @onclick="() => composing = false" disabled="@busy">Cancel</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    }
+
+    <div class="panel">
+        <div class="panel-header"><Icon Name="file" /><h2>Snippets</h2><span class="spacer"></span><span class="label">@snippets.Length</span></div>
+        @if (snippets.Length == 0) { <div class="panel-empty">Nothing shared yet.</div> }
+        else
+        {
+            <div class="list">
+                @foreach (SnippetResponse entry in snippets)
+                {
+                    <a class="list-item" href="@SnippetUrl(entry.Id)">
+                        <Icon Name="file" />
+                        <span class="list-item-main">
+                            <strong>@entry.Title</strong>
+                            <small><code>@entry.FileName</code> &middot; @entry.Author.Username &middot; @entry.UpdatedAt.ToLocalTime().ToString("yyyy-MM-dd")</small>
+                        </span>
+                    </a>
+                }
+            </div>
+        }
+    </div>
+}
+else if (snippet is null)
+{
+    <div class="page-header"><div><h1>Snippet unavailable</h1><p class="subtitle">@message</p></div></div>
+    <a class="button secondary" href="@SnippetsUrl"><Icon Name="chevron-left" />Back to snippets</a>
+}
+else
+{
+    <div class="page-header">
+        <div>
+            <h1>@snippet.Title</h1>
+            <p class="subtitle">
+                <a href="@ProjectUrl">@project.Namespace.Name / @project.Name</a> &middot; by @snippet.Author.Username
+                &middot; @snippet.UpdatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")
+            </p>
+        </div>
+        <div class="page-header-actions">
+            <a class="button secondary" href="@SnippetsUrl"><Icon Name="chevron-left" />Snippets</a>
+            <a class="button secondary" href="@RawUrl" download><Icon Name="download" />Download</a>
+            @if (CanEdit && !editing) { <button type="button" class="secondary" @onclick="StartEdit"><Icon Name="settings" />Edit</button> }
+        </div>
+    </div>
+
+    <Banner Message="@message" Kind="@messageKind" />
+
+    @if (snippet.Description.Length > 0) { <div class="panel"><div class="panel-body"><pre class="commit-message">@snippet.Description</pre></div></div> }
+
+    @if (editing)
+    {
+        <div class="panel">
+            <div class="panel-body">
+                <form class="form wide" @onsubmit="Save" @onsubmit:preventDefault>
+                    <label for="snippet-edit-title">Title</label>
+                    <input id="snippet-edit-title" @bind="draftTitle" required maxlength="255" />
+                    <label for="snippet-edit-file">File name</label>
+                    <input id="snippet-edit-file" @bind="draftFile" required maxlength="255" />
+                    <label for="snippet-edit-description">Description</label>
+                    <input id="snippet-edit-description" @bind="draftDescription" maxlength="50000" />
+                    <label for="snippet-edit-content">Content</label>
+                    <textarea id="snippet-edit-content" class="mono" @bind="draftContent" rows="18" required></textarea>
+                    <div class="form-actions">
+                        <button type="submit" disabled="@busy">@(busy ? "Saving…" : "Save")</button>
+                        <button type="button" class="secondary" @onclick="() => editing = false" disabled="@busy">Cancel</button>
+                        <button type="button" class="secondary danger-text" @onclick="Delete" disabled="@busy">Delete snippet</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    }
+    else
+    {
+        <div class="panel blob-view">
+            <div class="panel-header"><Icon Name="file" /><strong class="mono">@snippet.FileName</strong></div>
+            <pre>@snippet.Content</pre>
+        </div>
+    }
+}
+
+@code {
+    [Parameter] public string Namespace { get; set; } = "";
+    [Parameter] public string Slug { get; set; } = "";
+    [Parameter] public long? Id { get; set; }
+
+    private ProjectResponse? project;
+    private long projectId;
+    private bool canParticipate;
+    private bool canManage;
+    private SnippetResponse[] snippets = [];
+    private SnippetResponse? snippet;
+    private bool loading = true;
+    private bool busy;
+    private bool composing;
+    private bool editing;
+    private string draftTitle = "";
+    private string draftFile = "";
+    private string draftDescription = "";
+    private string draftContent = "";
+    private string message = "";
+    private string messageKind = "info";
+
+    private bool ViaSlug => Namespace.Length == 0;
+    private string ProjectUrl => ViaSlug
+        ? $"/projects/{Uri.EscapeDataString(Slug)}"
+        : $"/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
+    private string SnippetsUrl => ProjectUrl + "/-/snippets";
+    private string SnippetUrl(long id) => $"{SnippetsUrl}/{id}";
+    private string RawUrl => $"/api/projects/{projectId}/snippets/{Id}/raw";
+    private bool CanEdit => snippet is not null && canParticipate && (canManage || string.Equals(snippet.Author.Username, Api.Username, StringComparison.Ordinal));
+
+    protected override async Task OnParametersSetAsync()
+    {
+        loading = true;
+        message = "";
+        editing = false;
+        try
+        {
+            await Api.EnsureSessionAsync();
+            string path = ViaSlug
+                ? $"api/graft/slugs/{Uri.EscapeDataString(Slug)}"
+                : $"api/browser/projects/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
+            (bool reached, RepositoryPageResponse? repo) = await Api.GetOptionalAsync(path, ApiJson.Default.RepositoryPageResponse);
+            if (!reached) { message = "Graft could not be reached."; return; }
+            if (repo is null) { message = "That repository could not be found."; return; }
+            project = repo.Project;
+            projectId = repo.Project.Id;
+            canParticipate = repo.CanParticipate;
+            canManage = repo.CanManage;
+            if (Id is null) snippets = await Api.GetAsync($"api/projects/{projectId}/snippets", ApiJson.Default.SnippetResponseArray) ?? [];
+            else await LoadOne();
+        }
+        finally { loading = false; }
+    }
+
+    private async Task LoadOne()
+    {
+        snippet = await Api.GetAsync($"api/projects/{projectId}/snippets/{Id}", ApiJson.Default.SnippetResponse);
+        if (snippet is null) message = "That snippet could not be found.";
+    }
+
+    private void StartEdit()
+    {
+        if (snippet is null) return;
+        draftTitle = snippet.Title;
+        draftFile = snippet.FileName;
+        draftDescription = snippet.Description;
+        draftContent = snippet.Content ?? "";
+        editing = true;
+    }
+
+    private async Task Create()
+    {
+        if (busy) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult<SnippetResponse> result = await Api.SendAsync<SnippetRequest, SnippetResponse>(HttpMethod.Post,
+                $"api/projects/{projectId}/snippets", new SnippetRequest(draftTitle, draftFile, draftDescription, draftContent),
+                ApiJson.Default.SnippetRequest, ApiJson.Default.SnippetResponse, "Snippet created.");
+            if (!result.Ok || result.Value is null) { Report(false, result.Message); return; }
+            composing = false;
+            Navigation.NavigateTo(SnippetUrl(result.Value.Id));
+        }
+        finally { busy = false; }
+    }
+
+    private async Task Save()
+    {
+        if (busy || snippet is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/projects/{projectId}/snippets/{snippet.Id}",
+                new SnippetRequest(draftTitle, draftFile, draftDescription, draftContent), ApiJson.Default.SnippetRequest, "Snippet saved.");
+            Report(result.Ok, result.Message);
+            if (!result.Ok) return;
+            editing = false;
+            await LoadOne();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task Delete()
+    {
+        if (busy || snippet is null) return;
+        busy = true;
+        try
+        {
+            ApiResult result = await Api.DeleteAsync($"api/projects/{projectId}/snippets/{snippet.Id}", "Snippet deleted.");
+            Report(result.Ok, result.Message);
+            if (result.Ok) Navigation.NavigateTo(SnippetsUrl);
+        }
+        finally { busy = false; }
+    }
+
+    private void Report(bool ok, string text)
+    {
+        message = text;
+        messageKind = ok ? "success" : "error";
+    }
+}

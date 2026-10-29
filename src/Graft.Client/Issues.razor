@@ -228,7 +228,7 @@ else
               SelectedLabels="@([.. issue.LabelDetails ?? []])" Milestone="issue.Milestone" Assignees="@(issue.Assignees ?? [])"
               DueDate="@issue.DueDate" ShowDueDate="true" Confidential="issue.Confidential" ShowConfidential="true"
               TimeStats="issue.TimeStats"
-              CanTriage="@(canParticipate && (canPush || IsAuthor))" CanEditFlags="@CanChangeState" Busy="busy" OnSave="SaveMeta" />
+              CanTriage="@(canParticipate && (canPush || IsAuthor))" CanEditFlags="@CanChangeState" CanParticipate="canParticipate" Busy="busy" OnSave="SaveMeta" OnTime="RecordTime" />
     </div>
 }
 
@@ -289,6 +289,21 @@ else
         allLabels = await Api.GetAsync($"api/projects/{projectId}/labels", ApiJson.Default.LabelResponseArray) ?? [];
         milestones = await Api.GetAsync($"api/projects/{projectId}/milestones?state=all", ApiJson.Default.MilestoneResponseArray) ?? [];
         people = canParticipate ? await Api.GetAsync($"api/projects/{projectId}/users", ApiJson.Default.UserResponseArray) ?? [] : [];
+    }
+
+    private async Task RecordTime((string Action, TimeRequest Request) time)
+    {
+        if (busy || issue is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/projects/{projectId}/issues/{issue.Iid}/{time.Action}", time.Request,
+                ApiJson.Default.TimeRequest, time.Action == "time_estimate" ? "Estimate saved." : "Time recorded.");
+            Report(result.Ok, result.Message);
+            if (result.Ok) await LoadOne();
+        }
+        finally { busy = false; }
     }
 
     private async Task SaveMeta(IssueUpdateRequest request)

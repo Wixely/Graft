@@ -41,6 +41,9 @@ else
         <a href="@(ProjectBase + "/-/merge-requests")">Merge requests</a>
         <a href="@(ProjectBase + "/-/boards")">Boards</a>
         <a href="@(ProjectBase + "/-/milestones")">Milestones</a>
+        <a href="@(ProjectBase + "/-/releases")">Releases</a>
+        <a href="@(ProjectBase + "/-/wiki")">Wiki</a>
+        <a href="@(ProjectBase + "/-/snippets")">Snippets</a>
         @if (repo.CanPush)
         {
             <button type="button" class="@(tab == "upload" ? "active" : "")" @onclick='() => tab = "upload"'>Add files</button>
@@ -478,6 +481,14 @@ git push -u origin main</pre>
                 <form class="form inline" @onsubmit="SaveApprovals" @onsubmit:preventDefault>
                     <label for="approvals-required">Approvals required</label>
                     <input id="approvals-required" type="number" min="0" max="10" @bind="approvalsRequired" />
+                    <label class="checkbox">
+                        <input type="checkbox" @bind="requireCodeOwnerApproval" />
+                        Require a code owner's approval for every changed path a <code>CODEOWNERS</code> file names
+                    </label>
+                    <p class="field-hint">
+                        The file is read from the target branch, at <code>CODEOWNERS</code>, <code>.graft/CODEOWNERS</code>,
+                        <code>.gitlab/CODEOWNERS</code> or <code>docs/CODEOWNERS</code>. With no file the rule requires nothing.
+                    </p>
                     <div class="form-actions">
                         <button type="submit" disabled="@busy">Save</button>
                     </div>
@@ -683,6 +694,7 @@ git push -u origin main</pre>
     private string newTagFrom = "";
     private string? pendingTag;
     private int approvalsRequired;
+    private bool requireCodeOwnerApproval;
     private WebhookResponse[] hooks = [];
     private string hookUrl = "";
     private string hookSecret = "";
@@ -806,6 +818,7 @@ git push -u origin main</pre>
         if (newBranchFrom.Length == 0 || repo?.Branches.All(option => option.Name != newBranchFrom) == true)
             newBranchFrom = repo?.Project.DefaultBranch ?? repo?.Branches.FirstOrDefault()?.Name ?? "";
         approvalsRequired = repo?.ApprovalsRequired ?? 0;
+        requireCodeOwnerApproval = repo?.RequireCodeOwnerApproval ?? false;
         if (newTagFrom.Length == 0 || repo?.Branches.All(option => option.Name != newTagFrom) == true)
             newTagFrom = newBranchFrom;
         if (repo is not null) await LoadTags();
@@ -1073,10 +1086,11 @@ git push -u origin main</pre>
         try
         {
             ApiResult result = await Api.PostAsync($"api/projects/{repo.Project.Id}/approvals",
-                new ApprovalsRequiredRequest(approvalsRequired), ApiJson.Default.ApprovalsRequiredRequest,
-                approvalsRequired == 0
-                    ? "Merge requests no longer need approval."
-                    : $"Merge requests now need {approvalsRequired} approvals.");
+                new ApprovalsRequiredRequest(approvalsRequired, requireCodeOwnerApproval), ApiJson.Default.ApprovalsRequiredRequest,
+                (approvalsRequired == 0
+                    ? "Merge requests no longer need a number of approvals."
+                    : $"Merge requests now need {approvalsRequired} approvals.") +
+                (requireCodeOwnerApproval ? " Code owners must approve the paths they own." : ""));
             Report(result);
         }
         finally { busy = false; }
