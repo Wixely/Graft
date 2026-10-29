@@ -451,6 +451,69 @@ public sealed partial class GraftStore : IAsyncDisposable
             row.SecretCipher is { Length: > 0 })).ToArray();
     }
 
+    /// <summary>
+    /// Replaces a token's secret in place. The row keeps its id, name, scopes and expiry, which is what
+    /// makes this a rotation rather than a revocation and a creation: whatever is configured with the
+    /// token's name still names the same token afterwards, and the old secret stops working the moment the
+    /// new one starts. <paramref name="expiresAtUtc"/> lets the caller move the expiry at the same time,
+    /// within the year a new token may have; null keeps it.
+    /// </summary>
+    /// <returns>The new secret, or null where the token is not the caller's or is no longer live.</returns>
+    public async Task<RotatedToken?> RotateTokenAsync(
+        AuthenticatedIdentity actor,
+        long tokenId,
+        DateTimeOffset? expiresAtUtc = null,
+        CancellationToken cancellationToken = default,
+        Func<string, string>? protect = null)
+    {
+        ArgumentNullException.ThrowIfNull(actor);
+        if (expiresAtUtc is DateTimeOffset requested)
+        {
+            requested = requested.ToUniversalTime();
+            if (requested <= DateTimeOffset.UtcNow || requested > DateTimeOffset.UtcNow.AddYears(1))
+                throw new ArgumentOutOfRangeException(nameof(expiresAtUtc), "Token expiry must be within one year.");
+            expiresAtUtc = requested;
+        }
+
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
+        AuthenticatedIdentity liveActor = await RequireLiveIdentityAsync(db, transaction, actor, cancellationToken);
+        string now = Now();
+        TokenRow? current = await db.QuerySingleOrDefaultAsync<TokenRow>("""
+            SELECT Id, Name, Scopes, ExpiresAtUtc, CreatedAtUtc, SecretCipher
+            FROM AccessTokens
+            WHERE Id = @Id AND UserId = @UserId AND RevokedAtUtc IS NULL AND ExpiresAtUtc > @NowUtc;
+            """, new TokenCipherParameters(tokenId, liveActor.UserId, now), transaction);
+        if (current is null) return null;
+
+        string secret = NewSecret("graft_pat_");
+        string expiry = (expiresAtUtc ?? DateTimeOffset.Parse(current.ExpiresAtUtc, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind)).ToString("O");
+        // The cipher follows the same rule as creation: kept only where the operator asks for recoverable
+        // secrets now. A token issued while they were off becomes recoverable if they are on at rotation,
+        // and one issued while they were on stops being recoverable if they have since been turned off,
+        // because the secret being stored is the new one and the setting that governs it is today's.
+        int changed = await db.ExecuteAsync("""
+            UPDATE AccessTokens SET SecretDigest = @SecretDigest, SecretCipher = @SecretCipher, ExpiresAtUtc = @ExpiresAtUtc
+            WHERE Id = @Id AND UserId = @UserId AND RevokedAtUtc IS NULL;
+            """, new RotateTokenParameters(tokenId, liveActor.UserId, Digest(secret), protect?.Invoke(secret), expiry), transaction);
+        if (changed != 1) return null;
+        await AuditAsync(db, transaction, liveActor.UserId, "rotate-token", "token", tokenId.ToString(CultureInfo.InvariantCulture), "Personal token secret replaced.", now);
+        await transaction.CommitAsync(cancellationToken);
+        return new(new(tokenId, secret, (TokenScope)current.Scopes, DateTimeOffset.Parse(expiry, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind)),
+            current.Name, DateTimeOffset.Parse(current.CreatedAtUtc, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind));
+    }
+
+    /// <summary>The id of the live token a secret names, for a caller who wants to act on the token it is holding.</summary>
+    public async Task<long?> FindTokenIdAsync(string secret, CancellationToken cancellationToken = default)
+    {
+        if (!ValidSecret(secret, "graft_pat_")) return null;
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        return await db.QuerySingleOrDefaultAsync<long?>("""
+            SELECT Id FROM AccessTokens
+            WHERE SecretDigest = @SecretDigest AND RevokedAtUtc IS NULL AND ExpiresAtUtc > @NowUtc;
+            """, new ResolveSecretParameters(Digest(secret), Now()));
+    }
+
     public async Task RevokeOwnTokenAsync(
         AuthenticatedIdentity actor,
         long tokenId,
@@ -1657,3 +1720,4 @@ internal sealed class SettingRow
     public string Value { get; set; } = "";
 }
 internal sealed record TokenCipherParameters(long Id, long UserId, string NowUtc);
+internal sealed record RotateTokenParameters(long Id, long UserId, string SecretDigest, string? SecretCipher, string ExpiresAtUtc);

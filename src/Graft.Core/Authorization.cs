@@ -265,6 +265,8 @@ public sealed record SessionGrant(string Secret, DateTimeOffset ExpiresAtUtc);
 /// honouring it, and the two disagreeing is how a live session turns into an anonymous request.</summary>
 public sealed record ResolvedSession(AuthenticatedIdentity Identity, DateTimeOffset ExpiresAtUtc, bool Renewed);
 public sealed record TokenGrant(long Id, string Secret, TokenScope Scopes, DateTimeOffset ExpiresAtUtc);
+/// <summary>A token whose secret was just replaced: the grant with the new secret, and the unchanged name and creation time.</summary>
+public sealed record RotatedToken(TokenGrant Grant, string Name, DateTimeOffset CreatedAtUtc);
 public sealed record PersonalAccessToken(long Id, string Name, TokenScope Scopes, DateTimeOffset ExpiresAtUtc, DateTimeOffset CreatedAtUtc,
     /// <summary>Whether this token's secret can still be produced. True only where an operator had asked
     /// for recoverable tokens when it was issued, so it is a property of the token and not of the server.</summary>

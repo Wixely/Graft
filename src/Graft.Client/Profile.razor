@@ -67,7 +67,7 @@ else if (Api.Authenticated)
                 }
                 else
                 {
-                    <strong>@created!.Name is created. Copy it now.</strong>
+                    <strong>@created!.Name @(rotated ? "has a new secret" : "is created"). Copy it now.</strong>
                     <p class="field-hint">
                         The secret is held for five minutes and can be read once. It is never shown on this
                         page, so copy it straight to the clipboard.
@@ -157,6 +157,12 @@ else if (Api.Authenticated)
                                         <Icon Name="copy" />Copy
                                     </button>
                                 }
+                                @* Two clicks, because the old secret stops working the moment the new one
+                                   exists: whatever uses this token breaks until the new secret reaches it. *@
+                                <button type="button" class="@(pendingRotate == token.Id ? "danger" : "secondary")"
+                                        @onclick="() => RotateToken(token)" disabled="@busy">
+                                    @(pendingRotate == token.Id ? "Confirm rotate" : "Rotate")
+                                </button>
                                 <button type="button" class="secondary" @onclick="() => RevokeToken(token)" disabled="@busy">Revoke</button>
                             </span>
                         </div>
@@ -257,6 +263,7 @@ else if (Api.Authenticated)
         busy = true;
         message = "";
         created = null;
+        rotated = false;
         collected = false;
         fallbackSecret = null;
         try
@@ -357,6 +364,43 @@ else if (Api.Authenticated)
                 created = null;
                 secretFor = null;
             }
+        }
+        finally { busy = false; }
+    }
+
+    /// <summary>The token whose Rotate button has been pressed once, waiting for the confirming click.</summary>
+    private long? pendingRotate;
+    /// <summary>Whether the secret waiting to be copied belongs to a rotated token rather than a new one.</summary>
+    private bool rotated;
+
+    /// <summary>
+    /// Replaces a token's secret. The token keeps its name, scopes and expiry; the new secret is collected
+    /// exactly as a new token's is, once and straight to the clipboard.
+    /// </summary>
+    private async Task RotateToken(TokenResponse token)
+    {
+        if (busy) return;
+        if (pendingRotate != token.Id)
+        {
+            pendingRotate = token.Id;
+            Report(ApiResult.Refused($"Select Confirm rotate to replace the secret of {token.Name}. Its current secret stops working at once."));
+            return;
+        }
+        busy = true;
+        message = "";
+        created = null;
+        collected = false;
+        fallbackSecret = null;
+        try
+        {
+            ApiResult<TokenCreatedResponse> result = await Api.SendAsync(HttpMethod.Post,
+                $"api/tokens/{token.Id}/rotate", ApiJson.Default.TokenCreatedResponse, "Token rotated.");
+            Report(new ApiResult(result.Ok, result.Message));
+            pendingRotate = null;
+            if (!result.Ok) return;
+            created = result.Value;
+            rotated = true;
+            await LoadTokens();
         }
         finally { busy = false; }
     }

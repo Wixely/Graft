@@ -142,6 +142,22 @@ public sealed class GraftApi(HttpClient http)
         catch (HttpRequestException) { Reachable = false; return new(false, Unreachable, default); }
     }
 
+    /// <summary>The same without a body, for a route whose request is the verb and the path.</summary>
+    public async Task<ApiResult<TResponse>> SendAsync<TResponse>(HttpMethod method, string uri,
+        JsonTypeInfo<TResponse> responseType, string accepted, CancellationToken cancellationToken = default)
+    {
+        if (Session is null) return new(false, "There is no active session.", default);
+        try
+        {
+            using HttpRequestMessage request = Build(method, uri, null);
+            using HttpResponseMessage response = await http.SendAsync(request, cancellationToken);
+            if (!response.IsSuccessStatusCode)
+                return new(false, await ReadMessageAsync(response, cancellationToken), default);
+            return new(true, accepted, await response.Content.ReadFromJsonAsync(responseType, cancellationToken));
+        }
+        catch (HttpRequestException) { Reachable = false; return new(false, Unreachable, default); }
+    }
+
     /// <summary>Signs in. Login precedes the CSRF secret, so it does not go through <see cref="SendAsync"/>.</summary>
     public async Task<ApiResult> LoginAsync(string username, string password, CancellationToken cancellationToken = default)
     {

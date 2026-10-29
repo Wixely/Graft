@@ -142,6 +142,26 @@ public sealed record TokenResponse(long Id, string Name, string[] Scopes, DateTi
 /// <summary>Reads back an existing token's secret. The account password is required: a session alone must
 /// not turn into every credential the account holds.</summary>
 public sealed record TokenSecretRequest(string Password);
+
+/// <summary>Rotating a token, in GitLab's shape. <c>expires_at</c> is a date; absent keeps the token's expiry.</summary>
+public sealed record TokenRotateRequest(string? ExpiresAt);
+
+/// <summary>
+/// A personal access token in GitLab's shape, answered by the rotation route with the new secret in
+/// <c>token</c>, which is the one place a secret travels in a response: an API client has no clipboard to
+/// fetch it into and no second request to make.
+/// </summary>
+public sealed record PersonalAccessTokenResponse(
+    long Id,
+    string Name,
+    bool Revoked,
+    DateTimeOffset CreatedAt,
+    string[] Scopes,
+    long UserId,
+    DateTimeOffset? LastUsedAt,
+    bool Active,
+    string ExpiresAt,
+    string Token);
 public sealed record ProjectCreateRequest(string? Name, string? Path, string? Description, string? Visibility);
 public sealed record MembershipSetRequest(string Username, string Role);
 
@@ -991,6 +1011,8 @@ public sealed record MergeRequestChangesResponse(
 [JsonSerializable(typeof(PasswordResetRequest))]
 [JsonSerializable(typeof(TokenCreateRequest))]
 [JsonSerializable(typeof(TokenCreatedResponse))]
+[JsonSerializable(typeof(TokenRotateRequest))]
+[JsonSerializable(typeof(PersonalAccessTokenResponse))]
 [JsonSerializable(typeof(TokenRevealRequest))]
 [JsonSerializable(typeof(TokenSecretRequest))]
 [JsonSerializable(typeof(TokenRevealResponse))]

@@ -2161,6 +2161,107 @@ async Task CheckPersonalAccessTokens(string address, string username, string pas
     string gitUrl = AuthenticatedUrl(address, username, tokenSecret, $"alice/durable.git");
     await Git(root, ["ls-remote", gitUrl]);
     Check(true, "browser-created personal token authenticates Git HTTPS");
+
+    // Rotation: the same token, a new secret. The id, name, scopes and expiry stay, the old secret stops at
+    // once, and the new one is collected through the same one-time claim a new token's is.
+    using (HttpRequestMessage wrongCsrf = new(HttpMethod.Post, $"/api/tokens/{tokenId}/rotate"))
+    {
+        wrongCsrf.Headers.Add("Origin", address);
+        wrongCsrf.Headers.Add("X-Graft-CSRF", new string('0', 64));
+        using HttpResponseMessage response = await client.SendAsync(wrongCsrf);
+        Check(response.StatusCode == HttpStatusCode.Forbidden, "rotating a token rejects wrong CSRF");
+    }
+    using (HttpRequestMessage missing = new(HttpMethod.Post, "/api/tokens/999999/rotate"))
+    {
+        missing.Headers.Add("Origin", address);
+        missing.Headers.Add("X-Graft-CSRF", csrf);
+        using HttpResponseMessage response = await client.SendAsync(missing);
+        Check(response.StatusCode == HttpStatusCode.NotFound, "and a token that is not the caller's cannot be rotated");
+    }
+    string previousSecret = tokenSecret;
+    using (HttpRequestMessage rotate = new(HttpMethod.Post, $"/api/tokens/{tokenId}/rotate"))
+    {
+        rotate.Headers.Add("Origin", address);
+        rotate.Headers.Add("X-Graft-CSRF", csrf);
+        using HttpResponseMessage response = await client.SendAsync(rotate);
+        using JsonDocument json = JsonDocument.Parse(await response.Content.ReadAsStreamAsync());
+        Check(response.IsSuccessStatusCode && json.RootElement.GetProperty("id").GetInt64() == tokenId &&
+            json.RootElement.GetProperty("name").GetString() == "browser-git" &&
+            json.RootElement.GetProperty("scopes")[0].GetString() == "read_repository",
+            "a browser rotates a token and it keeps its id, name and scopes (got " + (int)response.StatusCode + ")");
+        Check(!json.RootElement.TryGetProperty("secret", out _), "rotation does not return the secret either");
+        tokenSecret = await RevealSecret(client, csrf, json.RootElement.GetProperty("reveal").GetString()!);
+        Check(tokenSecret.StartsWith("graft_pat_", StringComparison.Ordinal) && tokenSecret != previousSecret, "and the claimed secret is a new one");
+    }
+    (int oldSecretExit, _, _) = await RunGit(root, ["ls-remote", AuthenticatedUrl(address, username, previousSecret, "alice/durable.git")]);
+    Check(oldSecretExit != 0, "the previous secret stops working the moment the new one exists");
+    await Git(root, ["ls-remote", AuthenticatedUrl(address, username, tokenSecret, "alice/durable.git")]);
+    Check(true, "and the new secret authenticates Git HTTPS");
+    using (HttpResponseMessage response = await client.GetAsync("/api/tokens"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        Check(json.RootElement.EnumerateArray().Count(item => item.GetProperty("id").GetInt64() == tokenId) == 1 &&
+            json.RootElement.EnumerateArray().Count(item => item.GetProperty("name").GetString() == "browser-git") == 1,
+            "the list still shows one token of that name, not a revoked one and a new one");
+    }
+
+    // GitLab's shape, for a script rotating the credential it holds. The new secret travels in the response
+    // here, to the caller who already held the old one and has no clipboard to fetch it into.
+    string apiSecret;
+    long apiTokenId;
+    using (HttpRequestMessage create = new(HttpMethod.Post, "/api/tokens")
+    {
+        Content = JsonContent.Create(new { name = "rotate-api", scopes = new[] { "api" }, expires_in_days = 30 })
+    })
+    {
+        create.Headers.Add("Origin", address);
+        create.Headers.Add("X-Graft-CSRF", csrf);
+        using HttpResponseMessage response = await client.SendAsync(create);
+        using JsonDocument json = JsonDocument.Parse(await response.Content.ReadAsStreamAsync());
+        apiTokenId = json.RootElement.GetProperty("id").GetInt64();
+        apiSecret = await RevealSecret(client, csrf, json.RootElement.GetProperty("reveal").GetString()!);
+    }
+    using (HttpResponseMessage refused = await ApiPostJson(address, "/api/v4/personal_access_tokens/self/rotate", tokenSecret, "{}"))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden, "a token without the api scope cannot rotate itself, as GitLab requires");
+    using (HttpResponseMessage anonymous = await ApiPostJson(address, "/api/v4/personal_access_tokens/self/rotate", null, "{}"))
+        Check(anonymous.StatusCode == HttpStatusCode.Unauthorized, "and no token means no rotation");
+    string previousApiSecret = apiSecret;
+    using (HttpResponseMessage rotated = await ApiPostJson(address, "/api/v4/personal_access_tokens/self/rotate", apiSecret, "{}"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await rotated.Content.ReadAsStreamAsync());
+        Check(rotated.IsSuccessStatusCode && json.RootElement.GetProperty("id").GetInt64() == apiTokenId &&
+            json.RootElement.GetProperty("name").GetString() == "rotate-api" && json.RootElement.GetProperty("active").GetBoolean() &&
+            !json.RootElement.GetProperty("revoked").GetBoolean() && json.RootElement.GetProperty("scopes")[0].GetString() == "api",
+            "a token rotates itself over the GitLab-shaped route and keeps its identity (got " + (int)rotated.StatusCode + ")");
+        apiSecret = json.RootElement.GetProperty("token").GetString()!;
+        Check(apiSecret.StartsWith("graft_pat_", StringComparison.Ordinal) && apiSecret != previousApiSecret,
+            "and the response carries the new secret, as GitLab's does");
+        Check(DateOnly.TryParseExact(json.RootElement.GetProperty("expires_at").GetString(), "yyyy-MM-dd", out DateOnly kept) &&
+            kept == DateOnly.FromDateTime(DateTime.UtcNow.AddDays(30)), "the expiry is kept rather than reset to a week");
+    }
+    using (HttpResponseMessage stale = await ApiGet(address, "/api/v4/projects", previousApiSecret))
+        Check(stale.StatusCode == HttpStatusCode.Unauthorized, "the previous secret is refused by the API at once");
+    using (HttpResponseMessage fresh = await ApiGet(address, "/api/v4/projects", apiSecret))
+        Check(fresh.IsSuccessStatusCode, "and the new secret is accepted");
+    using (HttpResponseMessage badDate = await ApiPostJson(address, $"/api/v4/personal_access_tokens/{apiTokenId}/rotate", apiSecret, """{"expires_at":"soon"}"""))
+        Check(badDate.StatusCode == HttpStatusCode.BadRequest, "expires_at that is not a date is refused");
+    using (HttpResponseMessage farDate = await ApiPostJson(address, $"/api/v4/personal_access_tokens/{apiTokenId}/rotate", apiSecret,
+        $$"""{"expires_at":"{{DateTime.UtcNow.AddYears(2):yyyy-MM-dd}}"}"""))
+        Check(farDate.StatusCode == HttpStatusCode.BadRequest, "and one beyond a year is refused, as a new token's would be");
+    using (HttpResponseMessage check = await ApiGet(address, "/api/v4/projects", apiSecret))
+        Check(check.IsSuccessStatusCode, "a refused rotation leaves the current secret working");
+    string newDate = DateTime.UtcNow.AddDays(90).ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture);
+    using (HttpResponseMessage byId = await ApiPostJson(address, $"/api/v4/personal_access_tokens/{tokenId}/rotate", apiSecret,
+        $$"""{"expires_at":"{{newDate}}"}"""))
+    {
+        using JsonDocument json = JsonDocument.Parse(await byId.Content.ReadAsStreamAsync());
+        Check(byId.IsSuccessStatusCode && json.RootElement.GetProperty("id").GetInt64() == tokenId &&
+            json.RootElement.GetProperty("expires_at").GetString() == newDate,
+            "an api token rotates another of its owner's tokens by id and may move its expiry");
+        tokenSecret = json.RootElement.GetProperty("token").GetString()!;
+    }
+    using (HttpResponseMessage other = await ApiPostJson(address, "/api/v4/personal_access_tokens/999999/rotate", apiSecret, "{}"))
+        Check(other.StatusCode == HttpStatusCode.NotFound, "and a token that is not its owner's is not found");
     using (HttpRequestMessage wrongCsrf = new(HttpMethod.Delete, $"/api/tokens/{tokenId}"))
     {
         wrongCsrf.Headers.Add("Origin", address);

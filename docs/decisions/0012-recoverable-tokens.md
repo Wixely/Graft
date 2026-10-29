@@ -75,3 +75,9 @@ creation is byte-for-byte the one issued, it still authenticates, a wrong passwo
 the stored column is ciphertext rather than the token, and each read leaves an audit row.
 
 See [the evidence](../validation/2026-10-21-recoverable-tokens.md).
+
+## Note added 2026-10-29
+
+Rotation, offered above as the alternative, now exists alongside this: [ADR 0030](0030-token-rotation.md). A
+rotated token is recoverable afterwards exactly when the operator asks for recoverable secrets at the time of
+the rotation, so rotation is also how an existing token becomes recoverable after the switch is turned on.

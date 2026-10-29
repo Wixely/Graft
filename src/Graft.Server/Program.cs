@@ -66,6 +66,20 @@ const string SessionCookie = "__Host-graft-session";
 // and Graft is deliberately not one.
 ConcurrentDictionary<string, PendingSecret> pendingSecrets = new(StringComparer.Ordinal);
 TimeSpan pendingSecretWindow = TimeSpan.FromMinutes(5);
+
+// Parks a secret for one claim and returns the handle, or null when too many are waiting. The ceiling as
+// well as the expiry is what stops a script that creates tokens in a loop from growing this without bound
+// before the first of them expires.
+string? HoldSecret(long userId, string secret)
+{
+    DateTimeOffset now = DateTimeOffset.UtcNow;
+    foreach (KeyValuePair<string, PendingSecret> stale in pendingSecrets)
+        if (stale.Value.ExpiresAtUtc <= now) pendingSecrets.TryRemove(stale.Key, out _);
+    if (pendingSecrets.Count >= 512) return null;
+    string reveal = Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(16));
+    pendingSecrets[reveal] = new(userId, secret, now.Add(pendingSecretWindow));
+    return reveal;
+}
 // The forge's own Model Context Protocol endpoint. Mounted only when the operator asked for it, and then
 // governed by the administrator's stored switches, which the middleware in front of it reads per request.
 const string McpPath = "/mcp";
@@ -598,15 +612,8 @@ app.MapPost("/api/tokens", async context =>
             tokenProtector is null ? null : tokenProtector.Protect);
         // The secret stays here rather than travelling with the response, and the caller is handed a
         // one-time claim on it. See the note beside pendingSecrets for why.
-        DateTimeOffset now = DateTimeOffset.UtcNow;
-        foreach (KeyValuePair<string, PendingSecret> stale in pendingSecrets)
-            if (stale.Value.ExpiresAtUtc <= now) pendingSecrets.TryRemove(stale.Key, out _);
-        // A ceiling as well as an expiry, so a script that creates tokens in a loop cannot grow this
-        // without bound before the first of them expires.
-        if (pendingSecrets.Count >= 512) { await ApiError(context, 429, "too many uncollected tokens; wait a moment"); return; }
-
-        string reveal = Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(16));
-        pendingSecrets[reveal] = new(browser.Value.Identity.UserId, token.Secret, now.Add(pendingSecretWindow));
+        string? reveal = HoldSecret(browser.Value.Identity.UserId, token.Secret);
+        if (reveal is null) { await ApiError(context, 429, "too many uncollected tokens; wait a moment"); return; }
 
         context.Response.StatusCode = StatusCodes.Status201Created;
         await context.Response.WriteAsJsonAsync(new TokenCreatedResponse(
@@ -615,6 +622,91 @@ app.MapPost("/api/tokens", async context =>
     }
     catch (ArgumentException) { await ApiError(context, 400, "token"); }
 });
+
+// Replaces a token's secret in place, from the browser. The token keeps its id, name, scopes and expiry,
+// so whatever is configured with its name still names it; the old secret stops working as the new one
+// starts. The new secret is collected the way a new token's is, once, through the same claim.
+app.MapPost("/api/tokens/{tokenId:long}/rotate", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    long tokenId = Convert.ToInt64(context.Request.RouteValues["tokenId"], System.Globalization.CultureInfo.InvariantCulture);
+    RotatedToken? rotated = await store.RotateTokenAsync(browser.Value.Identity, tokenId, null, context.RequestAborted,
+        tokenProtector is null ? null : tokenProtector.Protect);
+    if (rotated is null) { await ApiError(context, 404, "token"); return; }
+    string? reveal = HoldSecret(browser.Value.Identity.UserId, rotated.Grant.Secret);
+    // The old secret is already gone by now, so an uncollectable new one is a token that has to be rotated
+    // again, which costs nothing and is said plainly.
+    if (reveal is null) { await ApiError(context, 429, "too many uncollected tokens; this token must be rotated again"); return; }
+    await context.Response.WriteAsJsonAsync(new TokenCreatedResponse(
+        rotated.Grant.Id, rotated.Name, reveal, TokenScopeNames(rotated.Grant.Scopes), rotated.Grant.ExpiresAtUtc),
+        ApiJson.Default.TokenCreatedResponse, null, context.RequestAborted);
+});
+
+// The same for an API client, in GitLab's shape. `self` names the token making the request, which is the
+// case a script rotating its own credential is in. The new secret is in the response, because an API client
+// has no clipboard to fetch it into and no second request to make; this is the one route where a secret
+// travels in a body, and it travels to the caller who already held the previous one.
+//
+// The `api` scope is required, as GitLab requires it, and only the owner may rotate: an administrator
+// rotating another account's token would hold a credential for that account, which is a different feature.
+Func<HttpContext, Task> rotateApiToken = async context =>
+{
+    AuthenticatedIdentity? caller = await AuthenticateApi(context, requireApiScope: false);
+    if (caller is null) return;
+    if (!caller.TokenScopes.HasFlag(TokenScope.Api)) { await ApiError(context, 403, "403 Forbidden: insufficient_scope"); return; }
+    if (!await OnlyQuery(context, "expires_at")) return;
+
+    string? expiresAt = context.Request.Query["expires_at"].ToString();
+    if (context.Request.ContentLength is > 0 || context.Request.Headers.TransferEncoding.Count > 0)
+    {
+        if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+        TokenRotateRequest? request;
+        try { request = await context.Request.ReadFromJsonAsync(ApiJson.Default.TokenRotateRequest, context.RequestAborted); }
+        catch (JsonException) { await ApiError(context, 400, "invalid JSON"); return; }
+        if (!string.IsNullOrWhiteSpace(request?.ExpiresAt)) expiresAt = request.ExpiresAt;
+    }
+    DateTimeOffset? expiry = null;
+    if (!string.IsNullOrWhiteSpace(expiresAt))
+    {
+        // GitLab takes a date; the token then expires at the start of that day, UTC, as GitLab's does.
+        if (!DateOnly.TryParseExact(expiresAt, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.None, out DateOnly date))
+        { await ApiError(context, 400, "expires_at must be a date, YYYY-MM-DD"); return; }
+        expiry = new DateTimeOffset(date.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc));
+    }
+
+    long tokenId;
+    string idText = context.Request.RouteValues["tokenId"]?.ToString() ?? "";
+    if (idText == "self")
+    {
+        string secret = context.Request.Headers["PRIVATE-TOKEN"].ToString();
+        if (secret.Length == 0) secret = context.Request.Headers.Authorization.ToString()[7..];
+        long? own = await store.FindTokenIdAsync(secret, context.RequestAborted);
+        if (own is null) { await ApiError(context, 401, "401 Unauthorized"); return; }
+        tokenId = own.Value;
+    }
+    else if (!long.TryParse(idText, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out tokenId))
+    { await ApiError(context, 404, "404 Not Found"); return; }
+
+    RotatedToken? rotated;
+    try
+    {
+        rotated = await store.RotateTokenAsync(caller, tokenId, expiry, context.RequestAborted,
+            tokenProtector is null ? null : tokenProtector.Protect);
+    }
+    catch (ArgumentOutOfRangeException) { await ApiError(context, 400, "expires_at must be after today and within one year"); return; }
+    if (rotated is null) { await ApiError(context, 404, "404 Not Found"); return; }
+
+    await context.Response.WriteAsJsonAsync(new PersonalAccessTokenResponse(
+        rotated.Grant.Id, rotated.Name, false, rotated.CreatedAtUtc, TokenScopeNames(rotated.Grant.Scopes), caller.UserId,
+        null, true, rotated.Grant.ExpiresAtUtc.UtcDateTime.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
+        rotated.Grant.Secret), ApiJson.Default.PersonalAccessTokenResponse, null, context.RequestAborted);
+};
+app.MapPost("/api/v4/personal_access_tokens/{tokenId}/rotate", rotateApiToken);
 
 // Claims the secret of a token just created, once. The handle is removed before the secret is written, so
 // a second attempt finds nothing even if the first never reached the caller; losing a secret to a dropped
