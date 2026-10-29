@@ -14,7 +14,7 @@
     <ProjectReference Include="../Graft.Core/Graft.Core.csproj" />
     <PackageReference Include="Dapper" Version="2.1.79" />
     <PackageReference Include="Dapper.AOT" Version="1.1.0" />
-    <PackageReference Include="DnaX.Data.Migrations.Sqlite" Version="10.0.0-alpha.7" />
+    <PackageReference Include="DnaX.Data.Migrations.Sqlite" Version="10.0.0-alpha.13" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.5" />
     <PackageReference Include="Microsoft.Extensions.Logging" Version="10.0.5" />

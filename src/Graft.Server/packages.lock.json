@@ -4,15 +4,21 @@
     "net10.0": {
       "DnaX.Uploads": {
         "type": "Direct",
-        "requested": "[10.0.0-alpha.7, )",
-        "resolved": "10.0.0-alpha.7",
-        "contentHash": "6AZ2tO/Pk0bG06Mh4RTEZTXZ9J2Mvz2YPlVTGQqJLVtqm+8qYj/dj1aJUDc60rzmlY67k3HwJ8kphM5W9mRVTA=="
+        "requested": "[10.0.0-alpha.13, )",
+        "resolved": "10.0.0-alpha.13",
+        "contentHash": "+hCqMv5ZgkEGtWnjXudw5cRaGqnKmsCxFckGfTsYnBVpogxnKrgw7RMUjpsIxAXi5ANtlCE7zq3ypn4ecLOS2A=="
       },
       "Markdig": {
         "type": "Direct",
         "requested": "[1.4.0, )",
         "resolved": "1.4.0",
         "contentHash": "lLhaiI/mNDTNzgLqnmknhf4LjgTqOAyjx5+GNz0X3AxYMxUhmFppF2WVMdER+SDqwhE5wUF1pzs/cuLwFxs7xA=="
+      },
+      "Microsoft.DotNet.ILCompiler": {
+        "type": "Direct",
+        "requested": "[10.0.10, )",
+        "resolved": "10.0.10",
+        "contentHash": "tnG8ntt/Bk6odvHREnGLMo3PEiihy5iSlIFVp0JbIo00GKtNRt2k73eKZbPqR5yaJNIa3z8R86YLwbxfqpb17g=="
       },
       "Microsoft.Extensions.Hosting.Systemd": {
         "type": "Direct",
@@ -28,6 +34,12 @@
         "dependencies": {
           "System.ServiceProcess.ServiceController": "10.0.12"
         }
+      },
+      "Microsoft.NET.ILLink.Tasks": {
+        "type": "Direct",
+        "requested": "[10.0.10, )",
+        "resolved": "10.0.10",
+        "contentHash": "f5VCIE7AJpd5YvzNTeMGVzQIgyE9tX+AreTYwQF+REbu+DZo/2Ae+jNSwhPEYrVz6RRkd7y8ubXjk6Nn6Ka+Cg=="
       },
       "ModelContextProtocol.AspNetCore": {
         "type": "Direct",
@@ -50,15 +62,15 @@
       },
       "DnaX.Data.Migrations": {
         "type": "Transitive",
-        "resolved": "10.0.0-alpha.7",
-        "contentHash": "zzsP/SjAm7AHykp7FSDLwQOcdT1Ir6g66VTLJu+CXSBtRgW8nzT3u/zRoGsm8wan/PXtNkGrx9kCOP+Z/jbCfw=="
+        "resolved": "10.0.0-alpha.13",
+        "contentHash": "+ZtKjMD10ofXvsIsleWbriNkFZxB67hRyN39ukVP1SLQWcqet7UXqgJsjGnc11Gouu6c1zhiUjdfplOUqX+OOg=="
       },
       "DnaX.Data.Migrations.Sqlite": {
         "type": "Transitive",
-        "resolved": "10.0.0-alpha.7",
-        "contentHash": "Q0X6mkGYxwTZPNYrLWJxvoMAwENZHRyA07Pb25i82P4JtFYgSb5dHZXXwDht5JgKZxWtTud9qHPeNSAE6HoELg==",
+        "resolved": "10.0.0-alpha.13",
+        "contentHash": "nq9eolfUEGlbChh9h7usp3JbhbXy0dPvIeVMemCYFp8RAa8PbxTPkAbQThrlcYfx24vaMUOqMsAkpbwhzH5A6g==",
         "dependencies": {
-          "DnaX.Data.Migrations": "10.0.0-alpha.7",
+          "DnaX.Data.Migrations": "10.0.0-alpha.13",
           "Microsoft.Data.Sqlite": "10.0.11"
         }
       },
@@ -161,10 +173,36 @@
         "dependencies": {
           "Dapper": "[2.1.79, )",
           "Dapper.AOT": "[1.1.0, )",
-          "DnaX.Data.Migrations.Sqlite": "[10.0.0-alpha.7, )",
+          "DnaX.Data.Migrations.Sqlite": "[10.0.0-alpha.13, )",
           "Graft.Core": "[1.0.0, )",
           "Microsoft.Data.Sqlite": "[10.0.12, )"
         }
+      }
+    },
+    "net10.0/win-x64": {
+      "Microsoft.DotNet.ILCompiler": {
+        "type": "Direct",
+        "requested": "[10.0.10, )",
+        "resolved": "10.0.10",
+        "contentHash": "tnG8ntt/Bk6odvHREnGLMo3PEiihy5iSlIFVp0JbIo00GKtNRt2k73eKZbPqR5yaJNIa3z8R86YLwbxfqpb17g==",
+        "dependencies": {
+          "runtime.win-x64.Microsoft.DotNet.ILCompiler": "10.0.10"
+        }
+      },
+      "runtime.win-x64.Microsoft.DotNet.ILCompiler": {
+        "type": "Transitive",
+        "resolved": "10.0.10",
+        "contentHash": "e5P00ObvdmAl49KkvGvqDLE5+EXu/IdXCDsLghgKFXKrNybyxMmH12HuGrsO7LTIGjXI58tyN3Hwxwr/MR0d8A=="
+      },
+      "SQLitePCLRaw.lib.e_sqlite3": {
+        "type": "Transitive",
+        "resolved": "2.1.12",
+        "contentHash": "fWi8Dbknuhgg72fWinIdjXVaqO1hHL4YBBwVLnr7e1c9TAZwJ0QE38j9syW1hwx6HaqEVTwI+O07WPdZn8Rp0w=="
+      },
+      "System.ServiceProcess.ServiceController": {
+        "type": "Transitive",
+        "resolved": "10.0.12",
+        "contentHash": "sFV+RM/yPtshiCAEIuTm8Dt4F7VuKRbL50PnGC9nXHolk/jw+z3T8zx7axKTBC8mqtQU2ZmjsoPC9b1iwOilNQ=="
       }
     }
   }

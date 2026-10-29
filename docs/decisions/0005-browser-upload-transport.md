@@ -35,7 +35,7 @@ API clients have no equivalent failure mode, so routing them through a session-b
 
 ## Status of the dependency
 
-`DnaX.Uploads` 10.0.0-alpha.7 is an experimental prerelease whose API and journal format are explicitly not stable. Graft is its first consumer. The prototype's own documentation records that 50–100 GiB transfers have not been run, that it is a single-process local-filesystem store, and that tus interoperability was evaluated but not implemented. Treat an upgrade as a breaking change until that stabilizes.
+`DnaX.Uploads` 10.0.0-alpha.7, and 10.0.0-alpha.13 since 2026-10-29 for the NativeAOT generator fix ([Wixely/DnaX#17](https://github.com/Wixely/DnaX/issues/17)), is an experimental prerelease whose API and journal format are explicitly not stable. Graft is its first consumer. The prototype's own documentation records that 50–100 GiB transfers have not been run, that it is a single-process local-filesystem store, and that tus interoperability was evaluated but not implemented. Treat an upgrade as a breaking change until that stabilizes.
 
 ## What this decision does not cover
 

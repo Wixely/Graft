@@ -149,7 +149,10 @@ These are recorded so nobody reopens them as oversights. Each has a decision rec
 
 Unchanged by this work and carried from [the MVP plan](mvp-plan.md).
 
-- The tested DnaX packages have no approved durable source, so a clean external checkout cannot restore.
+- The tested DnaX packages have no approved durable source in this repository, so a clean external checkout
+  cannot restore. Since 2026-10-29 DnaX's own CI publishes every version to GitHub Packages under Wixely,
+  which is a durable source; adopting it means adding an authenticated feed to `nuget.config`, which is the
+  user's call. Until then Graft restores `10.0.0-alpha.13` from the local, ignored feed.
 - Deployment certificate authority and DNS trust are unproven outside local runs.
 - The acceptance run on the required Linux 3.10.108 host has not happened.
 - The data-protection key ring sits beside the database, which bounds what encrypting token secrets
