@@ -2,6 +2,31 @@
 
 Updated: 2026-10-29. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
 
+## Added on 2026-10-29, third entry: deleting a file
+
+The user asked for another feature that needed no decision of theirs. The backlog's "Near, and small" list
+is the user's own list of wanted things, so its first item was taken: deleting a file, which the API, the
+browser and the agent surface could all write and none could remove. [ADR 0029](decisions/0029-file-deletion.md).
+
+- `DELETE /api/v4/projects/:id/repository/files/:file_path` with `branch` and `commit_message` in a JSON
+  body or on the query string, answering `204`; the same under the browser family; a `Delete` button on the
+  file view for anyone who may push, confirmed with a second click; and `graft_delete_file`, the 38th tool.
+- The object writer has one path through a commit, taking an edit of the tree, and `CommitFiles` and
+  `DeleteFiles` are two edits. A deletion that finds no file is refused and writes nothing. A directory left
+  empty disappears with its last file, which is the one rule here that was not obvious: Git has no empty
+  trees, and without it a deletion would have written a tree `git fsck` rejects.
+- Compatibility row GL-014d; GL-014b no longer says deletion is missing.
+
+Git suite 913 to 927; MCP suite 101 to 104. Not done, and recorded in the ADR: `last_commit_id`,
+`start_branch` and the author overrides; deleting a directory in one call. The browser button was compiled
+and wired to the same server function as the API route, and was not driven by a browser in a suite.
+
+**Next action.** Unchanged from the entry below: operator, back up the repositories directory before
+deploying this build, because the Git engine entry's format conversion is still the deployment's first
+upgrade step. Agent: the remaining two "Near, and small" items, token rotation and the icon fill rule, need
+no decision either; then the NativeAOT publish with the Git suite against it.
+
+
 ## Added on 2026-10-29, later the same day: the outside, the builds, and the Git engine
 
 The user asked for the second list from the 2026-10-28 review as one piece of work: forks, search,

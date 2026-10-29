@@ -1936,6 +1936,24 @@ app.MapMethods("/api/v4/projects/{projectId}/repository/files/{**filePath}", ["P
     catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
 });
 
+// Deleting one file, which is a commit like writing one. The branch and the message travel in a JSON body
+// as GitLab documents, or on the query string for a client whose DELETE cannot carry a body.
+app.MapDelete("/api/v4/projects/{projectId}/repository/files/{**filePath}", async context =>
+{
+    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.PushRepository);
+    if (project is null) return;
+    if (!await OnlyQuery(context, "branch", "commit_message")) return;
+    await DeleteRepositoryFile(context, project.Details, project.Identity, context.Request.RouteValues["filePath"]?.ToString() ?? "");
+});
+
+app.MapDelete("/api/projects/{projectId:long}/repository/files/{**filePath}", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: true);
+    if (scope is null) return;
+    if (!await OnlyQuery(context, "branch", "commit_message")) return;
+    await DeleteRepositoryFile(context, scope.Value.Details, scope.Value.Identity, context.Request.RouteValues["filePath"]?.ToString() ?? "");
+});
+
 app.MapGet("/api/v4/projects/{projectId}/repository/files/{**filePath}", async context =>
 {
     ApiProject? project = await AuthorizeApiProject(context, ProjectAction.BrowseRepository);
@@ -3103,6 +3121,52 @@ async Task DeleteBranch(HttpContext context, ProjectDetails project, Authenticat
                 "branch-is-default" => "this is the branch the project opens at; choose another default first",
                 _ => "the branch name is not valid"
             });
+        }
+    });
+}
+
+// Deleting a file is a commit, authored exactly as a write is, so it needs what a push needs. The whole
+// batch is one file here because that is the route's shape; the engine would take a hundred.
+async Task DeleteRepositoryFile(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity, string filePath)
+{
+    PermissionDecision push = await DecideFor(context, identity, project.Project.Id, ProjectAction.PushRepository);
+    if (!push.Allowed) { await ApiError(context, 403, push.Explanation); return; }
+    try { filePath = Uri.UnescapeDataString(filePath); }
+    catch (UriFormatException) { await ApiError(context, 400, "file path is not valid"); return; }
+    if (filePath.Length == 0) { await ApiError(context, 400, "file path is missing"); return; }
+
+    string? branch = context.Request.Query["branch"].ToString();
+    string? commitMessage = context.Request.Query["commit_message"].ToString();
+    if (context.Request.ContentLength is > 0 || context.Request.Headers.TransferEncoding.Count > 0)
+    {
+        if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+        RepositoryFileDeleteRequest? request;
+        try { request = await context.Request.ReadFromJsonAsync(ApiJson.Default.RepositoryFileDeleteRequest, context.RequestAborted); }
+        catch (JsonException) { await ApiError(context, 400, "invalid JSON"); return; }
+        if (!string.IsNullOrWhiteSpace(request?.Branch)) branch = request.Branch;
+        if (!string.IsNullOrWhiteSpace(request?.CommitMessage)) commitMessage = request.CommitMessage;
+    }
+    if (string.IsNullOrWhiteSpace(branch)) { await ApiError(context, 400, "branch is required"); return; }
+    if (string.IsNullOrWhiteSpace(commitMessage)) { await ApiError(context, 400, "commit_message is required"); return; }
+
+    GitIdentity author = new(identity!.Username, identity.Username + "@graft.invalid", DateTimeOffset.UtcNow);
+    await WithRepository(EndpointFor(project.Project), context, async repository =>
+    {
+        try
+        {
+            repository.DeleteFiles(branch, [filePath], author, commitMessage, context.RequestAborted);
+            context.Response.StatusCode = StatusCodes.Status204NoContent;
+        }
+        catch (GitInputException error)
+        {
+            (int status, string reason) = error.Message switch
+            {
+                "path-missing" => (404, "404 File Not Found"),
+                "branch-missing" => (400, "branch does not exist"),
+                "path-is-directory" => (400, "the path names a directory, not a file"),
+                _ => (400, error.Message)
+            };
+            await ApiError(context, status, reason);
         }
     });
 }

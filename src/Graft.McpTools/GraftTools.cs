@@ -469,6 +469,31 @@ public sealed class GraftTools
         catch (System.Text.Json.JsonException) { return new JsonObject { ["project"] = project, ["path"] = file, ["committed"] = true }.ToJsonString(); }
     }
 
+    [McpServerTool(Name = "graft_delete_file")]
+    [Description("Deletes one file from a project and commits the deletion. The file must exist on the branch; a directory left empty disappears with it. The history keeps the file. Refused unless writes are allowed on this server.")]
+    public static async Task<string> DeleteFile(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("File path inside the repository, such as docs/old.md.")] string file,
+        [Description("Branch to commit on, such as main. It must exist.")] string branch,
+        [Description("Commit message.")] string message,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowWrites) return Refused(graft, "deleting a file");
+        if (string.IsNullOrWhiteSpace(file)) return Failure("A file path is required.");
+        if (string.IsNullOrWhiteSpace(branch)) return Failure("A branch is required.");
+        if (string.IsNullOrWhiteSpace(message)) return Failure("A commit message is required.");
+
+        JsonObject body = new() { ["branch"] = branch, ["commit_message"] = message };
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Delete,
+            "api/v4/projects/" + Encode(project) + "/repository/files/" + Uri.EscapeDataString(file.Trim()),
+            body, cancellationToken);
+        if (!ok) return Failure(GraftClient.Describe(status, response));
+        // GitLab's shape answers 204 with nothing, so the report is what was asked for rather than what the
+        // server said; the commit itself is one graft_list_commits away.
+        return new JsonObject { ["project"] = project, ["path"] = file, ["branch"] = branch, ["deleted"] = true }.ToJsonString();
+    }
+
     [McpServerTool(Name = "graft_help")]
     [Description("Explains how this forge works: addressing a project, what bounds an agent, visibility, project pages, changing things, and limits. Call it with no topic for the list.")]
     public static string Help(

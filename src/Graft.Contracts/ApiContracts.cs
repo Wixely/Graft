@@ -195,6 +195,12 @@ public sealed record RepositoryFileWriteRequest(
     string? CommitMessage,
     bool ExecuteFilemode = false);
 
+/// <summary>
+/// Deleting one file, in GitLab's shape. A client that cannot send a body with <c>DELETE</c> may put the
+/// same two members on the query string instead.
+/// </summary>
+public sealed record RepositoryFileDeleteRequest(string? Branch, string? CommitMessage);
+
 public sealed record RepositoryCommitResponse(
     [property: JsonPropertyName("commit_id")] string CommitId,
     [property: JsonPropertyName("tree_id")] string TreeId,
@@ -1003,6 +1009,7 @@ public sealed record MergeRequestChangesResponse(
 [JsonSerializable(typeof(BundleInventoryResponse))]
 [JsonSerializable(typeof(RepositoryCommitRequest))]
 [JsonSerializable(typeof(RepositoryFileWriteRequest))]
+[JsonSerializable(typeof(RepositoryFileDeleteRequest))]
 [JsonSerializable(typeof(RepositoryCommitResponse))]
 [JsonSerializable(typeof(UploadStatusResponse))]
 [JsonSerializable(typeof(VisibilityRequest))]

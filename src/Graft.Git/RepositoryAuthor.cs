@@ -31,7 +31,9 @@ public static class RepositoryAuthor
 
     /// <summary>
     /// Commits <paramref name="changes"/> onto <paramref name="branch"/>, creating the branch when the
-    /// repository is empty. Adds or replaces files; it does not delete, and it never rewrites history.
+    /// repository is empty. Adds or replaces files; it never rewrites history. Deleting is
+    /// <see cref="DeleteFiles"/>, which cannot create a branch because there is nothing on a new branch to
+    /// delete.
     /// </summary>
     public static AuthoredCommit CommitFiles(
         this Repository repository,
@@ -43,13 +45,7 @@ public static class RepositoryAuthor
     {
         ArgumentNullException.ThrowIfNull(repository);
         ArgumentNullException.ThrowIfNull(changes);
-
-        string reference = "refs/heads/" + branch;
-        Limits.Require(Limits.IsRef(reference), "branch");
         Limits.Require(changes.Count is > 0 and <= MaximumChanges, "change-count");
-
-        string body = NormalizeMessage(message);
-        string identity = FormatIdentity(author);
 
         // Validate every path before writing anything, so a rejected batch leaves no partial state.
         string[] paths = [.. changes.Select(change => ValidatePath(change.Path))];
@@ -60,27 +56,95 @@ public static class RepositoryAuthor
             Limits.Require(change.Content.Length <= Limits.ObjectBytes, "blob-size");
         }
 
+        return Author(repository, branch, author, message, allowNewBranch: true, cancellationToken, (root, written) =>
+        {
+            for (int index = 0; index < changes.Count; index++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                string[] segments = paths[index].Split('/');
+                Node node = root;
+                for (int depth = 0; depth < segments.Length - 1; depth++)
+                    node = node.Descend(repository, segments[depth]);
+                string name = segments[^1];
+                Limits.Require(!node.Subtrees.ContainsKey(name) && !node.PendingSubtrees.ContainsKey(name), "path-is-directory");
+                GitObject blob = new(3, changes[index].Content);
+                written[blob.Id] = blob;
+                node.Leaves[name] = (changes[index].Executable ? ExecutableFileMode : RegularFileMode, blob.Id);
+            }
+        });
+    }
+
+    /// <summary>
+    /// Commits the removal of <paramref name="paths"/> from <paramref name="branch"/>. Every path must name
+    /// a file that is there, or the whole batch is refused and nothing is written: a deletion that did not
+    /// find its file is a caller who is looking at a different revision than the one they are changing. A
+    /// directory that is left empty disappears with its last file, because Git keeps no empty trees.
+    /// </summary>
+    public static AuthoredCommit DeleteFiles(
+        this Repository repository,
+        string branch,
+        IReadOnlyList<string> paths,
+        GitIdentity author,
+        string message,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(repository);
+        ArgumentNullException.ThrowIfNull(paths);
+        Limits.Require(paths.Count is > 0 and <= MaximumChanges, "change-count");
+        string[] validated = [.. paths.Select(ValidatePath)];
+        Limits.Require(validated.Distinct(StringComparer.Ordinal).Count() == validated.Length, "duplicate-path");
+
+        return Author(repository, branch, author, message, allowNewBranch: false, cancellationToken, (root, _) =>
+        {
+            foreach (string path in validated)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                string[] segments = path.Split('/');
+                Node node = root;
+                for (int depth = 0; depth < segments.Length - 1; depth++)
+                {
+                    string directory = segments[depth];
+                    Limits.Require(node.Subtrees.ContainsKey(directory) || node.PendingSubtrees.ContainsKey(directory), "path-missing");
+                    node = node.Descend(repository, directory);
+                }
+                string name = segments[^1];
+                Limits.Require(!node.Subtrees.ContainsKey(name) && !node.PendingSubtrees.ContainsKey(name), "path-is-directory");
+                Limits.Require(node.Leaves.Remove(name), "path-missing");
+            }
+        });
+    }
+
+    /// <summary>
+    /// The one way a commit is authored here: load the branch tip's tree, let <paramref name="edit"/> change
+    /// it, serialize what changed, build the commit and advance the branch under the same validation a
+    /// pushed batch gets.
+    /// </summary>
+    private static AuthoredCommit Author(
+        Repository repository,
+        string branch,
+        GitIdentity author,
+        string message,
+        bool allowNewBranch,
+        CancellationToken cancellationToken,
+        Action<Node, Dictionary<string, GitObject>> edit)
+    {
+        string reference = "refs/heads/" + branch;
+        Limits.Require(Limits.IsRef(reference), "branch");
+
+        string body = NormalizeMessage(message);
+        string identity = FormatIdentity(author);
+
         Dictionary<string, GitObject> written = new(StringComparer.Ordinal);
         string? parent = repository.Refs.GetValueOrDefault(reference);
         if (parent is not null)
             Limits.Require(repository.Objects.TryGetValue(parent, out GitObject? tip) && tip.Type == 1, "branch-tip");
+        else
+            Limits.Require(allowNewBranch, "branch-missing");
 
         string? parentTree = parent is null ? null : RepositoryView.ReadCommit(repository, parent).TreeId;
         Node root = Load(repository, parentTree);
 
-        for (int index = 0; index < changes.Count; index++)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            string[] segments = paths[index].Split('/');
-            Node node = root;
-            for (int depth = 0; depth < segments.Length - 1; depth++)
-                node = node.Descend(repository, segments[depth]);
-            string name = segments[^1];
-            Limits.Require(!node.Subtrees.ContainsKey(name) && !node.PendingSubtrees.ContainsKey(name), "path-is-directory");
-            GitObject blob = new(3, changes[index].Content);
-            written[blob.Id] = blob;
-            node.Leaves[name] = (changes[index].Executable ? ExecutableFileMode : RegularFileMode, blob.Id);
-        }
+        edit(root, written);
 
         string treeId = Serialize(root, written, cancellationToken);
         GitObject commit = BuildCommit(treeId, parent, identity, body);
@@ -184,6 +248,9 @@ public static class RepositoryAuthor
         public readonly Dictionary<string, Node> Subtrees = new(StringComparer.Ordinal);
         public readonly Dictionary<string, string> PendingSubtrees = new(StringComparer.Ordinal);
 
+        /// <summary>No files here or below. A pending subtree counts as content, because it was loaded from a tree that had some.</summary>
+        public bool IsEmpty => Leaves.Count == 0 && PendingSubtrees.Count == 0 && Subtrees.Values.All(child => child.IsEmpty);
+
         public Node Descend(Repository repository, string name)
         {
             Limits.Require(!Leaves.ContainsKey(name), "path-is-file");
@@ -224,7 +291,13 @@ public static class RepositoryAuthor
         foreach ((string name, (string mode, string id)) in node.Leaves) entries.Add((name, false, mode, id));
         foreach ((string name, string id) in node.PendingSubtrees) entries.Add((name, true, TreeMode, id));
         foreach ((string name, Node child) in node.Subtrees)
+        {
+            // Git has no empty trees: a directory whose last file was deleted leaves the tree with its file.
+            // Only the root is ever written empty, which is the empty-tree object Git itself writes for a
+            // commit with nothing in it.
+            if (child.IsEmpty) continue;
             entries.Add((name, true, TreeMode, Serialize(child, written, cancellationToken)));
+        }
 
         entries.Sort(static (left, right) => CompareNames(left.Name, left.IsTree, right.Name, right.IsTree));
         using MemoryStream output = new();

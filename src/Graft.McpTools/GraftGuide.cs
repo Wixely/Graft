@@ -45,7 +45,7 @@ public static class GraftGuide
 
         Writing. graft_write_file replaces a whole file and commits it, so read the file first unless you
         intend to discard what is there. It creates the branch if it does not exist, which makes a branch of
-        your own the safe default.
+        your own the safe default. graft_delete_file removes one file with a commit; the history keeps it.
 
         Collaboration. A project has issues and merge requests, numbered from one within that project, and
         comments on both. Reading them needs whatever reading the repository needs, so a public project's
@@ -174,6 +174,10 @@ public static class GraftGuide
             first with `graft_read_file` unless you mean to discard what is there. It creates the branch
             when it does not exist, which makes committing to a branch of your own the safe default rather
             than to the branch everybody else is using.
+
+            `graft_delete_file` removes one file from a branch with a commit. The branch must exist and so
+            must the file; a directory left with nothing in it disappears, as Git has no empty directories.
+            The history keeps the file, so this is a change to propose like any other, not a loss.
 
             `graft_update_project` changes a project's name, description and default branch. Only the fields
             you send are changed, so you need not resend the others and race whoever else is editing.
