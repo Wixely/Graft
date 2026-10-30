@@ -164,7 +164,11 @@ public sealed class Repository
         return persistence.Repack(entries, cancellationToken);
     }
 
-    public byte[] Advertise(string service)
+    /// <summary>
+    /// The protocol version 0 reference advertisement. <paramref name="serviceHeader"/> prefixes the
+    /// <c># service=</c> line smart HTTP requires; a stateful transport such as SSH takes the list bare.
+    /// </summary>
+    public byte[] Advertise(string service, bool serviceHeader = true)
     {
         var receive = service == "git-receive-pack";
         Limits.Require(receive || service == "git-upload-pack", "service");
@@ -176,8 +180,11 @@ public sealed class Repository
             ? "report-status ofs-delta " + Agent
             : "multi_ack_detailed ofs-delta include-tag " + Agent + (head is null ? "" : " symref=HEAD:refs/heads/" + head);
         using var output = new MemoryStream();
-        Packet.Write(output, "# service=" + service + "\n");
-        Packet.Flush(output);
+        if (serviceHeader)
+        {
+            Packet.Write(output, "# service=" + service + "\n");
+            Packet.Flush(output);
+        }
         var first = true;
         void Ref(string id, string name)
         {
@@ -200,12 +207,15 @@ public sealed class Repository
     /// The protocol version 2 capability advertisement, sent in place of the reference list when a client
     /// asks for version 2. References are then fetched with <c>ls-refs</c>.
     /// </summary>
-    public byte[] AdvertiseV2(string service)
+    public byte[] AdvertiseV2(string service, bool serviceHeader = true)
     {
         Limits.Require(service == "git-upload-pack", "service");
         using MemoryStream output = new();
-        Packet.Write(output, "# service=" + service + "\n");
-        Packet.Flush(output);
+        if (serviceHeader)
+        {
+            Packet.Write(output, "# service=" + service + "\n");
+            Packet.Flush(output);
+        }
         Packet.Write(output, "version 2\n");
         Packet.Write(output, Agent + "\n");
         Packet.Write(output, "ls-refs=unborn\n");

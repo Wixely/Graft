@@ -195,6 +195,47 @@ WEBHOOKS: off
 
 See [ADR 0016](decisions/0016-webhooks.md).
 
+### Optional Git over SSH
+
+Graft can serve Git over SSH itself, with no OpenSSH daemon in front of it. It is off until a port is named:
+
+```sh
+GRAFT_SSH_PORT=2222
+```
+
+or `--ssh-port 2222`. Port 22 works where the process may bind it; most deployments pick 2222 or redirect
+22 to it at the firewall. The listener binds the same address as the HTTPS listener and is a second port to
+open, which a reverse proxy in front of HTTPS does not carry: Cloudflare's proxy, for one, does not pass SSH,
+so the SSH port is reached directly or through a TCP forwarder of your own.
+
+Clone URLs name the host the request came by, as `ssh://git@host:2222/owner/project.git`. Where the public
+name differs, say it:
+
+```sh
+GRAFT_SSH_HOST=git.example.com
+```
+
+or `--ssh-host git.example.com`.
+
+The host key is created on first start as `ssh_host_ecdsa_key` beside the database, in the directory your
+backups already cover; keep it with the database when you move the server, or every client will be told the
+host has changed. The forge prints where it listens and the key's fingerprint at startup:
+
+```text
+SSH: ssh://git@graft.example.com:2222/<owner>/<project>.git; host key SHA256:…
+```
+
+Give that fingerprint to people, so a first connection has something to check against.
+
+Users register their public keys under **Profile and SSH keys** or through `POST /api/v4/user/keys`. A key
+authenticates as its owner for Git and for nothing else: there is no shell, no forwarding, and no command but
+`git-upload-pack` and `git-receive-pack`. Fetches are served in Git protocol version 2, which every Git
+since 2.26 asks for by default; an older client passes `-c protocol.version=2`. Repositories with LFS
+objects are cloned over HTTPS, or with `lfs.url` pointing at the HTTPS address, because `git-lfs-authenticate`
+is not served.
+
+See [ADR 0031](decisions/0031-git-over-ssh.md).
+
 ### Optional project sites
 
 A project page can serve a static site from a folder in its repository. That is repository-authored HTML,

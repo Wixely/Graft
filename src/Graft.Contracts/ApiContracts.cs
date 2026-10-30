@@ -341,6 +341,21 @@ public sealed record ProjectPageResponse(
 /// <summary>One surface a page links onward to, by GitLab's name and at the project's shareable address.</summary>
 public sealed record PageFeatureResponse(string Name, string Url);
 
+/// <summary>A registered SSH key, in GitLab's shape. <c>key</c> is the one-line public key as it was pasted;
+/// <c>fingerprint</c> is Graft's addition, the <c>SHA256:</c> form OpenSSH prints.</summary>
+public sealed record SshKeyResponse(
+    long Id,
+    string Title,
+    string Key,
+    string Fingerprint,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt,
+    [property: JsonPropertyName("expires_at")] DateTimeOffset? ExpiresAt,
+    [property: JsonPropertyName("last_used_at")] DateTimeOffset? LastUsedAt,
+    [property: JsonPropertyName("usage_type")] string UsageType = "auth");
+
+/// <summary>GitLab's request to add a key: a title, the one-line public key, and an optional expiry date.</summary>
+public sealed record SshKeyCreateRequest(string? Title, string? Key, [property: JsonPropertyName("expires_at")] string? ExpiresAt);
+
 /// <summary>One card in the public browser. Deliberately not the GitLab project shape: it carries only what
 /// a stranger is shown, so there is no field here that could accidentally describe a private project.</summary>
 public sealed record BrowseEntryResponse(
@@ -1033,6 +1048,9 @@ public sealed record MergeRequestChangesResponse(
 [JsonSerializable(typeof(RepositoryPageResponse))]
 [JsonSerializable(typeof(ReadmeResponse))]
 [JsonSerializable(typeof(PageFeatureResponse))]
+[JsonSerializable(typeof(SshKeyResponse))]
+[JsonSerializable(typeof(SshKeyResponse[]))]
+[JsonSerializable(typeof(SshKeyCreateRequest))]
 [JsonSerializable(typeof(CommitDiffResponse))]
 [JsonSerializable(typeof(UploadIngestRequest))]
 [JsonSerializable(typeof(BundleInventoryResponse))]

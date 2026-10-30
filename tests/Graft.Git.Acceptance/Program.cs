@@ -229,6 +229,7 @@ try
     await CheckCompressedGitRequests(address, aliceIdentity);
     await CheckGitEngine(address, aliceIdentity);
     await CheckFetching(address, aliceIdentity, "carol");
+    await CheckSsh(address, aliceIdentity, bob.Username);
     await CheckEmptyRepository(address, aliceIdentity, alicePassword);
     address = await CheckWebhooks(address, aliceIdentity);
     // After everything that writes an audit row, so the trail it reads already contains them.
@@ -320,6 +321,9 @@ ProcessStartInfo ServerStart()
     // every other assertion runs against a server that cannot call anything.
     start.ArgumentList.Add("--webhooks");
     start.ArgumentList.Add(webhooksEnabled ? "true" : "false");
+    // Git over SSH on whatever port is free; the server prints the one it bound and the SSH check reads it.
+    start.ArgumentList.Add("--ssh-port");
+    start.ArgumentList.Add("0");
     return start;
 }
 
@@ -5999,6 +6003,178 @@ async Task CheckFetching(string address, AuthenticatedIdentity alice, string str
 /// The empty-repository page, which used to report a 404 from the browse endpoint and which the browser
 /// then described as a permission problem.
 /// </summary>
+/// <summary>
+/// Git over SSH, end to end with the real OpenSSH client and real keys of all three families Graft
+/// verifies. Keys are registered through GitLab's routes, the host key is checked against what the server
+/// printed, and every refusal is driven: an unregistered key, a member of nothing, a client that will not
+/// speak protocol version 2, a command that is not Git, and a key that has just been removed.
+/// </summary>
+async Task CheckSsh(string address, AuthenticatedIdentity alice, string bobUsername)
+{
+    string sshLine = Required(serverLines.LastOrDefault(line => line.StartsWith("SSH: ssh://", StringComparison.Ordinal)), "the server's SSH line");
+    // "SSH: ssh://git@127.0.0.1:PORT/<owner>/<project>.git; host key SHA256:..."
+    string sshBase = sshLine["SSH: ".Length..sshLine.IndexOf("/<owner>", StringComparison.Ordinal)];
+    string printedFingerprint = sshLine[(sshLine.IndexOf("host key ", StringComparison.Ordinal) + "host key ".Length)..].Trim();
+    Check(sshBase.StartsWith("ssh://git@127.0.0.1:", StringComparison.Ordinal) && printedFingerprint.StartsWith("SHA256:", StringComparison.Ordinal),
+        "the server announces where it listens for SSH and its host key fingerprint");
+
+    string aliceApi;
+    string aliceReadApi;
+    string bobApi;
+    await using (GraftStore fixture = await GraftStore.OpenAsync(databasePath))
+    {
+        UserAccount bob = Required(await fixture.FindActiveUserAsync(bobUsername), "bob account");
+        AuthenticatedIdentity bobIdentity = new(bob.Id, bob.Username, false, IdentityKind.BrowserSession);
+        aliceApi = (await fixture.CreateTokenAsync(alice, "ssh-api", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        aliceReadApi = (await fixture.CreateTokenAsync(alice, "ssh-read-api", TokenScope.ReadApi, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        bobApi = (await fixture.CreateTokenAsync(bobIdentity, "ssh-bob-api", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+    }
+
+    // Real keys, made by OpenSSH.
+    string keyDirectory = Path.Combine(root, "ssh-keys");
+    Directory.CreateDirectory(keyDirectory);
+    async Task<string> KeyGen(string name, params string[] options)
+    {
+        string path = Path.Combine(keyDirectory, name);
+        (int exit, _, string errors) = await RunTool("ssh-keygen", keyDirectory, ["-q", "-N", "", "-C", name, "-f", path, .. options]);
+        if (exit != 0) throw new InvalidOperationException("ssh-keygen failed: " + errors);
+        return path;
+    }
+    string ed25519 = await KeyGen("ed25519", "-t", "ed25519");
+    string rsa = await KeyGen("rsa", "-t", "rsa", "-b", "3072");
+    string ecdsa = await KeyGen("ecdsa", "-t", "ecdsa", "-b", "256");
+    string stranger = await KeyGen("stranger", "-t", "ed25519");
+    string bobKey = await KeyGen("bob", "-t", "ed25519");
+    async Task<string> FingerprintOf(string publicKeyPath)
+    {
+        (int exit, string output, _) = await RunTool("ssh-keygen", keyDirectory, ["-lf", publicKeyPath]);
+        if (exit != 0) throw new InvalidOperationException("ssh-keygen -l failed");
+        return output.Split(' ')[1];
+    }
+
+    // Registration, through GitLab's routes.
+    using (HttpResponseMessage denied = await ApiPostJson(address, "/api/v4/user/keys", aliceReadApi,
+        """{"title":"laptop","key":""" + JsonSerializer.Serialize(File.ReadAllText(ed25519 + ".pub")) + "}"))
+        Check(denied.StatusCode == System.Net.HttpStatusCode.Forbidden, "a read_api token cannot add an SSH key");
+    long ed25519Id;
+    using (HttpResponseMessage created = await ApiPostJson(address, "/api/v4/user/keys", aliceApi,
+        """{"title":"laptop","key":""" + JsonSerializer.Serialize(File.ReadAllText(ed25519 + ".pub")) + "}"))
+    {
+        Check(created.StatusCode == System.Net.HttpStatusCode.Created, "an api token adds an Ed25519 key (got " + (int)created.StatusCode + ")");
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStringAsync());
+        ed25519Id = json.RootElement.GetProperty("id").GetInt64();
+        Check(json.RootElement.GetProperty("fingerprint").GetString() == await FingerprintOf(ed25519 + ".pub"),
+            "and reports the fingerprint ssh-keygen reports");
+        Check(json.RootElement.GetProperty("title").GetString() == "laptop" && json.RootElement.GetProperty("last_used_at").ValueKind == JsonValueKind.Null,
+            "with its title, and no use yet");
+    }
+    using (HttpResponseMessage duplicate = await ApiPostJson(address, "/api/v4/user/keys", bobApi,
+        """{"title":"copied","key":""" + JsonSerializer.Serialize(File.ReadAllText(ed25519 + ".pub")) + "}"))
+        Check(duplicate.StatusCode == System.Net.HttpStatusCode.BadRequest, "a key already registered cannot be registered to another account");
+    using (HttpResponseMessage invalid = await ApiPostJson(address, "/api/v4/user/keys", aliceApi, """{"title":"bad","key":"ssh-ed25519 AAAAC3 nope"}"""))
+        Check(invalid.StatusCode == System.Net.HttpStatusCode.BadRequest, "a malformed key is refused");
+    using (HttpResponseMessage dsa = await ApiPostJson(address, "/api/v4/user/keys", aliceApi,
+        """{"title":"old","key":"ssh-dss AAAAB3NzaC1kc3MAAACBAP1/U4EddRIpUt9KnC7s5Of2EbdSPO9EAMMeP4C2USZpRV1AIlH7WT2NWPq/xfW6MPbLm1Vs14E7gB00b/JmYLdrmVClpJ+f6AR7ECLCT7up1/63xhv4O1fnxqimFQ8E+4P208UewwI1VBNaFpEy9nXzrith1yrv8iIDGZ3RSAHHAAAAFQCXYFCPFSMLzLKSuYKi64QL8Fgc9QAAAIEA9+GghdabPd7LvKtcNrhXuXmUr7v6OuqC+VdMCz0HgmdRWVeOutRZT+ZxBxCBgLRJFnEj6EwoFhO3zwkyjMim4TwWeotUfI0o4KOuHiuzpnWRbqN/C/ohNWLx+2J6ASQ7zKTxvqhRkImog9/hWuWfBpKLZl6Ae1UlZAFMO/7PSSoAAACAJ0TwHlv6ar84wQjlwbqnqZQXu3bmrdN8YmHtXwpXYHgDkmvkmsDMirnq4Ry2LRpn7X0DU5ZGcMVVBDAtcQWmBNzJeh9okW2/AdRaAH0CHn3HFOXCj3e8zAtE+hygXygm3v+ZcYnKv/qINLCNRjFD4H4oAwzqw9ZsgbC5rzHzHH8="}"""))
+        Check(dsa.StatusCode == System.Net.HttpStatusCode.BadRequest, "a DSA key is refused by name");
+    foreach ((string path, string title) in new[] { (rsa, "rsa"), (ecdsa, "ecdsa") })
+        using (HttpResponseMessage created = await ApiPostJson(address, "/api/v4/user/keys", aliceApi,
+            """{"title":""" + JsonSerializer.Serialize(title) + ""","key":""" + JsonSerializer.Serialize(File.ReadAllText(path + ".pub")) + "}"))
+            Check(created.StatusCode == System.Net.HttpStatusCode.Created, "an " + title.ToUpperInvariant() + " key is accepted");
+    using (HttpResponseMessage bobCreated = await ApiPostJson(address, "/api/v4/user/keys", bobApi,
+        """{"title":"bob","key":""" + JsonSerializer.Serialize(File.ReadAllText(bobKey + ".pub")) + "}"))
+        Check(bobCreated.StatusCode == System.Net.HttpStatusCode.Created, "another account registers its own key");
+    using (HttpResponseMessage list = await ApiGet(address, "/api/v4/user/keys", aliceReadApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await list.Content.ReadAsStringAsync());
+        Check(list.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 3, "the account lists its three keys, readable with read_api");
+    }
+
+    // The host key the server printed is the one the wire presents.
+    (int scanExit, string scanned, _) = await RunTool("ssh-keyscan", keyDirectory, ["-p", sshBase[(sshBase.LastIndexOf(':') + 1)..], "-t", "ecdsa", "127.0.0.1"]);
+    string scannedLine = scanned.Split('\n').FirstOrDefault(line => line.Contains("ecdsa-sha2-nistp256", StringComparison.Ordinal)) ?? "";
+    string scannedKeyPath = Path.Combine(keyDirectory, "scanned.pub");
+    File.WriteAllText(scannedKeyPath, string.Join(' ', scannedLine.Split(' ').Skip(1)) + "\n");
+    Check(scanExit == 0 && scannedLine.Length > 0 && await FingerprintOf(scannedKeyPath) == printedFingerprint,
+        "ssh-keyscan sees the host key whose fingerprint the server printed");
+
+    // A project to push to, and the Git client configured to use one key at a time.
+    using (HttpResponseMessage created = await ApiPostJson(address, "/api/v4/projects", aliceApi, """{"name":"sshsample","path":"sshsample"}"""))
+        Check(created.StatusCode == System.Net.HttpStatusCode.Created, "a project for the SSH checks exists");
+    string Ssh(string key) => "ssh -i \"" + key.Replace('\\', '/') + "\" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR";
+    string remote = sshBase + "/alice/sshsample.git";
+    string work = Path.Combine(root, "ssh-work");
+    Directory.CreateDirectory(work);
+    await Git(work, ["init", "--initial-branch=main"]);
+    File.WriteAllText(Path.Combine(work, "README.md"), "# Over SSH\n");
+    await Git(work, ["add", "."]);
+    await Git(work, ["commit", "-m", "First, over SSH"]);
+    await Git(work, ["-c", "core.sshCommand=" + Ssh(ed25519), "push", remote, "main"]);
+    Check(true, "a push over SSH with an Ed25519 key succeeds");
+
+    string clone = Path.Combine(root, "ssh-clone");
+    await Git(root, ["-c", "core.sshCommand=" + Ssh(rsa), "clone", "-q", remote, clone]);
+    Check(File.ReadAllText(Path.Combine(clone, "README.md")) == "# Over SSH\n", "a clone over SSH with an RSA key brings the content back");
+
+    File.WriteAllText(Path.Combine(work, "second.txt"), "two\n");
+    await Git(work, ["add", "."]);
+    await Git(work, ["commit", "-m", "Second, over SSH"]);
+    await Git(work, ["tag", "v1-ssh"]);
+    await Git(work, ["-c", "core.sshCommand=" + Ssh(ecdsa), "push", remote, "main", "v1-ssh"]);
+    await Git(clone, ["-c", "core.sshCommand=" + Ssh(ecdsa), "pull", "-q", "--tags", "origin", "main"]);
+    Check(File.Exists(Path.Combine(clone, "second.txt")) && (await Git(clone, ["tag"])).Contains("v1-ssh", StringComparison.Ordinal),
+        "a second push and a fetch with haves over SSH, with an ECDSA key, bring the new commit and the tag");
+    string lsRemote = await Git(root, ["-c", "core.sshCommand=" + Ssh(ed25519), "ls-remote", remote]);
+    Check(lsRemote.Contains("refs/heads/main", StringComparison.Ordinal) && lsRemote.Contains("refs/tags/v1-ssh", StringComparison.Ordinal),
+        "ls-remote over SSH lists the branch and the tag");
+
+    // Use is recorded only once a signature has verified.
+    using (HttpResponseMessage key = await ApiGet(address, "/api/v4/user/keys/" + ed25519Id, aliceReadApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await key.Content.ReadAsStringAsync());
+        Check(key.IsSuccessStatusCode && json.RootElement.GetProperty("last_used_at").ValueKind == JsonValueKind.String, "the key's last use is recorded");
+    }
+
+    // Refusals, each by the client that would meet it.
+    await GitFails(root, ["-c", "core.sshCommand=" + Ssh(stranger), "ls-remote", remote], "an unregistered key is refused at authentication");
+    await GitFails(root, ["-c", "core.sshCommand=" + Ssh(bobKey), "ls-remote", remote], "a registered key of an account with no role sees no repository");
+    await GitFails(root, ["-c", "core.sshCommand=" + Ssh(ed25519), "ls-remote", sshBase + "/alice/no-such-project.git"], "a missing repository is the same refusal");
+    (int v0Exit, _, string v0Errors) = await RunGit(root, ["-c", "core.sshCommand=" + Ssh(ed25519), "-c", "protocol.version=0", "ls-remote", remote]);
+    Check(v0Exit != 0 && v0Errors.Contains("version 2", StringComparison.Ordinal), "a client refusing protocol version 2 is told so by name");
+    (int shellExit, _, string shellErrors) = await RunTool("ssh", root, [.. Ssh(ed25519).Split(' ').Skip(1).Select(part => part.Trim('"')),
+        "-p", sshBase[(sshBase.LastIndexOf(':') + 1)..], "git@127.0.0.1", "ls"]);
+    Check(shellExit == 128 && shellErrors.Contains("nothing else", StringComparison.Ordinal), "a command that is not Git is refused by name");
+    (int greetExit, string greeting, _) = await RunTool("ssh", root, [.. Ssh(ed25519).Split(' ').Skip(1).Select(part => part.Trim('"')),
+        "-T", "-p", sshBase[(sshBase.LastIndexOf(':') + 1)..], "git@127.0.0.1"]);
+    Check(greetExit == 0 && greeting.Contains("Welcome to Graft, alice", StringComparison.Ordinal), "an interactive login is greeted by name and given no shell");
+
+    // Removal stops the key at once.
+    using (HttpResponseMessage removed = await ApiDelete(address, "/api/v4/user/keys/" + ed25519Id, aliceApi))
+        Check(removed.StatusCode == System.Net.HttpStatusCode.NoContent, "a key is removed");
+    using (HttpResponseMessage again = await ApiDelete(address, "/api/v4/user/keys/" + ed25519Id, aliceApi))
+        Check(again.StatusCode == System.Net.HttpStatusCode.NotFound, "and is not there to remove twice");
+    await GitFails(root, ["-c", "core.sshCommand=" + Ssh(ed25519), "ls-remote", remote], "a removed key no longer authenticates");
+    await Git(root, ["-c", "core.sshCommand=" + Ssh(rsa), "ls-remote", remote]);
+    Check(true, "while the account's other keys still do");
+}
+
+async Task<(int ExitCode, string Output, string Errors)> RunTool(string file, string directory, string[] arguments)
+{
+    ProcessStartInfo start = new(file)
+    {
+        WorkingDirectory = directory,
+        UseShellExecute = false,
+        CreateNoWindow = true,
+        RedirectStandardOutput = true,
+        RedirectStandardError = true
+    };
+    foreach (string argument in arguments) start.ArgumentList.Add(argument);
+    using Process process = Process.Start(start)!;
+    Task<string> output = process.StandardOutput.ReadToEndAsync();
+    Task<string> errors = process.StandardError.ReadToEndAsync();
+    await process.WaitForExitAsync();
+    return (process.ExitCode, await output, await errors);
+}
+
 async Task CheckEmptyRepository(string address, AuthenticatedIdentity alice, string ownerPassword)
 {
     long projectId;

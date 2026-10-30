@@ -71,8 +71,16 @@ services:
       # self-hosted forge and is why it is the operator's switch. See docs/decisions/0016-webhooks.md.
       - --webhooks
       - ${GRAFT_WEBHOOKS:-false}
+      # Git over SSH, served by the forge itself. Empty means off. Name a port, publish it below, and give
+      # people the host key fingerprint the forge prints at startup. See docs/decisions/0031-git-over-ssh.md.
+      - --ssh-port
+      - ${GRAFT_SSH_PORT:-}
+      - --ssh-host
+      - ${GRAFT_SSH_HOST:-}
     ports:
       - "127.0.0.1:8443:8443"
+      # Uncomment with GRAFT_SSH_PORT=2222 to reach Git over SSH; nothing in front of HTTPS carries it.
+      # - "2222:2222"
     volumes:
       - graft-data:/data
     secrets:

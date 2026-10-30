@@ -340,6 +340,113 @@ public static class Pack
         zlib.Write(data);
     }
 
+    /// <summary>
+    /// Copies exactly one pack from a stream that does not end where the pack does, such as the standard
+    /// input of <c>git-receive-pack</c> over SSH, into <paramref name="destination"/>. The pack is walked
+    /// object by object to find its end, as <see cref="Read(Stream, IReadOnlyDictionary{string, GitObject}, CancellationToken, string?, long)"/>
+    /// does, but nothing is inflated into memory and nothing is checked beyond the framing: the destination
+    /// is then read by that method, which checks everything. The copy is bounded by <see cref="Limits.RequestBytes"/>.
+    /// </summary>
+    public static void Capture(Stream source, Stream destination, CancellationToken cancellationToken = default)
+    {
+        TeeReader tee = new(source, destination, cancellationToken);
+        Limits.Require(tee.Take(4).AsSpan().SequenceEqual("PACK"u8), "pack-magic");
+        Limits.Require(BinaryPrimitives.ReadUInt32BigEndian(tee.Take(4)) == 2, "pack-version");
+        uint count = BinaryPrimitives.ReadUInt32BigEndian(tee.Take(4));
+        Limits.Require(count <= Limits.ObjectCount, "object-count");
+        byte[] sink = new byte[64 * 1024];
+        for (uint index = 0; index < count; index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            byte first = tee.Byte();
+            int type = (first >> 4) & 7;
+            Limits.Require(type is >= 1 and <= 4 or 6 or 7, "object-type");
+            long size = first & 15;
+            int shift = 4;
+            byte next = first;
+            while ((next & 128) != 0)
+            {
+                Limits.Require(shift <= 25, "object-size");
+                next = tee.Byte();
+                size |= (long)(next & 127) << shift;
+                shift += 7;
+            }
+            Limits.Require(size <= Limits.ObjectBytes, "expanded-limit");
+            if (type == 6)
+            {
+                next = tee.Byte();
+                int groups = 1;
+                while ((next & 128) != 0)
+                {
+                    Limits.Require(++groups <= 5, "delta-offset");
+                    next = tee.Byte();
+                }
+            }
+            if (type == 7) tee.Take(20);
+            // Inflate and discard, one source byte at a time so the inflater stops exactly at the member's
+            // end and the next object's header is not swallowed.
+            using ZLibStream zlib = new(new OneByteSource(tee), CompressionMode.Decompress, leaveOpen: true);
+            long inflated = 0;
+            try
+            {
+                int read;
+                while ((read = zlib.Read(sink, 0, sink.Length)) > 0)
+                {
+                    inflated += read;
+                    Limits.Require(inflated <= size, "inflated-size");
+                }
+            }
+            catch (InvalidDataException) { throw new GitInputException("zlib-data"); }
+            Limits.Require(inflated == size, "inflated-size");
+        }
+        tee.Take(20);
+        destination.Flush();
+    }
+
+    /// <summary>Reads from one stream and writes every byte read to another, counting against the request bound.</summary>
+    private sealed class TeeReader(Stream source, Stream destination, CancellationToken cancellationToken)
+    {
+        private long copied;
+        private readonly byte[] one = new byte[1];
+
+        public byte Byte()
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Limits.Require(++copied <= Limits.RequestBytes, "request-limit");
+            int read = source.Read(one, 0, 1);
+            Limits.Require(read == 1, "truncated");
+            destination.WriteByte(one[0]);
+            return one[0];
+        }
+
+        public byte[] Take(int count)
+        {
+            byte[] result = new byte[count];
+            for (int index = 0; index < count; index++) result[index] = Byte();
+            return result;
+        }
+    }
+
+    private sealed class OneByteSource(TeeReader tee) : Stream
+    {
+        public override int Read(byte[] buffer, int offset, int count) => Read(buffer.AsSpan(offset, count));
+        public override int Read(Span<byte> buffer)
+        {
+            if (buffer.Length == 0) return 0;
+            buffer[0] = tee.Byte();
+            return 1;
+        }
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
     private sealed class ExactInput(Cursor cursor, CancellationToken cancellationToken) : Stream
     {
         public override int Read(byte[] buffer, int offset, int count) => Read(buffer.AsSpan(offset, count));

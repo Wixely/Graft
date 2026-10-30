@@ -38,6 +38,26 @@
             </p>
         </div>
 
+        @* Offered only when the server is listening for it. The key is the credential here, so the note
+           points at where one is registered rather than at a token. *@
+        @if (SshUrl.Length > 0)
+        {
+            <div class="clone-section">
+                <label class="clone-label" for="clone-ssh">Clone with SSH</label>
+                <div class="clone-row">
+                    <input id="clone-ssh" readonly value="@SshUrl" @ref="sshField" @onfocus="() => SelectAll(sshField)" />
+                    <button type="button" class="icon-button" title="Copy the SSH clone URL"
+                            aria-label="Copy the SSH clone URL" @onclick="() => Copy(SshUrl, nameof(SshUrl))">
+                        <Icon Name="@(copied == nameof(SshUrl) ? "check" : "copy")" />
+                    </button>
+                </div>
+                <p class="clone-note">
+                    Authenticates with an SSH key registered under <a href="/-/profile">Profile and SSH keys</a>.
+                    No token is needed.
+                </p>
+            </div>
+        }
+
         @* The short name, offered beside the owned one rather than instead of it. Both reach the same
            project; this one carries no account name, which is what makes it the one to paste somewhere
            public. It is not a secret and grants nothing: a private project stays private through it. *@
@@ -114,11 +134,15 @@
     /// section, so a server or a project without one simply does not offer it.</summary>
     [Parameter] public string ShareUrl { get; set; } = "";
 
+    /// <summary>The SSH clone URL, when the server listens for SSH. Empty hides the section.</summary>
+    [Parameter] public string SshUrl { get; set; } = "";
+
     private ElementReference urlField;
     private ElementReference commandField;
     private ElementReference branchField;
     private ElementReference shareField;
     private ElementReference shareCloneField;
+    private ElementReference sshField;
 
     /// <summary>The same slug as a clone URL. Graft's Git routes answer on the shared page's own address
     /// with <c>.git</c> after it, exactly as they do for the owned path.</summary>
