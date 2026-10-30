@@ -28,6 +28,34 @@ as their own entries and decision records as each lands.
 Git suite 947 to 951 managed. The native publish was not repeated for this entry. No migration, no new
 route, no new tool.
 
+## Added on 2026-10-30, fourth entry: the inbox, and the second factor
+
+The rest of the email item, under the same condition: nothing depends on email.
+
+- **Notifications** ([ADR 0033](decisions/0033-notifications.md)) are rows written in the transaction of
+  the event that caused them: assignment, a review asked for, a comment on something the person is part of,
+  an approval, a merge, a close or reopen. `GraftStoreNotifications.cs` has the writer and the participant
+  rule; the seven store methods that change issues and proposals call it, and `ApplyPlanningAsync` now
+  returns who was newly placed in a role. Migration 20. The bell in the header reads the unread count from
+  the session; `/-/notifications` is the inbox; `/api/v4/todos` is GitLab's shape of it with GitLab's
+  action names where they fit (row GL-044). A message per entry is an opt-in copy, sent through the store's
+  `NotificationCreated` hook after the commit, only when mail is on and the person asked.
+- **The second factor** ([ADR 0034](decisions/0034-second-factor.md)) is a time-based code from an
+  authenticator app: `Graft.Core/SecondFactor.cs` has RFC 6238 and Base32 on the platform's HMAC, checked in
+  the suite against the RFC's test vectors. Enrolment is pending until a code confirms it, which hands out ten
+  recovery codes; off needs the password and a code; an administrator removes another account's factor.
+  Signing in with the factor on is two answers: `/api/login` gives `401` with `error: second-factor` and a
+  five-minute challenge spent by one attempt; `/api/login/second-factor` takes it with the code. A code is
+  good once per window. Tokens and SSH keys are unaffected. Migration 21; `two_factor_enabled` on
+  `GET /api/v4/user`.
+- Two things learned in the suite: a check that assumes an empty inbox is wrong once earlier checks have
+  caused entries, so it clears first; and the sign-in throttle is per server per minute, so a check that
+  signs in many times must wait for the window rather than fail the next sign-in. `BrowserSession` waits.
+
+Git suite 1010 to 1077 managed. The MCP suite was not rerun: no tool or route it uses changed. The
+browser pages for the inbox, the email preference, enrolment and the admin removal compile against the routes
+the suite drove and were not driven by a browser. The email item is complete; the next is groups.
+
 ## Added on 2026-10-30, third entry: email is optional, and the reset link that needs no email
 
 The second of the four large items, in its first slice. The user's condition was that a non-email,

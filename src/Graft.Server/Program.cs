@@ -84,6 +84,20 @@ string? HoldSecret(long userId, string secret)
     pendingSecrets[reveal] = new(userId, secret, now.Add(pendingSecretWindow));
     return reveal;
 }
+
+// A sign-in whose password was accepted but whose account owes a second factor waits here, as a handle the
+// browser presents with the code. Five minutes, one use, in memory, bounded, for the same reasons as above.
+ConcurrentDictionary<string, PendingSecret> pendingLogins = new(StringComparer.Ordinal);
+string? HoldLoginChallenge(long userId)
+{
+    DateTimeOffset now = DateTimeOffset.UtcNow;
+    foreach (KeyValuePair<string, PendingSecret> stale in pendingLogins)
+        if (stale.Value.ExpiresAtUtc <= now) pendingLogins.TryRemove(stale.Key, out _);
+    if (pendingLogins.Count >= 512) return null;
+    string challenge = Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(16));
+    pendingLogins[challenge] = new(userId, "", now.Add(pendingSecretWindow));
+    return challenge;
+}
 // The forge's own Model Context Protocol endpoint. Mounted only when the operator asked for it, and then
 // governed by the administrator's stored switches, which the middleware in front of it reads per request.
 const string McpPath = "/mcp";
@@ -196,6 +210,32 @@ IDataProtector? tokenProtector = settings.RecoverableTokens
 await using WebhookSender? webhooks = settings.Webhooks ? new WebhookSender(store) : null;
 // Mail, when the operator named a server. Off, the forge sends nothing and says so where it matters.
 await using MailSender? mail = settings.Mail is null ? null : new MailSender(settings.Mail, (text, exception) => Console.Error.WriteLine("MAIL: " + text + (exception is null ? "" : " " + exception.Message)));
+// A notification is an inbox row first. A message is a copy of it, and only for a person who asked and has
+// an address, on a server that can send. The row exists either way, so the inbox never depends on mail.
+store.NotificationCreated = delivery =>
+{
+    if (mail is null || !delivery.ByEmail || delivery.Email is null) return Task.CompletedTask;
+    Notification note = delivery.Notification;
+    string what = (note.Subject == CommentSubject.Issue ? "issue #" : "proposal !") + note.Iid.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    string verb = note.Action switch
+    {
+        "assigned" => "assigned you",
+        "review_requested" => "asked you to review",
+        "commented" => "commented on",
+        "approved" => "approved",
+        "merged" => "merged",
+        "closed" => "closed",
+        "reopened" => "reopened",
+        _ => note.Action
+    };
+    string url = (serverOrigin ?? "") + "/" + note.ProjectPath + "/-/" + (note.Subject == CommentSubject.Issue ? "issues/" : "merge-requests/") +
+        note.Iid.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    mail.Send(delivery.Email, "[" + note.ProjectPath + "] " + note.ActorUsername + " " + verb + " " + what + ": " + note.Title,
+        "Hello " + delivery.Username + ",\n\n" + note.ActorUsername + " " + verb + " " + what + " in " + note.ProjectPath + ":\n\n    " + note.Title +
+        "\n\n" + url + "\n\nYou are receiving this because you asked for a message for each notification, under Profile and Email. " +
+        "Turn it off there; the inbox at " + (serverOrigin ?? "") + "/-/notifications stays either way.\n");
+    return Task.CompletedTask;
+};
 app.Use(async (context, next) =>
 {
     context.Response.Headers.CacheControl = "no-store";
@@ -269,7 +309,8 @@ app.MapGet("/api/session", async context =>
         UserAccount? account = await store.FindActiveUserAsync(browser.Value.Identity.Username, context.RequestAborted);
         response = new(true, browser.Value.Identity.Username, browser.Value.Identity.IsAdministrator,
             Csrf(browser.Value.Secret), userId, avatarUrl, settings.PublicBrowsing, settings.Mcp, settings.Webhooks, mail is not null,
-            account?.Email);
+            account?.Email, await store.CountUnreadNotificationsAsync(userId, context.RequestAborted),
+            await store.GetNotifyByEmailAsync(userId, context.RequestAborted), await store.HasSecondFactorAsync(userId, context.RequestAborted));
     }
     await context.Response.WriteAsJsonAsync(response, ApiJson.Default.SessionResponse, null, context.RequestAborted);
 });
@@ -340,14 +381,46 @@ app.MapPost("/api/login", async context =>
     LoginRequest? login = await context.Request.ReadFromJsonAsync(ApiJson.Default.LoginRequest, context.RequestAborted);
     if (login?.Username is not { Length: >= 2 and <= 39 } || !PasswordPolicy.IsAcceptableLength(login.Password))
     { await ApiError(context, 400, "credentials"); return; }
-    SessionGrant? grant = await store.LoginAsync(login.Username, login.Password, context.RequestAborted);
-    if (grant is null) { await ApiError(context, 401, "credentials"); return; }
+    FirstFactorResult? first = await store.LoginFirstFactorAsync(login.Username, login.Password, context.RequestAborted);
+    if (first is null) { await ApiError(context, 401, "credentials"); return; }
+    if (first.SecondFactorOwedByUserId is long owed)
+    {
+        // The password was right and that is all this answer says: the session comes with the code.
+        string? challenge = HoldLoginChallenge(owed);
+        if (challenge is null) { await ApiError(context, 429, "login-rate-limit"); return; }
+        context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+        await context.Response.WriteAsJsonAsync(new SecondFactorChallengeResponse("second-factor", challenge),
+            ApiJson.Default.SecondFactorChallengeResponse, null, context.RequestAborted);
+        return;
+    }
+    await IssueSession(context, first.Session!);
+});
+
+// The second step of a sign-in: the challenge the first step handed out, and a code from the app or a
+// recovery code. The challenge is spent whether or not the code is right, so a wrong code costs the password
+// step again, and every attempt counts against the sign-in throttle.
+app.MapPost("/api/login/second-factor", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    if (!loginThrottle.TryEnter(DateTimeOffset.UtcNow)) { await ApiError(context, 429, "login-rate-limit"); return; }
+    SecondFactorLoginRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.SecondFactorLoginRequest, context.RequestAborted);
+    if (request?.Challenge is not { Length: 32 } || request.Code is not { Length: >= 6 and <= 32 }) { await ApiError(context, 400, "code"); return; }
+    if (!pendingLogins.TryRemove(request.Challenge, out PendingSecret? pending) || pending.ExpiresAtUtc <= DateTimeOffset.UtcNow)
+    { await ApiError(context, 401, "challenge"); return; }
+    SessionGrant? grant = await store.LoginSecondFactorAsync(pending.UserId, request.Code, context.RequestAborted);
+    if (grant is null) { await ApiError(context, 401, "code"); return; }
+    await IssueSession(context, grant);
+});
+
+async Task IssueSession(HttpContext context, SessionGrant grant)
+{
     context.Response.Cookies.Append(SessionCookie, grant.Secret, SessionCookieOptions(grant.ExpiresAtUtc));
     AuthenticatedIdentity identity = (await store.ResolveSessionAsync(grant.Secret, context.RequestAborted))!;
     await context.Response.WriteAsJsonAsync(new SessionResponse(true, identity.Username, identity.IsAdministrator,
         Csrf(grant.Secret), identity.UserId, null),
         ApiJson.Default.SessionResponse, null, context.RequestAborted);
-});
+}
 
 app.MapPost("/api/logout", async context =>
 {
@@ -379,6 +452,79 @@ app.MapPost("/api/password", async context =>
         context.Response.StatusCode = StatusCodes.Status204NoContent;
     }
     catch (ArgumentException) { await ApiError(context, 400, "password"); }
+    catch (InvalidOperationException error) { await ApiError(context, 400, error.Message); }
+});
+
+// The second factor: an authenticator app, enrolled in two steps so a secret the app never received cannot
+// lock the account, and turned off with the password and a code so a stolen session cannot. An
+// administrator removes another account's factor for the person who lost both the app and the codes.
+app.MapPost("/api/second-factor/begin", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    try
+    {
+        SecondFactorSetup setup = await store.BeginSecondFactorAsync(browser.Value.Identity, "Graft " + context.Request.Host.Host, context.RequestAborted);
+        await context.Response.WriteAsJsonAsync(new SecondFactorSetupResponse(setup.SecretBase32, setup.OtpauthUri),
+            ApiJson.Default.SecondFactorSetupResponse, null, context.RequestAborted);
+    }
+    catch (InvalidOperationException error) { await ApiError(context, 400, error.Message); }
+});
+
+app.MapPost("/api/second-factor/confirm", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    SecondFactorCodeRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.SecondFactorCodeRequest, context.RequestAborted);
+    if (request?.Code is not { Length: >= 6 and <= 32 }) { await ApiError(context, 400, "code"); return; }
+    try
+    {
+        IReadOnlyList<string> codes = await store.ConfirmSecondFactorAsync(browser.Value.Identity, request.Code.Trim(), context.RequestAborted);
+        await context.Response.WriteAsJsonAsync(new RecoveryCodesResponse([.. codes]), ApiJson.Default.RecoveryCodesResponse, null, context.RequestAborted);
+    }
+    catch (InvalidOperationException error) { await ApiError(context, 400, error.Message); }
+});
+
+app.MapPost("/api/second-factor/disable", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    if (!loginThrottle.TryEnter(DateTimeOffset.UtcNow)) { await ApiError(context, 429, "login-rate-limit"); return; }
+    SecondFactorDisableRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.SecondFactorDisableRequest, context.RequestAborted);
+    if (request?.Password is null || request.Code is not { Length: >= 6 and <= 32 }) { await ApiError(context, 400, "code"); return; }
+    try
+    {
+        await store.DisableSecondFactorAsync(browser.Value.Identity, request.Password, request.Code.Trim(), context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (InvalidOperationException error) { await ApiError(context, 400, error.Message); }
+});
+
+app.MapDelete("/api/users/{userId:long}/second-factor", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!browser.Value.Identity.IsAdministrator) { await ApiError(context, 403, "administrator"); return; }
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    long userId = Convert.ToInt64(context.Request.RouteValues["userId"], System.Globalization.CultureInfo.InvariantCulture);
+    try
+    {
+        await store.RemoveSecondFactorAsync(browser.Value.Identity, userId, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
     catch (InvalidOperationException error) { await ApiError(context, 400, error.Message); }
 });
 
@@ -501,9 +647,11 @@ app.MapGet("/api/users", async context =>
     if (!browser.Value.Identity.IsAdministrator) { await ApiError(context, 403, "administrator"); return; }
     if (!await OnlyQuery(context)) return;
     IReadOnlyList<UserAccount> users = await store.ListUsersAsync(browser.Value.Identity, context.RequestAborted);
-    UserAccountResponse[] response = users.Select(user =>
-        new UserAccountResponse(user.Id, user.Username, user.IsAdministrator, user.Disabled, user.Email)).ToArray();
-    await context.Response.WriteAsJsonAsync(response, ApiJson.Default.UserAccountResponseArray, null, context.RequestAborted);
+    List<UserAccountResponse> response = [];
+    foreach (UserAccount user in users)
+        response.Add(new(user.Id, user.Username, user.IsAdministrator, user.Disabled, user.Email,
+            await store.HasSecondFactorAsync(user.Id, context.RequestAborted)));
+    await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.UserAccountResponseArray, null, context.RequestAborted);
 });
 
 app.MapPost("/api/users", async context =>
@@ -914,6 +1062,68 @@ app.MapDelete("/api/tokens/{tokenId:long}", async context =>
     }
     catch (UnauthorizedAccessException) { await ApiError(context, 404, "token"); }
 });
+
+// The inbox, for the browser. Every entry is the caller's own; reading one, or all, is the only change.
+app.MapGet("/api/notifications", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!await OnlyQuery(context, "unread", "page", "per_page")) return;
+    (int Page, int PerPage)? pagination = await Pagination(context);
+    if (pagination is null) return;
+    bool unreadOnly = context.Request.Query["unread"].ToString() == "true";
+    NotificationPage page = await store.ListNotificationsAsync(browser.Value.Identity, unreadOnly, pagination.Value.Page, pagination.Value.PerPage, context.RequestAborted);
+    await context.Response.WriteAsJsonAsync(new NotificationsResponse(page.Items.Select(note => NotificationResponseFor(context, note)).ToArray(), page.Unread, page.Total),
+        ApiJson.Default.NotificationsResponse, null, context.RequestAborted);
+});
+
+app.MapPost("/api/notifications/{notificationId:long}/read", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    long notificationId = Convert.ToInt64(context.Request.RouteValues["notificationId"], System.Globalization.CultureInfo.InvariantCulture);
+    if (await store.MarkNotificationReadAsync(browser.Value.Identity, notificationId, context.RequestAborted))
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    else await ApiError(context, 404, "notification");
+});
+
+app.MapPost("/api/notifications/read-all", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    await store.MarkAllNotificationsReadAsync(browser.Value.Identity, context.RequestAborted);
+    context.Response.StatusCode = StatusCodes.Status204NoContent;
+});
+
+// Whether the caller wants a message for each notification. Accepted whether or not the server can send:
+// the preference is the person's, and a server that gains a mail server later honours it from then on.
+app.MapPost("/api/notifications/email", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    NotifyByEmailRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.NotifyByEmailRequest, context.RequestAborted);
+    if (request is null) { await ApiError(context, 400, "enabled"); return; }
+    await store.SetNotifyByEmailAsync(browser.Value.Identity, request.Enabled, context.RequestAborted);
+    context.Response.StatusCode = StatusCodes.Status204NoContent;
+});
+
+NotificationResponse NotificationResponseFor(HttpContext context, Notification note) =>
+    new(note.Id, note.Action, note.Subject == CommentSubject.Issue ? "Issue" : "MergeRequest", note.Iid, note.Title, note.ProjectPath,
+        NotificationUrl(context, note), note.ActorUsername, note.CreatedAtUtc, note.ReadAtUtc);
+
+string NotificationUrl(HttpContext context, Notification note) =>
+    Origin(context) + "/" + note.ProjectPath + "/-/" + (note.Subject == CommentSubject.Issue ? "issues/" : "merge-requests/") +
+    note.Iid.ToString(System.Globalization.CultureInfo.InvariantCulture);
 
 // SSH keys, for the browser. A key is a credential like a token, so the same rules: the owner and nobody
 // else, a session with its CSRF token to change anything, every change audited. The key is parsed here and
@@ -1675,7 +1885,8 @@ app.MapGet("/api/v4/user", async context =>
     UserAccount? account = await store.FindActiveUserAsync(identity.Username, context.RequestAborted);
     await context.Response.WriteAsJsonAsync(new UserResponse(
         identity.UserId, identity.Username, identity.Username, "active", false,
-        origin + "/" + Uri.EscapeDataString(identity.Username), avatarUrl, account?.Email),
+        origin + "/" + Uri.EscapeDataString(identity.Username), avatarUrl, account?.Email,
+        await store.HasSecondFactorAsync(identity.UserId, context.RequestAborted)),
         ApiJson.Default.UserResponse, null, context.RequestAborted);
 });
 
@@ -1759,6 +1970,63 @@ async Task AddSshKey(HttpContext context, AuthenticatedIdentity identity)
 
 static SshKeyResponse SshKeyResponseFor(SshKeyInfo key) =>
     new(key.Id, key.Title, key.Key, key.Fingerprint, key.CreatedAtUtc, key.ExpiresAtUtc, key.LastUsedAtUtc);
+
+// GitLab's to-do list, which is where its clients look for "what needs me": Graft's inbox in that shape.
+// `state=pending` is the default and `state=done` the read ones; marking done is marking read.
+app.MapGet("/api/v4/todos", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!await OnlyQuery(context, "state", "page", "per_page")) return;
+    (int Page, int PerPage)? pagination = await Pagination(context);
+    if (pagination is null) return;
+    string state = context.Request.Query["state"].ToString();
+    if (state is not ("" or "pending" or "done")) { await ApiError(context, 400, "400 Bad Request: state is pending or done"); return; }
+    NotificationPage page = await store.ListNotificationsAsync(identity, state != "done", pagination.Value.Page, pagination.Value.PerPage, context.RequestAborted);
+    IEnumerable<Notification> items = state == "done" ? page.Items.Where(note => note.ReadAtUtc is not null) : page.Items;
+    await context.Response.WriteAsJsonAsync(items.Select(note => TodoFor(context, note)).ToArray(), ApiJson.Default.TodoResponseArray, null, context.RequestAborted);
+});
+
+app.MapPost("/api/v4/todos/{todoId:long}/mark_as_done", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!identity.TokenScopes.HasFlag(TokenScope.Api)) { await ApiError(context, 403, "403 Forbidden: insufficient_scope"); return; }
+    long todoId = Convert.ToInt64(context.Request.RouteValues["todoId"], System.Globalization.CultureInfo.InvariantCulture);
+    if (!await store.MarkNotificationReadAsync(identity, todoId, context.RequestAborted)) { await ApiError(context, 404, "404 Todo Not Found"); return; }
+    NotificationPage page = await store.ListNotificationsAsync(identity, false, 1, 100, context.RequestAborted);
+    Notification? marked = page.Items.FirstOrDefault(note => note.Id == todoId);
+    if (marked is null) { context.Response.StatusCode = StatusCodes.Status204NoContent; return; }
+    context.Response.StatusCode = StatusCodes.Status201Created;
+    await context.Response.WriteAsJsonAsync(TodoFor(context, marked), ApiJson.Default.TodoResponse, null, context.RequestAborted);
+});
+
+app.MapPost("/api/v4/todos/mark_as_done", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!identity.TokenScopes.HasFlag(TokenScope.Api)) { await ApiError(context, 403, "403 Forbidden: insufficient_scope"); return; }
+    await store.MarkAllNotificationsReadAsync(identity, context.RequestAborted);
+    context.Response.StatusCode = StatusCodes.Status204NoContent;
+});
+
+TodoResponse TodoFor(HttpContext context, Notification note)
+{
+    string origin = Origin(context);
+    string url = NotificationUrl(context, note);
+    // GitLab's names where one fits; Graft's own, said plainly, where GitLab has no to-do for the event.
+    string action = note.Action switch
+    {
+        "assigned" => "assigned",
+        "review_requested" => "review_requested",
+        "approved" => "review_submitted",
+        _ => note.Action
+    };
+    string[] path = note.ProjectPath.Split('/');
+    return new(note.Id, new(note.ProjectId, path[^1], path[^1], note.ProjectPath, origin + "/" + note.ProjectPath),
+        new(note.ActorUsername, note.ActorUsername), action, note.Subject == CommentSubject.Issue ? "Issue" : "MergeRequest",
+        new(note.Iid, note.Title, url), url, note.Title, note.ReadAtUtc is null ? "pending" : "done", note.CreatedAtUtc, note.ReadAtUtc ?? note.CreatedAtUtc);
+}
 
 app.MapGet("/api/v4/projects", async context =>
 {

@@ -63,12 +63,15 @@ public sealed partial class GraftStore
             """, new IssueInsertParameters(projectId, iid, author.UserId, cleanTitle, cleanDescription, now,
                 changes is { DueDate.Set: true } ? Day(changes.DueDate.Value) : null,
                 changes?.Confidential == true ? 1 : 0), transaction);
+        List<NotificationDelivery> deliveries = [];
         if (changes is not null)
-            await ApplyPlanningAsync(db, transaction, projectId, CommentSubject.Issue, id, changes.Labels, changes.AddLabels,
-                changes.RemoveLabels, changes.MilestoneId, changes.Assignees, null, now);
+            deliveries.AddRange(await NotifyAddedAsync(db, transaction, author.UserId, projectId, CommentSubject.Issue, id,
+                await ApplyPlanningAsync(db, transaction, projectId, CommentSubject.Issue, id, changes.Labels, changes.AddLabels,
+                    changes.RemoveLabels, changes.MilestoneId, changes.Assignees, null, now), now));
         await AuditAsync(db, transaction, author.UserId, "open-issue", "issue",
             Reference(projectId, iid), changes?.Confidential == true ? "Confidential issue opened." : "Issue opened.", now);
         await transaction.CommitAsync(cancellationToken);
+        await RaiseAsync(deliveries);
         return (await FindIssueAsync(actor, projectId, iid, cancellationToken))!;
     }
 
@@ -282,16 +285,24 @@ public sealed partial class GraftStore
             """, new IssueUpdateParameters(existing.Id, cleanTitle, cleanDescription, nextState, now,
                 changes is { DueDate.Set: true } ? 1 : 0, changes is { DueDate.Set: true } ? Day(changes.DueDate.Value) : null,
                 changes?.Confidential is null ? null : changes.Confidential.Value ? 1 : 0), transaction);
+        List<NotificationDelivery> deliveries = [];
         if (changes is not null)
-            await ApplyPlanningAsync(db, transaction, projectId, CommentSubject.Issue, existing.Id, changes.Labels, changes.AddLabels,
-                changes.RemoveLabels, changes.MilestoneId, changes.Assignees, null, now);
+            deliveries.AddRange(await NotifyAddedAsync(db, transaction, editor.UserId, projectId, CommentSubject.Issue, existing.Id,
+                await ApplyPlanningAsync(db, transaction, projectId, CommentSubject.Issue, existing.Id, changes.Labels, changes.AddLabels,
+                    changes.RemoveLabels, changes.MilestoneId, changes.Assignees, null, now), now));
         if (nextState != existing.State)
+        {
             await AuditAsync(db, transaction, editor.UserId, nextState == "closed" ? "close-issue" : "reopen-issue",
                 "issue", Reference(projectId, iid), nextState == "closed" ? "Issue closed." : "Issue reopened.", now);
+            deliveries.AddRange(await NotifyAsync(db, transaction, editor.UserId, projectId, CommentSubject.Issue, existing.Id,
+                nextState == "closed" ? "closed" : "reopened",
+                await ParticipantsAsync(db, transaction, CommentSubject.Issue, existing.Id, editor.UserId), now));
+        }
         if (changes?.Confidential is bool confidential && confidential != (existing.Confidential != 0))
             await AuditAsync(db, transaction, editor.UserId, confidential ? "make-issue-confidential" : "make-issue-public",
                 "issue", Reference(projectId, iid), confidential ? "Issue made confidential." : "Issue made visible to every reader.", now);
         await transaction.CommitAsync(cancellationToken);
+        await RaiseAsync(deliveries);
         return await FindIssueAsync(actor, projectId, iid, cancellationToken)
             ?? throw new CollaborationNotFoundException("Issue is unavailable.");
     }
@@ -381,12 +392,15 @@ public sealed partial class GraftStore
             """, new MergeInsertParameters(projectId, iid, author.UserId, cleanTitle, cleanDescription, source, target, now,
                 changes?.Draft == true ? 1 : 0, sourceProjectId),
             transaction);
+        List<NotificationDelivery> deliveries = [];
         if (changes is not null)
-            await ApplyPlanningAsync(db, transaction, projectId, CommentSubject.MergeRequest, id, changes.Labels, changes.AddLabels,
-                changes.RemoveLabels, changes.MilestoneId, changes.Assignees, changes.Reviewers, now);
+            deliveries.AddRange(await NotifyAddedAsync(db, transaction, author.UserId, projectId, CommentSubject.MergeRequest, id,
+                await ApplyPlanningAsync(db, transaction, projectId, CommentSubject.MergeRequest, id, changes.Labels, changes.AddLabels,
+                    changes.RemoveLabels, changes.MilestoneId, changes.Assignees, changes.Reviewers, now), now));
         await AuditAsync(db, transaction, author.UserId, "open-merge-request", "merge_request",
             Reference(projectId, iid), $"Merge proposed from {source} into {target}.", now);
         await transaction.CommitAsync(cancellationToken);
+        await RaiseAsync(deliveries);
         return (await FindMergeProposalAsync(actor, projectId, iid, null, cancellationToken))!;
     }
 
@@ -590,14 +604,22 @@ public sealed partial class GraftStore
             WHERE Id = @Id;
             """, new MergeUpdateParameters(existing.Id, cleanTitle, cleanDescription, nextState, now,
                 changes?.Draft is null ? null : changes.Draft.Value ? 1 : 0), transaction);
+        List<NotificationDelivery> deliveries = [];
         if (changes is not null)
-            await ApplyPlanningAsync(db, transaction, projectId, CommentSubject.MergeRequest, existing.Id, changes.Labels, changes.AddLabels,
-                changes.RemoveLabels, changes.MilestoneId, changes.Assignees, changes.Reviewers, now);
+            deliveries.AddRange(await NotifyAddedAsync(db, transaction, editor.UserId, projectId, CommentSubject.MergeRequest, existing.Id,
+                await ApplyPlanningAsync(db, transaction, projectId, CommentSubject.MergeRequest, existing.Id, changes.Labels, changes.AddLabels,
+                    changes.RemoveLabels, changes.MilestoneId, changes.Assignees, changes.Reviewers, now), now));
         if (nextState != existing.State)
+        {
             await AuditAsync(db, transaction, editor.UserId,
                 nextState == "closed" ? "close-merge-request" : "reopen-merge-request", "merge_request",
                 Reference(projectId, iid), nextState == "closed" ? "Merge proposal closed." : "Merge proposal reopened.", now);
+            deliveries.AddRange(await NotifyAsync(db, transaction, editor.UserId, projectId, CommentSubject.MergeRequest, existing.Id,
+                nextState == "closed" ? "closed" : "reopened",
+                await ParticipantsAsync(db, transaction, CommentSubject.MergeRequest, existing.Id, editor.UserId), now));
+        }
         await transaction.CommitAsync(cancellationToken);
+        await RaiseAsync(deliveries);
         return await FindMergeProposalAsync(actor, projectId, iid, null, cancellationToken)
             ?? throw new CollaborationNotFoundException("Merge proposal is unavailable.");
     }
@@ -639,7 +661,13 @@ public sealed partial class GraftStore
         if (changed != 1) throw new CollaborationConflictException("The proposal is no longer open.");
         await AuditAsync(db, transaction, actor.UserId, "merge-merge-request", "merge_request",
             Reference(projectId, iid), $"Merged as {mergeCommitSha}.", now);
+        CollaborationOwnerRow merged = (await db.QuerySingleOrDefaultAsync<CollaborationOwnerRow>(
+            "SELECT Id, AuthorUserId, State FROM MergeRequests WHERE ProjectId = @ProjectId AND Iid = @Iid;",
+            new CollaborationItemParameters(projectId, iid), transaction))!;
+        List<NotificationDelivery> deliveries = await NotifyAsync(db, transaction, actor.UserId, projectId, CommentSubject.MergeRequest, merged.Id,
+            "merged", await ParticipantsAsync(db, transaction, CommentSubject.MergeRequest, merged.Id, actor.UserId), now);
         await transaction.CommitAsync(cancellationToken);
+        await RaiseAsync(deliveries);
         return await FindMergeProposalAsync(actor, projectId, iid, null, cancellationToken)
             ?? throw new CollaborationNotFoundException("Merge proposal is unavailable.");
     }
@@ -715,7 +743,13 @@ public sealed partial class GraftStore
         await AuditAsync(db, transaction, reviewer.UserId, approved ? "approve-merge-request" : "unapprove-merge-request",
             "merge_request", Reference(projectId, iid),
             approved ? $"Approved at {sourceCommitSha}." : "Approval withdrawn.", now);
+        // The author hears about an approval; a withdrawal is the reviewer's own business until something
+        // else happens to the proposal.
+        List<NotificationDelivery> deliveries = approved
+            ? await NotifyAsync(db, transaction, reviewer.UserId, projectId, CommentSubject.MergeRequest, existing.Id, "approved", [existing.AuthorUserId], now)
+            : [];
         await transaction.CommitAsync(cancellationToken);
+        await RaiseAsync(deliveries);
         return await FindMergeProposalAsync(actor, projectId, iid, sourceCommitSha, cancellationToken)
             ?? throw new CollaborationNotFoundException("Merge proposal is unavailable.");
     }
@@ -917,7 +951,13 @@ public sealed partial class GraftStore
             ? "UPDATE Issues SET UpdatedAtUtc = @UpdatedAtUtc WHERE Id = @Id;"
             : "UPDATE MergeRequests SET UpdatedAtUtc = @UpdatedAtUtc WHERE Id = @Id;",
             new TouchParameters(subjectId, now), transaction);
+        // Everybody part of the conversation hears a new comment, except whoever just made it. The
+        // participants are read after the insert, so the author of this comment is now one of them for
+        // the next comment and not for this one.
+        List<NotificationDelivery> deliveries = await NotifyAsync(db, transaction, author.UserId, projectId, subject, subjectId, "commented",
+            await ParticipantsAsync(db, transaction, subject, subjectId, author.UserId), now);
         await transaction.CommitAsync(cancellationToken);
+        await RaiseAsync(deliveries);
         return new(id, author.UserId, author.Username, cleanBody, Instant(now), path, line, side, anchorCommitSha,
             parentCommentId);
     }

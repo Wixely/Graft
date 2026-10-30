@@ -531,7 +531,9 @@ public sealed partial class GraftStore
     /// caller has already decided the actor may; this resolves names to rows and refuses what does not
     /// exist, by name, rather than creating it, because a typo should be an error and not a new label.
     /// </summary>
-    private static async Task ApplyPlanningAsync(
+    /// <summary>Applies the planning fields and returns the people newly placed in a role, as
+    /// <c>("assignee", userId)</c> or <c>("reviewer", userId)</c>, for the caller to notify.</summary>
+    private static async Task<List<(string Role, long UserId)>> ApplyPlanningAsync(
         SqliteConnection db,
         SqliteTransaction transaction,
         long projectId,
@@ -545,6 +547,7 @@ public sealed partial class GraftStore
         IReadOnlyList<string>? reviewers,
         string now)
     {
+        List<(string Role, long UserId)> added = [];
         string kind = SubjectName(subject);
         if (labels is not null)
         {
@@ -580,13 +583,16 @@ public sealed partial class GraftStore
                 new NullableValueParameters(subjectId, resolved), transaction);
         }
 
-        if (assignees is not null) await SetPeopleAsync(db, transaction, projectId, kind, subjectId, "assignee", assignees);
-        if (reviewers is not null) await SetPeopleAsync(db, transaction, projectId, kind, subjectId, "reviewer", reviewers);
+        if (assignees is not null)
+            foreach (long id in await SetPeopleAsync(db, transaction, projectId, kind, subjectId, "assignee", assignees)) added.Add(("assignee", id));
+        if (reviewers is not null)
+            foreach (long id in await SetPeopleAsync(db, transaction, projectId, kind, subjectId, "reviewer", reviewers)) added.Add(("reviewer", id));
 
         await db.ExecuteAsync(subject == CommentSubject.Issue
             ? "UPDATE Issues SET UpdatedAtUtc = @UpdatedAtUtc WHERE Id = @Id;"
             : "UPDATE MergeRequests SET UpdatedAtUtc = @UpdatedAtUtc WHERE Id = @Id;",
             new TouchParameters(subjectId, now), transaction);
+        return added;
     }
 
     private static async Task<List<long>> ResolveLabelsAsync(
@@ -611,7 +617,9 @@ public sealed partial class GraftStore
     }
 
     /// <summary>Replaces the people of one kind on a subject. Each must be a member of the project.</summary>
-    private static async Task SetPeopleAsync(
+    /// <summary>Replaces the people in one role and returns those who were not in it before, so the caller
+    /// can tell them.</summary>
+    private static async Task<List<long>> SetPeopleAsync(
         SqliteConnection db,
         SqliteTransaction transaction,
         long projectId,
@@ -621,6 +629,9 @@ public sealed partial class GraftStore
         IReadOnlyList<string> usernames)
     {
         if (usernames.Count > MaximumPeople) throw new ArgumentException("At most twenty people.", nameof(usernames));
+        List<long> before = (await db.QueryAsync<long>(
+            "SELECT UserId FROM SubjectPeople WHERE SubjectType = @SubjectType AND SubjectId = @SubjectId AND Kind = @Kind;",
+            new PeopleClearParameters(kind, subjectId, role), transaction)).ToList();
         List<long> ids = [];
         foreach (string username in usernames)
         {
@@ -642,6 +653,7 @@ public sealed partial class GraftStore
         foreach (long id in ids)
             await db.ExecuteAsync("INSERT INTO SubjectPeople (SubjectType, SubjectId, UserId, Kind) VALUES (@SubjectType, @SubjectId, @UserId, @Kind);",
                 new PeopleInsertParameters(kind, subjectId, id, role), transaction);
+        return ids.Where(id => !before.Contains(id)).ToList();
     }
 
     /// <summary>Every label on every subject of one kind in a project, grouped by subject row id.</summary>

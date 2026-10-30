@@ -27,6 +27,7 @@ else if (Api.Authenticated)
         <button type="button" class="@(tab == "tokens" ? "active" : "")" @onclick='() => tab = "tokens"'>Access tokens</button>
         <button type="button" class="@(tab == "keys" ? "active" : "")" @onclick='() => tab = "keys"'>SSH keys</button>
         <button type="button" class="@(tab == "email" ? "active" : "")" @onclick='() => tab = "email"'>Email</button>
+        <button type="button" class="@(tab == "second-factor" ? "active" : "")" @onclick='() => tab = "second-factor"'>Two-factor</button>
         <button type="button" class="@(tab == "avatar" ? "active" : "")" @onclick='() => tab = "avatar"'>Avatar</button>
         <button type="button" class="@(tab == "password" ? "active" : "")" @onclick='() => tab = "password"'>Password</button>
     </div>
@@ -261,6 +262,105 @@ else if (Api.Authenticated)
                 </form>
             </div>
         </div>
+
+        <div class="panel">
+            <div class="panel-header"><h2>Notifications by email</h2></div>
+            <div class="panel-body">
+                <p class="secondary-text">
+                    Your <a href="/-/notifications">inbox</a> always has everything that concerns you. This sends a message
+                    for each entry as well, to the address above.
+                    @if (Api.Session?.MailAvailable != true)
+                    {
+                        <span>This server does not send email, so the choice is kept for a server that does.</span>
+                    }
+                </p>
+                <label class="checkbox">
+                    <input type="checkbox" checked="@(Api.Session?.NotifyByEmail == true)" @onchange="ToggleNotifyByEmail" disabled="@busy" />
+                    Email me each notification
+                </label>
+            </div>
+        </div>
+    }
+    else if (tab == "second-factor")
+    {
+        @if (recoveryCodes is not null)
+        {
+            <div class="panel">
+                <div class="panel-header"><Icon Name="shield" /><h2>Your recovery codes</h2></div>
+                <div class="panel-body">
+                    <div class="banner warning">
+                        <Icon Name="alert" />
+                        <span>Shown once. Keep them somewhere that is not the phone. Each signs you in one time if the app is gone.</span>
+                    </div>
+                    <pre class="commit-message">@string.Join("\n", recoveryCodes)</pre>
+                    <div class="form-actions">
+                        <button type="button" @onclick="() => recoveryCodes = null">I have kept them</button>
+                    </div>
+                </div>
+            </div>
+        }
+        else if (Api.Session?.SecondFactorEnabled == true)
+        {
+            <div class="panel">
+                <div class="panel-header"><Icon Name="shield" /><h2>Two-factor sign-in is on</h2></div>
+                <div class="panel-body">
+                    <p class="secondary-text">
+                        Signing in asks for a code from your authenticator app after your password. Personal access
+                        tokens and SSH keys are unaffected: they are issued from inside a session that already passed both.
+                        Turning it off needs your password and a current code, so a stolen session cannot.
+                    </p>
+                    <form class="form" @onsubmit="DisableSecondFactor" @onsubmit:preventDefault>
+                        <label for="disable-password">Password</label>
+                        <input id="disable-password" type="password" autocomplete="current-password" @bind="factorPassword" required maxlength="256" />
+                        <label for="disable-code">Code from the app, or a recovery code</label>
+                        <input id="disable-code" autocomplete="one-time-code" inputmode="numeric" @bind="factorCode" required maxlength="32" />
+                        <div class="form-actions">
+                            <button type="submit" class="danger" disabled="@busy">Turn off</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        }
+        else if (setup is not null)
+        {
+            <div class="panel">
+                <div class="panel-header"><Icon Name="shield" /><h2>Add this account to your authenticator app</h2></div>
+                <div class="panel-body">
+                    <p class="secondary-text">
+                        Enter the key in the app, or paste the address into one that takes it. Then type the code the
+                        app shows to confirm. Nothing is on until a code is accepted.
+                    </p>
+                    <label for="factor-secret">Key</label>
+                    <div class="clone-row"><input id="factor-secret" readonly class="mono" value="@setup.Secret" /></div>
+                    <label for="factor-uri">Address</label>
+                    <div class="clone-row"><input id="factor-uri" readonly class="mono" value="@setup.OtpauthUri" /></div>
+                    <form class="form" @onsubmit="ConfirmSecondFactor" @onsubmit:preventDefault>
+                        <label for="confirm-code">Code from the app</label>
+                        <input id="confirm-code" autocomplete="one-time-code" inputmode="numeric" @bind="factorCode" required minlength="6" maxlength="6" />
+                        <div class="form-actions">
+                            <button type="submit" disabled="@busy">Confirm and turn on</button>
+                            <button type="button" class="secondary" @onclick="() => setup = null" disabled="@busy">Cancel</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        }
+        else
+        {
+            <div class="panel">
+                <div class="panel-header"><Icon Name="shield" /><h2>Two-factor sign-in</h2></div>
+                <div class="panel-body">
+                    <p class="secondary-text">
+                        A code from an authenticator app after your password. It needs no email and no phone number;
+                        any app that speaks the usual time-based codes works. You get recovery codes for the day the
+                        app is gone, and an administrator can remove the factor if the codes are gone too.
+                    </p>
+                    <div class="form-actions">
+                        <button type="button" @onclick="BeginSecondFactor" disabled="@busy">Set up</button>
+                    </div>
+                </div>
+            </div>
+        }
     }
     else if (tab == "password")
     {
@@ -330,6 +430,64 @@ else if (Api.Authenticated)
 
     private async Task LoadTokens() => tokens = await Api.GetAsync("api/tokens", ApiJson.Default.TokenResponseArray) ?? [];
 
+    private SecondFactorSetupResponse? setup;
+    private string[]? recoveryCodes;
+    private string factorPassword = "";
+    private string factorCode = "";
+
+    private async Task BeginSecondFactor()
+    {
+        if (busy) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult<SecondFactorSetupResponse> result = await Api.SendAsync(HttpMethod.Post, "api/second-factor/begin",
+                ApiJson.Default.SecondFactorSetupResponse, "");
+            if (result.Ok) { setup = result.Value; factorCode = ""; }
+            else Report(new ApiResult(false, result.Message));
+        }
+        finally { busy = false; }
+    }
+
+    private async Task ConfirmSecondFactor()
+    {
+        if (busy) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult<RecoveryCodesResponse> result = await Api.SendAsync(HttpMethod.Post, "api/second-factor/confirm",
+                new SecondFactorCodeRequest(factorCode.Trim()), ApiJson.Default.SecondFactorCodeRequest, ApiJson.Default.RecoveryCodesResponse,
+                "Two-factor sign-in is on.");
+            Report(new ApiResult(result.Ok, result.Message));
+            if (result.Ok)
+            {
+                setup = null;
+                factorCode = "";
+                recoveryCodes = result.Value?.RecoveryCodes;
+                await Api.RefreshSessionAsync();
+            }
+        }
+        finally { busy = false; }
+    }
+
+    private async Task DisableSecondFactor()
+    {
+        if (busy) return;
+        busy = true;
+        message = "";
+        try
+        {
+            Report(await Api.PostAsync("api/second-factor/disable", new SecondFactorDisableRequest(factorPassword, factorCode.Trim()),
+                ApiJson.Default.SecondFactorDisableRequest, "Two-factor sign-in is off."));
+            factorPassword = "";
+            factorCode = "";
+            await Api.RefreshSessionAsync();
+        }
+        finally { busy = false; }
+    }
+
     private string email = "";
 
     protected override void OnParametersSet() => email = Api.Session?.Email ?? email;
@@ -345,6 +503,21 @@ else if (Api.Authenticated)
                 email.Trim().Length == 0 ? "Email address removed." : "Email address saved."));
             await Api.RefreshSessionAsync();
             email = Api.Session?.Email ?? "";
+        }
+        finally { busy = false; }
+    }
+
+    private async Task ToggleNotifyByEmail(ChangeEventArgs change)
+    {
+        if (busy) return;
+        busy = true;
+        message = "";
+        try
+        {
+            bool enabled = change.Value is bool value && value;
+            Report(await Api.PostAsync("api/notifications/email", new NotifyByEmailRequest(enabled), ApiJson.Default.NotifyByEmailRequest,
+                enabled ? "You will get a message for each notification." : "No more messages; the inbox stays."));
+            await Api.RefreshSessionAsync();
         }
         finally { busy = false; }
     }

@@ -102,6 +102,16 @@ Then the first of the four large items, in the order the user gave:
   profile tab, audited, unique across the instance. Fetches in protocol version 2 only; pushes as always.
   Off until `--ssh-port` names a port. Not done: LFS over an SSH remote, deploy keys, administrator-managed
   keys. [ADR 0031](decisions/0031-git-over-ssh.md).
+- **Email, optional.** `--mail-smtp` turns it on; nothing is sent without it. An optional unique address per
+  account, an in-process SMTP client, and a password reset by one-time link that an administrator hands over
+  or, with mail, the account asks for itself. [ADR 0032](decisions/0032-email-is-optional.md).
+- **Notifications.** An inbox row per person per event, written in the event's transaction: assignment,
+  review requests, comments, approvals, merges, closes. The bell, `/-/notifications`, GitLab's `/todos`. A
+  message per entry is an opt-in copy. Not done: mentions, muting, digests. [ADR 0033](decisions/0033-notifications.md).
+- **A second factor.** Time-based codes from an authenticator app, enrolled in two steps, with recovery codes;
+  off with the password and a code; removed by an administrator for the person who lost both. No email, no
+  phone number; tokens and SSH keys unaffected. Not done: WebAuthn, requiring it of everyone, a QR picture.
+  [ADR 0034](decisions/0034-second-factor.md).
 
 ## Near, and small
 
@@ -112,11 +122,6 @@ Nothing is here at the moment. Everything below needs a decision before it is bu
 **A project Maintainer cannot read their project's audit events.** The trail is instance-wide and
 administrator-only, because most of what it records is not about a project. A project-scoped view would need
 its own query and a rule about which entries are a project's business.
-
-**Notifications and a second factor**, the two things that depended on email and must not. Email itself is
-optional since [ADR 0032](decisions/0032-email-is-optional.md). Notifications would be an in-app inbox always
-and a message when mail is on and the person opted in; a second factor would be an authenticator app with
-recovery codes, which needs no mail at all. Both are the next slices of the user's email item.
 
 **Continuous integration and a runner protocol.** Recorded as a long-term goal since
 [ADR 0001](decisions/0001-name-and-compatibility.md) and still entirely absent. CupriNet remains a

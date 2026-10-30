@@ -305,3 +305,28 @@ public sealed record PackageFile(long Id, string FileName, long Size, string Sha
 public sealed record ContainerRepository(long Id, long ProjectId, string Name, DateTimeOffset CreatedAtUtc, IReadOnlyList<ContainerTag> Tags);
 public sealed record ContainerTag(string Tag, string Digest, string MediaType, long Size, DateTimeOffset UpdatedAtUtc);
 public sealed record ContainerManifest(string Digest, string MediaType, long Size);
+
+/// <summary>
+/// Something that happened to an issue or a proposal that concerns one person: they were assigned, asked to
+/// review, or something they are part of was commented on, approved, merged, closed or reopened. Kept until
+/// read, and read when the person says so or opens what it points at.
+/// </summary>
+public sealed record Notification(
+    long Id,
+    long ProjectId,
+    /// <summary><c>owner/project</c>, so the inbox can say where without a second lookup.</summary>
+    string ProjectPath,
+    /// <summary><c>assigned</c>, <c>review_requested</c>, <c>commented</c>, <c>approved</c>, <c>merged</c>, <c>closed</c>, <c>reopened</c>.</summary>
+    string Action,
+    CommentSubject Subject,
+    long Iid,
+    string Title,
+    string ActorUsername,
+    DateTimeOffset CreatedAtUtc,
+    DateTimeOffset? ReadAtUtc);
+
+public sealed record NotificationPage(IReadOnlyList<Notification> Items, long Unread, long Total);
+
+/// <summary>One notification as it was written, with what a sender needs to know about its recipient. Raised
+/// after the transaction that wrote it commits, so nothing is sent for a change that did not happen.</summary>
+public sealed record NotificationDelivery(long UserId, string Username, string? Email, bool ByEmail, Notification Notification);

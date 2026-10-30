@@ -17,6 +17,11 @@
             }
             @if (Api.Authenticated)
             {
+                @* The inbox, with how much of it is unread. The count comes with the session, so it costs no
+                   request of its own and is as fresh as the last navigation. *@
+                <a class="button secondary" href="/-/notifications" title="Notifications" aria-label="@NotificationsLabel">
+                    <Icon Name="bell" />@if (Api.Session?.UnreadNotifications > 0) { <span class="label">@Api.Session.UnreadNotifications</span> }
+                </a>
                 <a class="button secondary" href="/-/profile"><Avatar Url="@Api.Session?.AvatarUrl" Name="@Api.Username" Class="avatar-small" />@Api.Username</a>
                 <button type="button" class="secondary" @onclick="SignOut" disabled="@busy">Sign out</button>
             }
@@ -32,6 +37,7 @@
                     <a href="/" class="@Active("")"><Icon Name="repository" />Projects</a>
                     <a href="/-/explore" class="@Active("-/explore")"><Icon Name="search" />Explore</a>
                     <a href="/-/search" class="@Active("-/search")"><Icon Name="search" />Search</a>
+                    <a href="/-/notifications" class="@Active("-/notifications")"><Icon Name="bell" />Notifications</a>
                     <a href="/-/profile" class="@Active("-/profile")"><Icon Name="key" />Profile and tokens</a>
                 </nav>
                 @if (Api.IsAdministrator)
@@ -61,6 +67,10 @@
 </div>
 
 @code {
+    private string NotificationsLabel => Api.Session?.UnreadNotifications is long unread and > 0
+        ? unread.ToString(System.Globalization.CultureInfo.InvariantCulture) + " unread notifications"
+        : "Notifications";
+
     private bool busy;
 
     protected override void OnInitialized()

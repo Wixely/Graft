@@ -234,6 +234,8 @@ try
     await CheckSsh(address, aliceIdentity, bob.Username);
     await CheckEmptyRepository(address, aliceIdentity, alicePassword);
     address = await CheckWebhooks(address, aliceIdentity);
+    await CheckSecondFactor(address, bob.Username, bobPassword, adminPassword);
+    await CheckNotifications(address, aliceIdentity, bob.Username, "carol", alicePassword);
     address = await CheckMail(address, bob.Username, bobPassword, adminPassword);
     // After everything that writes an audit row, so the trail it reads already contains them.
     await CheckAuditTrail(address, adminPassword, alicePassword);
@@ -6014,6 +6016,326 @@ async Task CheckFetching(string address, AuthenticatedIdentity alice, string str
 /// then described as a permission problem.
 /// </summary>
 /// <summary>
+/// A second factor from an authenticator app. The code generator is first checked against RFC 6238's own test
+/// vectors, so that what the suite then types is what a real app would show; then enrolment in two steps,
+/// sign-in in two steps, a code refused twice in one window, a recovery code good once, turning it off with the
+/// password and a code, and an administrator removing it for the person who lost both.
+/// </summary>
+async Task CheckSecondFactor(string address, string bobUsername, string bobPassword, string adminPassword)
+{
+    // RFC 6238, appendix B, SHA-1, with the eight-digit vectors truncated to six as every app shows them.
+    byte[] vectorSecret = Encoding.ASCII.GetBytes("12345678901234567890");
+    Check(Totp.Compute(vectorSecret, 59 / 30) == "287082" && Totp.Compute(vectorSecret, 1111111109 / 30) == "081804" &&
+        Totp.Compute(vectorSecret, 1234567890 / 30) == "005924" && Totp.Compute(vectorSecret, 2000000000 / 30) == "279037",
+        "the code generator agrees with RFC 6238's test vectors");
+    Check(Base32.Encode(vectorSecret) == "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" && Base32.Decode("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ").AsSpan().SequenceEqual(vectorSecret),
+        "and the key encoding is the Base32 an app reads");
+
+    (HttpClient bob, string bobCsrf) = await BrowserSession(address, bobUsername, bobPassword);
+    async Task<HttpResponseMessage> Post(HttpClient client, string csrf, string path, object? body)
+    {
+        using HttpRequestMessage request = new(HttpMethod.Post, path) { Content = body is null ? null : JsonContent.Create(body) };
+        request.Headers.Add("Origin", address);
+        request.Headers.Add("X-Graft-CSRF", csrf);
+        return await client.SendAsync(request);
+    }
+    async Task<(HttpStatusCode Status, JsonElement? Body)> Login(string username, string password)
+    {
+        using HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false };
+        using HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
+        using HttpRequestMessage request = new(HttpMethod.Post, "/api/login") { Content = JsonContent.Create(new { username, password }) };
+        request.Headers.Add("Origin", address);
+        using HttpResponseMessage response = await client.SendAsync(request);
+        string text = await response.Content.ReadAsStringAsync();
+        return (response.StatusCode, text.Length == 0 ? null : JsonDocument.Parse(text).RootElement.Clone());
+    }
+    async Task<HttpStatusCode> SecondStep(string challenge, string code)
+    {
+        using HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false };
+        using HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
+        using HttpRequestMessage request = new(HttpMethod.Post, "/api/login/second-factor") { Content = JsonContent.Create(new { challenge, code }) };
+        request.Headers.Add("Origin", address);
+        using HttpResponseMessage response = await client.SendAsync(request);
+        return response.StatusCode;
+    }
+
+    using (HttpResponseMessage early = await Post(bob, bobCsrf, "/api/second-factor/confirm", new { code = "123456" }))
+        Check(early.StatusCode == HttpStatusCode.BadRequest, "confirming before beginning is refused");
+    byte[] secret;
+    using (HttpResponseMessage begun = await Post(bob, bobCsrf, "/api/second-factor/begin", null))
+    {
+        using JsonDocument json = JsonDocument.Parse(await begun.Content.ReadAsStringAsync());
+        Check(begun.IsSuccessStatusCode, "an enrolment begins");
+        string key = json.RootElement.GetProperty("secret").GetString()!;
+        string uri = json.RootElement.GetProperty("otpauth_uri").GetString()!;
+        Check(uri.StartsWith("otpauth://totp/", StringComparison.Ordinal) && uri.Contains("secret=" + key, StringComparison.Ordinal) &&
+            uri.Contains(bobUsername, StringComparison.Ordinal), "with the key and an otpauth address that carries it");
+        secret = Base32.Decode(key);
+    }
+    Check((await Login(bobUsername, bobPassword)).Status == HttpStatusCode.OK, "a pending enrolment changes nothing about signing in");
+    using (HttpResponseMessage wrong = await Post(bob, bobCsrf, "/api/second-factor/confirm", new { code = "000000" }))
+        Check(wrong.StatusCode == HttpStatusCode.BadRequest, "a wrong code does not confirm");
+    string[] recovery;
+    using (HttpResponseMessage confirmed = await Post(bob, bobCsrf, "/api/second-factor/confirm", new { code = Totp.Compute(secret, DateTimeOffset.UtcNow) }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await confirmed.Content.ReadAsStringAsync());
+        Check(confirmed.IsSuccessStatusCode, "the app's code confirms the enrolment");
+        recovery = [.. json.RootElement.GetProperty("recovery_codes").EnumerateArray().Select(code => code.GetString()!)];
+        Check(recovery.Length == 10 && recovery.All(code => code.Length == 11 && code[5] == '-'), "and ten recovery codes are shown once");
+    }
+    using (HttpResponseMessage session = await bob.GetAsync("/api/session"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await session.Content.ReadAsStringAsync());
+        Check(json.RootElement.GetProperty("second_factor_enabled").GetBoolean(), "the session says the factor is on");
+    }
+    using (HttpResponseMessage again = await Post(bob, bobCsrf, "/api/second-factor/begin", null))
+        Check(again.StatusCode == HttpStatusCode.BadRequest, "a second enrolment is refused while the factor is on");
+
+    // Signing in is now two steps.
+    (HttpStatusCode status, JsonElement? body) = await Login(bobUsername, bobPassword);
+    Check(status == HttpStatusCode.Unauthorized && body?.GetProperty("error").GetString() == "second-factor" &&
+        body?.GetProperty("challenge").GetString()?.Length == 32, "the password alone earns a challenge, not a session");
+    string challenge = body!.Value.GetProperty("challenge").GetString()!;
+    Check(await SecondStep(challenge, "000000") == HttpStatusCode.Unauthorized, "a wrong code is refused");
+    Check(await SecondStep(challenge, Totp.Compute(secret, DateTimeOffset.UtcNow)) == HttpStatusCode.Unauthorized,
+        "and spends the challenge, so the right code no longer has one to answer");
+    // The confirmation already spent this window's code, so the next window's is used, which the clock tolerance
+    // accepts and which a real app would show within half a minute.
+    string current = Totp.Compute(secret, DateTimeOffset.UtcNow.AddSeconds(30));
+    challenge = (await Login(bobUsername, bobPassword)).Body!.Value.GetProperty("challenge").GetString()!;
+    Check(await SecondStep(challenge, current) == HttpStatusCode.OK, "a fresh challenge and a code the window has not seen sign in");
+    challenge = (await Login(bobUsername, bobPassword)).Body!.Value.GetProperty("challenge").GetString()!;
+    Check(await SecondStep(challenge, current) == HttpStatusCode.Unauthorized, "the same code is not accepted twice in its window");
+    challenge = (await Login(bobUsername, bobPassword)).Body!.Value.GetProperty("challenge").GetString()!;
+    Check(await SecondStep(challenge, recovery[0]) == HttpStatusCode.OK, "a recovery code signs in");
+    challenge = (await Login(bobUsername, bobPassword)).Body!.Value.GetProperty("challenge").GetString()!;
+    Check(await SecondStep(challenge, recovery[0]) == HttpStatusCode.Unauthorized, "and is good once");
+    challenge = (await Login(bobUsername, bobPassword)).Body!.Value.GetProperty("challenge").GetString()!;
+    Check(await SecondStep(challenge, recovery[1].ToUpperInvariant().Replace("-", "")) == HttpStatusCode.OK, "another, typed without its dash and in capitals, is read as meant");
+    using (HttpResponseMessage personal = await ApiGet(address, "/api/v4/user", null))
+        Check(personal.StatusCode == HttpStatusCode.Unauthorized, "a token is still the API's credential, as before");
+
+    // Turning it off: the owner with password and code; an administrator for a lost one.
+    using (HttpResponseMessage noPassword = await Post(bob, bobCsrf, "/api/second-factor/disable", new { password = "wrong-password-here", code = Totp.Compute(secret, DateTimeOffset.UtcNow.AddSeconds(30)) }))
+        Check(noPassword.StatusCode == HttpStatusCode.BadRequest, "turning off needs the password");
+    using (HttpResponseMessage off = await Post(bob, bobCsrf, "/api/second-factor/disable", new { password = bobPassword, code = recovery[2] }))
+        Check(off.StatusCode == HttpStatusCode.NoContent, "the owner turns it off with the password and a code");
+    Check((await Login(bobUsername, bobPassword)).Status == HttpStatusCode.OK, "and the password alone signs in again");
+
+    using (HttpResponseMessage begun = await Post(bob, bobCsrf, "/api/second-factor/begin", null))
+    {
+        using JsonDocument json = JsonDocument.Parse(await begun.Content.ReadAsStringAsync());
+        secret = Base32.Decode(json.RootElement.GetProperty("secret").GetString()!);
+    }
+    using (HttpResponseMessage confirmed = await Post(bob, bobCsrf, "/api/second-factor/confirm", new { code = Totp.Compute(secret, DateTimeOffset.UtcNow) }))
+        Check(confirmed.IsSuccessStatusCode, "a new enrolment begins and confirms");
+    (HttpClient admin, string adminCsrf) = await BrowserSession(address, "admin", adminPassword);
+    long bobId;
+    long adminId;
+    using (HttpResponseMessage list = await admin.GetAsync("/api/users"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await list.Content.ReadAsStringAsync());
+        JsonElement bobRow = json.RootElement.EnumerateArray().First(user => user.GetProperty("username").GetString() == bobUsername);
+        bobId = bobRow.GetProperty("id").GetInt64();
+        adminId = json.RootElement.EnumerateArray().First(user => user.GetProperty("username").GetString() == "admin").GetProperty("id").GetInt64();
+        Check(bobRow.GetProperty("second_factor_enabled").GetBoolean(), "the administrator's list shows who has the factor on");
+    }
+    async Task<HttpStatusCode> Delete(HttpClient client, string csrf, string path)
+    {
+        using HttpRequestMessage request = new(HttpMethod.Delete, path);
+        request.Headers.Add("Origin", address);
+        request.Headers.Add("X-Graft-CSRF", csrf);
+        using HttpResponseMessage response = await client.SendAsync(request);
+        return response.StatusCode;
+    }
+    Check(await Delete(bob, bobCsrf, "/api/users/" + bobId + "/second-factor") == HttpStatusCode.Forbidden, "an ordinary account cannot remove a factor this way");
+    Check(await Delete(admin, adminCsrf, "/api/users/" + adminId + "/second-factor") == HttpStatusCode.BadRequest, "an administrator cannot remove their own this way");
+    Check(await Delete(admin, adminCsrf, "/api/users/" + bobId + "/second-factor") == HttpStatusCode.NoContent, "an administrator removes another account's factor");
+    Check((await Login(bobUsername, bobPassword)).Status == HttpStatusCode.OK, "and that account's password alone signs in");
+    bob.Dispose();
+    admin.Dispose();
+}
+
+/// <summary>
+/// The inbox. Each thing that concerns a person appears for them and not for whoever did it: assignment,
+/// a review asked for, a comment on something they are part of, an approval, a merge, a close. Read through
+/// GitLab's to-do routes and the browser's own, marked read one at a time and all at once. None of this
+/// needs a mail server, which is the point.
+/// </summary>
+async Task CheckNotifications(string address, AuthenticatedIdentity alice, string bobUsername, string strangerUsername, string alicePassword)
+{
+    long projectId;
+    string aliceApi;
+    string bobApi;
+    string bobReadApi;
+    string strangerApi;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        ProjectInfo created = await store.CreateProjectWithRepositoryAsync(alice, "inbox", "Inbox",
+            (project, cancellation) => { cancellation.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, project.StorageId)); return Task.CompletedTask; });
+        projectId = created.Id;
+        UserAccount bob = Required(await store.FindActiveUserAsync(bobUsername), "bob account");
+        await store.SetMembershipAsync(alice, projectId, bob.Id, ProjectRole.Developer);
+        AuthenticatedIdentity bobIdentity = new(bob.Id, bob.Username, false, IdentityKind.BrowserSession);
+        UserAccount stranger = Required(await store.FindActiveUserAsync(strangerUsername), "stranger account");
+        AuthenticatedIdentity strangerIdentity = new(stranger.Id, stranger.Username, false, IdentityKind.BrowserSession);
+        aliceApi = (await store.CreateTokenAsync(alice, "inbox-api", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        bobApi = (await store.CreateTokenAsync(bobIdentity, "inbox-bob", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        bobReadApi = (await store.CreateTokenAsync(bobIdentity, "inbox-bob-read", TokenScope.ReadApi, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        strangerApi = (await store.CreateTokenAsync(strangerIdentity, "inbox-stranger", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+    }
+    string prefix = "/api/v4/projects/" + projectId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    async Task<JsonElement[]> Todos(string token, string state = "")
+    {
+        using HttpResponseMessage response = await ApiGet(address, "/api/v4/todos" + (state.Length == 0 ? "" : "?state=" + state), token);
+        if (!response.IsSuccessStatusCode) throw new InvalidOperationException("todos " + (int)response.StatusCode);
+        using JsonDocument json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        return json.RootElement.EnumerateArray().Select(item => item.Clone()).ToArray();
+    }
+
+    // Earlier checks assigned, commented and merged; those entries are real and are cleared here so this check
+    // counts only what it causes.
+    foreach (string token in new[] { aliceApi, bobApi, strangerApi })
+        using (HttpResponseMessage cleared = await ApiPost(address, "/api/v4/todos/mark_as_done", token, new { }))
+            Check(cleared.StatusCode == HttpStatusCode.NoContent, "an inbox is cleared");
+    Check((await Todos(bobApi)).Length == 0 && (await Todos(aliceApi)).Length == 0, "nobody has anything pending before anything happens");
+
+    // Assignment tells the assignee and not the assigner.
+    long issue;
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/issues", aliceApi,
+        new { title = "Lantern flickers", assignee_usernames = new[] { bobUsername } }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStringAsync());
+        issue = json.RootElement.GetProperty("iid").GetInt64();
+    }
+    JsonElement[] bobsTodos = await Todos(bobApi);
+    Check(bobsTodos.Length == 1 && bobsTodos[0].GetProperty("action_name").GetString() == "assigned" &&
+        bobsTodos[0].GetProperty("target_type").GetString() == "Issue" && bobsTodos[0].GetProperty("target").GetProperty("iid").GetInt64() == issue &&
+        bobsTodos[0].GetProperty("author").GetProperty("username").GetString() == "alice" && bobsTodos[0].GetProperty("state").GetString() == "pending" &&
+        bobsTodos[0].GetProperty("target_url").GetString()!.EndsWith("/alice/inbox/-/issues/" + issue, StringComparison.Ordinal),
+        "the assignee has one pending to-do, assigned, pointing at the issue");
+    Check((await Todos(aliceApi)).Length == 0, "and the assigner has none for their own act");
+    Check((await Todos(bobReadApi)).Length == 1, "to-dos read with read_api");
+
+    // A comment tells everybody part of the issue except its author.
+    using (HttpResponseMessage commented = await ApiPost(address, prefix + "/issues/" + issue + "/notes", bobApi, new { body = "Looking." }))
+        Check(commented.StatusCode == HttpStatusCode.Created, "the assignee comments");
+    JsonElement[] alicesTodos = await Todos(aliceApi);
+    Check(alicesTodos.Length == 1 && alicesTodos[0].GetProperty("action_name").GetString() == "commented" &&
+        alicesTodos[0].GetProperty("author").GetProperty("username").GetString() == bobUsername,
+        "the issue's author hears about the comment");
+    Check((await Todos(bobApi)).Length == 1, "and the commenter does not hear about their own");
+    Check((await Todos(strangerApi)).Length == 0, "a stranger to the issue hears nothing");
+
+    // Marking done, one and all, and the done list.
+    long bobsTodoId = bobsTodos[0].GetProperty("id").GetInt64();
+    using (HttpResponseMessage refused = await ApiPost(address, "/api/v4/todos/" + bobsTodoId + "/mark_as_done", aliceApi, new { }))
+        Check(refused.StatusCode == HttpStatusCode.NotFound, "a to-do belongs to its recipient alone");
+    using (HttpResponseMessage readOnly = await ApiPost(address, "/api/v4/todos/" + bobsTodoId + "/mark_as_done", bobReadApi, new { }))
+        Check(readOnly.StatusCode == HttpStatusCode.Forbidden, "marking done needs the api scope");
+    using (HttpResponseMessage done = await ApiPost(address, "/api/v4/todos/" + bobsTodoId + "/mark_as_done", bobApi, new { }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await done.Content.ReadAsStringAsync());
+        Check(done.StatusCode == HttpStatusCode.Created && json.RootElement.GetProperty("state").GetString() == "done", "a to-do is marked done and comes back done");
+    }
+    Check((await Todos(bobApi)).Length == 0 && (await Todos(bobApi, "done")).Any(todo => todo.GetProperty("id").GetInt64() == bobsTodoId),
+        "it leaves pending and appears under done");
+
+    // A proposal: a review asked for, an approval, a merge, each heard by the right people.
+    string work = Path.Combine(root, "inbox-work");
+    await Git(root, ["clone", "-q", AuthenticatedUrl(address, "alice", aliceApi, "alice/inbox.git"), work]);
+    File.WriteAllText(Path.Combine(work, "README.md"), "# Inbox\n");
+    await Git(work, ["add", "."]);
+    await Git(work, ["commit", "-q", "-m", "Start"]);
+    await Git(work, ["push", "-q", "origin", "HEAD:main"]);
+    await Git(work, ["checkout", "-q", "-b", "work"]);
+    File.WriteAllText(Path.Combine(work, "work.txt"), "work\n");
+    await Git(work, ["add", "."]);
+    await Git(work, ["commit", "-q", "-m", "Work"]);
+    await Git(work, ["push", "-q", "origin", "work"]);
+    long proposal;
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/merge_requests", aliceApi,
+        new { source_branch = "work", target_branch = "main", title = "Do the work", reviewer_usernames = new[] { bobUsername } }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStringAsync());
+        proposal = json.RootElement.GetProperty("iid").GetInt64();
+    }
+    bobsTodos = await Todos(bobApi);
+    Check(bobsTodos.Length == 1 && bobsTodos[0].GetProperty("action_name").GetString() == "review_requested" &&
+        bobsTodos[0].GetProperty("target_type").GetString() == "MergeRequest", "the reviewer is asked to review");
+    using (HttpResponseMessage approved = await ApiPost(address, prefix + "/merge_requests/" + proposal + "/approve", bobApi, new { }))
+        Check(approved.IsSuccessStatusCode, "the reviewer approves");
+    alicesTodos = await Todos(aliceApi);
+    Check(alicesTodos.Any(todo => todo.GetProperty("action_name").GetString() == "review_submitted" &&
+        todo.GetProperty("target").GetProperty("iid").GetInt64() == proposal), "the author hears about the approval, as GitLab names it");
+    using (HttpResponseMessage merged = await ApiPut(address, prefix + "/merge_requests/" + proposal + "/merge", aliceApi, new { }))
+        Check(merged.IsSuccessStatusCode, "the author merges");
+    bobsTodos = await Todos(bobApi);
+    Check(bobsTodos.Any(todo => todo.GetProperty("action_name").GetString() == "merged"), "the reviewer hears about the merge");
+
+    // Closing an issue tells its people; everything read at once.
+    using (HttpResponseMessage closed = await ApiPut(address, prefix + "/issues/" + issue, aliceApi, new { state_event = "close" }))
+        Check(closed.IsSuccessStatusCode, "the author closes the issue");
+    Check((await Todos(bobApi)).Any(todo => todo.GetProperty("action_name").GetString() == "closed"), "the assignee hears about the close");
+    using (HttpResponseMessage all = await ApiPost(address, "/api/v4/todos/mark_as_done", bobApi, new { }))
+        Check(all.StatusCode == HttpStatusCode.NoContent, "everything is marked done at once");
+    Check((await Todos(bobApi)).Length == 0, "and nothing is pending");
+
+    // The browser's own view, with the unread count that rides on the session.
+    (HttpClient aliceBrowser, string aliceCsrf) = await BrowserSession(address, "alice", alicePassword);
+    using (HttpResponseMessage session = await aliceBrowser.GetAsync("/api/session"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await session.Content.ReadAsStringAsync());
+        Check(json.RootElement.GetProperty("unread_notifications").GetInt64() >= 2, "the session carries the unread count");
+    }
+    using (HttpResponseMessage inbox = await aliceBrowser.GetAsync("/api/notifications?unread=true"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await inbox.Content.ReadAsStringAsync());
+        Check(inbox.IsSuccessStatusCode && json.RootElement.GetProperty("unread").GetInt64() == json.RootElement.GetProperty("items").GetArrayLength() &&
+            json.RootElement.GetProperty("items")[0].GetProperty("actor").GetString() == bobUsername, "the browser lists the unread entries");
+    }
+    using (HttpRequestMessage readAll = new(HttpMethod.Post, "/api/notifications/read-all"))
+    {
+        readAll.Headers.Add("Origin", address);
+        readAll.Headers.Add("X-Graft-CSRF", aliceCsrf);
+        using HttpResponseMessage response = await aliceBrowser.SendAsync(readAll);
+        Check(response.StatusCode == HttpStatusCode.NoContent, "the browser marks everything read");
+    }
+    using (HttpResponseMessage session = await aliceBrowser.GetAsync("/api/session"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await session.Content.ReadAsStringAsync());
+        Check(json.RootElement.GetProperty("unread_notifications").GetInt64() == 0 && !json.RootElement.GetProperty("notify_by_email").GetBoolean(),
+            "and the count is zero; email per notification is off by default");
+    }
+    aliceBrowser.Dispose();
+}
+
+async Task<(HttpClient Client, string Csrf)> BrowserSession(string at, string username, string password)
+{
+    HttpClientHandler handler = new()
+    {
+        CookieContainer = new CookieContainer(),
+        ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
+        UseProxy = false
+    };
+    HttpClient client = new(handler) { BaseAddress = new(at), Timeout = TimeSpan.FromSeconds(20) };
+    // The sign-in throttle is per server per minute, and a check that signs in many times leaves the next
+    // one waiting for the window to turn. That is the throttle working, not a failure, so wait it out.
+    for (int attempt = 0; ; attempt++)
+    {
+        using HttpRequestMessage login = new(HttpMethod.Post, "/api/login") { Content = JsonContent.Create(new { username, password }) };
+        login.Headers.Add("Origin", at);
+        using HttpResponseMessage response = await client.SendAsync(login);
+        if (response.IsSuccessStatusCode) break;
+        if (response.StatusCode == HttpStatusCode.TooManyRequests && attempt < 20) { await Task.Delay(TimeSpan.FromSeconds(4)); continue; }
+        throw new InvalidOperationException("browser login failed for " + username + " (" + (int)response.StatusCode + ")");
+    }
+    using HttpResponseMessage session = await client.GetAsync("/api/session");
+    using JsonDocument json = JsonDocument.Parse(await session.Content.ReadAsStringAsync());
+    return (client, json.RootElement.GetProperty("csrf").GetString()!);
+}
+
+/// <summary>
 /// Email as an option, and the password reset that works either way. On the default server, which sends
 /// nothing: an administrator makes a reset link and the person sets their own password with it, once. Then
 /// the server is restarted against a mail server of this suite's own, and the account asks for its own link,
@@ -6021,25 +6343,7 @@ async Task CheckFetching(string address, AuthenticatedIdentity alice, string str
 /// </summary>
 async Task<string> CheckMail(string address, string bobUsername, string bobPassword, string adminPassword)
 {
-    async Task<(HttpClient Client, string Csrf)> Browser(string at, string username, string password)
-    {
-        HttpClientHandler handler = new()
-        {
-            CookieContainer = new CookieContainer(),
-            ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
-            UseProxy = false
-        };
-        HttpClient client = new(handler) { BaseAddress = new(at), Timeout = TimeSpan.FromSeconds(20) };
-        using (HttpRequestMessage login = new(HttpMethod.Post, "/api/login") { Content = JsonContent.Create(new { username, password }) })
-        {
-            login.Headers.Add("Origin", at);
-            using HttpResponseMessage response = await client.SendAsync(login);
-            if (!response.IsSuccessStatusCode) throw new InvalidOperationException("browser login failed for " + username);
-        }
-        using HttpResponseMessage session = await client.GetAsync("/api/session");
-        using JsonDocument json = JsonDocument.Parse(await session.Content.ReadAsStringAsync());
-        return (client, json.RootElement.GetProperty("csrf").GetString()!);
-    }
+    Task<(HttpClient Client, string Csrf)> Browser(string at, string username, string password) => BrowserSession(at, username, password);
     async Task<HttpResponseMessage> Post(HttpClient client, string csrf, string at, string path, object? body)
     {
         using HttpRequestMessage request = new(HttpMethod.Post, path) { Content = body is null ? null : JsonContent.Create(body) };
@@ -6059,10 +6363,14 @@ async Task<string> CheckMail(string address, string bobUsername, string bobPassw
     {
         using HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false };
         using HttpClient client = new(handler) { BaseAddress = new(at), Timeout = TimeSpan.FromSeconds(20) };
-        using HttpRequestMessage login = new(HttpMethod.Post, "/api/login") { Content = JsonContent.Create(new { username, password }) };
-        login.Headers.Add("Origin", at);
-        using HttpResponseMessage response = await client.SendAsync(login);
-        return response.IsSuccessStatusCode;
+        for (int attempt = 0; ; attempt++)
+        {
+            using HttpRequestMessage login = new(HttpMethod.Post, "/api/login") { Content = JsonContent.Create(new { username, password }) };
+            login.Headers.Add("Origin", at);
+            using HttpResponseMessage response = await client.SendAsync(login);
+            if (response.StatusCode == HttpStatusCode.TooManyRequests && attempt < 20) { await Task.Delay(TimeSpan.FromSeconds(4)); continue; }
+            return response.IsSuccessStatusCode;
+        }
     }
     static string SecretOf(string url) => url[(url.IndexOf("/-/reset/", StringComparison.Ordinal) + "/-/reset/".Length)..].Trim();
 
@@ -6180,6 +6488,43 @@ async Task<string> CheckMail(string address, string bobUsername, string bobPassw
         Check(done.StatusCode == HttpStatusCode.NoContent, "the mailed link sets a password");
     Check(!await CanSignIn(address, bobUsername, bobPassword) && await CanSignIn(address, bobUsername, bobsThirdPassword),
         "and the account signs in with it");
+
+    // A notification goes by mail only to a person who asked for it, and the inbox row exists either way.
+    string aliceApiForMail;
+    long inboxProjectId;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        UserAccount aliceAccount = Required(await store.FindActiveUserAsync("alice"), "alice account");
+        aliceApiForMail = (await store.CreateTokenAsync(new(aliceAccount.Id, aliceAccount.Username, aliceAccount.IsAdministrator, IdentityKind.BrowserSession),
+            "mail-notify", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        inboxProjectId = Required(await store.FindReadyProjectAsync("alice", "inbox"), "the inbox project").Id;
+    }
+    (HttpClient bobAgain, string bobAgainCsrf) = await Browser(address, bobUsername, bobsThirdPassword);
+    using (HttpResponseMessage assigned = await ApiPost(address, "/api/v4/projects/" + inboxProjectId + "/issues", aliceApiForMail,
+        new { title = "Before opting in", assignee_usernames = new[] { bobUsername } }))
+        Check(assigned.StatusCode == HttpStatusCode.Created, "an assignment is made before the assignee asked for mail");
+    await Task.Delay(500);
+    Check(inbox.IsEmpty, "and no message is sent for it");
+    using (HttpResponseMessage optIn = await Post(bobAgain, bobAgainCsrf, address, "/api/notifications/email", new { enabled = true }))
+        Check(optIn.StatusCode == HttpStatusCode.NoContent, "the person asks for a message per notification");
+    using (HttpResponseMessage assigned = await ApiPost(address, "/api/v4/projects/" + inboxProjectId + "/issues", aliceApiForMail,
+        new { title = "After opting in", assignee_usernames = new[] { bobUsername } }))
+        Check(assigned.StatusCode == HttpStatusCode.Created, "another assignment is made afterwards");
+    (string To, string Body) notice = ("", "");
+    for (int waited = 0; waited < 100 && !inbox.TryDequeue(out notice); waited++) await Task.Delay(100);
+    string noticeBody = notice.Body ?? "";
+    int noticeBlank = noticeBody.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+    string noticeText = noticeBlank < 0 ? "" : Encoding.UTF8.GetString(Convert.FromBase64String(noticeBody[(noticeBlank + 4)..].Replace("\r\n", "")));
+    Check(notice.To == "Bob@Example.test" && noticeBody.Contains("alice assigned you issue #", StringComparison.Ordinal) &&
+        noticeText.Contains("/alice/inbox/-/issues/", StringComparison.Ordinal),
+        "the message names who did what to which issue and links to it (to " + notice.To + ")");
+    using (HttpResponseMessage session = await bobAgain.GetAsync("/api/session"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await session.Content.ReadAsStringAsync());
+        Check(json.RootElement.GetProperty("notify_by_email").GetBoolean() && json.RootElement.GetProperty("unread_notifications").GetInt64() >= 2,
+            "the preference shows on the session, and both assignments are in the inbox whether or not they were mailed");
+    }
+    bobAgain.Dispose();
 
     smtpLife.Cancel();
     smtp.Stop();
