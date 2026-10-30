@@ -218,11 +218,12 @@ command line. Authentication is PLAIN or LOGIN. The forge prints what it is doin
 MAIL: off; a forgotten password is reset by an administrator's link
 ```
 
-The only message the forge sends today is a password reset link, to the address on the account, valid for an
-hour and once. Delivery is queued and retried three times; a message that cannot be delivered is logged to
-the error output and dropped. Nothing waits for the mail server.
+The forge sends two kinds of message: a password reset link, to the address on the account, valid for an
+hour and once; and, for a person who turned it on under Profile and Email, a copy of each entry in their
+inbox. Delivery is queued and retried three times; a message that cannot be delivered is logged to the error
+output and dropped. Nothing waits for the mail server, and the inbox is the same whether or not it exists.
 
-See [ADR 0032](decisions/0032-email-is-optional.md).
+See [ADR 0032](decisions/0032-email-is-optional.md) and [ADR 0033](decisions/0033-notifications.md).
 
 ### Optional Git over SSH
 

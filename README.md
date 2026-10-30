@@ -43,6 +43,15 @@ forgotten password is reset with a one-time link an administrator makes and hand
 never knows the password the person chooses. With a mail server, the sign-in page lets people ask for that
 link themselves, sent to the address on their account. See [ADR 0032](docs/decisions/0032-email-is-optional.md).
 
+What needs you arrives in an inbox, with or without mail: being assigned, being asked to review, and whatever
+happens to an issue or proposal you are part of, written in the same transaction as the event and read from the
+bell in the header, `/-/notifications`, or GitLab's `/api/v4/todos`. A message per entry is a preference, off
+by default, and only ever a copy of the inbox. See [ADR 0033](docs/decisions/0033-notifications.md).
+
+An account can ask for a code from an authenticator app after its password. The factor is the app and nothing
+else: no email, no phone number, recovery codes for the day the app is gone, and an administrator to remove it
+for the person who lost both. Tokens and SSH keys are unaffected. See [ADR 0034](docs/decisions/0034-second-factor.md).
+
 Status as of **2026-10-22**: Graft hosts the conversation about the code, not just the code. A project now
 has issues, merge requests and comments on both, numbered from one within that project. Reading them
 follows the repository, so a public project's issues are readable by a stranger; writing on them needs

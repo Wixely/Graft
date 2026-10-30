@@ -15,6 +15,9 @@ public readonly record struct ApiResult(bool Ok, string Message)
 /// <summary>A mutation outcome with a deserialized response body.</summary>
 public readonly record struct ApiResult<T>(bool Ok, string Message, T? Value);
 
+/// <summary>What a password earned: a session, a challenge for the second step, or a refusal with its reason.</summary>
+public readonly record struct SignInOutcome(bool Ok, string Message, string? Challenge);
+
 /// <summary>
 /// Session-aware API access for the browser client. Every Graft mutation requires the session cookie plus the
 /// matching <c>X-Graft-CSRF</c> header, so that pairing lives here instead of in each page. The session itself
@@ -174,6 +177,52 @@ public sealed class GraftApi(HttpClient http)
                 : ApiResult.Refused(response.StatusCode == HttpStatusCode.TooManyRequests
                     ? "Too many attempts. Wait and try again."
                     : await ReadMessageAsync(response, cancellationToken));
+        }
+        catch (HttpRequestException) { Reachable = false; return ApiResult.Refused(Unreachable); }
+    }
+
+    /// <summary>
+    /// The first step of a sign-in. Either a session, or a challenge for the second step when the account
+    /// signs in with an authenticator app as well, or a refusal.
+    /// </summary>
+    public async Task<SignInOutcome> SignInAsync(string username, string password, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            using HttpResponseMessage response = await http.PostAsJsonAsync("api/login",
+                new LoginRequest(username, password), ApiJson.Default.LoginRequest, cancellationToken);
+            if (response.StatusCode == HttpStatusCode.Unauthorized)
+            {
+                SecondFactorChallengeResponse? challenge = null;
+                try { challenge = await response.Content.ReadFromJsonAsync(ApiJson.Default.SecondFactorChallengeResponse, cancellationToken); }
+                catch (System.Text.Json.JsonException) { }
+                if (challenge is { Error: "second-factor", Challenge.Length: > 0 }) return new(false, "", challenge.Challenge);
+                return new(false, "Username or password was not accepted.", null);
+            }
+            if (!response.IsSuccessStatusCode)
+                return new(false, response.StatusCode == HttpStatusCode.TooManyRequests ? "Too many sign-in attempts. Wait and try again." : "Sign-in failed.", null);
+            await RefreshSessionAsync(cancellationToken);
+            return new(true, "Signed in.", null);
+        }
+        catch (HttpRequestException) { Reachable = false; return new(false, Unreachable, null); }
+    }
+
+    /// <summary>The second step: the challenge from the first and a code from the app or a recovery code.</summary>
+    public async Task<ApiResult> CompleteSignInAsync(string challenge, string code, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            using HttpResponseMessage response = await http.PostAsJsonAsync("api/login/second-factor",
+                new SecondFactorLoginRequest(challenge, code), ApiJson.Default.SecondFactorLoginRequest, cancellationToken);
+            if (!response.IsSuccessStatusCode)
+                return ApiResult.Refused(response.StatusCode switch
+                {
+                    HttpStatusCode.Unauthorized => "The code was not accepted. Start again from your password.",
+                    HttpStatusCode.TooManyRequests => "Too many attempts. Wait and try again.",
+                    _ => "Sign-in failed."
+                });
+            await RefreshSessionAsync(cancellationToken);
+            return ApiResult.Accepted("Signed in.");
         }
         catch (HttpRequestException) { Reachable = false; return ApiResult.Refused(Unreachable); }
     }

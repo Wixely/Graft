@@ -1,0 +1,146 @@
+@page "/-/notifications"
+@inject GraftApi Api
+@inject NavigationManager Navigation
+
+@* The inbox: what happened that concerns the signed-in person. Opening an entry marks it read and goes to the
+   issue or proposal it is about; nothing here is deleted, only read. The inbox is the same on a server that
+   sends mail and one that does not; mail is a copy of it, chosen under Profile and Email. *@
+
+<PageTitle>Notifications &middot; Graft</PageTitle>
+
+@if (loading)
+{
+    <p role="status" class="secondary-text">Loading…</p>
+}
+else if (!Api.Authenticated)
+{
+    <div class="page-header"><div><h1>Notifications</h1><p class="subtitle">Sign in to see what concerns you.</p></div></div>
+}
+else
+{
+    <div class="page-header">
+        <div>
+            <h1>Notifications</h1>
+            <p class="subtitle">
+                @(unread == 0 ? "Nothing unread." : unread == 1 ? "One unread." : $"{unread} unread.")
+                Being assigned, asked to review, and whatever happens to an issue or proposal you are part of.
+            </p>
+        </div>
+        <div class="page-header-actions">
+            <button type="button" class="secondary" @onclick="ToggleFilter" disabled="@busy">@(unreadOnly ? "Show all" : "Show unread only")</button>
+            @if (unread > 0)
+            {
+                <button type="button" class="secondary" @onclick="ReadAll" disabled="@busy">Mark all read</button>
+            }
+        </div>
+    </div>
+
+    <Banner Message="@message" Kind="error" />
+
+    <div class="panel">
+        <div class="panel-header"><Icon Name="bell" /><h2>@(unreadOnly ? "Unread" : "All")</h2><span class="spacer"></span><span class="label">@total</span></div>
+        @if (items.Count == 0)
+        {
+            <p class="panel-empty">@(unreadOnly ? "Nothing unread." : "Nothing yet.")</p>
+        }
+        else
+        {
+            <div class="list">
+                @foreach (NotificationResponse note in items)
+                {
+                    <button type="button" class="list-item" @onclick="() => Open(note)" disabled="@busy">
+                        <Icon Name="@(note.TargetType == "Issue" ? "issue" : "merge")" />
+                        <span class="list-item-main">
+                            <strong>
+                                @if (note.ReadAt is null) { <span class="label">new</span> }
+                                @note.Actor @Verb(note.Action) @(note.TargetType == "Issue" ? "#" : "!")@note.Iid
+                            </strong>
+                            <small>@note.Title &middot; @note.ProjectPath &middot; @note.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")</small>
+                        </span>
+                        <Icon Name="chevron-right" />
+                    </button>
+                }
+            </div>
+        }
+    </div>
+}
+
+@code {
+    private List<NotificationResponse> items = [];
+    private long unread;
+    private long total;
+    private bool unreadOnly = true;
+    private string message = "";
+    private bool loading = true;
+    private bool busy;
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            if (!await Api.EnsureSessionAsync())
+            {
+                if (Api.Reachable) Navigation.NavigateTo("/-/login", replace: true);
+                return;
+            }
+            await Load();
+        }
+        finally { loading = false; }
+    }
+
+    private async Task Load()
+    {
+        NotificationsResponse? page = await Api.GetAsync($"api/notifications?unread={(unreadOnly ? "true" : "false")}&per_page=100",
+            ApiJson.Default.NotificationsResponse);
+        items = page?.Items.ToList() ?? [];
+        unread = page?.Unread ?? 0;
+        total = page?.Total ?? 0;
+    }
+
+    private async Task ToggleFilter()
+    {
+        unreadOnly = !unreadOnly;
+        await Load();
+    }
+
+    private async Task ReadAll()
+    {
+        if (busy) return;
+        busy = true;
+        try
+        {
+            ApiResult result = await Api.PostAsync("api/notifications/read-all", "");
+            if (!result.Ok) message = result.Message;
+            await Api.RefreshSessionAsync();
+            await Load();
+        }
+        finally { busy = false; }
+    }
+
+    /// <summary>Marks the entry read and goes where it points. The destination page applies its own rules
+    /// again, so an entry about something the reader can no longer see simply arrives at a refusal.</summary>
+    private async Task Open(NotificationResponse note)
+    {
+        if (busy) return;
+        busy = true;
+        try
+        {
+            if (note.ReadAt is null) await Api.PostAsync($"api/notifications/{note.Id}/read", "");
+            await Api.RefreshSessionAsync();
+            Navigation.NavigateTo(new Uri(note.TargetUrl).PathAndQuery);
+        }
+        finally { busy = false; }
+    }
+
+    private static string Verb(string action) => action switch
+    {
+        "assigned" => "assigned you",
+        "review_requested" => "asked you to review",
+        "commented" => "commented on",
+        "approved" => "approved",
+        "merged" => "merged",
+        "closed" => "closed",
+        "reopened" => "reopened",
+        _ => action
+    };
+}

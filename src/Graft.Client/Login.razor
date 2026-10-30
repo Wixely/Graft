@@ -17,6 +17,21 @@
 
     <div class="panel">
         <div class="panel-body">
+            @if (challenge is not null)
+            {
+                @* The password was accepted; the account signs in with an authenticator app as well. The
+                   challenge is spent by one attempt, right or wrong, so a wrong code starts again. *@
+                <form class="form" @onsubmit="Complete" @onsubmit:preventDefault>
+                    <label for="code">Code from your authenticator app, or a recovery code</label>
+                    <input id="code" autocomplete="one-time-code" inputmode="numeric" @bind="code" required maxlength="32" @ref="codeField" />
+                    <div class="form-actions">
+                        <button type="submit" disabled="@busy">@(busy ? "Signing in…" : "Sign in")</button>
+                        <button type="button" class="secondary" @onclick="StartOver" disabled="@busy">Start over</button>
+                    </div>
+                </form>
+            }
+            else
+            {
             <form class="form" @onsubmit="SignIn" @onsubmit:preventDefault>
                 <label for="username">Username</label>
                 <input id="username" autocomplete="username" @bind="username" required maxlength="39" @ref="usernameField" />
@@ -30,6 +45,7 @@
                 </div>
             </form>
             <p class="secondary-text"><a href="/-/forgot">Forgot your password?</a></p>
+            }
         </div>
     </div>
 </div>
@@ -74,7 +90,7 @@
     /// never interrupted by the caret jumping to the other.
     /// </para>
     /// </summary>
-    protected override async Task OnAfterRenderAsync(bool firstRender)
+    private async Task FocusAsync(bool firstRender)
     {
         if (!firstRender && !refocus) return;
         // A signed-in visitor is redirected away by OnInitializedAsync, and the element is gone by the time
@@ -95,12 +111,57 @@
         message = "";
         try
         {
-            ApiResult result = await Api.LoginAsync(username, password);
+            SignInOutcome outcome = await Api.SignInAsync(username, password);
             password = "";
+            if (outcome.Ok) { Navigation.NavigateTo("/", replace: true); return; }
+            if (outcome.Challenge is not null) { challenge = outcome.Challenge; focusCode = true; return; }
+            message = outcome.Message;
+            refocus = true;
+        }
+        finally { busy = false; }
+    }
+
+    /// <summary>The second step, when the account signs in with an authenticator app as well.</summary>
+    private string? challenge;
+    private string code = "";
+    private ElementReference codeField;
+    private bool focusCode;
+
+    private async Task Complete()
+    {
+        if (busy || challenge is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.CompleteSignInAsync(challenge, code.Trim());
+            code = "";
             if (result.Ok) { Navigation.NavigateTo("/", replace: true); return; }
+            // The challenge is spent by the attempt; the password step comes round again.
+            challenge = null;
             message = result.Message;
             refocus = true;
         }
         finally { busy = false; }
+    }
+
+    private void StartOver()
+    {
+        challenge = null;
+        code = "";
+        message = "";
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (focusCode)
+        {
+            focusCode = false;
+            try { await codeField.FocusAsync(); }
+            catch (Microsoft.JSInterop.JSException) { }
+            catch (InvalidOperationException) { }
+            return;
+        }
+        await FocusAsync(firstRender);
     }
 }

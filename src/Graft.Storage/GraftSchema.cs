@@ -4,7 +4,7 @@ namespace Graft.Storage;
 
 public static class GraftSchema
 {
-    public static DnaXMigrationManifest Manifest { get; } = new(19,
+    public static DnaXMigrationManifest Manifest { get; } = new(21,
     [
         DnaXMigration.Sql(1, "initial-identity-project-schema", "Create identity and private project schema", """
             CREATE TABLE Users (
@@ -646,6 +646,51 @@ public static class GraftSchema
             );
 
             CREATE INDEX IX_PasswordResets_User ON PasswordResets(UserId, Id);
+            """),
+        // Notifications.
+        //
+        // An inbox row per person per event, written in the transaction that caused it, so the inbox is as true
+        // as the audit trail. Email is a preference of the person, off by default, and only ever a copy of
+        // what is in the inbox: a server that sends nothing has the same rows.
+        DnaXMigration.Sql(20, "notifications", "An inbox of what concerns a person, and whether to email it too", """
+            CREATE TABLE Notifications (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                UserId INTEGER NOT NULL REFERENCES Users(Id) ON DELETE CASCADE,
+                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                Action TEXT NOT NULL,
+                SubjectType TEXT NOT NULL CHECK (SubjectType IN ('issue', 'merge_request')),
+                SubjectIid INTEGER NOT NULL,
+                Title TEXT NOT NULL,
+                ActorUserId INTEGER NULL REFERENCES Users(Id) ON DELETE SET NULL,
+                CreatedAtUtc TEXT NOT NULL,
+                ReadAtUtc TEXT NULL
+            );
+
+            CREATE INDEX IX_Notifications_User ON Notifications(UserId, ReadAtUtc, Id);
+
+            ALTER TABLE Users ADD COLUMN NotifyByEmail INTEGER NOT NULL DEFAULT 0 CHECK (NotifyByEmail IN (0, 1));
+            """),
+        // A second factor.
+        //
+        // One time-based secret per account, pending until the first code proves the app holds it, and a set of
+        // recovery codes kept as digests, each good once. Nothing here involves email: the factor is the app.
+        DnaXMigration.Sql(21, "second-factor", "An authenticator-app second factor with recovery codes", """
+            CREATE TABLE SecondFactors (
+                UserId INTEGER NOT NULL PRIMARY KEY REFERENCES Users(Id) ON DELETE CASCADE,
+                Secret TEXT NOT NULL,
+                CreatedAtUtc TEXT NOT NULL,
+                EnabledAtUtc TEXT NULL,
+                LastStep INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE RecoveryCodes (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                UserId INTEGER NOT NULL REFERENCES Users(Id) ON DELETE CASCADE,
+                CodeDigest TEXT NOT NULL UNIQUE,
+                UsedAtUtc TEXT NULL
+            );
+
+            CREATE INDEX IX_RecoveryCodes_User ON RecoveryCodes(UserId);
             """)
     ]);
 }

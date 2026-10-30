@@ -10,7 +10,8 @@ public sealed record UserResponse(
     bool Locked,
     [property: JsonPropertyName("web_url")] string WebUrl,
     [property: JsonPropertyName("avatar_url")] string? AvatarUrl,
-    string? Email = null);
+    string? Email = null,
+    [property: JsonPropertyName("two_factor_enabled")] bool TwoFactorEnabled = false);
 
 public sealed record NamespaceResponse(
     long Id,
@@ -123,10 +124,17 @@ public sealed record SessionResponse(
     /// business, and the page says so rather than promising a message that will never come.</summary>
     bool MailAvailable = false,
     /// <summary>The caller's own email address, when one is set. Null for an anonymous caller or none.</summary>
-    string? Email = null);
+    string? Email = null,
+    /// <summary>How many inbox entries the caller has not read. Zero for an anonymous caller.</summary>
+    [property: JsonPropertyName("unread_notifications")] long UnreadNotifications = 0,
+    /// <summary>Whether the caller asked for a message for each notification.</summary>
+    [property: JsonPropertyName("notify_by_email")] bool NotifyByEmail = false,
+    /// <summary>Whether the caller signs in with an authenticator app as well as a password.</summary>
+    [property: JsonPropertyName("second_factor_enabled")] bool SecondFactorEnabled = false);
 public sealed record LoginRequest(string Username, string Password);
 public sealed record UserCreateRequest(string Username, string Password);
-public sealed record UserAccountResponse(long Id, string Username, bool IsAdministrator, bool Disabled, string? Email = null);
+public sealed record UserAccountResponse(long Id, string Username, bool IsAdministrator, bool Disabled, string? Email = null,
+    [property: JsonPropertyName("second_factor_enabled")] bool SecondFactorEnabled = false);
 /// <summary>Sets or clears an email address. Null or empty clears it.</summary>
 public sealed record EmailChangeRequest(string? Email);
 /// <summary>Asks for a password reset by username or email. Answered the same whether or not it names anyone.</summary>
@@ -135,6 +143,56 @@ public sealed record ForgotPasswordRequest(string? Login);
 public sealed record PasswordResetCompleteRequest(string? Secret, string? NewPassword);
 /// <summary>A reset link an administrator made, shown once.</summary>
 public sealed record PasswordResetLinkResponse(string Url, [property: JsonPropertyName("expires_at")] DateTimeOffset ExpiresAt);
+
+/// <summary>One inbox entry: what happened, to which issue or proposal, where, by whom, and whether it has been read.</summary>
+public sealed record NotificationResponse(
+    long Id,
+    string Action,
+    [property: JsonPropertyName("target_type")] string TargetType,
+    long Iid,
+    string Title,
+    [property: JsonPropertyName("project_path")] string ProjectPath,
+    [property: JsonPropertyName("target_url")] string TargetUrl,
+    string Actor,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt,
+    [property: JsonPropertyName("read_at")] DateTimeOffset? ReadAt);
+
+public sealed record NotificationsResponse(IReadOnlyList<NotificationResponse> Items, long Unread, long Total);
+
+/// <summary>Whether to send a message for each notification as well as keeping it in the inbox.</summary>
+public sealed record NotifyByEmailRequest(bool Enabled);
+
+/// <summary>An enrolment in progress: the secret for the authenticator app and the otpauth address that carries it.</summary>
+public sealed record SecondFactorSetupResponse(string Secret, [property: JsonPropertyName("otpauth_uri")] string OtpauthUri);
+/// <summary>A six-digit code from the app, or a recovery code.</summary>
+public sealed record SecondFactorCodeRequest(string? Code);
+/// <summary>Turning the factor off needs the password and a current code, so a stolen session cannot do it.</summary>
+public sealed record SecondFactorDisableRequest(string? Password, string? Code);
+/// <summary>The recovery codes, shown once, at enrolment.</summary>
+public sealed record RecoveryCodesResponse([property: JsonPropertyName("recovery_codes")] string[] RecoveryCodes);
+/// <summary>Finishing a sign-in whose password was accepted but whose account owes a second factor.</summary>
+public sealed record SecondFactorLoginRequest(string? Challenge, string? Code);
+/// <summary>The sign-in answer when a second factor is owed: a handle for the second step, and nothing else.</summary>
+public sealed record SecondFactorChallengeResponse(string Error, string Challenge);
+
+/// <summary>GitLab's to-do item, as far as Graft's notifications map onto it.</summary>
+public sealed record TodoResponse(
+    long Id,
+    TodoProjectResponse Project,
+    TodoAuthorResponse Author,
+    [property: JsonPropertyName("action_name")] string ActionName,
+    [property: JsonPropertyName("target_type")] string TargetType,
+    TodoTargetResponse Target,
+    [property: JsonPropertyName("target_url")] string TargetUrl,
+    string Body,
+    string State,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt,
+    [property: JsonPropertyName("updated_at")] DateTimeOffset UpdatedAt);
+
+public sealed record TodoProjectResponse(long Id, string Name, string Path, [property: JsonPropertyName("path_with_namespace")] string PathWithNamespace,
+    [property: JsonPropertyName("web_url")] string WebUrl);
+public sealed record TodoAuthorResponse(string Username, string Name, string State = "active");
+public sealed record TodoTargetResponse(long Iid, string Title, [property: JsonPropertyName("web_url")] string WebUrl);
 public sealed record PasswordChangeRequest(string CurrentPassword, string NewPassword);
 public sealed record PasswordResetRequest(string NewPassword);
 public sealed record TokenCreateRequest(string Name, string[] Scopes, int ExpiresInDays);
@@ -1069,6 +1127,16 @@ public sealed record MergeRequestChangesResponse(
 [JsonSerializable(typeof(ForgotPasswordRequest))]
 [JsonSerializable(typeof(PasswordResetCompleteRequest))]
 [JsonSerializable(typeof(PasswordResetLinkResponse))]
+[JsonSerializable(typeof(NotificationsResponse))]
+[JsonSerializable(typeof(NotifyByEmailRequest))]
+[JsonSerializable(typeof(SecondFactorSetupResponse))]
+[JsonSerializable(typeof(SecondFactorCodeRequest))]
+[JsonSerializable(typeof(SecondFactorDisableRequest))]
+[JsonSerializable(typeof(RecoveryCodesResponse))]
+[JsonSerializable(typeof(SecondFactorLoginRequest))]
+[JsonSerializable(typeof(SecondFactorChallengeResponse))]
+[JsonSerializable(typeof(TodoResponse))]
+[JsonSerializable(typeof(TodoResponse[]))]
 [JsonSerializable(typeof(CommitDiffResponse))]
 [JsonSerializable(typeof(UploadIngestRequest))]
 [JsonSerializable(typeof(BundleInventoryResponse))]

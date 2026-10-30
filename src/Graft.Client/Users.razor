@@ -61,6 +61,15 @@ else
                     <span class="list-item-actions">
                         @if (!user.Disabled && user.Username != Api.Username)
                         {
+                            @if (user.SecondFactorEnabled)
+                            {
+                                @* For the person who lost the app and the recovery codes. Two clicks: afterwards
+                                   their password alone signs in until they enrol again. *@
+                                <button type="button" class="@(pendingFactorRemoval == user.Id ? "danger" : "secondary")"
+                                        @onclick="() => RemoveSecondFactor(user)" disabled="@busy">
+                                    @(pendingFactorRemoval == user.Id ? "Confirm remove two-factor" : "Remove two-factor")
+                                </button>
+                            }
                             <button type="button" class="@(pendingDisable == user.Id ? "danger" : "secondary")"
                                     @onclick="() => DisableUser(user)" disabled="@busy">
                                 @(pendingDisable == user.Id ? "Confirm disable" : "Disable")
@@ -265,6 +274,24 @@ else
                 $"{user.Username} disabled. Their sessions and tokens were revoked.");
             pendingDisable = null;
             Report(result);
+            await LoadUsers();
+        }
+        finally { busy = false; }
+    }
+
+    private long? pendingFactorRemoval;
+
+    private async Task RemoveSecondFactor(UserAccountResponse user)
+    {
+        if (pendingFactorRemoval != user.Id) { pendingFactorRemoval = user.Id; return; }
+        if (busy) return;
+        busy = true;
+        message = "";
+        pendingFactorRemoval = null;
+        try
+        {
+            Report(await Api.DeleteAsync($"api/users/{user.Id}/second-factor",
+                $"{user.Username}'s two-factor sign-in was removed. Their password alone signs in until they enrol again."));
             await LoadUsers();
         }
         finally { busy = false; }
