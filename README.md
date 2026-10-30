@@ -188,9 +188,9 @@ frame with a policy of its own; the main document's policy is unchanged.
 A [commit page](docs/validation/2026-10-09-commit-diff.md) shows what changed, behind the
 `/-/commit/<sha>` links the API had been handing out with nothing behind them. The diff is computed on the object model rather than by invoking Git, and is measured
 against Git rather than assumed to match it: `tests/Graft.Diff.Fuzz` generates file pairs and compares every
-result, currently agreeing on **99%** of cases with `git diff -c diff.indentHeuristic=false` and **95%** with
-Git's default output. The difference between those two figures is Git's indent heuristic, which Graft does
-not implement; that is queued, not hidden.
+result, agreeing on about **99%** of cases with `git diff` at its default settings. Graft's placement of a
+change is a port of Git's own compaction step, indent heuristic included, since 2026-10-30; the residual is
+Git's search settling on a different script of the same length, which placement cannot reconcile.
 
 A clone menu offers the HTTPS URL, ready `git clone` commands including a single-branch one, and handoff to
 Visual Studio Code and Visual Studio. [Third-party notices](THIRD-PARTY-NOTICES.md) are embedded in the
@@ -212,6 +212,26 @@ behaviour needs a machine with the C++ build tools.
 A single Linux x64 NativeAOT executable, statically linked with musl, SQLite, OpenSSL and ICU, passed all six compatibility checks on the required **Linux 3.10.108 x86_64** host. Dapper.AOT query generation, full globalization and ASP.NET Core loopback HTTPS were exercised. No Docker, runtime installation, kernel upgrade or system-library replacement was required. [Acceptance evidence](docs/validation/2026-09-18-nativeaot.md) records the exact boundary.
 
 The earlier self-contained CoreCLR build failed there because host libraries lacked `GLIBC_2.27`. Do not confuse single-file packaging, self-contained CoreCLR, Dapper.AOT generation and NativeAOT compilation.
+
+## Cloning and pushing with Git
+
+Graft serves Git over HTTPS. A public or unlisted project clones with no credentials. Anything else, and
+every push, authenticates with HTTP Basic where the **password is a personal access token**, never the
+account password. A password is refused before any lookup happens.
+
+1. Sign in, open **Profile and tokens** and create a token. Pushing needs the `write_repository` or `api`
+   scope; cloning a private project needs `read_repository` or better.
+2. When Git prompts, give your username and paste the token as the password. The token is shown once; it
+   begins `graft_pat_`.
+
+If a push fails and keeps failing with no prompt, a credential helper has cached the refused password and is
+replaying it. Clear it and try again:
+
+```text
+printf "protocol=https\nhost=<your graft host>\n\n" | git credential reject
+```
+
+The clone menu on every repository says the same thing, so this is not the only place to find out.
 
 ## Run the existing experiment
 

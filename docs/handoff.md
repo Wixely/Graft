@@ -1,6 +1,32 @@
 # Next-agent handoff
 
-Updated: 2026-10-29. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
+Updated: 2026-10-30. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
+
+## Added on 2026-10-30: the three small things, before the large list
+
+The user asked what was left and then said: fix the three small things first, then build SSH, email as an
+option with a non-email self-hosted path behind a config switch, groups and nested namespaces, and the
+project-scoped audit view, in that order. This entry is the three small things; the four large ones follow
+as their own entries and decision records as each lands.
+
+- **`features` in `.graft/project.json`** names the seven surfaces that exist, by GitLab's names, and each
+  is a link to `/projects/<slug>/-/<feature>` offered only to a reader the project's own collaboration rule
+  admits, decided per request. A name is never a grant. An unknown name is still an error and unpublishes
+  the page. [project-pages.md](project-pages.md#features); the page view shows the links in a panel.
+- **The token nobody was told about.** The clone menu says, under the clone command, that the password Git
+  asks for is a personal access token and names the scope a push needs. The readme has a section on cloning
+  and pushing with the `git credential reject` recipe for a helper that cached the refusal.
+- **Git's indent heuristic.** `RepositoryDiff` no longer has its own two normalisation passes. Group
+  placement is a port of Git's `xdl_change_compact`, walking both sides' groups in lockstep, bringing a
+  group back to the last position level with a change on the other side, and otherwise scoring candidate
+  splits with Git's weights and bounds. On six seeds not used while writing it, 1,758 pairs, agreement with
+  `git diff` at its defaults is 99.3%, from 95%. With Git's heuristic turned off and Graft's on, agreement
+  falls to 95.9%, which is the heuristic doing its work. The residual was read from the shrunk failures: Git's
+  divide-and-conquer search picks a different script of the same length, such as matching the other of two
+  repeated lines, and no placement reconciles that. Closing it would mean porting `xdl_split` as well.
+
+Git suite 947 to 951 managed. The native publish was not repeated for this entry. No migration, no new
+route, no new tool.
 
 ## Added on 2026-10-29, third entry: deleting a file, and rotating a token
 
@@ -760,9 +786,9 @@ invoking Git, with Myers line comparison, three lines of context, and caps for b
 
 **The diff is measured against Git, not assumed to match it.** `tests/Graft.Diff.Fuzz` generates file pairs
 from a deliberately repetitive alphabet, because repeated and blank lines are what make a change's placement
-ambiguous, and compares every result with `git diff`. Agreement is 99% against
-`git diff -c diff.indentHeuristic=false` and 95% against Git's default. The gap between those two is Git's
-indent heuristic, which this does not implement; it is in the queue below with a concrete acceptance test.
+ambiguous, and compares every result with `git diff`. At the time of this entry agreement was 99% against
+`git diff -c diff.indentHeuristic=false` and 95% against Git's default. The gap between those two was Git's
+indent heuristic, implemented on 2026-10-30; see the entry of that date.
 
 Writing that harness paid for itself three times. It found that a minimal diff is not enough to agree with
 Git, which led to the two normalisation passes now in the engine. It then showed that an early version of
@@ -832,7 +858,7 @@ Continue to use the ignored reproducible DnaX feed until the user or DnaX mainta
 | ~~Project ownership continuity~~ | Done 2026-10-04 | [Evidence](validation/2026-10-04-project-ownership.md): transfer is owner-or-administrator only, and an account owning projects cannot be disabled |
 | ~~`.graft` config and file allowlist~~ | Done 2026-10-20 | [Evidence](validation/2026-10-20-project-pages.md) |
 | ~~Custom static site on a pages origin~~ | Done 2026-10-20 | [Evidence](validation/2026-10-20-project-pages.md) |
-| Git's indent heuristic in the diff | Implementation agent | `tests/Graft.Diff.Fuzz` agrees with `git diff` at its default settings as closely as it already does with the heuristic turned off |
+| ~~Git's indent heuristic in the diff~~ | Done 2026-10-30 | `tests/Graft.Diff.Fuzz` agrees with `git diff` at its default settings on 99.3% of 1,758 fresh pairs, against 95% before; the normalisation is now a port of Git's `xdl_change_compact` |
 | ~~Line-level comments on a diff~~ | Done 2026-10-22 | [Evidence](validation/2026-10-22-review.md): anchored to a file, line, side and commit, and reported as outdated rather than moved |
 | Replies, threads and resolving a conversation | Implementation agent | A reviewer can reply under a line comment and mark the conversation settled, with a rule for who may settle it |
 | Markdig under NativeAOT | User + implementation agent | `tests/Graft.Git.Acceptance` passes against a published NativeAOT server built where the C++ workload exists |

@@ -439,7 +439,8 @@ async Task CheckProjectPages(string address, AuthenticatedIdentity alice, string
     Directory.CreateDirectory(Path.Combine(source, "src"));
     File.WriteAllText(Path.Combine(source, ".graft", "project.json"), """
         {"version":1,"page":{"title":"Sample","description":"Curated.","readme":"README.md",
-         "files":["README.md","docs/**/*.md"],"site":{"root":"site","index":"index.html"}}}
+         "files":["README.md","docs/**/*.md"],"features":["issues","wiki","issues"],
+         "site":{"root":"site","index":"index.html"}}}
         """);
     File.WriteAllText(Path.Combine(source, "README.md"), "# Sample\n\nCurated page.\n");
     File.WriteAllText(Path.Combine(source, "docs", "guide.md"), "# Guide\n");
@@ -478,7 +479,27 @@ async Task CheckProjectPages(string address, AuthenticatedIdentity alice, string
         Check(json.RootElement.GetProperty("readme").ValueKind != JsonValueKind.Null, "the named readme is rendered");
         Check(json.RootElement.GetProperty("site_url").GetString()!.Contains(PagesHost, StringComparison.Ordinal),
             "and the site is advertised on the pages origin, not this one");
+        Check(json.RootElement.GetProperty("features").GetArrayLength() == 0,
+            "the features the config named are not offered to a reader the project itself would refuse");
     }
+
+    // The same page once the project is public: the features become links, each named once, at the
+    // project's shareable address. A feature is a link and never a grant, so the page could not have shown
+    // them above however the config was written.
+    await using (GraftStore fixture = await GraftStore.OpenAsync(databasePath))
+        await fixture.SetProjectVisibilityAsync(alice, pageProjectId, ProjectVisibility.Public);
+    using (HttpResponseMessage page = await PagesGet(address, null, "/api/graft/pages/" + slug))
+    {
+        using JsonDocument json = JsonDocument.Parse(await page.Content.ReadAsStreamAsync());
+        var features = json.RootElement.GetProperty("features").EnumerateArray()
+            .Select(entry => (Name: entry.GetProperty("name").GetString(), Url: entry.GetProperty("url").GetString())).ToArray();
+        Check(features.Length == 2 && features[0].Name == "issues" && features[1].Name == "wiki",
+            "a public project's page links to the features its config named, once each");
+        Check(features[0].Url == "/projects/" + slug + "/-/issues" && features[1].Url == "/projects/" + slug + "/-/wiki",
+            "at the project's shareable address, which names no account");
+    }
+    await using (GraftStore fixture = await GraftStore.OpenAsync(databasePath))
+        await fixture.SetProjectVisibilityAsync(alice, pageProjectId, ProjectVisibility.Private);
 
     // Files, through the page. Named paths only.
     using (HttpResponseMessage allowed = await PagesGet(address, null, "/api/graft/pages/" + slug + "/files/" + Uri.EscapeDataString("docs/guide.md")))
@@ -576,6 +597,16 @@ async Task CheckProjectPages(string address, AuthenticatedIdentity alice, string
               policy.Any(value => value.Contains("frame-ancestors 'none'", StringComparison.Ordinal)),
             "and cannot be framed");
     }
+
+    // A feature Graft does not have is an error, so a config cannot appear to expose something that is not
+    // there, and the page goes down with it until the config is corrected.
+    File.WriteAllText(Path.Combine(source, ".graft", "project.json"), """{"version":1,"page":{"features":["pipelines"]}}""");
+    await Git(source, ["add", "."]);
+    await Git(source, ["commit", "-m", "Name a feature that does not exist"]);
+    await Git(source, ["push", AuthenticatedUrl(address, "alice", grant.Secret, "alice/pagesample.git"), "main"]);
+    using (HttpResponseMessage unknownFeature = await PagesGet(address, null, "/api/graft/pages/" + slug))
+        Check(unknownFeature.StatusCode == System.Net.HttpStatusCode.NotFound,
+            "a config naming a feature Graft does not have unpublishes the page");
 
     // An invalid config unpublishes the page rather than serving it with defaults.
     File.WriteAllText(Path.Combine(source, ".graft", "project.json"), """{"page":{"flies":["*"]}}""");

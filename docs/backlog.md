@@ -79,6 +79,21 @@ The collaboration depth list from the 2026-10-28 review, taken on as one piece o
   the mark in the alert and the lines on the repository, and turning the chevrons and the check into wedges.
   No decision record: it was a defect, and the backlog entry had already said one side had to change.
 
+## Closed on 2026-10-30
+
+The three small things the 2026-10-30 review of what was left found, fixed before the larger list below was
+taken on in the order the user gave: SSH, optional email, groups, the project-scoped audit view.
+
+- **`features` in `.graft/project.json`.** Every name was an error because there was nothing to name. The
+  seven surfaces that exist are now names, and a name is a link offered only to a reader the project would
+  admit, never a grant. [Project pages](project-pages.md#features).
+- **Pushing needs a token and nothing said so.** The clone menu now says it where Git asks for the
+  password, and the readme has a section on cloning and pushing, including how to clear a credential helper
+  that cached the refused password.
+- **Git's indent heuristic.** The diff's two home-grown normalisation passes were replaced by a port of
+  Git's `xdl_change_compact`, heuristic included. Agreement with `git diff` at its defaults went from 95% to
+  99.3% over 1,758 fresh pairs. The residual is Git's search choosing a different script of the same length.
+
 ## Near, and small
 
 Nothing is here at the moment. Everything below needs a decision before it is built.
@@ -119,9 +134,6 @@ These are recorded so nobody reopens them as oversights. Each has a decision rec
 - **Account administration, password resets and token issue over the agent surface.** Withheld.
   [ADR 0011](decisions/0011-agent-parity.md).
 - **Recoverable token secrets off by default.** [ADR 0012](decisions/0012-recoverable-tokens.md).
-- **`features` in `.graft/project.json`.** Parses, and naming anything is an error, because a config
-  claiming to expose issues had to fail loudly while there were no issues. Now that there are, this is
-  worth revisiting. [Project pages](project-pages.md).
 - **Project sites need a second hostname.** No single-hostname fallback.
   [ADR 0006](decisions/0006-project-pages-and-public-browsing.md).
 - **A line comment ages rather than moves.** When the branch changes it is reported as outdated instead of
