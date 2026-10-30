@@ -52,18 +52,16 @@ public sealed record CommitDiff(
 /// <para>
 /// A minimal script is not by itself enough to agree with Git. Where a change sits beside lines identical
 /// to the ones it touches, several equally minimal scripts exist, so after the comparison each group of
-/// changed lines is slid as far down its file as the content allows, and then pulled back up to sit against
-/// whatever the other file changes in the same place. Those two passes are what turn a correct diff into
-/// the same diff a reader sees from <c>git diff</c>.
+/// changed lines is moved to where Git would put it. That normalisation is a port of Git's own
+/// <c>xdl_change_compact</c>, including the indent heuristic Git has applied by default since 2.14, which
+/// chooses among the legal positions of a group by scoring the indentation around each candidate split.
 /// </para>
 ///
 /// <para>
-/// Measured against real Git over generated file pairs built from a deliberately repetitive alphabet, the
-/// two passes agree with Git on 99% of cases once Git's indent heuristic is turned off, which is the
-/// like-for-like comparison because this does not implement that heuristic. Against Git's default output
-/// agreement is about 95%, and the difference between those two figures is the heuristic: a scoring pass
-/// Git has applied since 2.14 that prefers to split a run of changes at a line whose indentation makes the
-/// result easier to read. Implementing it is recorded as follow-on work.
+/// Measured against real Git over generated file pairs built from a deliberately repetitive alphabet, this
+/// agrees with <c>git diff</c> at its default settings on about 99% of cases. What remains is not placement:
+/// Git's divide-and-conquer search sometimes settles on a different script of the same length, such as
+/// matching a different one of two repeated lines, and no amount of sliding turns one into the other.
 /// </para>
 ///
 /// <para>
@@ -313,11 +311,11 @@ public static class RepositoryDiff
         Myers(oldKeys[prefix..(oldKeys.Length - suffix)], newKeys[prefix..(newKeys.Length - suffix)],
             oldChanged, newChanged, prefix);
 
-        // Trimming the common ends above fixes those lines as context, but sliding below works on the whole
-        // arrays, so a group is still free to move across the boundary if that is where it belongs.
-        Compact(oldKeys, oldChanged);
-        Compact(newKeys, newChanged);
-        while (Align(oldKeys, oldChanged, newKeys, newChanged)) { }
+        // Trimming the common ends above fixes those lines as context, but compaction below works on the
+        // whole arrays, so a group is still free to move across the boundary if that is where it belongs.
+        // Each side is compacted against the other in turn, in the order Git does it.
+        Compact(oldKeys, oldChanged, Indents(oldLines.Texts), newChanged);
+        Compact(newKeys, newChanged, Indents(newLines.Texts), oldChanged);
 
         List<DiffLine> script = [];
         int i = 0;
@@ -344,121 +342,279 @@ public static class RepositoryDiff
     }
 
     /// <summary>
-    /// Slides each group of changed lines as far down its file as it can legally go, joining it to the next
-    /// group when they meet.
+    /// Normalises where each group of changed lines sits, following Git's <c>xdl_change_compact</c> step
+    /// for step so that the output is the one <c>git diff</c> shows.
     ///
     /// <para>
     /// A group can move whenever the line just past it is identical to the line at its other edge: deleting
-    /// the first of two identical lines and deleting the second produce the same file. Git normalises that
-    /// freedom so a diff does not wander, and this reproduces the normalisation.
+    /// the first of two identical lines and deleting the second produce the same file. For each group this
+    /// slides it as far up as it can go and then as far down, merging whatever other groups it bumps into.
+    /// If nothing moved, the group stays. If at some position on the way it sat level with a change in the
+    /// other file, it is brought back to the lowest such position, so a substitution reads as one edit rather
+    /// than a deletion a few lines from its insertion. Otherwise the indent heuristic chooses among the
+    /// positions, which is what Git has done by default since 2.14.
+    /// </para>
+    ///
+    /// <para>
+    /// The two sides are walked in lockstep as sequences of groups, where a group also exists, empty, between
+    /// every two unchanged lines. That is what lets "the change the other file makes in the same place" be
+    /// found by counting rather than by searching, and it is why each slide here moves a cursor on the other
+    /// side too.
     /// </para>
     /// </summary>
-    private static void Compact(string[] keys, bool[] changed)
+    private static void Compact(string[] keys, bool[] changed, int[] indents, bool[] otherChanged)
     {
-        int length = changed.Length;
-        int index = 0;
+        Group g = Group.First(changed);
+        Group go = Group.First(otherChanged);
+
         while (true)
         {
-            while (index < length && !changed[index]) index++;
-            if (index >= length) break;
-            int start = index;
-            while (index < length && changed[index]) index++;
-            int end = index;
-
-            bool joined;
-            do
+            if (g.End != g.Start)
             {
-                joined = false;
-                while (start > 0 && string.Equals(keys[start - 1], keys[end - 1], StringComparison.Ordinal))
+                int groupSize;
+                int earliestEnd;
+                int endMatchingOther;
+                do
                 {
-                    changed[--start] = true;
-                    changed[--end] = false;
-                    if (start > 0 && changed[start - 1])
-                    {
-                        while (start > 0 && changed[start - 1]) start--;
-                        joined = true;
-                    }
-                }
-                while (end < length && string.Equals(keys[end], keys[start], StringComparison.Ordinal))
-                {
-                    changed[start++] = false;
-                    changed[end++] = true;
-                    if (end < length && changed[end])
-                    {
-                        while (end < length && changed[end]) end++;
-                        joined = true;
-                    }
-                }
-            } while (joined);
+                    groupSize = g.End - g.Start;
+                    endMatchingOther = -1;
 
-            index = end;
+                    while (g.SlideUp(keys, changed))
+                        if (!go.Previous(otherChanged)) throw Desynchronised();
+                    earliestEnd = g.End;
+                    if (go.End > go.Start) endMatchingOther = g.End;
+
+                    while (g.SlideDown(keys, changed))
+                    {
+                        if (!go.Next(otherChanged)) throw Desynchronised();
+                        if (go.End > go.Start) endMatchingOther = g.End;
+                    }
+                } while (groupSize != g.End - g.Start);
+
+                if (g.End == earliestEnd)
+                {
+                    // Nowhere to move.
+                }
+                else if (endMatchingOther != -1)
+                {
+                    while (go.End == go.Start)
+                    {
+                        if (!g.SlideUp(keys, changed)) throw Desynchronised();
+                        if (!go.Previous(otherChanged)) throw Desynchronised();
+                    }
+                }
+                else
+                {
+                    // Every position the group may occupy implies two splits, one above it and one below.
+                    // Each split is scored on its own, the two are summed, and the lowest sum wins, with the
+                    // lower position taking a tie. Candidates are bounded to the group's own length plus one
+                    // and to a fixed distance, exactly as Git bounds them.
+                    int shift = Math.Max(earliestEnd, Math.Max(g.End - groupSize - 1, g.End - IndentHeuristicMaxSliding));
+                    int bestShift = -1;
+                    SplitScore best = default;
+                    for (; shift <= g.End; shift++)
+                    {
+                        SplitScore score = default;
+                        score.Add(MeasureSplit(indents, shift));
+                        score.Add(MeasureSplit(indents, shift - groupSize));
+                        if (bestShift == -1 || score.CompareTo(best) <= 0)
+                        {
+                            best = score;
+                            bestShift = shift;
+                        }
+                    }
+
+                    while (g.End > bestShift)
+                    {
+                        if (!g.SlideUp(keys, changed)) throw Desynchronised();
+                        if (!go.Previous(otherChanged)) throw Desynchronised();
+                    }
+                }
+            }
+
+            if (!g.Next(changed)) break;
+            if (!go.Next(otherChanged)) throw Desynchronised();
+        }
+
+        if (go.Next(otherChanged)) throw Desynchronised();
+    }
+
+    private static InvalidOperationException Desynchronised() =>
+        new("The two sides of the diff lost step while normalising group positions.");
+
+    /// <summary>
+    /// A run of changed lines on one side, or the empty run between two unchanged lines. <see cref="Start"/>
+    /// is the first changed line, <see cref="End"/> the first unchanged line after it; they are equal for an
+    /// empty group.
+    /// </summary>
+    private struct Group
+    {
+        public int Start;
+        public int End;
+
+        public static Group First(bool[] changed)
+        {
+            Group g = default;
+            while (g.End < changed.Length && changed[g.End]) g.End++;
+            return g;
+        }
+
+        /// <summary>Moves to the next group, which may be empty. False once already at the end of the file.</summary>
+        public bool Next(bool[] changed)
+        {
+            if (End == changed.Length) return false;
+            Start = End + 1;
+            for (End = Start; End < changed.Length && changed[End]; End++) { }
+            return true;
+        }
+
+        /// <summary>Moves to the previous group, which may be empty. False once already at the start.</summary>
+        public bool Previous(bool[] changed)
+        {
+            if (Start == 0) return false;
+            End = Start - 1;
+            for (Start = End; Start > 0 && changed[Start - 1]; Start--) { }
+            return true;
+        }
+
+        /// <summary>Slides the group one line down if the content allows, absorbing any group it meets.</summary>
+        public bool SlideDown(string[] keys, bool[] changed)
+        {
+            if (End >= keys.Length || !string.Equals(keys[Start], keys[End], StringComparison.Ordinal)) return false;
+            changed[Start++] = false;
+            changed[End++] = true;
+            while (End < changed.Length && changed[End]) End++;
+            return true;
+        }
+
+        /// <summary>Slides the group one line up if the content allows, absorbing any group it meets.</summary>
+        public bool SlideUp(string[] keys, bool[] changed)
+        {
+            if (Start <= 0 || !string.Equals(keys[Start - 1], keys[End - 1], StringComparison.Ordinal)) return false;
+            changed[--Start] = true;
+            changed[--End] = false;
+            while (Start > 0 && changed[Start - 1]) Start--;
+            return true;
         }
     }
 
-    /// <summary>
-    /// Pulls a group up so it sits against the change the other file makes in the same place, and reports
-    /// whether anything moved.
-    ///
-    /// <para>
-    /// Sliding leaves every group as low as it can go, which can leave a deletion a line below the insertion
-    /// that replaces it. That reads as two unrelated edits rather than one substitution, and it is not what
-    /// Git shows. Where the two are separated only by context, and the lower one can legally move up to meet
-    /// the other, it does.
-    /// </para>
-    /// </summary>
-    private static bool Align(string[] oldKeys, bool[] oldChanged, string[] newKeys, bool[] newChanged)
-    {
-        int i = 0;
-        int j = 0;
-        int previousSide = 0;
-        int context = 0;
-        while (i < oldChanged.Length || j < newChanged.Length)
-        {
-            if (i < oldChanged.Length && oldChanged[i])
-            {
-                int start = i;
-                while (i < oldChanged.Length && oldChanged[i]) i++;
-                if (previousSide == 2 && context > 0 && SlideUp(oldKeys, oldChanged, start, i, context)) return true;
-                previousSide = 1;
-                context = 0;
-            }
-            else if (j < newChanged.Length && newChanged[j])
-            {
-                int start = j;
-                while (j < newChanged.Length && newChanged[j]) j++;
-                if (previousSide == 1 && context > 0 && SlideUp(newKeys, newChanged, start, j, context)) return true;
-                previousSide = 2;
-                context = 0;
-            }
-            else if (i < oldChanged.Length && j < newChanged.Length) { i++; j++; context++; }
-            else break;
-        }
-        return false;
-    }
+    // The weights of Git's indent heuristic, kept with Git's names so the two can be read side by side.
+    private const int IndentWeight = 60;
+    private const int IndentHeuristicMaxSliding = 100;
+    private const int MaxIndent = 200;
+    private const int MaxBlanks = 20;
+    private const int StartOfFilePenalty = 1;
+    private const int EndOfFilePenalty = 21;
+    private const int TotalBlankWeight = -30;
+    private const int PostBlankWeight = 6;
+    private const int RelativeIndentPenalty = -4;
+    private const int RelativeIndentWithBlankPenalty = 10;
+    private const int RelativeOutdentPenalty = 24;
+    private const int RelativeOutdentWithBlankPenalty = 17;
+    private const int RelativeDedentPenalty = 23;
+    private const int RelativeDedentWithBlankPenalty = 17;
 
     /// <summary>
-    /// Moves a group up by exactly <paramref name="steps"/> lines, or not at all.
-    ///
-    /// <para>
-    /// All or nothing matters. Moving part of the way leaves the two groups still apart, so nothing has been
-    /// joined, and the group has been dragged off the position sliding chose for it. A partial move made the
-    /// output disagree with Git on edits that were never related in the first place: a deletion near the top
-    /// of a file would tug an unrelated insertion several lines up towards it.
-    /// </para>
+    /// Each line's indentation in columns, a tab counting to the next multiple of eight, or -1 for a line
+    /// that is blank or whitespace only. Computed from the text rather than the comparison key, which may
+    /// carry the no-newline marker.
     /// </summary>
-    private static bool SlideUp(string[] keys, bool[] changed, int start, int end, int steps)
+    private static int[] Indents(string[] texts)
     {
-        for (int step = 1; step <= steps; step++)
+        int[] indents = new int[texts.Length];
+        for (int index = 0; index < texts.Length; index++)
         {
-            if (start - step < 0 || changed[start - step]) return false;
-            if (!string.Equals(keys[start - step], keys[end - step], StringComparison.Ordinal)) return false;
+            string text = texts[index];
+            int indent = 0;
+            indents[index] = -1;
+            for (int position = 0; position < text.Length; position++)
+            {
+                char c = text[position];
+                if (c is not (' ' or '\t' or '\r' or '\n' or '\f' or '\v')) { indents[index] = indent; break; }
+                if (c == ' ') indent++;
+                else if (c == '\t') indent += 8 - indent % 8;
+                if (indent >= MaxIndent) { indents[index] = MaxIndent; break; }
+            }
         }
-        for (int step = 0; step < steps; step++)
+        return indents;
+    }
+
+    /// <summary>What a hypothetical split just above line <c>split</c> looks like to the heuristic.</summary>
+    private readonly record struct SplitMeasurement(
+        bool EndOfFile, int Indent, int PreBlank, int PreIndent, int PostBlank, int PostIndent);
+
+    private static SplitMeasurement MeasureSplit(int[] indents, int split)
+    {
+        bool endOfFile = split >= indents.Length;
+        int indent = endOfFile ? -1 : indents[split];
+
+        int preBlank = 0;
+        int preIndent = -1;
+        for (int i = split - 1; i >= 0; i--)
         {
-            changed[--start] = true;
-            changed[--end] = false;
+            preIndent = indents[i];
+            if (preIndent != -1) break;
+            preBlank++;
+            if (preBlank == MaxBlanks) { preIndent = 0; break; }
         }
-        return steps > 0;
+
+        int postBlank = 0;
+        int postIndent = -1;
+        for (int i = split + 1; i < indents.Length; i++)
+        {
+            postIndent = indents[i];
+            if (postIndent != -1) break;
+            postBlank++;
+            if (postBlank == MaxBlanks) { postIndent = 0; break; }
+        }
+
+        return new(endOfFile, indent, preBlank, preIndent, postBlank, postIndent);
+    }
+
+    /// <summary>The accumulated score of the two splits a group position implies. Lower is better.</summary>
+    private struct SplitScore
+    {
+        public int EffectiveIndent;
+        public int Penalty;
+
+        public void Add(SplitMeasurement m)
+        {
+            if (m.PreIndent == -1 && m.PreBlank == 0) Penalty += StartOfFilePenalty;
+            if (m.EndOfFile) Penalty += EndOfFilePenalty;
+
+            int postBlank = m.Indent == -1 ? 1 + m.PostBlank : 0;
+            int totalBlank = m.PreBlank + postBlank;
+            Penalty += TotalBlankWeight * totalBlank;
+            Penalty += PostBlankWeight * postBlank;
+
+            int indent = m.Indent != -1 ? m.Indent : m.PostIndent;
+            bool anyBlanks = totalBlank != 0;
+            EffectiveIndent += indent;
+
+            if (indent == -1 || m.PreIndent == -1)
+            {
+                // Nothing to compare against.
+            }
+            else if (indent > m.PreIndent)
+            {
+                Penalty += anyBlanks ? RelativeIndentWithBlankPenalty : RelativeIndentPenalty;
+            }
+            else if (indent < m.PreIndent)
+            {
+                // Indented less than its predecessor: either the end of a block, or the start of a new one
+                // whose own body follows. What comes next tells the two apart.
+                if (m.PostIndent != -1 && m.PostIndent > indent)
+                    Penalty += anyBlanks ? RelativeOutdentWithBlankPenalty : RelativeOutdentPenalty;
+                else
+                    Penalty += anyBlanks ? RelativeDedentWithBlankPenalty : RelativeDedentPenalty;
+            }
+        }
+
+        public int CompareTo(SplitScore other)
+        {
+            int indents = (EffectiveIndent > other.EffectiveIndent ? 1 : 0) - (EffectiveIndent < other.EffectiveIndent ? 1 : 0);
+            return IndentWeight * indents + (Penalty - other.Penalty);
+        }
     }
 
     /// <summary>

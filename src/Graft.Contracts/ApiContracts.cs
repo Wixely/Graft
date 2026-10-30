@@ -333,7 +333,13 @@ public sealed record ProjectPageResponse(
     /// <summary>The files this page offers, already filtered to what the allowlist admits.</summary>
     IReadOnlyList<string> Files,
     /// <summary>Where this project's static site is served, or null when it publishes none.</summary>
-    [property: JsonPropertyName("site_url")] string? SiteUrl);
+    [property: JsonPropertyName("site_url")] string? SiteUrl,
+    /// <summary>The product surfaces the config named that this reader may open. Empty for a reader the
+    /// project itself would refuse, so a page never advertises a door that is locked to its visitor.</summary>
+    IReadOnlyList<PageFeatureResponse> Features);
+
+/// <summary>One surface a page links onward to, by GitLab's name and at the project's shareable address.</summary>
+public sealed record PageFeatureResponse(string Name, string Url);
 
 /// <summary>One card in the public browser. Deliberately not the GitLab project shape: it carries only what
 /// a stranger is shown, so there is no field here that could accidentally describe a private project.</summary>
@@ -1026,6 +1032,7 @@ public sealed record MergeRequestChangesResponse(
 [JsonSerializable(typeof(ProjectMemberResponse[]))]
 [JsonSerializable(typeof(RepositoryPageResponse))]
 [JsonSerializable(typeof(ReadmeResponse))]
+[JsonSerializable(typeof(PageFeatureResponse))]
 [JsonSerializable(typeof(CommitDiffResponse))]
 [JsonSerializable(typeof(UploadIngestRequest))]
 [JsonSerializable(typeof(BundleInventoryResponse))]

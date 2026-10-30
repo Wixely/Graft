@@ -69,6 +69,25 @@ else
         }
     </div>
 
+    @* Only what the config named and only what this reader may open: the server decided both. The
+       destinations are the project's own pages, which apply their own rules again on arrival. *@
+    @if (view.Features.Count > 0)
+    {
+        <div class="panel">
+            <div class="panel-header"><Icon Name="issue" /><h2>On this project</h2></div>
+            <div class="list">
+                @foreach (PageFeatureResponse feature in view.Features)
+                {
+                    <a class="list-item" href="@feature.Url">
+                        <Icon Name="@FeatureIcon(feature.Name)" />
+                        <span class="list-item-main"><strong>@FeatureLabel(feature.Name)</strong></span>
+                        <Icon Name="chevron-right" />
+                    </a>
+                }
+            </div>
+        </div>
+    }
+
     @if (openPath is not null)
     {
         <div class="panel">
@@ -128,4 +147,25 @@ else
         openPath = file;
         openText = text;
     }
+
+    /// <summary>The config names features by GitLab's snake-case names; a reader is shown words.</summary>
+    private static string FeatureLabel(string name) => name switch
+    {
+        "issues" => "Issues",
+        "merge_requests" => "Merge requests",
+        "boards" => "Boards",
+        "milestones" => "Milestones",
+        "wiki" => "Wiki",
+        "releases" => "Releases",
+        "snippets" => "Snippets",
+        _ => name
+    };
+
+    private static string FeatureIcon(string name) => name switch
+    {
+        "merge_requests" => "merge",
+        "wiki" or "snippets" => "file",
+        "releases" => "archive",
+        _ => "issue"
+    };
 }

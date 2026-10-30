@@ -59,7 +59,8 @@ Nothing else is a metacharacter, and there is no "everything except" form. Patte
 
 - **Deny by default.** No `files` means no files. An empty list means no files.
 - **Unknown fields and unknown feature names are errors**, not warnings, so a config that claims to expose
-  something Graft does not have fails loudly instead of appearing to work.
+  something Graft does not have fails loudly instead of appearing to work. The names that exist are listed
+  under [Features](#features).
 - **An invalid config unpublishes the page.** A parse failure is never a page with default settings.
 - **`.graft/` is never servable**, at any visibility, and a config cannot name it.
 - **`readme` and `image` must themselves match `files`.** A path named in one field but absent from the
@@ -164,10 +165,22 @@ The page links onward to the source for anyone allowed to see it.
 A complete worked example lives in [samples/project-page](../samples/project-page/SAMPLE.md): a config, a
 readme, two allowlisted files, a four-file site, and instructions for pushing it.
 
+## Features
+
+`features` names the product surfaces a page points its readers at, by GitLab's names: `issues`,
+`merge_requests`, `boards`, `milestones`, `wiki`, `releases` and `snippets`. Naming anything else is an error
+and unpublishes the page, as any other invalid config does. The names are links, not grants: naming `issues`
+does not make a private project's issues readable. The page offers the links only to a reader the project
+itself would admit to those surfaces, so a page-only private project's visitors see none of them and a
+public project's visitors see each one as a link to `/projects/<slug>/-/<feature>`, at the shareable address
+that names no account. Each name appears once however many times the config repeats it.
+
+The rule was the opposite until 2026-10-30, when every name was an error because there was nothing to name.
+Issues arrived with [ADR 0014](decisions/0014-collaboration.md), the rest with ADRs 0020 to 0023, and the
+field now means what ADR 0006 said it would.
+
 ## What is not built
 
-- **`features`**, for exposing product surfaces such as issues on a page. The field is parsed and naming
-  anything is currently an error, because there is nothing yet to name.
 - **A fallback for operators with one hostname.** A sandboxed frame was considered and is a worse product,
   since links and navigation inside the site break. Without a second hostname there is no site.
 

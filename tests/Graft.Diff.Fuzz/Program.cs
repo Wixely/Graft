@@ -22,8 +22,9 @@ const string JOIN = "\n";
 const string FILE = "f.txt";
 const string GIT = "git";
 
-// Git has applied its indent heuristic by default since 2.14. Turning it off is how this harness
-// separates "Graft places a change differently" from "Graft does not implement that heuristic".
+// Git has applied its indent heuristic by default since 2.14, and since 2026-10-30 so does Graft, so the
+// default comparison is the like-for-like one. Turning Git's off is kept for measuring the heuristic's own
+// effect: with it off here and on in Graft, agreement drops, which is the heuristic doing its work.
 string[] GitDiff = Environment.GetEnvironmentVariable("GRAFT_FUZZ_NO_INDENT") == "1"
     ? ["-c", "diff.indentHeuristic=false", "diff", "--no-color", "--no-renames", "--unified=3", "--", FILE]
     : ["diff", "--no-color", "--no-renames", "--unified=3", "--", FILE];

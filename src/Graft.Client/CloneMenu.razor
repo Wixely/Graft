@@ -29,6 +29,13 @@
                     <Icon Name="@(copied == nameof(Command) ? "check" : "copy")" />
                 </button>
             </div>
+            @* Said here because this is where people find out the hard way. Git asks for a password and the
+               account password is refused, and a credential helper then replays the refusal silently. *@
+            <p class="clone-note">
+                When Git asks for a password, give it a personal access token, not your account password.
+                Create one under <a href="/-/profile">Profile and tokens</a>; pushing needs the
+                <span class="mono">write_repository</span> scope.
+            </p>
         </div>
 
         @* The short name, offered beside the owned one rather than instead of it. Both reach the same

@@ -64,9 +64,15 @@ public static class PageConfiguration
     /// <summary>Most patterns one config may carry, so matching stays bounded however the file was authored.</summary>
     public const int MaximumPatterns = 100;
 
-    /// <summary>The product features a page may name. Naming anything else is an error, not a warning: a
-    /// config claiming a feature that does not exist must fail loudly rather than appear to work.</summary>
-    public static IReadOnlyList<string> KnownFeatures { get; } = [];
+    /// <summary>
+    /// The product surfaces a page may point its readers at, by GitLab's names. Naming anything else is an
+    /// error, not a warning: a config claiming a feature that does not exist must fail loudly rather than
+    /// appear to work. Naming one of these grants nothing. The page shows a link to the surface only to a
+    /// reader who could already open it, so a page-only private project names features that nobody but its
+    /// members will see, and a public project's page links its visitors onward.
+    /// </summary>
+    public static IReadOnlyList<string> KnownFeatures { get; } =
+        ["issues", "merge_requests", "boards", "milestones", "wiki", "releases", "snippets"];
 
     /// <summary>
     /// Parses the config bytes. Returns the settings, or the reason the page must not be served.

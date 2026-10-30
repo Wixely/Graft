@@ -1393,6 +1393,18 @@ app.MapGet("/api/graft/pages/{globalSlug}", async context =>
         CollectPagePaths(repository, page, "", files);
         files.Sort(StringComparer.Ordinal);
 
+        // The features the config named are links, not grants. They are offered only to a reader the
+        // project's own collaboration surface would admit, which is decided here for this reader rather
+        // than assumed from the page, so a visitor is never shown a door the project would then refuse.
+        List<PageFeatureResponse> features = [];
+        if (page.Features.Count > 0 &&
+            (await DecideFor(context, browser?.Identity, found.Id, ProjectAction.ReadCollaboration)).Allowed)
+        {
+            string projectBase = "/projects/" + Uri.EscapeDataString(details.Project.GlobalSlug) + "/-/";
+            foreach (string feature in page.Features.Distinct(StringComparer.Ordinal))
+                features.Add(new(feature, projectBase + feature.Replace('_', '-')));
+        }
+
         ProjectPageResponse response = new(
             page.Title is { Length: > 0 } ? page.Title : details.Project.Name,
             page.Description is { Length: > 0 } ? page.Description : details.Description,
@@ -1401,7 +1413,8 @@ app.MapGet("/api/graft/pages/{globalSlug}", async context =>
             files,
             page.Site is null || settings.PagesOrigin is null
                 ? null
-                : settings.PagesOrigin.TrimEnd('/') + "/" + Uri.EscapeDataString(details.Project.GlobalSlug) + "/");
+                : settings.PagesOrigin.TrimEnd('/') + "/" + Uri.EscapeDataString(details.Project.GlobalSlug) + "/",
+            features);
         await context.Response.WriteAsJsonAsync(response, ApiJson.Default.ProjectPageResponse, null, context.RequestAborted);
     });
 });
