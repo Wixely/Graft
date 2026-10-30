@@ -28,6 +28,33 @@ as their own entries and decision records as each lands.
 Git suite 947 to 951 managed. The native publish was not repeated for this entry. No migration, no new
 route, no new tool.
 
+## Added on 2026-10-30, third entry: email is optional, and the reset link that needs no email
+
+The second of the four large items, in its first slice. The user's condition was that a non-email,
+self-hosted path exist behind a config switch; [ADR 0032](decisions/0032-email-is-optional.md) is that.
+
+- **The switch is `--mail-smtp <url>`**, with `--mail-from` and an optional `--mail-password-file`. Without
+  it the forge sends nothing and says `MAIL: off` at startup; the session carries `mail_available` so the
+  browser tells the right story. The URL's scheme is the transport: `smtp://` clear, `smtp+starttls://`,
+  `smtps://`. The SMTP client is in `MailSender.cs`, a hundred lines, queued with three attempts; no package.
+- **An address** is optional and unique without regard to case: `Users.Email`, migration 19, set on the
+  profile's Email tab or by an administrator on the users page; in `GET /api/v4/user` as `email`; in the
+  session and the administrator's list.
+- **A password reset is a one-time link**, `/-/reset/<secret>`, redeemed by choosing a password, revoking
+  every session and token. An administrator makes one on the users page (a day) and hands it over, which is
+  the non-email path and means they never know the password. With mail, "Forgot your password?" on the
+  sign-in page takes a username or address, answers `202` whoever was named, and sends a link (an hour) to
+  the address on file. Both share the sign-in throttle. The temporary-password reset stays.
+- The argument parser cannot call a top-level local function, so the one-line secret-file reader is now
+  `PasswordFiles.Read`, shared by the certificate and mail passwords.
+
+Git suite 982 to 1010 managed, against a server with no mail and then against an SMTP server the suite
+runs itself, reading the reset link out of the message. The MCP suite was not rerun for this entry: no
+tool, route it uses, or startup line it reads changed. Not done, and the next slices of this item:
+notifications (an in-app inbox always, a message when mail is on and the person opted in) and a second
+factor (an authenticator app with recovery codes, no mail involved). The browser pages compile against the
+routes the suite drove and were not driven by a browser.
+
 ## Added on 2026-10-30, second entry: Git over SSH
 
 The first of the four large items. [ADR 0031](decisions/0031-git-over-ssh.md) carries the reasoning; this

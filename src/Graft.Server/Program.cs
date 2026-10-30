@@ -33,7 +33,7 @@ if (args.Length == 1 && args[0] == "--licences")
 
 if (!Arguments.TryParse(args, out Arguments? parsedSettings))
 {
-    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>] [--mcp true|false] [--pages-origin <https origin>] [--recoverable-tokens true|false] [--webhooks true|false] [--ssh-port <0-65535>] [--ssh-host <name>].");
+    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>] [--mcp true|false] [--pages-origin <https origin>] [--recoverable-tokens true|false] [--webhooks true|false] [--ssh-port <0-65535>] [--ssh-host <name>] [--mail-smtp <smtp|smtp+starttls|smtps URL>] [--mail-from <address>] [--mail-password-file <UTF-8 path>].");
     Console.Error.WriteLine("       Graft.Server --licences  prints the third-party notices this build redistributes.");
     return 2;
 }
@@ -194,6 +194,8 @@ IDataProtector? tokenProtector = settings.RecoverableTokens
 // Outbound notification, when the operator has allowed it. Null is not "off for now": with no sender,
 // nothing anywhere queues a delivery, and the routes that manage hooks are absent rather than refusing.
 await using WebhookSender? webhooks = settings.Webhooks ? new WebhookSender(store) : null;
+// Mail, when the operator named a server. Off, the forge sends nothing and says so where it matters.
+await using MailSender? mail = settings.Mail is null ? null : new MailSender(settings.Mail, (text, exception) => Console.Error.WriteLine("MAIL: " + text + (exception is null ? "" : " " + exception.Message)));
 app.Use(async (context, next) =>
 {
     context.Response.Headers.CacheControl = "no-store";
@@ -257,15 +259,17 @@ app.MapGet("/api/session", async context =>
     if (!await OnlyQuery(context)) return;
     (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: false);
     SessionResponse response;
-    if (browser is null) response = new(false, null, false, "", 0, null, settings.PublicBrowsing, settings.Mcp, settings.Webhooks);
+    if (browser is null) response = new(false, null, false, "", 0, null, settings.PublicBrowsing, settings.Mcp, settings.Webhooks, mail is not null);
     else
     {
         long userId = browser.Value.Identity.UserId;
         string? avatarUrl = await store.HasAvatarAsync(AvatarOwner.User, userId, context.RequestAborted)
             ? AvatarUrl(context, AvatarOwner.User, userId)
             : null;
+        UserAccount? account = await store.FindActiveUserAsync(browser.Value.Identity.Username, context.RequestAborted);
         response = new(true, browser.Value.Identity.Username, browser.Value.Identity.IsAdministrator,
-            Csrf(browser.Value.Secret), userId, avatarUrl, settings.PublicBrowsing, settings.Mcp, settings.Webhooks);
+            Csrf(browser.Value.Secret), userId, avatarUrl, settings.PublicBrowsing, settings.Mcp, settings.Webhooks, mail is not null,
+            account?.Email);
     }
     await context.Response.WriteAsJsonAsync(response, ApiJson.Default.SessionResponse, null, context.RequestAborted);
 });
@@ -378,6 +382,118 @@ app.MapPost("/api/password", async context =>
     catch (InvalidOperationException error) { await ApiError(context, 400, error.Message); }
 });
 
+// Email addresses, and password resets by link.
+//
+// The forge works without any address and sends nothing unless the operator named a mail server. With one,
+// an account can ask for a reset link by username or address; without one, an administrator makes the link
+// and hands it over. Either way the link is the same secret, lives for a bounded time, works once, and sets
+// a password while revoking every session and token the account had.
+app.MapPost("/api/email", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    EmailChangeRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.EmailChangeRequest, context.RequestAborted);
+    try
+    {
+        await store.SetOwnEmailAsync(browser.Value.Identity, request?.Email, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (ArgumentException) { await ApiError(context, 400, "that is not an email address"); }
+    catch (EmailConflictException) { await ApiError(context, 400, "that address is already used by another account"); }
+});
+
+app.MapPost("/api/users/{userId:long}/email", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!browser.Value.Identity.IsAdministrator) { await ApiError(context, 403, "administrator"); return; }
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    EmailChangeRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.EmailChangeRequest, context.RequestAborted);
+    long userId = Convert.ToInt64(context.Request.RouteValues["userId"], System.Globalization.CultureInfo.InvariantCulture);
+    try
+    {
+        await store.SetUserEmailAsync(browser.Value.Identity, userId, request?.Email, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (ArgumentException) { await ApiError(context, 400, "that is not an email address"); }
+    catch (EmailConflictException) { await ApiError(context, 400, "that address is already used by another account"); }
+    catch (InvalidOperationException error) { await ApiError(context, 400, error.Message); }
+});
+
+// An administrator makes a link and hands it over. The non-email path, and the only one on a server that
+// sends nothing: the administrator never learns the password, and the person sets their own.
+app.MapPost("/api/users/{userId:long}/reset-link", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!browser.Value.Identity.IsAdministrator) { await ApiError(context, 403, "administrator"); return; }
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    long userId = Convert.ToInt64(context.Request.RouteValues["userId"], System.Globalization.CultureInfo.InvariantCulture);
+    try
+    {
+        PasswordResetGrant grant = await store.IssuePasswordResetAsync(browser.Value.Identity, userId, GraftStore.AdministratorResetLifetime, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status201Created;
+        await context.Response.WriteAsJsonAsync(new PasswordResetLinkResponse(ResetUrl(grant.Secret), grant.ExpiresAtUtc),
+            ApiJson.Default.PasswordResetLinkResponse, null, context.RequestAborted);
+    }
+    catch (InvalidOperationException error) { await ApiError(context, 400, error.Message); }
+});
+
+// The account asks for itself. Answered the same whether the login names anyone, whether they have an
+// address, and whether the server can send: a different answer would say who exists. Where it can, a link
+// goes to the address on file and nowhere else.
+app.MapPost("/api/password-reset/request", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    if (!loginThrottle.TryEnter(DateTimeOffset.UtcNow)) { await ApiError(context, 429, "login-rate-limit"); return; }
+    ForgotPasswordRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.ForgotPasswordRequest, context.RequestAborted);
+    if (request?.Login is not { Length: >= 2 and <= 254 }) { await ApiError(context, 400, "login"); return; }
+    if (mail is not null)
+    {
+        ResetTarget? target = await store.FindResetTargetAsync(request.Login, context.RequestAborted);
+        if (target?.Email is not null)
+        {
+            PasswordResetGrant grant = await store.IssuePasswordResetAsync(null, target.UserId, GraftStore.EmailedResetLifetime, context.RequestAborted);
+            mail.Send(target.Email, "Reset your Graft password",
+                "Hello " + target.Username + ",\n\n" +
+                "Somebody asked to reset the password of your Graft account at " + serverOrigin + ". If that was you, open this link " +
+                "within the hour and choose a new password:\n\n" + ResetUrl(grant.Secret) + "\n\n" +
+                "If it was not you, nothing has changed and you can ignore this message. The link works once and expires at " +
+                grant.ExpiresAtUtc.ToString("yyyy-MM-dd HH:mm 'UTC'", System.Globalization.CultureInfo.InvariantCulture) + ".\n");
+        }
+    }
+    context.Response.StatusCode = StatusCodes.Status202Accepted;
+});
+
+app.MapPost("/api/password-reset", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    if (!loginThrottle.TryEnter(DateTimeOffset.UtcNow)) { await ApiError(context, 429, "login-rate-limit"); return; }
+    PasswordResetCompleteRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.PasswordResetCompleteRequest, context.RequestAborted);
+    if (request?.Secret is not { Length: > 0 and <= 128 } || !PasswordPolicy.IsAcceptableLength(request.NewPassword ?? ""))
+    { await ApiError(context, 400, "password"); return; }
+    try
+    {
+        if (await store.RedeemPasswordResetAsync(request.Secret, request.NewPassword!, context.RequestAborted))
+            context.Response.StatusCode = StatusCodes.Status204NoContent;
+        else await ApiError(context, 400, "this reset link is not valid; it may have been used or have expired");
+    }
+    catch (ArgumentException) { await ApiError(context, 400, "password"); }
+});
+
+string ResetUrl(string secret) => serverOrigin + "/-/reset/" + secret;
+
 app.MapGet("/api/users", async context =>
 {
     (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
@@ -386,7 +502,7 @@ app.MapGet("/api/users", async context =>
     if (!await OnlyQuery(context)) return;
     IReadOnlyList<UserAccount> users = await store.ListUsersAsync(browser.Value.Identity, context.RequestAborted);
     UserAccountResponse[] response = users.Select(user =>
-        new UserAccountResponse(user.Id, user.Username, user.IsAdministrator, user.Disabled)).ToArray();
+        new UserAccountResponse(user.Id, user.Username, user.IsAdministrator, user.Disabled, user.Email)).ToArray();
     await context.Response.WriteAsJsonAsync(response, ApiJson.Default.UserAccountResponseArray, null, context.RequestAborted);
 });
 
@@ -1556,9 +1672,10 @@ app.MapGet("/api/v4/user", async context =>
     string? avatarUrl = await store.HasAvatarAsync(AvatarOwner.User, identity.UserId, context.RequestAborted)
         ? AvatarUrl(context, AvatarOwner.User, identity.UserId)
         : null;
+    UserAccount? account = await store.FindActiveUserAsync(identity.Username, context.RequestAborted);
     await context.Response.WriteAsJsonAsync(new UserResponse(
         identity.UserId, identity.Username, identity.Username, "active", false,
-        origin + "/" + Uri.EscapeDataString(identity.Username), avatarUrl),
+        origin + "/" + Uri.EscapeDataString(identity.Username), avatarUrl, account?.Email),
         ApiJson.Default.UserResponse, null, context.RequestAborted);
 });
 
@@ -6225,6 +6342,9 @@ Console.WriteLine(settings.PagesOrigin is null ? "PAGES: off" : "PAGES: " + sett
 Console.WriteLine("WEBHOOKS: " + (settings.Webhooks
     ? "on; a project Maintainer can make this server call an address of their choosing"
     : "off"));
+Console.WriteLine(settings.Mail is null
+    ? "MAIL: off; a forgotten password is reset by an administrator's link"
+    : "MAIL: " + settings.Mail.Describe());
 // Git over SSH. The host key lives beside the database, because the database is the thing an operator
 // already backs up and moves, and a server that changed its host key on every move would teach every
 // client to ignore the warning that matters. The fingerprint is printed so it can be checked from a known
@@ -7011,14 +7131,20 @@ static X509Certificate2 LoadCertificate(Arguments settings)
     return certificate;
 }
 
-static string ReadPassword(string path)
+static string ReadPassword(string path) => PasswordFiles.Read(path);
+
+/// <summary>A secret kept in a file of its own: one UTF-8 line, with or without its newline, and nothing else.</summary>
+static class PasswordFiles
 {
-    string password = File.ReadAllText(path, new UTF8Encoding(false, true));
-    if (password.EndsWith("\r\n", StringComparison.Ordinal)) password = password[..^2];
-    else if (password.EndsWith('\n')) password = password[..^1];
-    if (password.Contains('\r') || password.Contains('\n') || password.Contains('\0'))
-        throw new InvalidDataException("The certificate password file must contain one UTF-8 line.");
-    return password;
+    public static string Read(string path)
+    {
+        string password = File.ReadAllText(path, new UTF8Encoding(false, true));
+        if (password.EndsWith("\r\n", StringComparison.Ordinal)) password = password[..^2];
+        else if (password.EndsWith('\n')) password = password[..^1];
+        if (password.Contains('\r') || password.Contains('\n') || password.Contains('\0'))
+            throw new InvalidDataException("A password file must contain one UTF-8 line.");
+        return password;
+    }
 }
 
 sealed record AuthorizedRepository(
@@ -7083,12 +7209,12 @@ sealed record PendingSecret(long UserId, string Secret, DateTimeOffset ExpiresAt
 
 sealed record Arguments(string Database, string Repositories, IPAddress ListenAddress, int ListenPort, string? Origin,
     string? Certificate, string? CertificatePasswordFile, bool PublicBrowsing, bool PushToCreate, int SessionMinutes, bool Mcp,
-    string? PagesOrigin, bool RecoverableTokens, bool Webhooks, int SshPort, string? SshHost)
+    string? PagesOrigin, bool RecoverableTokens, bool Webhooks, int SshPort, string? SshHost, MailSettings? Mail)
 {
     public static bool TryParse(string[] values, out Arguments? result)
     {
         result = null;
-        if (values.Length is < 4 or > 30 || values.Length % 2 != 0) return false;
+        if (values.Length is < 4 or > 36 || values.Length % 2 != 0) return false;
         string? database = null;
         string? repositories = null;
         string? listen = null;
@@ -7104,6 +7230,9 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         string? webhooks = null;
         string? sshPort = null;
         string? sshHost = null;
+        string? mailSmtp = null;
+        string? mailFrom = null;
+        string? mailPasswordFile = null;
         HashSet<string> seen = new(StringComparer.Ordinal);
         for (int index = 0; index < values.Length; index += 2)
         {
@@ -7123,6 +7252,9 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             else if (values[index] == "--webhooks") webhooks = values[index + 1];
             else if (values[index] == "--ssh-port") sshPort = values[index + 1];
             else if (values[index] == "--ssh-host") sshHost = values[index + 1];
+            else if (values[index] == "--mail-smtp") mailSmtp = values[index + 1];
+            else if (values[index] == "--mail-from") mailFrom = values[index + 1];
+            else if (values[index] == "--mail-password-file") mailPasswordFile = values[index + 1];
             else return false;
         }
         if (string.IsNullOrWhiteSpace(database) || string.IsNullOrWhiteSpace(repositories)) return false;
@@ -7185,6 +7317,20 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             return false;
         if (string.IsNullOrWhiteSpace(sshHost)) sshHost = null;
         if (sshHost is not null && (sshHost.Length > 253 || Uri.CheckHostName(sshHost) is UriHostNameType.Unknown or UriHostNameType.Basic)) return false;
+        // Mail is on when a server is named. Empty means off, as every other optional value does. The password
+        // comes from a file, as the certificate's does, so it is never in a process listing.
+        if (string.IsNullOrWhiteSpace(mailSmtp)) mailSmtp = null;
+        if (string.IsNullOrWhiteSpace(mailFrom)) mailFrom = null;
+        if (string.IsNullOrWhiteSpace(mailPasswordFile)) mailPasswordFile = null;
+        MailSettings? mail = null;
+        if (mailSmtp is not null)
+        {
+            if (mailFrom is null) return false;
+            if (mailPasswordFile is not null && !File.Exists(mailPasswordFile)) return false;
+            string? mailPassword = mailPasswordFile is null ? null : PasswordFiles.Read(Path.GetFullPath(mailPasswordFile));
+            if (!MailSettings.TryParse(mailSmtp, mailFrom, mailPassword, out mail)) return false;
+        }
+        else if (mailFrom is not null || mailPasswordFile is not null) return false;
         if (certificatePasswordFile is not null && certificate is null) return false;
         if (!IPAddress.IsLoopback(address) && certificate is null) return false;
         if (!IPAddress.IsLoopback(address) && origin is null) return false;
@@ -7195,7 +7341,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             origin is null ? null : origin.TrimEnd('/'), certificate is null ? null : Path.GetFullPath(certificate),
             certificatePasswordFile is null ? null : Path.GetFullPath(certificatePasswordFile),
             publicBrowsing == "true", pushToCreate == "true", window, mcp == "true",
-            pagesOrigin, recoverableTokens == "true", webhooks == "true", sshPortNumber, sshHost);
+            pagesOrigin, recoverableTokens == "true", webhooks == "true", sshPortNumber, sshHost, mail);
         return true;
     }
 }

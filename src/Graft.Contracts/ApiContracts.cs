@@ -9,7 +9,8 @@ public sealed record UserResponse(
     string State,
     bool Locked,
     [property: JsonPropertyName("web_url")] string WebUrl,
-    [property: JsonPropertyName("avatar_url")] string? AvatarUrl);
+    [property: JsonPropertyName("avatar_url")] string? AvatarUrl,
+    string? Email = null);
 
 public sealed record NamespaceResponse(
     long Id,
@@ -117,10 +118,23 @@ public sealed record SessionResponse(
     bool McpAvailable = false,
     /// <summary>Whether this server's operator allowed it to make outbound requests on a project's behalf.
     /// False hides the hook controls rather than offering a setting the server would refuse.</summary>
-    bool WebhooksAvailable = false);
+    bool WebhooksAvailable = false,
+    /// <summary>Whether this server sends email. False means a forgotten password is an administrator's
+    /// business, and the page says so rather than promising a message that will never come.</summary>
+    bool MailAvailable = false,
+    /// <summary>The caller's own email address, when one is set. Null for an anonymous caller or none.</summary>
+    string? Email = null);
 public sealed record LoginRequest(string Username, string Password);
 public sealed record UserCreateRequest(string Username, string Password);
-public sealed record UserAccountResponse(long Id, string Username, bool IsAdministrator, bool Disabled);
+public sealed record UserAccountResponse(long Id, string Username, bool IsAdministrator, bool Disabled, string? Email = null);
+/// <summary>Sets or clears an email address. Null or empty clears it.</summary>
+public sealed record EmailChangeRequest(string? Email);
+/// <summary>Asks for a password reset by username or email. Answered the same whether or not it names anyone.</summary>
+public sealed record ForgotPasswordRequest(string? Login);
+/// <summary>Completes a reset: the secret from the link and the password to set.</summary>
+public sealed record PasswordResetCompleteRequest(string? Secret, string? NewPassword);
+/// <summary>A reset link an administrator made, shown once.</summary>
+public sealed record PasswordResetLinkResponse(string Url, [property: JsonPropertyName("expires_at")] DateTimeOffset ExpiresAt);
 public sealed record PasswordChangeRequest(string CurrentPassword, string NewPassword);
 public sealed record PasswordResetRequest(string NewPassword);
 public sealed record TokenCreateRequest(string Name, string[] Scopes, int ExpiresInDays);
@@ -1051,6 +1065,10 @@ public sealed record MergeRequestChangesResponse(
 [JsonSerializable(typeof(SshKeyResponse))]
 [JsonSerializable(typeof(SshKeyResponse[]))]
 [JsonSerializable(typeof(SshKeyCreateRequest))]
+[JsonSerializable(typeof(EmailChangeRequest))]
+[JsonSerializable(typeof(ForgotPasswordRequest))]
+[JsonSerializable(typeof(PasswordResetCompleteRequest))]
+[JsonSerializable(typeof(PasswordResetLinkResponse))]
 [JsonSerializable(typeof(CommitDiffResponse))]
 [JsonSerializable(typeof(UploadIngestRequest))]
 [JsonSerializable(typeof(BundleInventoryResponse))]

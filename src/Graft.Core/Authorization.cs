@@ -220,7 +220,13 @@ public static class ProjectAuthorization
     private static PermissionDecision Denied(string source, string explanation) => new(false, null, source, explanation);
 }
 
-public sealed record UserAccount(long Id, string Username, bool IsAdministrator, bool Disabled);
+public sealed record UserAccount(long Id, string Username, bool IsAdministrator, bool Disabled, string? Email = null);
+
+/// <summary>A one-time password reset: the secret that goes into the link, and when it stops working.</summary>
+public sealed record PasswordResetGrant(string Secret, DateTimeOffset ExpiresAtUtc);
+
+/// <summary>The account a reset is for, found by username or email, with the address to send to if any.</summary>
+public sealed record ResetTarget(long UserId, string Username, string? Email);
 
 /// <summary>
 /// One recorded act. The actor is nullable because the first administrator is created before any account

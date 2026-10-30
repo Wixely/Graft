@@ -77,6 +77,15 @@ services:
       - ${GRAFT_SSH_PORT:-}
       - --ssh-host
       - ${GRAFT_SSH_HOST:-}
+      # Email. Empty means the forge sends nothing, and a forgotten password is reset with a link an
+      # administrator makes. Name a server as smtp://, smtp+starttls:// or smtps:// with the username in the
+      # URL; the password is a one-line secret file. See docs/decisions/0032-email-is-optional.md.
+      - --mail-smtp
+      - ${GRAFT_MAIL_SMTP:-}
+      - --mail-from
+      - ${GRAFT_MAIL_FROM:-}
+      - --mail-password-file
+      - ${GRAFT_MAIL_PASSWORD_FILE:-}
     ports:
       - "127.0.0.1:8443:8443"
       # Uncomment with GRAFT_SSH_PORT=2222 to reach Git over SSH; nothing in front of HTTPS carries it.

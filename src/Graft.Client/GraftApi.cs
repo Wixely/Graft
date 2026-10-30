@@ -158,6 +158,26 @@ public sealed class GraftApi(HttpClient http)
         catch (HttpRequestException) { Reachable = false; return new(false, Unreachable, default); }
     }
 
+    /// <summary>
+    /// A request made before there is a session: asking for a password reset, or completing one. The browser
+    /// adds the Origin header the server checks; there is no CSRF secret to add because there is nobody to
+    /// act as yet.
+    /// </summary>
+    public async Task<ApiResult> PostAnonymousAsync<TRequest>(string uri, TRequest body, JsonTypeInfo<TRequest> type, string accepted,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            using HttpResponseMessage response = await http.PostAsJsonAsync(uri, body, type, cancellationToken);
+            return response.IsSuccessStatusCode
+                ? ApiResult.Accepted(accepted)
+                : ApiResult.Refused(response.StatusCode == HttpStatusCode.TooManyRequests
+                    ? "Too many attempts. Wait and try again."
+                    : await ReadMessageAsync(response, cancellationToken));
+        }
+        catch (HttpRequestException) { Reachable = false; return ApiResult.Refused(Unreachable); }
+    }
+
     /// <summary>Signs in. Login precedes the CSRF secret, so it does not go through <see cref="SendAsync"/>.</summary>
     public async Task<ApiResult> LoginAsync(string username, string password, CancellationToken cancellationToken = default)
     {

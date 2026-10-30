@@ -4,7 +4,7 @@ namespace Graft.Storage;
 
 public static class GraftSchema
 {
-    public static DnaXMigrationManifest Manifest { get; } = new(18,
+    public static DnaXMigrationManifest Manifest { get; } = new(19,
     [
         DnaXMigration.Sql(1, "initial-identity-project-schema", "Create identity and private project schema", """
             CREATE TABLE Users (
@@ -625,6 +625,27 @@ public static class GraftSchema
             );
 
             CREATE INDEX IX_SshKeys_User ON SshKeys(UserId, Id);
+            """),
+        // Email, and password resets by link.
+        //
+        // An address is optional and unique where present, compared without case. A reset is a one-time secret
+        // with an expiry, issued either by an administrator who hands the link over, or by the account itself
+        // when the server can send it by email. The two paths make one row; which path made it is recorded.
+        DnaXMigration.Sql(19, "email-and-reset-links", "Optional email addresses and one-time password reset links", """
+            ALTER TABLE Users ADD COLUMN Email TEXT NULL;
+            CREATE UNIQUE INDEX IX_Users_Email ON Users(lower(Email)) WHERE Email IS NOT NULL;
+
+            CREATE TABLE PasswordResets (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                UserId INTEGER NOT NULL REFERENCES Users(Id) ON DELETE CASCADE,
+                SecretDigest TEXT NOT NULL UNIQUE,
+                IssuedByUserId INTEGER NULL REFERENCES Users(Id) ON DELETE SET NULL,
+                CreatedAtUtc TEXT NOT NULL,
+                ExpiresAtUtc TEXT NOT NULL,
+                UsedAtUtc TEXT NULL
+            );
+
+            CREATE INDEX IX_PasswordResets_User ON PasswordResets(UserId, Id);
             """)
     ]);
 }

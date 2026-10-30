@@ -113,9 +113,10 @@ Nothing is here at the moment. Everything below needs a decision before it is bu
 administrator-only, because most of what it records is not about a project. A project-scoped view would need
 its own query and a rule about which entries are a project's business.
 
-**Email, and anything that depends on it.** Graft holds no email addresses and sends nothing. Password
-reset is therefore administrator-driven with no self-service path, there are no notifications, and there is
-no second factor. Adding email is a dependency decision as much as a feature.
+**Notifications and a second factor**, the two things that depended on email and must not. Email itself is
+optional since [ADR 0032](decisions/0032-email-is-optional.md). Notifications would be an in-app inbox always
+and a message when mail is on and the person opted in; a second factor would be an authenticator app with
+recovery codes, which needs no mail at all. Both are the next slices of the user's email item.
 
 **Continuous integration and a runner protocol.** Recorded as a long-term goal since
 [ADR 0001](decisions/0001-name-and-compatibility.md) and still entirely absent. CupriNet remains a

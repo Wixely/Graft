@@ -30,6 +30,8 @@ int assertions = 0;
 bool publicBrowsing = false;
 bool pushToCreate = false;
 bool webhooksEnabled = false;
+// The mail server a restart points the forge at, or null for a forge that sends nothing, which is the default.
+string? mailSmtpUrl = null;
 Process? server = null;
 Task? outputReader = null;
 Task<string>? errorReader = null;
@@ -232,6 +234,7 @@ try
     await CheckSsh(address, aliceIdentity, bob.Username);
     await CheckEmptyRepository(address, aliceIdentity, alicePassword);
     address = await CheckWebhooks(address, aliceIdentity);
+    address = await CheckMail(address, bob.Username, bobPassword, adminPassword);
     // After everything that writes an audit row, so the trail it reads already contains them.
     await CheckAuditTrail(address, adminPassword, alicePassword);
 
@@ -324,6 +327,13 @@ ProcessStartInfo ServerStart()
     // Git over SSH on whatever port is free; the server prints the one it bound and the SSH check reads it.
     start.ArgumentList.Add("--ssh-port");
     start.ArgumentList.Add("0");
+    if (mailSmtpUrl is not null)
+    {
+        start.ArgumentList.Add("--mail-smtp");
+        start.ArgumentList.Add(mailSmtpUrl);
+        start.ArgumentList.Add("--mail-from");
+        start.ArgumentList.Add("graft@test.invalid");
+    }
     return start;
 }
 
@@ -6003,6 +6013,217 @@ async Task CheckFetching(string address, AuthenticatedIdentity alice, string str
 /// The empty-repository page, which used to report a 404 from the browse endpoint and which the browser
 /// then described as a permission problem.
 /// </summary>
+/// <summary>
+/// Email as an option, and the password reset that works either way. On the default server, which sends
+/// nothing: an administrator makes a reset link and the person sets their own password with it, once. Then
+/// the server is restarted against a mail server of this suite's own, and the account asks for its own link,
+/// which arrives, is read out of the message, and works.
+/// </summary>
+async Task<string> CheckMail(string address, string bobUsername, string bobPassword, string adminPassword)
+{
+    async Task<(HttpClient Client, string Csrf)> Browser(string at, string username, string password)
+    {
+        HttpClientHandler handler = new()
+        {
+            CookieContainer = new CookieContainer(),
+            ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
+            UseProxy = false
+        };
+        HttpClient client = new(handler) { BaseAddress = new(at), Timeout = TimeSpan.FromSeconds(20) };
+        using (HttpRequestMessage login = new(HttpMethod.Post, "/api/login") { Content = JsonContent.Create(new { username, password }) })
+        {
+            login.Headers.Add("Origin", at);
+            using HttpResponseMessage response = await client.SendAsync(login);
+            if (!response.IsSuccessStatusCode) throw new InvalidOperationException("browser login failed for " + username);
+        }
+        using HttpResponseMessage session = await client.GetAsync("/api/session");
+        using JsonDocument json = JsonDocument.Parse(await session.Content.ReadAsStringAsync());
+        return (client, json.RootElement.GetProperty("csrf").GetString()!);
+    }
+    async Task<HttpResponseMessage> Post(HttpClient client, string csrf, string at, string path, object? body)
+    {
+        using HttpRequestMessage request = new(HttpMethod.Post, path) { Content = body is null ? null : JsonContent.Create(body) };
+        request.Headers.Add("Origin", at);
+        request.Headers.Add("X-Graft-CSRF", csrf);
+        return await client.SendAsync(request);
+    }
+    async Task<HttpResponseMessage> Anonymous(string at, string path, object body)
+    {
+        using HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false };
+        using HttpClient client = new(handler) { BaseAddress = new(at), Timeout = TimeSpan.FromSeconds(20) };
+        using HttpRequestMessage request = new(HttpMethod.Post, path) { Content = JsonContent.Create(body) };
+        request.Headers.Add("Origin", at);
+        return await client.SendAsync(request);
+    }
+    async Task<bool> CanSignIn(string at, string username, string password)
+    {
+        using HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false };
+        using HttpClient client = new(handler) { BaseAddress = new(at), Timeout = TimeSpan.FromSeconds(20) };
+        using HttpRequestMessage login = new(HttpMethod.Post, "/api/login") { Content = JsonContent.Create(new { username, password }) };
+        login.Headers.Add("Origin", at);
+        using HttpResponseMessage response = await client.SendAsync(login);
+        return response.IsSuccessStatusCode;
+    }
+    static string SecretOf(string url) => url[(url.IndexOf("/-/reset/", StringComparison.Ordinal) + "/-/reset/".Length)..].Trim();
+
+    Check(serverLines.Any(line => line.StartsWith("MAIL: off", StringComparison.Ordinal)), "a server given no mail server says it sends nothing");
+    (HttpClient admin, string adminCsrf) = await Browser(address, "admin", adminPassword);
+    (HttpClient bob, string bobCsrf) = await Browser(address, bobUsername, bobPassword);
+    long bobId;
+    long adminId;
+    using (HttpResponseMessage list = await admin.GetAsync("/api/users"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await list.Content.ReadAsStringAsync());
+        bobId = json.RootElement.EnumerateArray().First(user => user.GetProperty("username").GetString() == bobUsername).GetProperty("id").GetInt64();
+        adminId = json.RootElement.EnumerateArray().First(user => user.GetProperty("username").GetString() == "admin").GetProperty("id").GetInt64();
+    }
+    using (HttpResponseMessage session = await bob.GetAsync("/api/session"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await session.Content.ReadAsStringAsync());
+        Check(!json.RootElement.GetProperty("mail_available").GetBoolean() && json.RootElement.GetProperty("email").ValueKind == JsonValueKind.Null,
+            "the session says the server sends no mail and the account has no address");
+    }
+
+    // The non-email path: an administrator's link, handed over.
+    using (HttpResponseMessage self = await Post(admin, adminCsrf, address, "/api/users/" + adminId + "/reset-link", null))
+        Check(self.StatusCode == HttpStatusCode.BadRequest, "an administrator cannot make a reset link for their own account");
+    using (HttpResponseMessage forbidden = await Post(bob, bobCsrf, address, "/api/users/" + bobId + "/reset-link", null))
+        Check(forbidden.StatusCode == HttpStatusCode.Forbidden, "an ordinary account cannot make a reset link");
+    string linkSecret;
+    using (HttpResponseMessage made = await Post(admin, adminCsrf, address, "/api/users/" + bobId + "/reset-link", null))
+    {
+        Check(made.StatusCode == HttpStatusCode.Created, "an administrator makes a reset link for another account");
+        using JsonDocument json = JsonDocument.Parse(await made.Content.ReadAsStringAsync());
+        string url = json.RootElement.GetProperty("url").GetString()!;
+        Check(url.StartsWith(address + "/-/reset/graft_reset_", StringComparison.Ordinal), "the link points at this server's reset page");
+        linkSecret = SecretOf(url);
+    }
+    string bobsNewPassword = Password();
+    using (HttpResponseMessage weak = await Anonymous(address, "/api/password-reset", new { secret = linkSecret, new_password = "x" }))
+        Check(weak.StatusCode == HttpStatusCode.BadRequest, "a reset refuses a password the policy refuses, and the link survives it");
+    using (HttpResponseMessage wrong = await Anonymous(address, "/api/password-reset", new { secret = "graft_reset_" + new string('0', 64), new_password = bobsNewPassword }))
+        Check(wrong.StatusCode == HttpStatusCode.BadRequest, "an unknown secret is refused");
+    using (HttpResponseMessage done = await Anonymous(address, "/api/password-reset", new { secret = linkSecret, new_password = bobsNewPassword }))
+        Check(done.StatusCode == HttpStatusCode.NoContent, "the link sets a password");
+    Check(!await CanSignIn(address, bobUsername, bobPassword) && await CanSignIn(address, bobUsername, bobsNewPassword),
+        "the old password is gone and the new one signs in");
+    using (HttpResponseMessage again = await Anonymous(address, "/api/password-reset", new { secret = linkSecret, new_password = Password() }))
+        Check(again.StatusCode == HttpStatusCode.BadRequest, "a used link does not work twice");
+    using (HttpResponseMessage signedOut = await bob.GetAsync("/api/session"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await signedOut.Content.ReadAsStringAsync());
+        Check(!json.RootElement.GetProperty("authenticated").GetBoolean(), "the reset signed the account out everywhere");
+    }
+    bob.Dispose();
+    bobPassword = bobsNewPassword;
+    (bob, bobCsrf) = await Browser(address, bobUsername, bobPassword);
+
+    // Addresses, with or without a mail server.
+    using (HttpResponseMessage bad = await Post(bob, bobCsrf, address, "/api/email", new { email = "not an address" }))
+        Check(bad.StatusCode == HttpStatusCode.BadRequest, "a non-address is refused");
+    using (HttpResponseMessage set = await Post(bob, bobCsrf, address, "/api/email", new { email = "Bob@Example.test" }))
+        Check(set.StatusCode == HttpStatusCode.NoContent, "an account sets its own address");
+    using (HttpResponseMessage taken = await Post(admin, adminCsrf, address, "/api/users/" + adminId + "/email", new { email = "bob@example.test" }))
+        Check(taken.StatusCode == HttpStatusCode.BadRequest, "an address already on one account cannot go on another, whatever its case");
+    using (HttpResponseMessage adminSet = await Post(admin, adminCsrf, address, "/api/users/" + adminId + "/email", new { email = "admin@example.test" }))
+        Check(adminSet.StatusCode == HttpStatusCode.NoContent, "an administrator sets an address on an account");
+    using (HttpResponseMessage session = await bob.GetAsync("/api/session"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await session.Content.ReadAsStringAsync());
+        Check(json.RootElement.GetProperty("email").GetString() == "Bob@Example.test", "the session carries the address as it was given");
+    }
+    using (HttpResponseMessage list = await admin.GetAsync("/api/users"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await list.Content.ReadAsStringAsync());
+        Check(json.RootElement.EnumerateArray().First(user => user.GetProperty("id").GetInt64() == bobId).GetProperty("email").GetString() == "Bob@Example.test",
+            "the administrator's list shows it");
+    }
+    using (HttpResponseMessage accepted = await Anonymous(address, "/api/password-reset/request", new { login = bobUsername }))
+        Check(accepted.StatusCode == HttpStatusCode.Accepted, "a request for a link is accepted on a server that cannot send one, saying nothing more");
+    admin.Dispose();
+    bob.Dispose();
+
+    // Now with a mail server of our own, so the message is observed arriving rather than assumed.
+    ConcurrentQueue<(string To, string Body)> inbox = new();
+    using System.Net.Sockets.TcpListener smtp = new(IPAddress.Loopback, 0);
+    smtp.Start();
+    int smtpPort = ((IPEndPoint)smtp.LocalEndpoint).Port;
+    using CancellationTokenSource smtpLife = new();
+    Task smtpServer = Task.Run(() => ServeSmtp(smtp, inbox, smtpLife.Token));
+
+    await StopServer();
+    mailSmtpUrl = "smtp://127.0.0.1:" + smtpPort.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    address = await StartServer();
+    Check(serverLines.Any(line => line.StartsWith("MAIL: smtp://127.0.0.1:", StringComparison.Ordinal)), "a server given a mail server says so at startup");
+    using (HttpResponseMessage session = await (await Browser(address, bobUsername, bobPassword)).Client.GetAsync("/api/session"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await session.Content.ReadAsStringAsync());
+        Check(json.RootElement.GetProperty("mail_available").GetBoolean(), "and the session says mail is available");
+    }
+
+    using (HttpResponseMessage nobody = await Anonymous(address, "/api/password-reset/request", new { login = "nobody-here" }))
+        Check(nobody.StatusCode == HttpStatusCode.Accepted, "a request naming nobody is accepted exactly as one naming somebody");
+    using (HttpResponseMessage asked = await Anonymous(address, "/api/password-reset/request", new { login = "bob@example.test" }))
+        Check(asked.StatusCode == HttpStatusCode.Accepted, "an account asks for a link by its address");
+    (string To, string Body) message = ("", "");
+    for (int waited = 0; waited < 100 && !inbox.TryDequeue(out message); waited++) await Task.Delay(100);
+    Check(message.To == "Bob@Example.test", "the message went to the address on the account and nowhere else (got " + message.To + ")");
+    Check(inbox.IsEmpty, "and the request naming nobody sent nothing");
+    string body = message.Body ?? "";
+    int blank = body.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+    string text = Encoding.UTF8.GetString(Convert.FromBase64String(body[(blank + 4)..].Replace("\r\n", "")));
+    Check(body.Contains("Subject: Reset your Graft password", StringComparison.Ordinal) && text.Contains("Hello " + bobUsername, StringComparison.Ordinal),
+        "the message is the reset message, addressed to the person by name");
+    string mailedSecret = SecretOf(text.Split('\n').First(line => line.Contains("/-/reset/", StringComparison.Ordinal)));
+    string bobsThirdPassword = Password();
+    using (HttpResponseMessage done = await Anonymous(address, "/api/password-reset", new { secret = mailedSecret, new_password = bobsThirdPassword }))
+        Check(done.StatusCode == HttpStatusCode.NoContent, "the mailed link sets a password");
+    Check(!await CanSignIn(address, bobUsername, bobPassword) && await CanSignIn(address, bobUsername, bobsThirdPassword),
+        "and the account signs in with it");
+
+    smtpLife.Cancel();
+    smtp.Stop();
+    try { await smtpServer; } catch (OperationCanceledException) { } catch (System.Net.Sockets.SocketException) { } catch (ObjectDisposedException) { }
+
+    // Back to a server that sends nothing, which is how the rest of the suite expects it.
+    await StopServer();
+    mailSmtpUrl = null;
+    return await StartServer();
+}
+
+/// <summary>
+/// The least SMTP server that can receive a message: greets, agrees to everything, and keeps what arrives in
+/// DATA. One connection at a time, which is all a single forge sends it.
+/// </summary>
+static async Task ServeSmtp(System.Net.Sockets.TcpListener listener, ConcurrentQueue<(string To, string Body)> inbox, CancellationToken token)
+{
+    while (!token.IsCancellationRequested)
+    {
+        using System.Net.Sockets.TcpClient client = await listener.AcceptTcpClientAsync(token);
+        using System.Net.Sockets.NetworkStream stream = client.GetStream();
+        using StreamReader reader = new(stream, Encoding.ASCII, false, 1024, leaveOpen: true);
+        async Task Reply(string line) => await stream.WriteAsync(Encoding.ASCII.GetBytes(line + "\r\n"), token);
+        await Reply("220 test.invalid ESMTP");
+        string to = "";
+        while (await reader.ReadLineAsync(token) is string line)
+        {
+            if (line.StartsWith("EHLO", StringComparison.OrdinalIgnoreCase)) { await Reply("250-test.invalid"); await Reply("250 8BITMIME"); }
+            else if (line.StartsWith("MAIL FROM:", StringComparison.OrdinalIgnoreCase)) await Reply("250 OK");
+            else if (line.StartsWith("RCPT TO:", StringComparison.OrdinalIgnoreCase)) { to = line["RCPT TO:".Length..].Trim().Trim('<', '>'); await Reply("250 OK"); }
+            else if (line.Equals("DATA", StringComparison.OrdinalIgnoreCase))
+            {
+                await Reply("354 go ahead");
+                StringBuilder data = new();
+                while (await reader.ReadLineAsync(token) is string dataLine && dataLine != ".") data.Append(dataLine).Append("\r\n");
+                inbox.Enqueue((to, data.ToString()));
+                await Reply("250 queued");
+            }
+            else if (line.Equals("QUIT", StringComparison.OrdinalIgnoreCase)) { await Reply("221 bye"); break; }
+            else await Reply("250 OK");
+        }
+    }
+}
+
 /// <summary>
 /// Git over SSH, end to end with the real OpenSSH client and real keys of all three families Graft
 /// verifies. Keys are registered through GitLab's routes, the host key is checked against what the server

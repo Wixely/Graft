@@ -1,0 +1,85 @@
+@page "/-/forgot"
+@inject GraftApi Api
+@inject NavigationManager Navigation
+
+@* A forgotten password. What this page can do depends on the server: one that sends mail takes a username
+   or address and sends a link; one that does not says so and points at the administrator, who can make the
+   same link by hand. The server answers the request the same way whoever is named, so this page cannot be
+   used to learn who has an account. *@
+
+<PageTitle>Forgot your password &middot; Graft</PageTitle>
+
+<div class="sign-in">
+    <div class="sign-in-mark">
+        <img src="graft-app-blue.png" alt="" width="36" height="36" />
+        <h1>Forgot your password</h1>
+    </div>
+
+    <Banner Message="@message" Kind="@messageKind" />
+
+    <div class="panel">
+        <div class="panel-body">
+            @if (Api.Session?.MailAvailable == true)
+            {
+                @if (sent)
+                {
+                    <p>
+                        If that names an account with an email address, a message with a reset link is on its way.
+                        The link works once and expires in an hour.
+                    </p>
+                    <p class="secondary-text"><a href="/-/login">Back to sign in</a></p>
+                }
+                else
+                {
+                    <p class="secondary-text">Enter your username or the email address on your account.</p>
+                    <form class="form" @onsubmit="Request" @onsubmit:preventDefault>
+                        <label for="login">Username or email</label>
+                        <input id="login" autocomplete="username" @bind="login" required maxlength="254" />
+                        <div class="form-actions">
+                            <button type="submit" disabled="@busy">@(busy ? "Sending…" : "Send a reset link")</button>
+                        </div>
+                    </form>
+                    <p class="secondary-text"><a href="/-/login">Back to sign in</a></p>
+                }
+            }
+            else
+            {
+                <p>
+                    This server does not send email. Ask an administrator for a reset link: they can make one
+                    under Users and give it to you, and it lets you choose a new password yourself. It works once
+                    and expires after a day.
+                </p>
+                <p class="secondary-text"><a href="/-/login">Back to sign in</a></p>
+            }
+        </div>
+    </div>
+</div>
+
+@code {
+    private string login = "";
+    private string message = "";
+    private string messageKind = "info";
+    private bool busy;
+    private bool sent;
+
+    protected override async Task OnInitializedAsync()
+    {
+        // The session call also reports whether the server sends mail, which is what this page branches on.
+        if (await Api.EnsureSessionAsync()) Navigation.NavigateTo("/", replace: true);
+    }
+
+    private async Task Request()
+    {
+        if (busy) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAnonymousAsync("api/password-reset/request", new ForgotPasswordRequest(login.Trim()),
+                ApiJson.Default.ForgotPasswordRequest, "");
+            if (result.Ok) sent = true;
+            else { message = result.Message; messageKind = "error"; }
+        }
+        finally { busy = false; }
+    }
+}

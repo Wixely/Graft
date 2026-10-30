@@ -150,12 +150,12 @@ public sealed partial class GraftStore : IAsyncDisposable
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
         AuthenticatedIdentity liveActor = await RequireLiveIdentityAsync(db, null, actor, cancellationToken);
         if (!liveActor.IsAdministrator) throw new UnauthorizedAccessException("Administrator access is required.");
-        IEnumerable<IdentityRow> rows = await db.QueryAsync<IdentityRow>("""
-            SELECT Id, Username, IsAdministrator, Disabled
+        IEnumerable<UserListRow> rows = await db.QueryAsync<UserListRow>("""
+            SELECT Id, Username, IsAdministrator, Disabled, Email
             FROM Users
             ORDER BY NormalizedUsername;
             """);
-        return rows.Select(row => new UserAccount(row.Id, row.Username, row.IsAdministrator != 0, row.Disabled != 0)).ToArray();
+        return rows.Select(row => new UserAccount(row.Id, row.Username, row.IsAdministrator != 0, row.Disabled != 0, row.Email)).ToArray();
     }
 
     public async Task ChangePasswordAsync(
@@ -746,11 +746,11 @@ public sealed partial class GraftStore : IAsyncDisposable
     {
         string normalized = NormalizeName(username, nameof(username));
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
-        IdentityRow? row = await db.QuerySingleOrDefaultAsync<IdentityRow>("""
-            SELECT Id, Username, IsAdministrator, Disabled
+        UserListRow? row = await db.QuerySingleOrDefaultAsync<UserListRow>("""
+            SELECT Id, Username, IsAdministrator, Disabled, Email
             FROM Users WHERE NormalizedUsername = @NormalizedUsername AND Disabled = 0;
             """, new NormalizedNameParameters(normalized));
-        return row is null ? null : new(row.Id, row.Username, row.IsAdministrator != 0, false);
+        return row is null ? null : new(row.Id, row.Username, row.IsAdministrator != 0, false, row.Email);
     }
 
     public async Task<IReadOnlyList<ProjectMember>> ListProjectMembersAsync(

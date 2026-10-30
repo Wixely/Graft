@@ -1,0 +1,64 @@
+@page "/-/reset/{Secret}"
+@inject GraftApi Api
+@inject NavigationManager Navigation
+
+@* The far end of a reset link, whether it came by email or from an administrator's hand. The secret is in
+   the address and goes to the server once, with the new password; it is never shown and never stored here.
+   A link that has been used or has expired is refused by the server, and this page says so without saying
+   which. *@
+
+<PageTitle>Choose a new password &middot; Graft</PageTitle>
+
+<div class="sign-in">
+    <div class="sign-in-mark">
+        <img src="graft-app-blue.png" alt="" width="36" height="36" />
+        <h1>Choose a new password</h1>
+    </div>
+
+    <Banner Message="@message" Kind="error" />
+
+    <div class="panel">
+        <div class="panel-body">
+            <p class="secondary-text">
+                Setting a password signs the account out everywhere and revokes its personal access tokens.
+            </p>
+            <form class="form" @onsubmit="Complete" @onsubmit:preventDefault>
+                <label for="new-password">New password</label>
+                <input id="new-password" type="password" @bind="newPassword" required minlength="16" maxlength="256" autocomplete="new-password" />
+                <label for="confirm-password">Confirm new password</label>
+                <input id="confirm-password" type="password" @bind="confirmPassword" required minlength="16" maxlength="256" autocomplete="new-password" />
+                <div class="form-actions">
+                    <button type="submit" disabled="@busy">@(busy ? "Setting…" : "Set password")</button>
+                </div>
+            </form>
+            <p class="secondary-text"><a href="/-/login">Back to sign in</a></p>
+        </div>
+    </div>
+</div>
+
+@code {
+    [Parameter] public string Secret { get; set; } = "";
+
+    private string newPassword = "";
+    private string confirmPassword = "";
+    private string message = "";
+    private bool busy;
+
+    private async Task Complete()
+    {
+        if (busy) return;
+        if (newPassword != confirmPassword) { message = "The passwords do not match."; return; }
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAnonymousAsync("api/password-reset", new PasswordResetCompleteRequest(Secret, newPassword),
+                ApiJson.Default.PasswordResetCompleteRequest, "");
+            newPassword = "";
+            confirmPassword = "";
+            if (result.Ok) { Navigation.NavigateTo("/-/login?notice=reset", replace: true); return; }
+            message = result.Message;
+        }
+        finally { busy = false; }
+    }
+}
