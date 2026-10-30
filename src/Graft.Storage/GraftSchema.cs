@@ -4,7 +4,7 @@ namespace Graft.Storage;
 
 public static class GraftSchema
 {
-    public static DnaXMigrationManifest Manifest { get; } = new(17,
+    public static DnaXMigrationManifest Manifest { get; } = new(18,
     [
         DnaXMigration.Sql(1, "initial-identity-project-schema", "Create identity and private project schema", """
             CREATE TABLE Users (
@@ -603,6 +603,28 @@ public static class GraftSchema
 
             CREATE INDEX IX_Packages_Project ON Packages(ProjectId, PackageType, NormalizedName);
             CREATE INDEX IX_ContainerRepositories_Project ON ContainerRepositories(ProjectId);
+            """),
+        // SSH keys.
+        //
+        // A key belongs to one account and is found by its fingerprint, which is unique across the instance
+        // because a key that two accounts both registered would name two people at once. The key itself is
+        // stored in the one-line form a person pasted, so it can be shown back and compared by eye. An
+        // expiry is optional and a last-use time is kept, because a key nobody has used in a year is the one
+        // to remove.
+        DnaXMigration.Sql(18, "ssh-keys", "Let an account register public keys for Git over SSH", """
+            CREATE TABLE SshKeys (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                UserId INTEGER NOT NULL REFERENCES Users(Id) ON DELETE CASCADE,
+                Title TEXT NOT NULL,
+                KeyType TEXT NOT NULL,
+                PublicKey TEXT NOT NULL,
+                Fingerprint TEXT NOT NULL UNIQUE,
+                CreatedAtUtc TEXT NOT NULL,
+                ExpiresAtUtc TEXT NULL,
+                LastUsedAtUtc TEXT NULL
+            );
+
+            CREATE INDEX IX_SshKeys_User ON SshKeys(UserId, Id);
             """)
     ]);
 }

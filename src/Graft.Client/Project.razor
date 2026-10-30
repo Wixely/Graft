@@ -120,7 +120,7 @@ git push -u origin main</pre>
                 @* Arrive by the slug and the clone URL offered first is the slug's, so a reader who was
                    given an ownerless link is never handed back one with an account name in it. *@
                 <CloneMenu Url="@(ViaSlug && repo.Project.GlobalWebUrl.Length > 0 ? repo.Project.GlobalWebUrl + ".git" : repo.Project.HttpUrlToRepo)"
-                           Branch="@Branch" ShareUrl="@repo.Project.GlobalWebUrl" />
+                           Branch="@Branch" ShareUrl="@repo.Project.GlobalWebUrl" SshUrl="@(repo.Project.SshUrlToRepo ?? "")" />
             </div>
         </div>
 

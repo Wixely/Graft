@@ -25,6 +25,7 @@ else if (Api.Authenticated)
 
     <div class="tabs">
         <button type="button" class="@(tab == "tokens" ? "active" : "")" @onclick='() => tab = "tokens"'>Access tokens</button>
+        <button type="button" class="@(tab == "keys" ? "active" : "")" @onclick='() => tab = "keys"'>SSH keys</button>
         <button type="button" class="@(tab == "avatar" ? "active" : "")" @onclick='() => tab = "avatar"'>Avatar</button>
         <button type="button" class="@(tab == "password" ? "active" : "")" @onclick='() => tab = "password"'>Password</button>
     </div>
@@ -171,6 +172,63 @@ else if (Api.Authenticated)
             }
         </div>
     }
+    else if (tab == "keys")
+    {
+        <div class="panel">
+            <div class="panel-header"><h2>Add an SSH key</h2></div>
+            <div class="panel-body">
+                <p class="secondary-text">
+                    Paste the public half of a key, the contents of a <span class="mono">.pub</span> file, as one line.
+                    Graft accepts Ed25519, ECDSA and RSA keys. A key lets you clone and push over SSH as yourself;
+                    it grants nothing a token could not, and nothing beyond Git.
+                </p>
+                <form class="form" @onsubmit="AddKey" @onsubmit:preventDefault>
+                    <label for="key-title">Title</label>
+                    <input id="key-title" @bind="keyTitle" required maxlength="100" placeholder="laptop" />
+                    <label for="key-text">Public key</label>
+                    <textarea id="key-text" @bind="keyText" required rows="3" spellcheck="false" placeholder="ssh-ed25519 AAAA… comment"></textarea>
+                    <div class="form-actions">
+                        <button type="submit" disabled="@busy">@(busy ? "Adding…" : "Add key")</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="panel-header"><h2>Your SSH keys</h2><span class="spacer"></span><span class="label">@keys.Length</span></div>
+            @if (keys.Length == 0)
+            {
+                <p class="panel-empty">No SSH keys. Cloning and pushing over SSH needs one.</p>
+            }
+            else
+            {
+                <div class="list">
+                    @foreach (SshKeyResponse key in keys)
+                    {
+                        <div class="list-item">
+                            <Icon Name="key" />
+                            <span class="list-item-main">
+                                <strong>@key.Title</strong>
+                                <small class="mono">@key.Fingerprint</small>
+                                <small>
+                                    @key.Key.Split(' ')[0] &middot; added @key.CreatedAt.ToString("yyyy-MM-dd")
+                                    @(key.LastUsedAt is DateTimeOffset used ? " · last used " + used.ToString("yyyy-MM-dd") : " · never used")
+                                    @(key.ExpiresAt is DateTimeOffset expires ? " · expires " + expires.ToString("yyyy-MM-dd") : "")
+                                </small>
+                            </span>
+                            <span class="list-item-actions">
+                                @* Two clicks: a removed key stops every clone and push that used it, at once. *@
+                                <button type="button" class="@(pendingKeyDelete == key.Id ? "danger" : "secondary")"
+                                        @onclick="() => DeleteKey(key)" disabled="@busy">
+                                    @(pendingKeyDelete == key.Id ? "Confirm remove" : "Remove")
+                                </button>
+                            </span>
+                        </div>
+                    }
+                </div>
+            }
+        </div>
+    }
     else if (tab == "password")
     {
         <div class="panel">
@@ -232,11 +290,54 @@ else if (Api.Authenticated)
                 return;
             }
             await LoadTokens();
+            await LoadKeys();
         }
         finally { loading = false; }
     }
 
     private async Task LoadTokens() => tokens = await Api.GetAsync("api/tokens", ApiJson.Default.TokenResponseArray) ?? [];
+
+    private SshKeyResponse[] keys = [];
+    private string keyTitle = "";
+    private string keyText = "";
+    private long? pendingKeyDelete;
+
+    private async Task LoadKeys() => keys = await Api.GetAsync("api/keys", ApiJson.Default.SshKeyResponseArray) ?? [];
+
+    private async Task AddKey()
+    {
+        if (busy) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync("api/keys", new SshKeyCreateRequest(keyTitle.Trim(), keyText.Trim(), null),
+                ApiJson.Default.SshKeyCreateRequest, "Key added.");
+            Report(result);
+            if (result.Ok)
+            {
+                keyTitle = "";
+                keyText = "";
+                await LoadKeys();
+            }
+        }
+        finally { busy = false; }
+    }
+
+    private async Task DeleteKey(SshKeyResponse key)
+    {
+        if (pendingKeyDelete != key.Id) { pendingKeyDelete = key.Id; return; }
+        if (busy) return;
+        busy = true;
+        message = "";
+        pendingKeyDelete = null;
+        try
+        {
+            Report(await Api.DeleteAsync($"api/keys/{key.Id}", "Key removed."));
+            await LoadKeys();
+        }
+        finally { busy = false; }
+    }
 
     /// <summary>
     /// Sends a completed avatar upload to be validated and stored. Refreshing the session afterwards is what

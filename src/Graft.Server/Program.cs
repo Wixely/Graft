@@ -33,7 +33,7 @@ if (args.Length == 1 && args[0] == "--licences")
 
 if (!Arguments.TryParse(args, out Arguments? parsedSettings))
 {
-    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>] [--mcp true|false] [--pages-origin <https origin>] [--recoverable-tokens true|false] [--webhooks true|false].");
+    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>] [--mcp true|false] [--pages-origin <https origin>] [--recoverable-tokens true|false] [--webhooks true|false] [--ssh-port <0-65535>] [--ssh-host <name>].");
     Console.Error.WriteLine("       Graft.Server --licences  prints the third-party notices this build redistributes.");
     return 2;
 }
@@ -52,6 +52,10 @@ RequestThrottle loginThrottle = new(20);
 // these, and far tighter than unbounded because the route answers without credentials.
 RequestThrottle browseThrottle = new(240);
 string? serverOrigin = null;
+// Git over SSH, started once the HTTP side is up so the clone URLs it advertises exist. Declared here because
+// the project response needs the port that was actually bound, which a test learns only after the start.
+Graft.Ssh.SshServer? sshServer = null;
+Graft.Ssh.SshHostKey? sshHostKey = null;
 const string SessionCookie = "__Host-graft-session";
 
 // Secrets of tokens their owner has just created and not yet copied.
@@ -795,6 +799,42 @@ app.MapDelete("/api/tokens/{tokenId:long}", async context =>
     catch (UnauthorizedAccessException) { await ApiError(context, 404, "token"); }
 });
 
+// SSH keys, for the browser. A key is a credential like a token, so the same rules: the owner and nobody
+// else, a session with its CSRF token to change anything, every change audited. The key is parsed here and
+// refused by name when it is not one of the types the SSH server will verify, so what is stored is what
+// will work.
+app.MapGet("/api/keys", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!await OnlyQuery(context)) return;
+    IReadOnlyList<SshKeyInfo> keys = await store.ListSshKeysAsync(browser.Value.Identity, context.RequestAborted);
+    await context.Response.WriteAsJsonAsync(keys.Select(SshKeyResponseFor).ToArray(), ApiJson.Default.SshKeyResponseArray, null, context.RequestAborted);
+});
+
+app.MapPost("/api/keys", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    await AddSshKey(context, browser.Value.Identity);
+});
+
+app.MapDelete("/api/keys/{keyId:long}", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    long keyId = Convert.ToInt64(context.Request.RouteValues["keyId"], System.Globalization.CultureInfo.InvariantCulture);
+    if (await store.DeleteSshKeyAsync(browser.Value.Identity, keyId, context.RequestAborted))
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    else await ApiError(context, 404, "key");
+});
+
 app.MapGet("/api/projects", async context =>
 {
     (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
@@ -1521,6 +1561,87 @@ app.MapGet("/api/v4/user", async context =>
         origin + "/" + Uri.EscapeDataString(identity.Username), avatarUrl),
         ApiJson.Default.UserResponse, null, context.RequestAborted);
 });
+
+// GitLab's SSH key routes for the calling account. Reading needs read_api; adding and removing need api,
+// as token routes do, because a key is a credential and a read-only token must not be able to mint one.
+app.MapGet("/api/v4/user/keys", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!await OnlyQuery(context)) return;
+    IReadOnlyList<SshKeyInfo> keys = await store.ListSshKeysAsync(identity, context.RequestAborted);
+    await context.Response.WriteAsJsonAsync(keys.Select(SshKeyResponseFor).ToArray(), ApiJson.Default.SshKeyResponseArray, null, context.RequestAborted);
+});
+
+app.MapGet("/api/v4/user/keys/{keyId:long}", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!await OnlyQuery(context)) return;
+    long keyId = Convert.ToInt64(context.Request.RouteValues["keyId"], System.Globalization.CultureInfo.InvariantCulture);
+    SshKeyInfo? key = await store.GetSshKeyAsync(identity, keyId, context.RequestAborted);
+    if (key is null) { await ApiError(context, 404, "404 Key Not Found"); return; }
+    await context.Response.WriteAsJsonAsync(SshKeyResponseFor(key), ApiJson.Default.SshKeyResponse, null, context.RequestAborted);
+});
+
+app.MapPost("/api/v4/user/keys", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!identity.TokenScopes.HasFlag(TokenScope.Api)) { await ApiError(context, 403, "403 Forbidden: insufficient_scope"); return; }
+    await AddSshKey(context, identity);
+});
+
+app.MapDelete("/api/v4/user/keys/{keyId:long}", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!identity.TokenScopes.HasFlag(TokenScope.Api)) { await ApiError(context, 403, "403 Forbidden: insufficient_scope"); return; }
+    long keyId = Convert.ToInt64(context.Request.RouteValues["keyId"], System.Globalization.CultureInfo.InvariantCulture);
+    if (await store.DeleteSshKeyAsync(identity, keyId, context.RequestAborted))
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    else await ApiError(context, 404, "404 Key Not Found");
+});
+
+/// <summary>Adds a key from GitLab's request shape, for either family. The key is parsed and refused by
+/// name when it is not one the SSH server would verify; a key already registered anywhere is refused too,
+/// because it would otherwise name two people.</summary>
+async Task AddSshKey(HttpContext context, AuthenticatedIdentity identity)
+{
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    SshKeyCreateRequest? request;
+    try { request = await context.Request.ReadFromJsonAsync(ApiJson.Default.SshKeyCreateRequest, context.RequestAborted); }
+    catch (JsonException) { await ApiError(context, 400, "400 Bad Request: body is not valid JSON"); return; }
+    string title = request?.Title?.Trim() ?? "";
+    if (title.Length is 0 or > 100) { await ApiError(context, 400, "400 Bad Request: title is required and at most 100 characters"); return; }
+    if (request?.Key is null || request.Key.Length > 2 * Graft.Ssh.SshPublicKey.MaximumBlobBytes + 300)
+    { await ApiError(context, 400, "400 Bad Request: key is required"); return; }
+    Graft.Ssh.SshPublicKey? key = Graft.Ssh.SshPublicKey.ParseAuthorizedKey(request.Key);
+    if (key is null)
+    {
+        await ApiError(context, 400, "400 Bad Request: key is invalid; Graft accepts ssh-ed25519, ecdsa-sha2-nistp256/384/521 and ssh-rsa of 2048 bits or more, as one line");
+        return;
+    }
+    DateTimeOffset? expires = null;
+    if (!string.IsNullOrWhiteSpace(request.ExpiresAt))
+    {
+        if (!DateOnly.TryParseExact(request.ExpiresAt.Trim(), "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.None, out DateOnly date) || date <= DateOnly.FromDateTime(DateTime.UtcNow))
+        { await ApiError(context, 400, "400 Bad Request: expires_at must be a future date as YYYY-MM-DD"); return; }
+        expires = new DateTimeOffset(date.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero);
+    }
+    try
+    {
+        SshKeyInfo added = await store.AddSshKeyAsync(identity, title, key.Type, key.ToAuthorizedKeyLine(), key.Fingerprint, expires, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status201Created;
+        await context.Response.WriteAsJsonAsync(SshKeyResponseFor(added), ApiJson.Default.SshKeyResponse, null, context.RequestAborted);
+    }
+    catch (SshKeyConflictException) { await ApiError(context, 400, "400 Bad Request: fingerprint has already been taken"); }
+    catch (InvalidOperationException exception) { await ApiError(context, 400, "400 Bad Request: " + exception.Message); }
+}
+
+static SshKeyResponse SshKeyResponseFor(SshKeyInfo key) =>
+    new(key.Id, key.Title, key.Key, key.Fingerprint, key.CreatedAtUtc, key.ExpiresAtUtc, key.LastUsedAtUtc);
 
 app.MapGet("/api/v4/projects", async context =>
 {
@@ -3500,8 +3621,12 @@ async Task DeleteWebhook(HttpContext context, ProjectDetails project, Authentica
 /// debugger and fail in the published build.
 /// </para>
 /// </summary>
-async Task Notify(HttpContext context, ProjectInfo project, WebhookEvent single,
-    Action<System.Text.Json.Nodes.JsonObject> describe)
+Task Notify(HttpContext context, ProjectInfo project, WebhookEvent single, Action<System.Text.Json.Nodes.JsonObject> describe) =>
+    NotifyAt(Origin(context), project, single, describe, context.RequestAborted);
+
+/// <summary>The notification itself, from whichever transport: the SSH side has no request to take an origin from.</summary>
+async Task NotifyAt(string origin, ProjectInfo project, WebhookEvent single,
+    Action<System.Text.Json.Nodes.JsonObject> describe, CancellationToken cancellationToken)
 {
     if (webhooks is null) return;
     System.Text.Json.Nodes.JsonObject payload = new()
@@ -3511,12 +3636,38 @@ async Task Notify(HttpContext context, ProjectInfo project, WebhookEvent single,
         {
             ["id"] = project.Id,
             ["path"] = project.Namespace + "/" + project.Slug,
-            ["web_url"] = ProjectUrlFor(context, project)
+            ["web_url"] = origin + "/" + Uri.EscapeDataString(project.Namespace) + "/" + Uri.EscapeDataString(project.Slug)
         },
         ["at"] = DateTimeOffset.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture)
     };
     describe(payload);
-    await webhooks.PublishAsync(project.Id, single, payload.ToJsonString(), context.RequestAborted);
+    await webhooks.PublishAsync(project.Id, single, payload.ToJsonString(), cancellationToken);
+}
+
+/// <summary>What a push over SSH tells the hooks: the same shape as a push over HTTP, with <c>via</c> saying which.</summary>
+async Task NotifyPushAt(string origin, ProjectInfo project, AuthenticatedIdentity identity, List<(string Branch, string? From, string? To)> moved)
+{
+    foreach ((string branch, string? from, string? to) in moved)
+    {
+        await NotifyAt(origin, project, WebhookEvent.Push, payload =>
+        {
+            payload["branch"] = branch;
+            payload["before"] = from;
+            payload["commit"] = to;
+            payload["by"] = identity.Username;
+            payload["via"] = "ssh";
+        }, CancellationToken.None);
+    }
+}
+
+/// <summary><c>ssh://git@host[:port]</c>, with the configured host name when there is one and the port only
+/// when it is not SSH's own.</summary>
+string SshBase(string requestHost)
+{
+    string host = settings.SshHost ?? requestHost;
+    int port = sshServer?.Port ?? settings.SshPort;
+    if (host.Contains(':', StringComparison.Ordinal)) host = "[" + host + "]";
+    return "ssh://git@" + host + (port == 22 ? "" : ":" + port.ToString(System.Globalization.CultureInfo.InvariantCulture));
 }
 
 static System.Text.Json.Nodes.JsonObject MergeNode(MergeProposal proposal) => new()
@@ -6074,6 +6225,28 @@ Console.WriteLine(settings.PagesOrigin is null ? "PAGES: off" : "PAGES: " + sett
 Console.WriteLine("WEBHOOKS: " + (settings.Webhooks
     ? "on; a project Maintainer can make this server call an address of their choosing"
     : "off"));
+// Git over SSH. The host key lives beside the database, because the database is the thing an operator
+// already backs up and moves, and a server that changed its host key on every move would teach every
+// client to ignore the warning that matters. The fingerprint is printed so it can be checked from a known
+// place, which is the only honest answer to "is this the right server" on first connection.
+if (settings.SshPort >= 0)
+{
+    sshHostKey = Graft.Ssh.SshHostKey.LoadOrCreate(Path.Combine(Path.GetDirectoryName(settings.Database)!, "ssh_host_ecdsa_key"));
+    GitSshHost gitHost = new(store, settings.PublicBrowsing, GlobalNamespace, EndpointFor,
+        (project, identity, moved) => NotifyPushAt(serverOrigin!, project, identity, moved),
+        (text, exception) => app.Logger.LogInformation(exception, "{Message}", text));
+    sshServer = new(new Graft.Ssh.SshServerOptions
+    {
+        Address = settings.ListenAddress,
+        Port = settings.SshPort,
+        HostKey = sshHostKey,
+        Log = (text, exception) => app.Logger.LogInformation(exception, "{Message}", text)
+    }, gitHost);
+    sshServer.Start();
+    app.Lifetime.ApplicationStopping.Register(() => sshServer.DisposeAsync().AsTask().GetAwaiter().GetResult());
+    Console.WriteLine("SSH: " + SshBase(new Uri(serverOrigin!).Host) + "/<owner>/<project>.git; host key " + sshHostKey.Fingerprint);
+}
+else Console.WriteLine("SSH: off");
 Console.WriteLine("READY: " + address);
 await app.WaitForShutdownAsync();
 return 0;
@@ -6511,7 +6684,8 @@ async Task<ProjectResponse> ProjectResponseForLocked(HttpContext context, Projec
     ForkInfo forks = await store.GetForkInfoAsync(details.Project.Id, context.RequestAborted);
     return new(details.Project.Id, details.Description, details.Project.Name,
         details.Project.Namespace + " / " + details.Project.Name, details.Project.Slug, path, details.CreatedAtUtc,
-        defaultBranch, VisibilityName(details.Project.Visibility), null, webUrl + ".git", webUrl, avatarUrl,
+        defaultBranch, VisibilityName(details.Project.Visibility),
+        sshServer is null ? null : SshBase(context.Request.Host.Host) + "/" + path + ".git", webUrl + ".git", webUrl, avatarUrl,
         new(details.Project.OwnerUserId, details.Project.Namespace, details.Project.Namespace, "user", details.Project.Namespace,
             origin + "/" + Uri.EscapeDataString(details.Project.Namespace)),
         details.Project.GlobalSlug,
@@ -6909,12 +7083,12 @@ sealed record PendingSecret(long UserId, string Secret, DateTimeOffset ExpiresAt
 
 sealed record Arguments(string Database, string Repositories, IPAddress ListenAddress, int ListenPort, string? Origin,
     string? Certificate, string? CertificatePasswordFile, bool PublicBrowsing, bool PushToCreate, int SessionMinutes, bool Mcp,
-    string? PagesOrigin, bool RecoverableTokens, bool Webhooks)
+    string? PagesOrigin, bool RecoverableTokens, bool Webhooks, int SshPort, string? SshHost)
 {
     public static bool TryParse(string[] values, out Arguments? result)
     {
         result = null;
-        if (values.Length is < 4 or > 26 || values.Length % 2 != 0) return false;
+        if (values.Length is < 4 or > 30 || values.Length % 2 != 0) return false;
         string? database = null;
         string? repositories = null;
         string? listen = null;
@@ -6928,6 +7102,8 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         string? pagesOrigin = null;
         string? recoverableTokens = null;
         string? webhooks = null;
+        string? sshPort = null;
+        string? sshHost = null;
         HashSet<string> seen = new(StringComparer.Ordinal);
         for (int index = 0; index < values.Length; index += 2)
         {
@@ -6945,6 +7121,8 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             else if (values[index] == "--pages-origin") pagesOrigin = values[index + 1];
             else if (values[index] == "--recoverable-tokens") recoverableTokens = values[index + 1];
             else if (values[index] == "--webhooks") webhooks = values[index + 1];
+            else if (values[index] == "--ssh-port") sshPort = values[index + 1];
+            else if (values[index] == "--ssh-host") sshHost = values[index + 1];
             else return false;
         }
         if (string.IsNullOrWhiteSpace(database) || string.IsNullOrWhiteSpace(repositories)) return false;
@@ -6997,6 +7175,16 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             !string.IsNullOrEmpty(originUri.UserInfo) || !string.IsNullOrEmpty(originUri.Query) ||
             !string.IsNullOrEmpty(originUri.Fragment)))
             return false;
+        // Git over SSH listens on its own port, off unless named. Zero is permitted and means "any free
+        // port", which only a test wants; a deployment names 22 or 2222. The host is what clone URLs say,
+        // for a server whose public name is not the one requests arrive by; empty means unset, as above.
+        int sshPortNumber = -1;
+        if (string.IsNullOrWhiteSpace(sshPort)) sshPort = null;
+        if (sshPort is not null && (!int.TryParse(sshPort, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out sshPortNumber) ||
+            sshPortNumber is < 0 or > 65535))
+            return false;
+        if (string.IsNullOrWhiteSpace(sshHost)) sshHost = null;
+        if (sshHost is not null && (sshHost.Length > 253 || Uri.CheckHostName(sshHost) is UriHostNameType.Unknown or UriHostNameType.Basic)) return false;
         if (certificatePasswordFile is not null && certificate is null) return false;
         if (!IPAddress.IsLoopback(address) && certificate is null) return false;
         if (!IPAddress.IsLoopback(address) && origin is null) return false;
@@ -7007,7 +7195,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             origin is null ? null : origin.TrimEnd('/'), certificate is null ? null : Path.GetFullPath(certificate),
             certificatePasswordFile is null ? null : Path.GetFullPath(certificatePasswordFile),
             publicBrowsing == "true", pushToCreate == "true", window, mcp == "true",
-            pagesOrigin, recoverableTokens == "true", webhooks == "true");
+            pagesOrigin, recoverableTokens == "true", webhooks == "true", sshPortNumber, sshHost);
         return true;
     }
 }

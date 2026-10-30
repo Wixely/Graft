@@ -233,6 +233,13 @@ printf "protocol=https\nhost=<your graft host>\n\n" | git credential reject
 
 The clone menu on every repository says the same thing, so this is not the only place to find out.
 
+**Or use SSH.** Where the operator has started the SSH listener with `--ssh-port`, the clone menu also
+offers `ssh://git@host:port/owner/project.git`. Register the public half of your key under **Profile and
+SSH keys**, or with `POST /api/v4/user/keys`, and Git authenticates with it: no token, no password. Graft is
+the SSH server, with no shell behind it; it accepts Ed25519, ECDSA and RSA keys and serves fetches in Git
+protocol version 2, which every Git since 2.26 uses by default. Check the host key fingerprint the server
+prints at startup the first time you connect. See [ADR 0031](docs/decisions/0031-git-over-ssh.md).
+
 ## Run the existing experiment
 
 From this repository using .NET SDK 10.0.300 or a compatible newer .NET 10 feature band:

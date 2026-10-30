@@ -94,6 +94,15 @@ taken on in the order the user gave: SSH, optional email, groups, the project-sc
   Git's `xdl_change_compact`, heuristic included. Agreement with `git diff` at its defaults went from 95% to
   99.3% over 1,758 fresh pairs. The residual is Git's search choosing a different script of the same length.
 
+Then the first of the four large items, in the order the user gave:
+
+- **SSH.** Graft is the SSH server, in a dependency-free project of its own: ECDH P-256, an ECDSA host key
+  beside the database, AES-GCM with AES-CTR as the fallback, Ed25519, ECDSA and RSA client keys, one session
+  and one command per connection. Keys are registered to accounts through GitLab's `user/keys` routes and a
+  profile tab, audited, unique across the instance. Fetches in protocol version 2 only; pushes as always.
+  Off until `--ssh-port` names a port. Not done: LFS over an SSH remote, deploy keys, administrator-managed
+  keys. [ADR 0031](decisions/0031-git-over-ssh.md).
+
 ## Near, and small
 
 Nothing is here at the moment. Everything below needs a decision before it is built.
@@ -103,9 +112,6 @@ Nothing is here at the moment. Everything below needs a decision before it is bu
 **A project Maintainer cannot read their project's audit events.** The trail is instance-wide and
 administrator-only, because most of what it records is not about a project. A project-scoped view would need
 its own query and a rule about which entries are a project's business.
-
-**SSH.** Smart HTTP only. SSH means a host key, an authorized-keys store, a key management interface and a
-second transport to keep correct. It is the most requested thing on this list and the most work.
 
 **Email, and anything that depends on it.** Graft holds no email addresses and sends nothing. Password
 reset is therefore administrator-driven with no self-service path, there are no notifications, and there is

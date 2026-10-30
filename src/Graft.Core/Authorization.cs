@@ -87,7 +87,10 @@ public enum TokenScope
 public enum IdentityKind
 {
     BrowserSession,
-    PersonalAccessToken
+    PersonalAccessToken,
+    /// <summary>Authenticated over SSH by a registered public key. Acts with the account's full role, as a
+    /// browser session does: a key has no scopes, because Git over SSH is the only thing it can reach.</summary>
+    SshKey
 }
 
 public sealed record AuthenticatedIdentity(
@@ -287,3 +290,16 @@ public sealed record McpSettings(bool Enabled, bool AllowWrites, bool AllowAnony
 {
     public static McpSettings Default { get; } = new(true, false, false);
 }
+
+/// <summary>A public key registered to an account for Git over SSH. <see cref="Key"/> is the one-line
+/// <c>type base64</c> form; <see cref="Fingerprint"/> is OpenSSH's <c>SHA256:</c> form.</summary>
+public sealed record SshKeyInfo(
+    long Id,
+    long UserId,
+    string Title,
+    string Type,
+    string Key,
+    string Fingerprint,
+    DateTimeOffset CreatedAtUtc,
+    DateTimeOffset? ExpiresAtUtc,
+    DateTimeOffset? LastUsedAtUtc);

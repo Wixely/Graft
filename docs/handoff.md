@@ -28,6 +28,41 @@ as their own entries and decision records as each lands.
 Git suite 947 to 951 managed. The native publish was not repeated for this entry. No migration, no new
 route, no new tool.
 
+## Added on 2026-10-30, second entry: Git over SSH
+
+The first of the four large items. [ADR 0031](decisions/0031-git-over-ssh.md) carries the reasoning; this
+is what exists and how it was proved.
+
+- **`src/Graft.Ssh`**, a new project with no dependencies: the SSH transport (RFC 4253), public-key
+  authentication (4252) and the session channel with `env` and `exec` (4254), written against the platform's
+  cryptography. One algorithm per job, chosen for what every OpenSSH client since 5.7 accepts: ECDH P-256,
+  an ECDSA P-256 host key, AES-GCM with AES-CTR and HMAC-SHA-256 as the fallback. Client keys of the three
+  families people have. **Ed25519 verification is hand-written** (`Ed25519.cs`, RFC 8032 on `BigInteger`),
+  because .NET 10 has no public Ed25519; it is checked against signatures OpenSSH produced and a flipped bit.
+  Rekeying works: the transport was driven with `RekeyLimit=1M` through a 40 MB stream before any of the
+  forge was attached to it.
+- **`GitOverSsh.cs`** in the server maps a key to an account through the store, the account's role to the
+  command through the same permission decision HTTP uses, and the command to the same engine. Fetches are
+  protocol version 2 only, told so by name; a push reads the commands and then the pack from the channel,
+  finding the pack's end by walking its objects (`Pack.Capture`), and answers the report. `Advertise` and
+  `AdvertiseV2` take a flag for the `# service=` line, which only HTTP wants. A push fires the same webhooks
+  with `via: ssh`; `Notify` was split so the SSH side can call it without a request.
+- **Keys** are a table (migration 18), unique by fingerprint, with an optional expiry and a last use that is
+  recorded only after a verified signature. GitLab's `GET`/`POST /api/v4/user/keys` and `GET`/`DELETE .../:id`,
+  and `/api/keys` for the browser; a profile tab; `add-ssh-key` and `delete-ssh-key` in the audit trail; row
+  GL-043. `IdentityKind.SshKey` acts with the account's full role and no scopes.
+- **`--ssh-port` and `--ssh-host`**; off without the first. The host key is created as `ssh_host_ecdsa_key`
+  beside the database and its fingerprint printed as `SSH:` at startup. Project responses carry
+  `ssh_url_to_repo` when the listener is up, the clone menu shows it, and the compose file and
+  deployment.md have the options.
+
+Git suite 951 to 982 managed, with OpenSSH 10.5 as the client and `ssh-keygen`, `ssh-keyscan` and real
+keys; MCP suite 104, unchanged. The native publish was not repeated: the new project is marked
+AOT-compatible and uses nothing reflective, but that is a claim until the publish is run. Not done, and in
+the ADR: LFS over an SSH remote (`git-lfs-authenticate`), deploy keys, administrator-managed keys, protocol
+version 0 fetches. The browser tab and the clone menu's SSH section compile against the routes the suite
+drove and were not driven by a browser.
+
 ## Added on 2026-10-29, third entry: deleting a file, and rotating a token
 
 The user asked for another feature that needed no decision of theirs. The backlog's "Near, and small" list
