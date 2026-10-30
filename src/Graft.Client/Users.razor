@@ -98,6 +98,61 @@ else
         </div>
     }
 
+    @if (Resettable.Length > 0)
+    {
+        <div class="panel">
+            <div class="panel-header"><h2>Make a reset link</h2></div>
+            <div class="panel-body">
+                <p class="secondary-text">
+                    The link lets the person choose their own password, so you never know it. Hand it over by
+                    whatever channel you share. It works once and expires after a day; using it signs them out
+                    everywhere and revokes their tokens.
+                    @if (Api.Session?.MailAvailable == true)
+                    {
+                        <span>They can also ask for one themselves from the sign-in page, sent to their email address.</span>
+                    }
+                </p>
+                <form class="form" @onsubmit="MakeResetLink" @onsubmit:preventDefault>
+                    <label for="link-user">User</label>
+                    <select id="link-user" @bind="linkUserId">
+                        @foreach (UserAccountResponse user in Resettable) { <option value="@user.Id">@user.Username</option> }
+                    </select>
+                    <div class="form-actions">
+                        <button type="submit" disabled="@busy">Make a reset link</button>
+                    </div>
+                </form>
+                @if (resetLink is not null)
+                {
+                    <label for="reset-link-url">Reset link, shown once</label>
+                    <div class="clone-row">
+                        <input id="reset-link-url" readonly value="@resetLink.Url" />
+                    </div>
+                    <p class="field-hint">Expires @resetLink.ExpiresAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm").</p>
+                }
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="panel-header"><h2>Email address</h2></div>
+            <div class="panel-body">
+                <p class="secondary-text">
+                    Where a reset link goes when the person asks for one, on a server that sends email. Empty removes it.
+                </p>
+                <form class="form" @onsubmit="SetEmail" @onsubmit:preventDefault>
+                    <label for="email-user">User</label>
+                    <select id="email-user" value="@emailUserId" @onchange="EmailUserChanged">
+                        @foreach (UserAccountResponse user in Resettable) { <option value="@user.Id">@user.Username</option> }
+                    </select>
+                    <label for="email-address">Address</label>
+                    <input id="email-address" type="email" @bind="emailAddress" maxlength="254" placeholder="none" />
+                    <div class="form-actions">
+                        <button type="submit" disabled="@busy">Save address</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    }
+
     @if (Disabled.Length > 0)
     {
         <div class="panel">
@@ -127,6 +182,10 @@ else
     private string newUsername = "";
     private string newPassword = "";
     private long resetUserId;
+    private long linkUserId;
+    private PasswordResetLinkResponse? resetLink;
+    private long emailUserId;
+    private string emailAddress = "";
     private string resetPassword = "";
     private string resetPasswordConfirm = "";
     private long enableUserId;
@@ -160,6 +219,12 @@ else
     {
         users = await Api.GetAsync("api/users", ApiJson.Default.UserAccountResponseArray) ?? [];
         if (!Resettable.Any(user => user.Id == resetUserId)) resetUserId = Resettable.FirstOrDefault()?.Id ?? 0;
+        if (!Resettable.Any(user => user.Id == linkUserId)) linkUserId = Resettable.FirstOrDefault()?.Id ?? 0;
+        if (!Resettable.Any(user => user.Id == emailUserId))
+        {
+            emailUserId = Resettable.FirstOrDefault()?.Id ?? 0;
+            emailAddress = users.FirstOrDefault(user => user.Id == emailUserId)?.Email ?? "";
+        }
         if (!Disabled.Any(user => user.Id == enableUserId)) enableUserId = Disabled.FirstOrDefault()?.Id ?? 0;
     }
 
@@ -201,6 +266,46 @@ else
             pendingDisable = null;
             Report(result);
             await LoadUsers();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task MakeResetLink()
+    {
+        if (busy || linkUserId == 0) return;
+        busy = true;
+        message = "";
+        pendingDisable = null;
+        resetLink = null;
+        try
+        {
+            ApiResult<PasswordResetLinkResponse> result = await Api.SendAsync(HttpMethod.Post, $"api/users/{linkUserId}/reset-link",
+                ApiJson.Default.PasswordResetLinkResponse, "Reset link made. Copy it now; it is not shown again.");
+            Report(new ApiResult(result.Ok, result.Message));
+            if (result.Ok) resetLink = result.Value;
+        }
+        finally { busy = false; }
+    }
+
+    private void EmailUserChanged(ChangeEventArgs change)
+    {
+        emailUserId = long.TryParse(change.Value?.ToString(), out long id) ? id : 0;
+        emailAddress = users.FirstOrDefault(user => user.Id == emailUserId)?.Email ?? "";
+    }
+
+    private async Task SetEmail()
+    {
+        if (busy || emailUserId == 0) return;
+        busy = true;
+        message = "";
+        pendingDisable = null;
+        try
+        {
+            string username = users.FirstOrDefault(user => user.Id == emailUserId)?.Username ?? "The account";
+            Report(await Api.PostAsync($"api/users/{emailUserId}/email", new EmailChangeRequest(emailAddress.Trim()),
+                ApiJson.Default.EmailChangeRequest, emailAddress.Trim().Length == 0 ? $"{username}'s address removed." : $"{username}'s address saved."));
+            await LoadUsers();
+            emailAddress = users.FirstOrDefault(user => user.Id == emailUserId)?.Email ?? "";
         }
         finally { busy = false; }
     }

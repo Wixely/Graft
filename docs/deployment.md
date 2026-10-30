@@ -195,6 +195,35 @@ WEBHOOKS: off
 
 See [ADR 0016](decisions/0016-webhooks.md).
 
+### Optional email
+
+Graft sends nothing unless you name a mail server, and it works without one. With no mail, a forgotten
+password is reset with a link an administrator makes on the Users page and hands over; the person chooses
+their own password from it, so the administrator never knows it. To let people ask for that link themselves,
+name a server:
+
+```sh
+GRAFT_MAIL_SMTP=smtp+starttls://graft@smtp.example.com:587
+GRAFT_MAIL_FROM=graft@example.com
+GRAFT_MAIL_PASSWORD_FILE=/run/secrets/graft-mail-password
+```
+
+or `--mail-smtp`, `--mail-from` and `--mail-password-file`. The URL's scheme is the transport:
+`smtp://` sends in clear and is for a relay on the same machine or network only; `smtp+starttls://` upgrades
+to TLS before anything else is said and refuses a server that will not; `smtps://` connects with TLS from
+the first byte. The username rides in the URL; the password comes from a file of one line, never from the
+command line. Authentication is PLAIN or LOGIN. The forge prints what it is doing at startup:
+
+```text
+MAIL: off; a forgotten password is reset by an administrator's link
+```
+
+The only message the forge sends today is a password reset link, to the address on the account, valid for an
+hour and once. Delivery is queued and retried three times; a message that cannot be delivered is logged to
+the error output and dropped. Nothing waits for the mail server.
+
+See [ADR 0032](decisions/0032-email-is-optional.md).
+
 ### Optional Git over SSH
 
 Graft can serve Git over SSH itself, with no OpenSSH daemon in front of it. It is off until a port is named:

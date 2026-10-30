@@ -13,6 +13,7 @@
     @if (message.Length > 0) { <Banner Message="@message" Kind="error" /> }
     else if (Notice == "password") { <Banner Message="Password changed. Sign in again." Kind="success" /> }
     else if (Notice == "signed-out") { <Banner Message="You were signed out." Kind="info" /> }
+    else if (Notice == "reset") { <Banner Message="Password set. Sign in with it." Kind="success" /> }
 
     <div class="panel">
         <div class="panel-body">
@@ -28,6 +29,7 @@
                     <button type="submit" disabled="@busy">@(busy ? "Signing in…" : "Sign in")</button>
                 </div>
             </form>
+            <p class="secondary-text"><a href="/-/forgot">Forgot your password?</a></p>
         </div>
     </div>
 </div>

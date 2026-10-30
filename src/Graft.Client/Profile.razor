@@ -26,6 +26,7 @@ else if (Api.Authenticated)
     <div class="tabs">
         <button type="button" class="@(tab == "tokens" ? "active" : "")" @onclick='() => tab = "tokens"'>Access tokens</button>
         <button type="button" class="@(tab == "keys" ? "active" : "")" @onclick='() => tab = "keys"'>SSH keys</button>
+        <button type="button" class="@(tab == "email" ? "active" : "")" @onclick='() => tab = "email"'>Email</button>
         <button type="button" class="@(tab == "avatar" ? "active" : "")" @onclick='() => tab = "avatar"'>Avatar</button>
         <button type="button" class="@(tab == "password" ? "active" : "")" @onclick='() => tab = "password"'>Password</button>
     </div>
@@ -229,6 +230,38 @@ else if (Api.Authenticated)
             }
         </div>
     }
+    else if (tab == "email")
+    {
+        <div class="panel">
+            <div class="panel-header"><h2>Email address</h2></div>
+            <div class="panel-body">
+                <p class="secondary-text">
+                    @if (Api.Session?.MailAvailable == true)
+                    {
+                        <span>Used for one thing: a password reset link, if you ask for one. Nothing else is sent.</span>
+                    }
+                    else
+                    {
+                        <span>
+                            This server does not send email, so the address is kept for the record and for a server
+                            that does later. A forgotten password is reset with a link from an administrator.
+                        </span>
+                    }
+                </p>
+                <form class="form" @onsubmit="SaveEmail" @onsubmit:preventDefault>
+                    <label for="email">Address</label>
+                    <input id="email" type="email" autocomplete="email" @bind="email" maxlength="254" placeholder="you@example.com" />
+                    <div class="form-actions">
+                        <button type="submit" disabled="@busy">@(busy ? "Saving…" : "Save")</button>
+                        @if (!string.IsNullOrEmpty(Api.Session?.Email))
+                        {
+                            <button type="button" class="secondary" @onclick="ClearEmail" disabled="@busy">Remove</button>
+                        }
+                    </div>
+                </form>
+            </div>
+        </div>
+    }
     else if (tab == "password")
     {
         <div class="panel">
@@ -296,6 +329,31 @@ else if (Api.Authenticated)
     }
 
     private async Task LoadTokens() => tokens = await Api.GetAsync("api/tokens", ApiJson.Default.TokenResponseArray) ?? [];
+
+    private string email = "";
+
+    protected override void OnParametersSet() => email = Api.Session?.Email ?? email;
+
+    private async Task SaveEmail()
+    {
+        if (busy) return;
+        busy = true;
+        message = "";
+        try
+        {
+            Report(await Api.PostAsync("api/email", new EmailChangeRequest(email.Trim()), ApiJson.Default.EmailChangeRequest,
+                email.Trim().Length == 0 ? "Email address removed." : "Email address saved."));
+            await Api.RefreshSessionAsync();
+            email = Api.Session?.Email ?? "";
+        }
+        finally { busy = false; }
+    }
+
+    private async Task ClearEmail()
+    {
+        email = "";
+        await SaveEmail();
+    }
 
     private SshKeyResponse[] keys = [];
     private string keyTitle = "";

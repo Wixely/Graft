@@ -38,6 +38,11 @@ project Maintainer make the server call an address of their choosing, which is w
 See [ADR 0015](docs/decisions/0015-review-journey.md), [ADR 0016](docs/decisions/0016-webhooks.md) and
 [the evidence](docs/validation/2026-10-22-review.md).
 
+Email is optional. Graft sends nothing unless `--mail-smtp` names a server, and it works without one: a
+forgotten password is reset with a one-time link an administrator makes and hands over, so the administrator
+never knows the password the person chooses. With a mail server, the sign-in page lets people ask for that
+link themselves, sent to the address on their account. See [ADR 0032](docs/decisions/0032-email-is-optional.md).
+
 Status as of **2026-10-22**: Graft hosts the conversation about the code, not just the code. A project now
 has issues, merge requests and comments on both, numbered from one within that project. Reading them
 follows the repository, so a public project's issues are readable by a stranger; writing on them needs
