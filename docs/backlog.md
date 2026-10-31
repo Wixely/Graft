@@ -112,6 +112,15 @@ Then the first of the four large items, in the order the user gave:
   off with the password and a code; removed by an administrator for the person who lost both. No email, no
   phone number; tokens and SSH keys unaffected. Not done: WebAuthn, requiring it of everyone, a QR picture.
   [ADR 0034](decisions/0034-second-factor.md).
+- **Groups and nested namespaces.** A group is a namespace with members and may hold groups; a role in it is
+  held on everything beneath; a project is created under a group and reached by its nested path over the API,
+  HTTPS and SSH. Deleted only when empty. The browser addresses a nested project with its namespace as one
+  encoded segment, a recorded deviation. Not done: transfers, group visibility, group-level labels and the
+  rest. [ADR 0035](decisions/0035-groups.md).
+- **A project's own view of the audit trail.** For whoever may manage the project: the entries that name the
+  project, its issues, proposals and comments, or its releases, packages, images and snippets that still
+  exist, on the settings tab and at GitLab's `audit_events` route. The whole trail stays the administrator's.
+  [ADR 0036](decisions/0036-project-audit.md).
 
 ## Near, and small
 
@@ -119,19 +128,12 @@ Nothing is here at the moment. Everything below needs a decision before it is bu
 
 ## Larger, and worth deciding deliberately
 
-**A project Maintainer cannot read their project's audit events.** The trail is instance-wide and
-administrator-only, because most of what it records is not about a project. A project-scoped view would need
-its own query and a rule about which entries are a project's business.
-
 **Continuous integration and a runner protocol.** Recorded as a long-term goal since
 [ADR 0001](decisions/0001-name-and-compatibility.md) and still entirely absent. CupriNet remains a
 user-requested candidate rather than a chosen dependency.
 
 **GraphQL.** GitLab's newer clients increasingly prefer it. Not implemented, and implementing a useful
 subset is a large piece of work with its own schema to keep honest.
-
-**Nested groups and namespaces.** A namespace is an account name. There are no groups, so there is no way to
-own projects collectively or to grant access to a team rather than to people one at a time.
 
 
 ## Known boundaries that are decisions, not gaps

@@ -64,7 +64,7 @@ else
         }
         @if (repo.CanManage)
         {
-            <button type="button" class="@(tab == "settings" ? "active" : "")" @onclick='() => tab = "settings"'>Settings</button>
+            <button type="button" class="@(tab == "settings" ? "active" : "")" @onclick="OpenSettings">Settings</button>
         }
     </div>
 
@@ -638,6 +638,35 @@ git push -u origin main</pre>
             }
         </div>
 
+        @* What has been done to this project, as the instance trail records it, scoped to what is this
+           project's business. For whoever may manage the project; the whole trail stays the administrator's. *@
+        <div class="panel">
+            <div class="panel-header"><Icon Name="archive" /><h2>Recent activity</h2><span class="spacer"></span><span class="label">@auditTotal total</span></div>
+            @if (audit.Length == 0)
+            {
+                <div class="panel-empty">Nothing recorded for this project yet.</div>
+            }
+            else
+            {
+                <div class="list">
+                    @foreach (AuditEntryResponse entry in audit)
+                    {
+                        <div class="list-item">
+                            <span class="list-item-main">
+                                <strong>@entry.Action</strong>
+                                <small>@entry.Detail</small>
+                            </span>
+                            <span class="label">@entry.TargetType@(entry.TargetId is null ? "" : " " + entry.TargetId)</span>
+                            <span class="list-item-meta">
+                                <small>@(entry.ActorUsername ?? "the system")</small>
+                                <small title="@entry.CreatedAt.ToString("O")">@entry.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")</small>
+                            </span>
+                        </div>
+                    }
+                </div>
+            }
+        </div>
+
         @* Only the owner and an administrator, matching what the server will accept. A Maintainer sees no
            button rather than one that answers 403: offering an action nobody can take is worse than not
            offering it. *@
@@ -714,6 +743,18 @@ git push -u origin main</pre>
     private string? pendingBranch;
     private string? pendingFile;
     private TagResponse[] tags = [];
+    private AuditEntryResponse[] audit = [];
+    private long auditTotal;
+
+    /// <summary>Opens the settings tab and fetches the project's recent activity, which only that tab shows.</summary>
+    private async Task OpenSettings()
+    {
+        tab = "settings";
+        if (repo is null) return;
+        AuditPageResponse? page = await Api.GetAsync($"api/projects/{repo.Project.Id}/audit?per_page=50", ApiJson.Default.AuditPageResponse);
+        audit = page?.Entries.ToArray() ?? [];
+        auditTotal = page?.Total ?? 0;
+    }
     private string newTag = "";
     private string newTagFrom = "";
     private string? pendingTag;

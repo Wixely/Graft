@@ -1,0 +1,36 @@
+@page "/{*Path}"
+@inject NavigationManager Navigation
+
+@* The natural address of a project under a nested group, `/team/platform/api/-/issues`, has more segments
+   than the project pages' templates, which the router matches by segment count. This page catches what no
+   template matched and, where the shape is a namespace of several segments followed by a project, sends the
+   reader to the same place in the form the pages answer to: the namespace as one encoded segment,
+   `/team%2Fplatform/api/-/issues`. Anything else is simply not found. *@
+
+<PageTitle>Graft</PageTitle>
+
+@if (!redirected)
+{
+    <div class="page-header"><div><h1>Not found</h1><p class="subtitle">There is nothing at this address.</p></div></div>
+}
+
+@code {
+    [Parameter] public string? Path { get; set; }
+
+    private bool redirected;
+
+    protected override void OnParametersSet()
+    {
+        redirected = false;
+        string[] segments = (Path ?? "").Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (segments.Length < 3 || segments[0] is "-" or "api" or "projects") return;
+        // The project is the segment before "-" when there is one, otherwise the last segment.
+        int marker = Array.IndexOf(segments, "-");
+        int project = marker > 0 ? marker - 1 : segments.Length - 1;
+        if (project < 2) return;
+        string ns = Uri.EscapeDataString(string.Join('/', segments[..project]));
+        string rest = string.Join('/', segments[project..]);
+        redirected = true;
+        Navigation.NavigateTo("/" + ns + "/" + rest + new Uri(Navigation.Uri).Query, replace: true);
+    }
+}

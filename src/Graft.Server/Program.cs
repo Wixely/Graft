@@ -236,6 +236,30 @@ store.NotificationCreated = delivery =>
         "Turn it off there; the inbox at " + (serverOrigin ?? "") + "/-/notifications stays either way.\n");
     return Task.CompletedTask;
 };
+// A project under a nested group is addressed as `team/platform/api.git`, more segments than the Git routes
+// below were written for. Ahead of routing, a path with more than one namespace segment before `.git` is
+// folded into one encoded segment, `team%2Fplatform/api.git`, so the existing two-segment routes serve it;
+// the handlers unescape what they read. Nothing under the API, Graft's own routes or the registry is touched.
+app.Use(async (context, next) =>
+{
+    string path = context.Request.Path.Value ?? "";
+    int git = path.IndexOf(".git/", StringComparison.Ordinal);
+    if (git > 0 && !path.StartsWith("/api/", StringComparison.Ordinal) && !path.StartsWith("/-/", StringComparison.Ordinal) &&
+        !path.StartsWith("/v2/", StringComparison.Ordinal))
+    {
+        string[] segments = path[1..git].Split('/');
+        if (segments.Length > 2 && segments.All(segment => segment.Length > 0))
+        {
+            string folded = "/" + Uri.EscapeDataString(string.Join('/', segments[..^1])) + "/" + segments[^1] + path[git..];
+            context.Request.Path = new PathString(folded);
+        }
+    }
+    await next(context);
+});
+// Routing is placed here on purpose: the host would otherwise put it at the very front of the pipeline, ahead
+// of the fold above, and choose an endpoint for the path as it arrived.
+app.UseRouting();
+
 app.Use(async (context, next) =>
 {
     context.Response.Headers.CacheControl = "no-store";
@@ -847,6 +871,54 @@ app.MapGet("/api/graft/admin/audit", async context =>
     SetPagination(context, page, perPage, entries.Total);
     await context.Response.WriteAsJsonAsync(new AuditPageResponse(response, entries.Total, page, perPage),
         ApiJson.Default.AuditPageResponse, null, context.RequestAborted);
+});
+
+// A project's own view of the trail, for whoever may manage the project. The scoping rule lives in the store.
+app.MapGet("/api/projects/{projectId:long}/audit", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!await OnlyQuery(context, "page", "per_page", "action")) return;
+    (int Page, int PerPage)? pagination = await Pagination(context);
+    if (pagination is null) return;
+    long projectId = Convert.ToInt64(context.Request.RouteValues["projectId"], System.Globalization.CultureInfo.InvariantCulture);
+    string? action = context.Request.Query["action"].ToString();
+    if (action.Length == 0) action = null;
+    if (action?.Length > 64) { await ApiError(context, 400, "filter is too long"); return; }
+    AuditPage entries;
+    try
+    {
+        entries = await store.ListProjectAuditEventsAsync(browser.Value.Identity, projectId, (pagination.Value.Page - 1) * pagination.Value.PerPage,
+            pagination.Value.PerPage, action, context.RequestAborted);
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "project"); return; }
+    AuditEntryResponse[] response = [.. entries.Entries.Select(entry => new AuditEntryResponse(
+        entry.Id, entry.ActorUserId, entry.ActorUsername, entry.Action, entry.TargetType, entry.TargetId, entry.Detail, entry.CreatedAtUtc))];
+    SetPagination(context, pagination.Value.Page, pagination.Value.PerPage, entries.Total);
+    await context.Response.WriteAsJsonAsync(new AuditPageResponse(response, entries.Total, pagination.Value.Page, pagination.Value.PerPage),
+        ApiJson.Default.AuditPageResponse, null, context.RequestAborted);
+});
+
+// The same in GitLab's event shape, where its clients look for a project's audit events.
+app.MapGet("/api/v4/projects/{projectId}/audit_events", async context =>
+{
+    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.ManageProject);
+    if (project is null) return;
+    if (!await OnlyQuery(context, "page", "per_page")) return;
+    (int Page, int PerPage)? pagination = await Pagination(context);
+    if (pagination is null) return;
+    AuditPage entries;
+    try
+    {
+        entries = await store.ListProjectAuditEventsAsync(project.Identity!, project.Details.Project.Id,
+            (pagination.Value.Page - 1) * pagination.Value.PerPage, pagination.Value.PerPage, null, context.RequestAborted);
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "404 Project Not Found"); return; }
+    AuditEventResponse[] response = [.. entries.Entries.Select(entry => new AuditEventResponse(
+        entry.Id, entry.ActorUserId, project.Details.Project.Id, "Project",
+        new(entry.ActorUsername, entry.Detail, entry.Action, entry.TargetType, entry.TargetId), entry.CreatedAtUtc))];
+    SetPagination(context, pagination.Value.Page, pagination.Value.PerPage, entries.Total);
+    await context.Response.WriteAsJsonAsync(response, ApiJson.Default.AuditEventResponseArray, null, context.RequestAborted);
 });
 
 app.MapGet("/api/tokens", async context =>
@@ -1702,7 +1774,7 @@ app.MapGet("/api/browser/projects/{projectId:long}", async context => await brow
 
 app.MapGet("/api/browser/projects/{projectNamespace}/{slug}", async context => await browseProject(context,
     await store.FindReadyProjectDetailsAsync(
-        context.Request.RouteValues["projectNamespace"]?.ToString() ?? "",
+        UnescapeNamespace(context.Request.RouteValues["projectNamespace"]?.ToString() ?? ""),
         context.Request.RouteValues["slug"]?.ToString() ?? "",
         context.RequestAborted)));
 
@@ -2026,6 +2098,349 @@ TodoResponse TodoFor(HttpContext context, Notification note)
     return new(note.Id, new(note.ProjectId, path[^1], path[^1], note.ProjectPath, origin + "/" + note.ProjectPath),
         new(note.ActorUsername, note.ActorUsername), action, note.Subject == CommentSubject.Issue ? "Issue" : "MergeRequest",
         new(note.Iid, note.Title, url), url, note.Title, note.ReadAtUtc is null ? "pending" : "done", note.CreatedAtUtc, note.ReadAtUtc ?? note.CreatedAtUtc);
+}
+
+// Groups, in GitLab's shape: list, create, read by id or encoded full path, the group's projects and
+// subgroups, and its members with GitLab's access levels. A group is visible to its members, at any level,
+// and to administrators; creating a top-level group needs only a session, a subgroup needs Owner of the
+// parent, and members are an Owner's business. Deleting is refused while anything is beneath.
+app.MapGet("/api/v4/groups", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!await OnlyQuery(context)) return;
+    IReadOnlyList<Group> groups = await store.ListGroupsAsync(identity, context.RequestAborted);
+    List<GroupResponse> response = [];
+    foreach (Group group in groups) response.Add(await GroupResponseFor(context, identity, group));
+    await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.GroupResponseArray, null, context.RequestAborted);
+});
+
+app.MapPost("/api/v4/groups", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!identity.TokenScopes.HasFlag(TokenScope.Api)) { await ApiError(context, 403, "403 Forbidden: insufficient_scope"); return; }
+    await CreateGroup(context, identity);
+});
+
+app.MapGet("/api/v4/groups/{groupId}", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!await OnlyQuery(context)) return;
+    Group? group = await ResolveGroup(context, identity);
+    if (group is null) return;
+    await context.Response.WriteAsJsonAsync(await GroupResponseFor(context, identity, group), ApiJson.Default.GroupResponse, null, context.RequestAborted);
+});
+
+app.MapDelete("/api/v4/groups/{groupId}", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!identity.TokenScopes.HasFlag(TokenScope.Api)) { await ApiError(context, 403, "403 Forbidden: insufficient_scope"); return; }
+    Group? group = await ResolveGroup(context, identity);
+    if (group is null) return;
+    await DeleteGroup(context, identity, group);
+});
+
+app.MapGet("/api/v4/groups/{groupId}/projects", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!await OnlyQuery(context, "page", "per_page")) return;
+    (int Page, int PerPage)? pagination = await Pagination(context);
+    if (pagination is null) return;
+    Group? group = await ResolveGroup(context, identity);
+    if (group is null) return;
+    ProjectPage page = await store.ListGroupProjectsAsync(identity, group.Id, (pagination.Value.Page - 1) * pagination.Value.PerPage, pagination.Value.PerPage, context.RequestAborted);
+    List<ProjectResponse> response = [];
+    foreach (ProjectDetails details in page.Projects) response.Add(await ProjectResponseFor(context, details));
+    context.Response.Headers["X-Total"] = page.Total.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.ProjectResponseArray, null, context.RequestAborted);
+});
+
+app.MapGet("/api/v4/groups/{groupId}/subgroups", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!await OnlyQuery(context)) return;
+    Group? group = await ResolveGroup(context, identity);
+    if (group is null) return;
+    List<GroupResponse> response = [];
+    foreach (Group child in await store.ListSubgroupsAsync(identity, group.Id, context.RequestAborted)) response.Add(await GroupResponseFor(context, identity, child));
+    await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.GroupResponseArray, null, context.RequestAborted);
+});
+
+app.MapGet("/api/v4/groups/{groupId}/members", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!await OnlyQuery(context)) return;
+    Group? group = await ResolveGroup(context, identity);
+    if (group is null) return;
+    IReadOnlyList<GroupMember> members = await store.ListGroupMembersAsync(identity, group.Id, context.RequestAborted);
+    await context.Response.WriteAsJsonAsync(members.Select(GroupMemberResponseFor).ToArray(), ApiJson.Default.GroupMemberResponseArray, null, context.RequestAborted);
+});
+
+app.MapPost("/api/v4/groups/{groupId}/members", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!identity.TokenScopes.HasFlag(TokenScope.Api)) { await ApiError(context, 403, "403 Forbidden: insufficient_scope"); return; }
+    Group? group = await ResolveGroup(context, identity);
+    if (group is null) return;
+    await SetGroupMember(context, identity, group, null);
+});
+
+app.MapPut("/api/v4/groups/{groupId}/members/{userId:long}", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!identity.TokenScopes.HasFlag(TokenScope.Api)) { await ApiError(context, 403, "403 Forbidden: insufficient_scope"); return; }
+    Group? group = await ResolveGroup(context, identity);
+    if (group is null) return;
+    await SetGroupMember(context, identity, group, Convert.ToInt64(context.Request.RouteValues["userId"], System.Globalization.CultureInfo.InvariantCulture));
+});
+
+app.MapDelete("/api/v4/groups/{groupId}/members/{userId:long}", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!identity.TokenScopes.HasFlag(TokenScope.Api)) { await ApiError(context, 403, "403 Forbidden: insufficient_scope"); return; }
+    Group? group = await ResolveGroup(context, identity);
+    if (group is null) return;
+    await RemoveGroupMember(context, identity, group, Convert.ToInt64(context.Request.RouteValues["userId"], System.Globalization.CultureInfo.InvariantCulture));
+});
+
+// The same for the browser, under Graft's own family, with the session and its CSRF token.
+app.MapGet("/api/groups", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!await OnlyQuery(context)) return;
+    List<GroupResponse> response = [];
+    foreach (Group group in await store.ListGroupsAsync(browser.Value.Identity, context.RequestAborted))
+        response.Add(await GroupResponseFor(context, browser.Value.Identity, group));
+    await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.GroupResponseArray, null, context.RequestAborted);
+});
+
+app.MapPost("/api/groups", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await BrowserWriter(context);
+    if (browser is null) return;
+    await CreateGroup(context, browser.Value.Identity);
+});
+
+app.MapGet("/api/groups/{groupId}", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!await OnlyQuery(context)) return;
+    Group? group = await ResolveGroup(context, browser.Value.Identity);
+    if (group is null) return;
+    await context.Response.WriteAsJsonAsync(await GroupResponseFor(context, browser.Value.Identity, group), ApiJson.Default.GroupResponse, null, context.RequestAborted);
+});
+
+app.MapDelete("/api/groups/{groupId}", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await BrowserWriter(context);
+    if (browser is null) return;
+    Group? group = await ResolveGroup(context, browser.Value.Identity);
+    if (group is null) return;
+    await DeleteGroup(context, browser.Value.Identity, group);
+});
+
+app.MapGet("/api/groups/{groupId}/projects", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!await OnlyQuery(context)) return;
+    Group? group = await ResolveGroup(context, browser.Value.Identity);
+    if (group is null) return;
+    ProjectPage page = await store.ListGroupProjectsAsync(browser.Value.Identity, group.Id, 0, 100, context.RequestAborted);
+    List<ProjectResponse> response = [];
+    foreach (ProjectDetails details in page.Projects) response.Add(await ProjectResponseFor(context, details));
+    await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.ProjectResponseArray, null, context.RequestAborted);
+});
+
+app.MapGet("/api/groups/{groupId}/subgroups", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!await OnlyQuery(context)) return;
+    Group? group = await ResolveGroup(context, browser.Value.Identity);
+    if (group is null) return;
+    List<GroupResponse> response = [];
+    foreach (Group child in await store.ListSubgroupsAsync(browser.Value.Identity, group.Id, context.RequestAborted))
+        response.Add(await GroupResponseFor(context, browser.Value.Identity, child));
+    await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.GroupResponseArray, null, context.RequestAborted);
+});
+
+app.MapGet("/api/groups/{groupId}/members", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!await OnlyQuery(context)) return;
+    Group? group = await ResolveGroup(context, browser.Value.Identity);
+    if (group is null) return;
+    IReadOnlyList<GroupMember> members = await store.ListGroupMembersAsync(browser.Value.Identity, group.Id, context.RequestAborted);
+    await context.Response.WriteAsJsonAsync(members.Select(GroupMemberResponseFor).ToArray(), ApiJson.Default.GroupMemberResponseArray, null, context.RequestAborted);
+});
+
+app.MapPost("/api/groups/{groupId}/members", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await BrowserWriter(context);
+    if (browser is null) return;
+    Group? group = await ResolveGroup(context, browser.Value.Identity);
+    if (group is null) return;
+    await SetGroupMember(context, browser.Value.Identity, group, null);
+});
+
+app.MapDelete("/api/groups/{groupId}/members/{userId:long}", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await BrowserWriter(context);
+    if (browser is null) return;
+    Group? group = await ResolveGroup(context, browser.Value.Identity);
+    if (group is null) return;
+    await RemoveGroupMember(context, browser.Value.Identity, group, Convert.ToInt64(context.Request.RouteValues["userId"], System.Globalization.CultureInfo.InvariantCulture));
+});
+
+/// <summary>A browser session that may change things: Origin, session and CSRF token, all checked.</summary>
+async Task<(AuthenticatedIdentity Identity, string Secret)?> BrowserWriter(HttpContext context)
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return null; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return null;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return null; }
+    return browser;
+}
+
+/// <summary>The group the route names, by id or URL-encoded full path, if the caller may see it; else 404.</summary>
+async Task<Group?> ResolveGroup(HttpContext context, AuthenticatedIdentity identity)
+{
+    string identifier = context.Request.RouteValues["groupId"]?.ToString() ?? "";
+    try { identifier = Uri.UnescapeDataString(identifier); }
+    catch (UriFormatException) { identifier = ""; }
+    Group? group = identifier.Length == 0 ? null : await store.FindGroupAsync(identity, identifier, context.RequestAborted);
+    if (group is null) await ApiError(context, 404, "404 Group Not Found");
+    return group;
+}
+
+async Task CreateGroup(HttpContext context, AuthenticatedIdentity identity)
+{
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    GroupCreateRequest? request;
+    try { request = await context.Request.ReadFromJsonAsync(ApiJson.Default.GroupCreateRequest, context.RequestAborted); }
+    catch (JsonException) { await ApiError(context, 400, "400 Bad Request: body is not valid JSON"); return; }
+    string name = request?.Name?.Trim() ?? "";
+    string path = request?.Path?.Trim() ?? "";
+    if (name.Length == 0 && path.Length == 0) { await ApiError(context, 400, "400 Bad Request: name or path is required"); return; }
+    if (path.Length == 0) path = ProjectPathFromName(name);
+    if (name.Length == 0) name = path;
+    if (!ValidProjectPath(path)) { await ApiError(context, 400, "400 Bad Request: path must be 2-39 ASCII letters or numbers separated by single dots, underscores or hyphens"); return; }
+    if (name.Length > 200) { await ApiError(context, 400, "400 Bad Request: name must be at most 200 characters"); return; }
+    string description = request?.Description ?? "";
+    if (description.Length > 2_000) { await ApiError(context, 400, "400 Bad Request: description must be at most 2000 characters"); return; }
+    try
+    {
+        Group group = await store.CreateGroupAsync(identity, path, name, description, request?.ParentId, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status201Created;
+        await context.Response.WriteAsJsonAsync(await GroupResponseFor(context, identity, group), ApiJson.Default.GroupResponse, null, context.RequestAborted);
+    }
+    catch (ArgumentException error) { await ApiError(context, 400, "400 Bad Request: " + error.Message); }
+    catch (GroupConflictException error) { await ApiError(context, 400, "400 Bad Request: " + error.Message); }
+    catch (GroupNotFoundException) { await ApiError(context, 404, "404 Group Not Found"); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, "403 Forbidden: " + error.Message); }
+}
+
+async Task DeleteGroup(HttpContext context, AuthenticatedIdentity identity, Group group)
+{
+    try
+    {
+        await store.DeleteGroupAsync(identity, group.Id, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (InvalidOperationException error) { await ApiError(context, 400, "400 Bad Request: " + error.Message); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, "403 Forbidden: " + error.Message); }
+    catch (GroupNotFoundException) { await ApiError(context, 404, "404 Group Not Found"); }
+}
+
+async Task SetGroupMember(HttpContext context, AuthenticatedIdentity identity, Group group, long? routeUserId)
+{
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    GroupMemberRequest? request;
+    try { request = await context.Request.ReadFromJsonAsync(ApiJson.Default.GroupMemberRequest, context.RequestAborted); }
+    catch (JsonException) { await ApiError(context, 400, "400 Bad Request: body is not valid JSON"); return; }
+    if (!TryGroupRole(request?.AccessLevel, out GroupRole role))
+    { await ApiError(context, 400, "400 Bad Request: access_level must be 20 (Reporter), 30 (Developer), 40 (Maintainer) or 50 (Owner)"); return; }
+    long? userId = routeUserId ?? request?.UserId;
+    if (userId is null && request?.Username is { Length: > 0 } username)
+        userId = (await store.FindActiveUserAsync(username, context.RequestAborted))?.Id;
+    if (userId is null) { await ApiError(context, 400, "400 Bad Request: user_id or username is required and must name an active account"); return; }
+    try
+    {
+        await store.SetGroupMemberAsync(identity, group.Id, userId.Value, role, context.RequestAborted);
+        GroupMember? member = (await store.ListGroupMembersAsync(identity, group.Id, context.RequestAborted)).FirstOrDefault(m => m.UserId == userId.Value);
+        context.Response.StatusCode = routeUserId is null ? StatusCodes.Status201Created : StatusCodes.Status200OK;
+        if (member is not null)
+            await context.Response.WriteAsJsonAsync(GroupMemberResponseFor(member), ApiJson.Default.GroupMemberResponse, null, context.RequestAborted);
+    }
+    catch (InvalidOperationException error) { await ApiError(context, 400, "400 Bad Request: " + error.Message); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, "403 Forbidden: " + error.Message); }
+    catch (GroupNotFoundException) { await ApiError(context, 404, "404 Group Not Found"); }
+}
+
+async Task RemoveGroupMember(HttpContext context, AuthenticatedIdentity identity, Group group, long userId)
+{
+    try
+    {
+        await store.RemoveGroupMemberAsync(identity, group.Id, userId, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (InvalidOperationException error) { await ApiError(context, 400, "400 Bad Request: " + error.Message); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, "403 Forbidden: " + error.Message); }
+    catch (GroupNotFoundException) { await ApiError(context, 404, "404 Group Not Found"); }
+}
+
+async Task<GroupResponse> GroupResponseFor(HttpContext context, AuthenticatedIdentity identity, Group group)
+{
+    GroupRole? role = await store.GetGroupRoleAsync(identity, group.Id, context.RequestAborted);
+    return new(group.Id, group.Name, group.Path, group.Description, "private", group.FullPath.Replace("/", " / ", StringComparison.Ordinal), group.FullPath,
+        group.ParentId, Origin(context) + "/-/groups/" + group.FullPath, group.CreatedAtUtc, group.ProjectCount, group.SubgroupCount,
+        role is null ? null : AccessLevelOf(role.Value));
+}
+
+static GroupMemberResponse GroupMemberResponseFor(GroupMember member) =>
+    new(member.UserId, member.Username, member.Username, AccessLevelOf(member.Role), "active", member.Inherited);
+
+// GitLab's access levels: Reporter 20, Developer 30, Maintainer 40, Owner 50. Guest, 10, is not a role Graft has.
+static int AccessLevelOf(GroupRole role) => role switch
+{
+    GroupRole.Reporter => 20,
+    GroupRole.Developer => 30,
+    GroupRole.Maintainer => 40,
+    _ => 50
+};
+
+static bool TryGroupRole(int? accessLevel, out GroupRole role)
+{
+    role = GroupRole.Reporter;
+    switch (accessLevel)
+    {
+        case 20: role = GroupRole.Reporter; return true;
+        case 30: role = GroupRole.Developer; return true;
+        case 40: role = GroupRole.Maintainer; return true;
+        case 50: role = GroupRole.Owner; return true;
+        default: return false;
+    }
+}
+
+/// <summary>A route value that may carry a group's full path as one encoded segment.</summary>
+static string UnescapeNamespace(string value)
+{
+    try { return Uri.UnescapeDataString(value); }
+    catch (UriFormatException) { return value; }
 }
 
 app.MapGet("/api/v4/projects", async context =>
@@ -5069,10 +5484,12 @@ async Task<(ProjectDetails Details, AuthenticatedIdentity? Identity)?> PackagePr
     if (long.TryParse(identifier, out long id)) details = await store.GetReadyProjectAsync(id, context.RequestAborted);
     else
     {
+        // One segment is the instance-wide slug; two or more are a namespace, which may be a nested group's
+        // full path, and a project.
         string[] path = identifier.Split('/');
         details = path.Length switch
         {
-            2 => await store.FindReadyProjectDetailsAsync(path[0], path[1], context.RequestAborted),
+            >= 2 => await store.FindReadyProjectDetailsAsync(string.Join('/', path[..^1]), path[^1], context.RequestAborted),
             1 => await store.FindReadyProjectDetailsByGlobalSlugAsync(path[0], context.RequestAborted),
             _ => null
         };
@@ -6658,7 +7075,8 @@ async Task<PermissionDecision> DecideFor(HttpContext context, AuthenticatedIdent
 
 async Task<AuthorizedRepository?> Authorize(HttpContext context, ProjectAction action)
 {
-    string projectNamespace = context.Request.RouteValues["projectNamespace"]?.ToString() ?? "";
+    // The namespace may be a group's full path folded into one encoded segment; see the middleware ahead of routing.
+    string projectNamespace = UnescapeNamespace(context.Request.RouteValues["projectNamespace"]?.ToString() ?? "");
     string projectSlug = context.Request.RouteValues["project"]?.ToString() ?? "";
 
     // `/projects/<slug>.git` is the same two segments as `/<owner>/<slug>.git`, so this route already
@@ -6797,7 +7215,7 @@ async Task<ProjectCreateRequest?> ReadProjectCreateRequest(HttpContext context)
         using JsonDocument document = await JsonDocument.ParseAsync(context.Request.Body, cancellationToken: context.RequestAborted);
         if (document.RootElement.ValueKind != JsonValueKind.Object)
         { await ApiError(context, 400, "project must be a JSON object"); return null; }
-        string[] allowed = ["name", "path", "description", "visibility"];
+        string[] allowed = ["name", "path", "description", "visibility", "namespace_id"];
         string? unsupported = document.RootElement.EnumerateObject()
             .Select(property => property.Name)
             .FirstOrDefault(name => !allowed.Contains(name, StringComparer.Ordinal));
@@ -6840,13 +7258,17 @@ async Task CreateProject(HttpContext context, AuthenticatedIdentity identity, Pr
     }
     try
     {
-        ProjectInfo project = await store.CreateProjectWithRepositoryAsync(identity, path, name,
-            (created, cancellationToken) =>
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                _ = EndpointFor(created);
-                return Task.CompletedTask;
-            }, description, context.RequestAborted);
+        Func<ProjectInfo, CancellationToken, Task> initialize = (created, cancellationToken) =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            _ = EndpointFor(created);
+            return Task.CompletedTask;
+        };
+        // Under a group when the request names one, in the caller's own namespace otherwise. GitLab's
+        // `namespace_id` is a group's id; a user namespace is simply the default.
+        ProjectInfo project = request.NamespaceId is long groupId
+            ? await store.CreateProjectInGroupWithRepositoryAsync(identity, groupId, path, name, initialize, description, context.RequestAborted)
+            : await store.CreateProjectWithRepositoryAsync(identity, path, name, initialize, description, context.RequestAborted);
         // Applied after creation rather than inside it, so a project is never briefly readable by the world
         // while its repository is still being initialised. Creation publishes nothing on its own.
         if (requested != ProjectVisibility.Private)
@@ -6859,6 +7281,8 @@ async Task CreateProject(HttpContext context, AuthenticatedIdentity identity, Pr
     {
         await ApiError(context, 400, "path has already been taken");
     }
+    catch (GroupNotFoundException) { await ApiError(context, 404, "404 Namespace Not Found"); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, "403 Forbidden: " + error.Message); }
 }
 
 static string ProjectPathFromName(string name)
@@ -6958,12 +7382,13 @@ async Task<ApiProject?> AuthorizeApiProject(HttpContext context, ProjectAction a
     else
     {
         string[] path = identifier.Split('/');
-        // Two segments is GitLab's `owner/slug`. One segment that is not a number is Graft's instance-wide
-        // slug, which GitLab has no meaning for at all, so reading it here takes nothing away from a
-        // GitLab client and lets an API caller use the same name it was given to share.
+        // Two or more segments is GitLab's `namespace/slug`, where the namespace may be a nested group's full
+        // path. One segment that is not a number is Graft's instance-wide slug, which GitLab has no meaning
+        // for at all, so reading it here takes nothing away from a GitLab client and lets an API caller use
+        // the same name it was given to share.
         details = path.Length switch
         {
-            2 => await store.FindReadyProjectDetailsAsync(path[0], path[1], context.RequestAborted),
+            >= 2 => await store.FindReadyProjectDetailsAsync(string.Join('/', path[..^1]), path[^1], context.RequestAborted),
             1 => await store.FindReadyProjectDetailsByGlobalSlugAsync(path[0], context.RequestAborted),
             _ => null
         };
@@ -7074,8 +7499,11 @@ async Task<ProjectResponse> ProjectResponseForLocked(HttpContext context, Projec
         details.Project.Namespace + " / " + details.Project.Name, details.Project.Slug, path, details.CreatedAtUtc,
         defaultBranch, VisibilityName(details.Project.Visibility),
         sshServer is null ? null : SshBase(context.Request.Host.Host) + "/" + path + ".git", webUrl + ".git", webUrl, avatarUrl,
-        new(details.Project.OwnerUserId, details.Project.Namespace, details.Project.Namespace, "user", details.Project.Namespace,
-            origin + "/" + Uri.EscapeDataString(details.Project.Namespace)),
+        details.Project.GroupId is long groupId
+            ? new(groupId, details.Project.Namespace.Split('/')[^1], details.Project.Namespace.Split('/')[^1], "group", details.Project.Namespace,
+                origin + "/-/groups/" + details.Project.Namespace)
+            : new(details.Project.OwnerUserId, details.Project.Namespace, details.Project.Namespace, "user", details.Project.Namespace,
+                origin + "/" + Uri.EscapeDataString(details.Project.Namespace)),
         details.Project.GlobalSlug,
         details.Project.GlobalSlug.Length == 0 ? "" : origin + GlobalPrefix + "/" + Uri.EscapeDataString(details.Project.GlobalSlug),
         forks.UpstreamId is long upstreamId ? new ForkedFromResponse(upstreamId, forks.UpstreamPath!, origin + "/" + forks.UpstreamPath) : null,

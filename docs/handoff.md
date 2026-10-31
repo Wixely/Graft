@@ -28,6 +28,59 @@ as their own entries and decision records as each lands.
 Git suite 947 to 951 managed. The native publish was not repeated for this entry. No migration, no new
 route, no new tool.
 
+## Added on 2026-10-30, sixth entry: a project's own view of the audit trail
+
+The fourth and last of the user's ordered items. [ADR 0036](decisions/0036-project-audit.md).
+
+- **The rule** is how an entry names its target, as a query over the rows the trail already has
+  (`GraftStoreAudit.cs`): the project's id for entries about the project, `projectId#iid` for issues,
+  proposals and comments, and a lookup of the row's project for releases, packages, images and snippets.
+  An entry about one of those that no longer exists leaves the project's view and stays in the instance
+  trail; the ADR records that edge.
+- **Where it is read.** For whoever may manage the project: the bottom of the settings tab as recent
+  activity, `GET /api/projects/:id/audit` with an `action` filter for the browser, and GitLab's
+  `GET /api/v4/projects/:id/audit_events` in its event shape (row GL-046). A Developer and a stranger are
+  answered as for a project they may not manage. The whole trail stays the administrator's.
+
+Git suite 1130 managed with groups; MCP suite 104. With this, the four large items the user ordered on
+2026-10-30 are built: SSH, optional email with its inbox and second factor, groups, and this. What remains in
+the backlog's larger list is continuous integration and GraphQL, both of which need the user's decision.
+
+## Added on 2026-10-30, fifth entry: groups
+
+The third of the four large items. [ADR 0035](decisions/0035-groups.md) has the reasoning and the two
+deviations; this is what exists.
+
+- **Model.** `Groups` with a parent, a path and a materialised full path; `GroupMemberships` with Reporter,
+  Developer, Maintainer and the new Owner; `Projects.GroupId`. Migration 22. A role is inherited down a
+  recursive chain of parents (`GroupRoleForAsync`), merged into the project decision as the greater of the
+  direct and the inherited role, with Owner acting as Maintainer on projects. Every project query derives its
+  namespace as the group's full path or the owner's username, and the project row carries its group.
+- **The schema workaround.** `Projects` has `UNIQUE (OwnerUserId, NormalizedSlug)` from migration 1 and
+  SQLite cannot drop it in place, so a group project's `NormalizedSlug` is stored as `g<GroupId>/<slug>`
+  with a unique index on `(GroupId, NormalizedSlug)`. Every lookup of a group project goes through its group.
+  It is marked as a workaround in the schema and the ADR.
+- **Routes.** GitLab's `/api/v4/groups` family (row GL-045) and `/api/groups` for the browser;
+  `namespace_id` on project creation. A nested path reaches a project over the API encoded, over HTTPS in
+  the natural form through a middleware that folds the namespace into one encoded segment ahead of routing,
+  and over SSH by splitting at the last segment. In the browser the namespace is one encoded segment;
+  `Dispatch.razor` catches natural nested addresses and redirects. Pages: `/-/groups` and `/-/groups/<path>`;
+  the home page offers a namespace when the person is a Developer somewhere.
+- **Two traps found in the suite.** The host puts routing at the front of the pipeline unless told otherwise,
+  so the fold middleware ran after an endpoint had already been chosen and the natural nested path was a 404;
+  `app.UseRouting()` now sits directly after it. And SQLite cannot correlate a recursive CTE with an outer
+  row, so "is the caller in this group or an ancestor" is a statement-level closure (`GroupAncestors`)
+  joined to the outer query rather than a recursive subquery inside `EXISTS`.
+- **Rules.** Anyone signed in creates a top-level group; a username and a top-level group path cannot take
+  each other's name, checked at both creation points; a subgroup needs Owner of the parent, and an outsider
+  is not told the parent exists; a project in a group needs Developer or better; the last Owner stays; a
+  group is deleted only when empty.
+
+Git suite 1077 to 1130 managed, together with the project audit view in the next entry. The MCP suite was not rerun: no tool changed. Not done, and in the
+ADR: transfers, group visibility, group-level labels, milestones, boards and runners, sharing a project
+with a group, agent tools for groups. The group pages compile against the routes the suite drove and were
+not driven by a browser.
+
 ## Added on 2026-10-30, fourth entry: the inbox, and the second factor
 
 The rest of the email item, under the same condition: nothing depends on email.

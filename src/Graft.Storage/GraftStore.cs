@@ -123,6 +123,10 @@ public sealed partial class GraftStore : IAsyncDisposable
         await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
         AuthenticatedIdentity liveActor = await RequireLiveIdentityAsync(db, transaction, actor, cancellationToken);
         if (!liveActor.IsAdministrator) throw new UnauthorizedAccessException("Administrator access is required.");
+        // A username and a top-level group's path share one namespace: a project address names one or the other.
+        if (await db.ExecuteScalarAsync<long>("SELECT COUNT(*) FROM Groups WHERE ParentGroupId IS NULL AND NormalizedPath = @NormalizedUsername;",
+            new NormalizedNameParameters(normalized), transaction) > 0)
+            throw new UserConflictException("A group already has this name.", new InvalidOperationException("namespace taken by a group"));
 
         string now = Now();
         long id;
@@ -586,19 +590,23 @@ public sealed partial class GraftStore : IAsyncDisposable
         string normalizedSlug;
         try
         {
-            normalizedNamespace = NormalizeName(projectNamespace, nameof(projectNamespace));
+            normalizedNamespace = NormalizeNamespacePath(projectNamespace);
             normalizedSlug = NormalizeName(slug, nameof(slug));
         }
         catch (ArgumentException) { return null; }
 
+        // An account's project, or a group's: the namespace is one or the other and the two cannot share a
+        // name, so one query answers both. A group project's stored slug carries its group's prefix.
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
         ProjectPathRow? row = await db.QuerySingleOrDefaultAsync<ProjectPathRow>("""
-            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.StorageId, p.DefaultBranch,
+            SELECT p.Id, p.OwnerUserId, COALESCE(g.FullPath, u.Username) AS Namespace, p.GroupId, p.Slug, p.Name, p.StorageId, p.DefaultBranch,
                    p.Visibility, p.PagePublished, p.GlobalSlug
             FROM Projects p
             JOIN Users u ON u.Id = p.OwnerUserId
-            WHERE u.NormalizedUsername = @NormalizedNamespace
-              AND p.NormalizedSlug = @NormalizedSlug
+            LEFT JOIN Groups g ON g.Id = p.GroupId
+            WHERE ((p.GroupId IS NULL AND u.NormalizedUsername = @NormalizedNamespace AND p.NormalizedSlug = @NormalizedSlug)
+                OR (p.GroupId IS NOT NULL AND g.NormalizedFullPath = @NormalizedNamespace
+                    AND p.NormalizedSlug = 'g' || p.GroupId || '/' || @NormalizedSlug))
               AND p.State = 'ready';
             """, new ProjectPathParameters(normalizedNamespace, normalizedSlug));
         return row is null ? null : ToInfo(row);
@@ -608,10 +616,11 @@ public sealed partial class GraftStore : IAsyncDisposable
     {
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
         ProjectDetailsRow? row = await db.QuerySingleOrDefaultAsync<ProjectDetailsRow>("""
-            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.Description, p.StorageId, p.CreatedAtUtc,
+            SELECT p.Id, p.OwnerUserId, COALESCE(g.FullPath, u.Username) AS Namespace, p.GroupId, p.Slug, p.Name, p.Description, p.StorageId, p.CreatedAtUtc,
                    p.DefaultBranch, p.Visibility, p.PagePublished, p.GlobalSlug
             FROM Projects p
             JOIN Users u ON u.Id = p.OwnerUserId
+            LEFT JOIN Groups g ON g.Id = p.GroupId
             WHERE p.Id = @Id AND p.State = 'ready';
             """, new IdParameters(projectId));
         return row is null ? null : ToDetails(row);
@@ -636,23 +645,28 @@ public sealed partial class GraftStore : IAsyncDisposable
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
         AuthenticatedIdentity live = await RequireLiveIdentityAsync(db, null, identity, cancellationToken);
         ProjectListParameters parameters = new(live.UserId, live.IsAdministrator ? 1 : 0, take, skip);
-        IEnumerable<ProjectDetailsRow> rows = await db.QueryAsync<ProjectDetailsRow>("""
-            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.Description, p.StorageId, p.CreatedAtUtc,
+        IEnumerable<ProjectDetailsRow> rows = await db.QueryAsync<ProjectDetailsRow>(GroupAncestors + """
+            SELECT p.Id, p.OwnerUserId, COALESCE(g.FullPath, u.Username) AS Namespace, p.GroupId, p.Slug, p.Name, p.Description, p.StorageId, p.CreatedAtUtc,
                    p.DefaultBranch, p.Visibility, p.PagePublished, p.GlobalSlug
             FROM Projects p
             JOIN Users u ON u.Id = p.OwnerUserId
+            LEFT JOIN Groups g ON g.Id = p.GroupId
             WHERE p.State = 'ready' AND (
                 @IsAdministrator = 1 OR p.OwnerUserId = @UserId OR
-                EXISTS (SELECT 1 FROM ProjectMemberships m WHERE m.ProjectId = p.Id AND m.UserId = @UserId)
+                EXISTS (SELECT 1 FROM ProjectMemberships m WHERE m.ProjectId = p.Id AND m.UserId = @UserId) OR
+                EXISTS (SELECT 1 FROM GroupMemberships gm JOIN ancestors a ON a.AncestorId = gm.GroupId
+                        WHERE gm.UserId = @UserId AND a.GroupId = p.GroupId)
             )
             ORDER BY p.Id
             LIMIT @Take OFFSET @Skip;
             """, parameters);
-        long total = await db.QuerySingleAsync<long>("""
+        long total = await db.QuerySingleAsync<long>(GroupAncestors + """
             SELECT COUNT(*) FROM Projects p
             WHERE p.State = 'ready' AND (
                 @IsAdministrator = 1 OR p.OwnerUserId = @UserId OR
-                EXISTS (SELECT 1 FROM ProjectMemberships m WHERE m.ProjectId = p.Id AND m.UserId = @UserId)
+                EXISTS (SELECT 1 FROM ProjectMemberships m WHERE m.ProjectId = p.Id AND m.UserId = @UserId) OR
+                EXISTS (SELECT 1 FROM GroupMemberships gm JOIN ancestors a ON a.AncestorId = gm.GroupId
+                        WHERE gm.UserId = @UserId AND a.GroupId = p.GroupId)
             );
             """, parameters);
         return new(rows.Select(ToDetails).ToArray(), total);
@@ -665,7 +679,8 @@ public sealed partial class GraftStore : IAsyncDisposable
         string description,
         Func<ProjectInfo, CancellationToken, Task>? initializeRepository,
         CancellationToken cancellationToken,
-        string origin = "the API or browser")
+        string origin = "the API or browser",
+        long? groupId = null)
     {
         string normalizedSlug = NormalizeName(slug, nameof(slug));
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
@@ -674,6 +689,22 @@ public sealed partial class GraftStore : IAsyncDisposable
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
         await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
         AuthenticatedIdentity liveActor = await RequireLiveIdentityAsync(db, transaction, actor, cancellationToken);
+        // Under a group, the caller needs Developer or better in it, the slug is stored with the group's
+        // prefix (see migration 22), and the namespace is the group's full path.
+        string namespacePath = liveActor.Username;
+        string storedSlug = normalizedSlug;
+        if (groupId is long inGroup)
+        {
+            GroupRow group = await db.QuerySingleOrDefaultAsync<GroupRow>(GroupSelect + " WHERE g.Id = @Id;", new IdParameters(inGroup), transaction)
+                ?? throw new GroupNotFoundException();
+            GroupRole? role = await GroupRoleForAsync(db, transaction, liveActor.UserId, inGroup);
+            // Somebody outside the group is not told it exists; a member below Developer is told what is needed.
+            if (!liveActor.IsAdministrator && role is null) throw new GroupNotFoundException();
+            if (!liveActor.IsAdministrator && role is not (>= GroupRole.Developer))
+                throw new UnauthorizedAccessException("Creating a project in this group needs the Developer role in it or above.");
+            namespacePath = group.FullPath;
+            storedSlug = "g" + inGroup.ToString(CultureInfo.InvariantCulture) + "/" + normalizedSlug;
+        }
         string storageId = Guid.NewGuid().ToString("N");
         string now = Now();
         string globalSlug = await ReserveGlobalSlugAsync(db, transaction, normalizedSlug);
@@ -681,10 +712,10 @@ public sealed partial class GraftStore : IAsyncDisposable
         try
         {
             id = await db.QuerySingleAsync<long>("""
-                INSERT INTO Projects (OwnerUserId, Slug, NormalizedSlug, Name, Description, StorageId, State, CreatedAtUtc, GlobalSlug)
-                VALUES (@OwnerUserId, @Slug, @NormalizedSlug, @Name, @Description, @StorageId, 'pending', @CreatedAtUtc, @GlobalSlug)
+                INSERT INTO Projects (OwnerUserId, Slug, NormalizedSlug, Name, Description, StorageId, State, CreatedAtUtc, GlobalSlug, GroupId)
+                VALUES (@OwnerUserId, @Slug, @NormalizedSlug, @Name, @Description, @StorageId, 'pending', @CreatedAtUtc, @GlobalSlug, @GroupId)
                 RETURNING Id;
-                """, new CreateProjectParameters(liveActor.UserId, slug, normalizedSlug, name, description, storageId, now, globalSlug), transaction);
+                """, new CreateProjectParameters(liveActor.UserId, slug, storedSlug, name, description, storageId, now, globalSlug, groupId), transaction);
         }
         catch (SqliteException error) when (error.SqliteErrorCode == 19)
         {
@@ -696,8 +727,8 @@ public sealed partial class GraftStore : IAsyncDisposable
         // Carrying the slug it was just given, so a caller that uses the returned value can address the
         // project by it immediately. Returning a blank here made the new project look as though it had no
         // instance-wide name until somebody read it back.
-        ProjectInfo project = new(id, liveActor.UserId, liveActor.Username, slug, name, storageId,
-            null, ProjectVisibility.Private, false, globalSlug);
+        ProjectInfo project = new(id, liveActor.UserId, namespacePath, slug, name, storageId,
+            null, ProjectVisibility.Private, false, globalSlug, groupId);
         if (initializeRepository is not null) await initializeRepository(project, cancellationToken);
 
         await using SqliteConnection readyDb = await OpenConnectionAsync(cancellationToken);
@@ -860,10 +891,11 @@ public sealed partial class GraftStore : IAsyncDisposable
         AuthenticatedIdentity liveActor = await RequireLiveIdentityAsync(db, transaction, actor, cancellationToken);
 
         ProjectPathRow? project = await db.QuerySingleOrDefaultAsync<ProjectPathRow>("""
-            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.StorageId, p.DefaultBranch,
+            SELECT p.Id, p.OwnerUserId, COALESCE(g.FullPath, u.Username) AS Namespace, p.GroupId, p.Slug, p.Name, p.StorageId, p.DefaultBranch,
                    p.Visibility, p.PagePublished, p.GlobalSlug
             FROM Projects p
             JOIN Users u ON u.Id = p.OwnerUserId
+            LEFT JOIN Groups g ON g.Id = p.GroupId
             WHERE p.Id = @Id AND p.State = 'ready';
             """, new IdParameters(projectId), transaction);
         if (project is null) throw new UnauthorizedAccessException("Project is unavailable.");
@@ -1058,10 +1090,11 @@ public sealed partial class GraftStore : IAsyncDisposable
                    OR u.Username LIKE @Pattern ESCAPE '\')
             """;
         IEnumerable<ProjectDetailsRow> rows = await db.QueryAsync<ProjectDetailsRow>($"""
-            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.Description, p.StorageId, p.CreatedAtUtc,
+            SELECT p.Id, p.OwnerUserId, COALESCE(g.FullPath, u.Username) AS Namespace, p.GroupId, p.Slug, p.Name, p.Description, p.StorageId, p.CreatedAtUtc,
                    p.DefaultBranch, p.Visibility, p.PagePublished, p.GlobalSlug
             FROM Projects p
             JOIN Users u ON u.Id = p.OwnerUserId
+            LEFT JOIN Groups g ON g.Id = p.GroupId
             {where}
             ORDER BY p.CreatedAtUtc DESC, p.Id DESC
             LIMIT @Take OFFSET @Skip;
@@ -1069,6 +1102,7 @@ public sealed partial class GraftStore : IAsyncDisposable
         long total = await db.QuerySingleAsync<long>($"""
             SELECT COUNT(*) FROM Projects p
             JOIN Users u ON u.Id = p.OwnerUserId
+            LEFT JOIN Groups g ON g.Id = p.GroupId
             {where};
             """, parameters);
         return new(rows.Select(ToDetails).ToArray(), total);
@@ -1122,10 +1156,11 @@ public sealed partial class GraftStore : IAsyncDisposable
         // way to appoint a replacement. Transfer first. For an urgent response to a compromised account,
         // resetting its password already revokes every session and token immediately.
         IEnumerable<ProjectPathRow> owned = await db.QueryAsync<ProjectPathRow>("""
-            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.StorageId, p.DefaultBranch,
+            SELECT p.Id, p.OwnerUserId, COALESCE(g.FullPath, u.Username) AS Namespace, p.GroupId, p.Slug, p.Name, p.StorageId, p.DefaultBranch,
                    p.Visibility, p.PagePublished, p.GlobalSlug
             FROM Projects p
             JOIN Users u ON u.Id = p.OwnerUserId
+            LEFT JOIN Groups g ON g.Id = p.GroupId
             WHERE p.OwnerUserId = @Id
             ORDER BY p.NormalizedSlug;
             """, new IdParameters(userId), transaction);
@@ -1389,7 +1424,7 @@ public sealed partial class GraftStore : IAsyncDisposable
         CancellationToken cancellationToken)
     {
         ProjectAccessRow? project = await db.QuerySingleOrDefaultAsync<ProjectAccessRow>("""
-            SELECT p.OwnerUserId, p.Visibility, p.PagePublished, m.Role
+            SELECT p.OwnerUserId, p.Visibility, p.PagePublished, m.Role, p.GroupId
             FROM Projects p
             LEFT JOIN ProjectMemberships m ON m.ProjectId = p.Id AND m.UserId = @UserId
             WHERE p.Id = @ProjectId AND p.State = 'ready';
@@ -1399,11 +1434,20 @@ public sealed partial class GraftStore : IAsyncDisposable
         AuthenticatedIdentity? liveIdentity = identity is null
             ? null
             : await FindLiveIdentityAsync(db, transaction, identity, cancellationToken);
+        // The role inherited through the owning group and its ancestors, as a project role: an Owner of the
+        // group is a Maintainer of its projects.
+        ProjectRole? groupRole = null;
+        if (project.GroupId is long groupId && liveIdentity is not null)
+        {
+            GroupRole? held = await GroupRoleForAsync(db, transaction, liveIdentity.UserId, groupId);
+            if (held is GroupRole role) groupRole = role >= GroupRole.Maintainer ? ProjectRole.Maintainer : (ProjectRole)(int)role;
+        }
         ProjectAccess access = new(
             project.OwnerUserId,
             ParseVisibility(project.Visibility),
             project.PagePublished != 0,
-            project.Role is null ? null : (ProjectRole)project.Role.Value);
+            project.Role is null ? null : (ProjectRole)project.Role.Value,
+            groupRole);
         return ProjectAuthorization.Decide(liveIdentity, access, action);
     }
 
@@ -1487,6 +1531,15 @@ public sealed partial class GraftStore : IAsyncDisposable
         return normalized;
     }
 
+    /// <summary>A namespace as a path: an account name, or a group's full path of such names joined by <c>/</c>.</summary>
+    private static string NormalizeNamespacePath(string value)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(value);
+        string[] segments = value.Split('/');
+        if (segments.Length > MaximumGroupDepth + 1) throw new ArgumentException("That namespace is nested too deeply.", nameof(value));
+        return string.Join('/', segments.Select(segment => NormalizeName(segment, nameof(value))));
+    }
+
     private static string NormalizeName(string value, string parameterName)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(value, parameterName);
@@ -1544,10 +1597,11 @@ public sealed partial class GraftStore : IAsyncDisposable
         if (string.IsNullOrWhiteSpace(globalSlug)) return null;
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
         ProjectPathRow? row = await db.QuerySingleOrDefaultAsync<ProjectPathRow>("""
-            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.StorageId, p.DefaultBranch,
+            SELECT p.Id, p.OwnerUserId, COALESCE(g.FullPath, u.Username) AS Namespace, p.GroupId, p.Slug, p.Name, p.StorageId, p.DefaultBranch,
                    p.Visibility, p.PagePublished, p.GlobalSlug
             FROM Projects p
             JOIN Users u ON u.Id = p.OwnerUserId
+            LEFT JOIN Groups g ON g.Id = p.GroupId
             WHERE p.GlobalSlug = @Value AND p.State = 'ready';
             """, new RawValueParameters(globalSlug.Trim().ToLowerInvariant()));
         return row is null ? null : ToInfo(row);
@@ -1580,7 +1634,7 @@ public sealed partial class GraftStore : IAsyncDisposable
 
     private static ProjectInfo ToInfo(ProjectPathRow row) => new(
         row.Id, row.OwnerUserId, row.Namespace, row.Slug, row.Name, row.StorageId, row.DefaultBranch,
-        ParseVisibility(row.Visibility), row.PagePublished != 0, row.GlobalSlug);
+        ParseVisibility(row.Visibility), row.PagePublished != 0, row.GlobalSlug, row.GroupId);
 
     /// <summary>
     /// Turns the stored text into the enum. An unrecognised value is treated as private rather than thrown
@@ -1660,6 +1714,7 @@ internal sealed class ProjectAccessRow
     public string Visibility { get; set; } = "private";
     public long PagePublished { get; set; }
     public long? Role { get; set; }
+    public long? GroupId { get; set; }
 }
 internal sealed class ProjectMemberRow { public long UserId { get; set; } public string Username { get; set; } = ""; public long Role { get; set; } }
 internal class ProjectPathRow
@@ -1674,6 +1729,7 @@ internal class ProjectPathRow
     public string Visibility { get; set; } = "private";
     public long PagePublished { get; set; }
     public string GlobalSlug { get; set; } = "";
+    public long? GroupId { get; set; }
 }
 internal sealed class ProjectDetailsRow : ProjectPathRow
 {
@@ -1694,7 +1750,7 @@ internal sealed record RevokeOwnTokenParameters(long Id, long UserId, string Rev
 internal sealed record ActiveTokensParameters(long UserId, string NowUtc);
 internal sealed record RevokeUserParameters(long UserId, string RevokedAtUtc);
 internal sealed record PasswordUpdateParameters(long Id, string PasswordHash);
-internal sealed record CreateProjectParameters(long OwnerUserId, string Slug, string NormalizedSlug, string Name, string Description, string StorageId, string CreatedAtUtc, string GlobalSlug);
+internal sealed record CreateProjectParameters(long OwnerUserId, string Slug, string NormalizedSlug, string Name, string Description, string StorageId, string CreatedAtUtc, string GlobalSlug, long? GroupId);
 internal sealed record MembershipParameters(long ProjectId, long UserId, int Role, long GrantedByUserId, string CreatedAtUtc);
 internal sealed record ProjectUserParameters(long ProjectId, long UserId);
 internal sealed record PermissionQueryParameters(long ProjectId, long UserId);

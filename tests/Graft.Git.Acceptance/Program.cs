@@ -234,6 +234,8 @@ try
     await CheckSsh(address, aliceIdentity, bob.Username);
     await CheckEmptyRepository(address, aliceIdentity, alicePassword);
     address = await CheckWebhooks(address, aliceIdentity);
+    await CheckProjectAudit(address, aliceIdentity, bob.Username, "carol", alicePassword);
+    await CheckGroups(address, aliceIdentity, bob.Username, "carol", adminPassword);
     await CheckSecondFactor(address, bob.Username, bobPassword, adminPassword);
     await CheckNotifications(address, aliceIdentity, bob.Username, "carol", alicePassword);
     address = await CheckMail(address, bob.Username, bobPassword, adminPassword);
@@ -6015,6 +6017,274 @@ async Task CheckFetching(string address, AuthenticatedIdentity alice, string str
 /// The empty-repository page, which used to report a 404 from the browse endpoint and which the browser
 /// then described as a permission problem.
 /// </summary>
+/// <summary>
+/// A project's own view of the audit trail: what is the project's business and nothing else, for a Maintainer,
+/// through the browser's route and GitLab's `audit_events` shape; refused to a Developer and to a stranger.
+/// </summary>
+async Task CheckProjectAudit(string address, AuthenticatedIdentity alice, string bobUsername, string strangerUsername, string alicePassword)
+{
+    long projectId;
+    string aliceApi;
+    string bobApi;
+    string strangerApi;
+    long otherProjectId;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        ProjectInfo created = await store.CreateProjectWithRepositoryAsync(alice, "audited", "Audited",
+            (project, cancellation) => { cancellation.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, project.StorageId)); return Task.CompletedTask; });
+        projectId = created.Id;
+        ProjectInfo other = await store.CreateProjectWithRepositoryAsync(alice, "unaudited", "Unaudited",
+            (project, cancellation) => { cancellation.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, project.StorageId)); return Task.CompletedTask; });
+        otherProjectId = other.Id;
+        UserAccount bob = Required(await store.FindActiveUserAsync(bobUsername), "bob account");
+        await store.SetMembershipAsync(alice, projectId, bob.Id, ProjectRole.Developer);
+        UserAccount stranger = Required(await store.FindActiveUserAsync(strangerUsername), "stranger account");
+        aliceApi = (await store.CreateTokenAsync(alice, "audit-api", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        bobApi = (await store.CreateTokenAsync(new(bob.Id, bob.Username, false, IdentityKind.BrowserSession), "audit-bob", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        strangerApi = (await store.CreateTokenAsync(new(stranger.Id, stranger.Username, false, IdentityKind.BrowserSession), "audit-stranger", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+    }
+    string prefix = "/api/v4/projects/" + projectId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    // Something to see: an issue opened and closed in this project, and an issue in another, which must not appear.
+    long issue;
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/issues", aliceApi, new { title = "Logged" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStringAsync());
+        issue = json.RootElement.GetProperty("iid").GetInt64();
+    }
+    using (HttpResponseMessage closed = await ApiPut(address, prefix + "/issues/" + issue, aliceApi, new { state_event = "close" }))
+        Check(closed.IsSuccessStatusCode, "an issue is opened and closed in the project");
+    using (HttpResponseMessage elsewhere = await ApiPost(address, "/api/v4/projects/" + otherProjectId + "/issues", aliceApi, new { title = "Elsewhere" }))
+        Check(elsewhere.StatusCode == HttpStatusCode.Created, "and one is opened in another project");
+
+    using (HttpResponseMessage events = await ApiGet(address, prefix + "/audit_events", aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await events.Content.ReadAsStringAsync());
+        JsonElement[] items = json.RootElement.EnumerateArray().ToArray();
+        Check(events.IsSuccessStatusCode && items.Length >= 4 && items.All(item => item.GetProperty("entity_type").GetString() == "Project" &&
+            item.GetProperty("entity_id").GetInt64() == projectId), "the Maintainer reads the project's events, each about this project");
+        string[] actions = items.Select(item => item.GetProperty("details").GetProperty("action").GetString()!).ToArray();
+        Check(actions.Contains("create-project") && actions.Contains("open-issue") && actions.Contains("close-issue") && actions.Contains("grant-membership") ||
+            actions.Contains("create-project") && actions.Contains("open-issue") && actions.Contains("close-issue"),
+            "including its creation and the issue's life (" + string.Join(", ", actions) + ")");
+        Check(items.All(item => item.GetProperty("details").GetProperty("target_id").GetString() is string target &&
+            (target == projectId.ToString(System.Globalization.CultureInfo.InvariantCulture) || target.StartsWith(projectId + "#", StringComparison.Ordinal))),
+            "and nothing about the other project or anything else");
+        Check(items[0].GetProperty("details").GetProperty("author_name").GetString() == "alice", "with who did it");
+    }
+    using (HttpResponseMessage refused = await ApiGet(address, prefix + "/audit_events", bobApi))
+        Check(refused.StatusCode == HttpStatusCode.NotFound, "a Developer is not shown the trail");
+    using (HttpResponseMessage refused = await ApiGet(address, prefix + "/audit_events", strangerApi))
+        Check(refused.StatusCode == HttpStatusCode.NotFound, "nor is a stranger");
+
+    (HttpClient browser, string csrf) = await BrowserSession(address, "alice", alicePassword);
+    using (HttpResponseMessage page = await browser.GetAsync("/api/projects/" + projectId + "/audit?per_page=10"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await page.Content.ReadAsStringAsync());
+        Check(page.IsSuccessStatusCode && json.RootElement.GetProperty("total").GetInt64() >= 3 &&
+            json.RootElement.GetProperty("entries").EnumerateArray().All(entry => entry.GetProperty("target_type").GetString() is "project" or "issue"),
+            "the browser's route gives the Maintainer the same entries");
+    }
+    using (HttpResponseMessage filtered = await browser.GetAsync("/api/projects/" + projectId + "/audit?action=close-issue"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await filtered.Content.ReadAsStringAsync());
+        Check(filtered.IsSuccessStatusCode && json.RootElement.GetProperty("total").GetInt64() == 1, "filtered by action");
+    }
+    browser.Dispose();
+}
+
+/// <summary>
+/// Groups: a namespace with members that may hold groups. A top-level group cannot take an account's name
+/// nor an account a group's; a subgroup needs Owner of the parent; a role in a group reaches its subgroups
+/// and their projects; a project is created under a group and reached by its nested path over the API, over
+/// HTTPS in the natural and the encoded form, and over SSH; a group is deleted only once empty.
+/// </summary>
+async Task CheckGroups(string address, AuthenticatedIdentity alice, string bobUsername, string strangerUsername, string adminPassword)
+{
+    string aliceApi;
+    string bobApi;
+    string strangerApi;
+    long bobId;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        UserAccount bob = Required(await store.FindActiveUserAsync(bobUsername), "bob account");
+        bobId = bob.Id;
+        UserAccount stranger = Required(await store.FindActiveUserAsync(strangerUsername), "stranger account");
+        aliceApi = (await store.CreateTokenAsync(alice, "groups-api", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        bobApi = (await store.CreateTokenAsync(new(bob.Id, bob.Username, false, IdentityKind.BrowserSession), "groups-bob", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        strangerApi = (await store.CreateTokenAsync(new(stranger.Id, stranger.Username, false, IdentityKind.BrowserSession), "groups-stranger", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+    }
+
+    // Names: a group cannot take an account's, an account cannot take a group's.
+    using (HttpResponseMessage taken = await ApiPost(address, "/api/v4/groups", aliceApi, new { name = "Alice", path = "alice" }))
+        Check(taken.StatusCode == HttpStatusCode.BadRequest, "a top-level group cannot take an account's name");
+    long team;
+    using (HttpResponseMessage created = await ApiPost(address, "/api/v4/groups", aliceApi, new { name = "Team", path = "team", description = "The team" }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStringAsync());
+        Check(created.StatusCode == HttpStatusCode.Created && json.RootElement.GetProperty("full_path").GetString() == "team" &&
+            json.RootElement.GetProperty("access_level").GetInt32() == 50 && json.RootElement.GetProperty("parent_id").ValueKind == JsonValueKind.Null,
+            "a signed-in account creates a top-level group and owns it");
+        team = json.RootElement.GetProperty("id").GetInt64();
+    }
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        UserAccount admin = Required(await store.FindActiveUserAsync("admin"), "admin account");
+        await Throws<UserConflictException>(() => store.CreateUserAsync(new(admin.Id, admin.Username, true, IdentityKind.BrowserSession), "team", Password()),
+            "an account cannot take a group's name");
+    }
+    using (HttpResponseMessage duplicate = await ApiPost(address, "/api/v4/groups", aliceApi, new { name = "Team again", path = "team" }))
+        Check(duplicate.StatusCode == HttpStatusCode.BadRequest, "a group path is unique at its level");
+
+    // Subgroups need Owner of the parent; roles reach down.
+    using (HttpResponseMessage refused = await ApiPost(address, "/api/v4/groups", bobApi, new { name = "Platform", path = "platform", parent_id = team }))
+        Check(refused.StatusCode == HttpStatusCode.NotFound, "a stranger to the group cannot create a subgroup, and is not told the group exists");
+    long platform;
+    using (HttpResponseMessage created = await ApiPost(address, "/api/v4/groups", aliceApi, new { name = "Platform", path = "platform", parent_id = team }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStringAsync());
+        Check(created.StatusCode == HttpStatusCode.Created && json.RootElement.GetProperty("full_path").GetString() == "team/platform" &&
+            json.RootElement.GetProperty("parent_id").GetInt64() == team, "the Owner creates a subgroup, whose full path is nested");
+        platform = json.RootElement.GetProperty("id").GetInt64();
+    }
+    using (HttpResponseMessage listed = await ApiGet(address, "/api/v4/groups", aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await listed.Content.ReadAsStringAsync());
+        Check(listed.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 2, "the Owner lists both groups");
+    }
+    using (HttpResponseMessage listed = await ApiGet(address, "/api/v4/groups", bobApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await listed.Content.ReadAsStringAsync());
+        Check(listed.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 0, "an account in no group lists none");
+    }
+    using (HttpResponseMessage byPath = await ApiGet(address, "/api/v4/groups/" + Uri.EscapeDataString("team/platform"), aliceApi))
+        Check(byPath.IsSuccessStatusCode, "a group is read by its encoded full path");
+    using (HttpResponseMessage hidden = await ApiGet(address, "/api/v4/groups/" + platform, bobApi))
+        Check(hidden.StatusCode == HttpStatusCode.NotFound, "and is not found by somebody outside it");
+    using (HttpResponseMessage added = await ApiPost(address, "/api/v4/groups/" + team + "/members", aliceApi, new { username = bobUsername, access_level = 30 }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await added.Content.ReadAsStringAsync());
+        Check(added.StatusCode == HttpStatusCode.Created && json.RootElement.GetProperty("access_level").GetInt32() == 30, "the Owner makes bob a Developer of the parent");
+    }
+    using (HttpResponseMessage guest = await ApiPost(address, "/api/v4/groups/" + team + "/members", aliceApi, new { username = strangerUsername, access_level = 10 }))
+        Check(guest.StatusCode == HttpStatusCode.BadRequest, "Guest is not a role Graft has, and is refused by name");
+    using (HttpResponseMessage inherited = await ApiGet(address, "/api/v4/groups/" + platform + "/members", bobApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await inherited.Content.ReadAsStringAsync());
+        JsonElement bobRow = json.RootElement.EnumerateArray().First(member => member.GetProperty("username").GetString() == bobUsername);
+        Check(inherited.IsSuccessStatusCode && bobRow.GetProperty("inherited").GetBoolean() && bobRow.GetProperty("access_level").GetInt32() == 30,
+            "bob now sees the subgroup, where his role is inherited from the parent");
+    }
+
+    // A project under the subgroup, by a Developer of the parent; not by a stranger.
+    using (HttpResponseMessage refused = await ApiPost(address, "/api/v4/projects", strangerApi, new { name = "api", namespace_id = platform }))
+        Check(refused.StatusCode == HttpStatusCode.NotFound, "a stranger cannot create a project in the group, and is not told it exists");
+    long projectId;
+    using (HttpResponseMessage created = await ApiPost(address, "/api/v4/projects", bobApi, new { name = "api", namespace_id = platform }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStringAsync());
+        Check(created.StatusCode == HttpStatusCode.Created && json.RootElement.GetProperty("path_with_namespace").GetString() == "team/platform/api" &&
+            json.RootElement.GetProperty("namespace").GetProperty("kind").GetString() == "group" &&
+            json.RootElement.GetProperty("namespace").GetProperty("full_path").GetString() == "team/platform" &&
+            json.RootElement.GetProperty("http_url_to_repo").GetString()!.EndsWith("/team/platform/api.git", StringComparison.Ordinal),
+            "a Developer of the parent creates a project in the subgroup, addressed by its nested path");
+        projectId = json.RootElement.GetProperty("id").GetInt64();
+    }
+    using (HttpResponseMessage byPath = await ApiGet(address, "/api/v4/projects/" + Uri.EscapeDataString("team/platform/api"), aliceApi))
+        Check(byPath.IsSuccessStatusCode, "the project is found by its encoded nested path, as GitLab's clients send it");
+    using (HttpResponseMessage hidden = await ApiGet(address, "/api/v4/projects/" + projectId, strangerApi))
+        Check(hidden.StatusCode == HttpStatusCode.NotFound, "and not by a stranger");
+    using (HttpResponseMessage inGroup = await ApiGet(address, "/api/v4/groups/" + platform + "/projects", bobApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await inGroup.Content.ReadAsStringAsync());
+        Check(inGroup.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 1, "the group lists its project");
+    }
+    using (HttpResponseMessage mine = await ApiGet(address, "/api/v4/projects?per_page=100", bobApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await mine.Content.ReadAsStringAsync());
+        Check(mine.IsSuccessStatusCode && json.RootElement.EnumerateArray().Any(project => project.GetProperty("id").GetInt64() == projectId),
+            "and the project is among those the group member can see");
+    }
+    using (HttpResponseMessage mine = await ApiGet(address, "/api/v4/projects?per_page=100", aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await mine.Content.ReadAsStringAsync());
+        Check(json.RootElement.EnumerateArray().Any(project => project.GetProperty("id").GetInt64() == projectId),
+            "the group's Owner sees it too, with no direct membership");
+    }
+
+    // Git, by the natural nested path and by the encoded one, over HTTPS and over SSH.
+    string work = Path.Combine(root, "group-work");
+    Directory.CreateDirectory(work);
+    await Git(work, ["init", "--initial-branch=main"]);
+    File.WriteAllText(Path.Combine(work, "README.md"), "# In a group\n");
+    await Git(work, ["add", "."]);
+    await Git(work, ["commit", "-q", "-m", "First"]);
+    await Git(work, ["push", "-q", AuthenticatedUrl(address, bobUsername, bobApi, "team/platform/api.git"), "main"]);
+    Check(true, "a Developer inherited from the parent group pushes over HTTPS at the natural nested path");
+    string clone = Path.Combine(root, "group-clone");
+    await Git(root, ["clone", "-q", AuthenticatedUrl(address, "alice", aliceApi, Uri.EscapeDataString("team/platform") + "/api.git"), clone]);
+    Check(File.Exists(Path.Combine(clone, "README.md")), "the Owner clones by the encoded form of the same path");
+    await GitFails(root, ["ls-remote", AuthenticatedUrl(address, strangerUsername, strangerApi, "team/platform/api.git")], "a stranger finds nothing at the path");
+    string sshLine = serverLines.LastOrDefault(line => line.StartsWith("SSH: ssh://", StringComparison.Ordinal)) ?? "";
+    string bobKey = Path.Combine(root, "ssh-keys", "bob");
+    if (sshLine.Length > 0 && File.Exists(bobKey))
+    {
+        string sshBase = sshLine["SSH: ".Length..sshLine.IndexOf("/<owner>", StringComparison.Ordinal)];
+        string sshCommand = "ssh -i \"" + bobKey.Replace('\\', '/') + "\" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR";
+        string listed = await Git(root, ["-c", "core.sshCommand=" + sshCommand, "ls-remote", sshBase + "/team/platform/api.git"]);
+        Check(listed.Contains("refs/heads/main", StringComparison.Ordinal), "and over SSH the nested path resolves to the same repository");
+    }
+
+    // Membership withdrawn, the last Owner kept, and deletion only once empty.
+    using (HttpResponseMessage self = await ApiDelete(address, "/api/v4/groups/" + team + "/members/" + alice.UserId, aliceApi))
+        Check(self.StatusCode == HttpStatusCode.BadRequest, "the last Owner cannot be removed");
+    // A member whose only reach is the group: given a role in the parent, they reach the subgroup's project;
+    // removed, they do not. (bob created the project and stays its owner, as the ADR says, so he is not the one
+    // to test this with.)
+    long strangerId;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+        strangerId = Required(await store.FindActiveUserAsync(strangerUsername), "stranger account").Id;
+    using (HttpResponseMessage added = await ApiPost(address, "/api/v4/groups/" + team + "/members", aliceApi, new { username = strangerUsername, access_level = 20 }))
+        Check(added.StatusCode == HttpStatusCode.Created, "a Reporter is added to the parent group");
+    await Git(root, ["ls-remote", AuthenticatedUrl(address, strangerUsername, strangerApi, "team/platform/api.git")]);
+    Check(true, "and reaches the subgroup's project through the inherited role");
+    using (HttpResponseMessage removed = await ApiDelete(address, "/api/v4/groups/" + team + "/members/" + strangerId, aliceApi))
+        Check(removed.StatusCode == HttpStatusCode.NoContent, "the Owner removes them");
+    await GitFails(root, ["ls-remote", AuthenticatedUrl(address, strangerUsername, strangerApi, "team/platform/api.git")], "and their reach is gone with it");
+    using (HttpResponseMessage removed = await ApiDelete(address, "/api/v4/groups/" + team + "/members/" + bobId, aliceApi))
+        Check(removed.StatusCode == HttpStatusCode.NoContent, "the Owner removes bob too; as the project's creator he keeps it, as the record says");
+    using (HttpResponseMessage full = await ApiDelete(address, "/api/v4/groups/" + team, aliceApi))
+        Check(full.StatusCode == HttpStatusCode.BadRequest, "a group with a subgroup is not deleted");
+    using (HttpResponseMessage full = await ApiDelete(address, "/api/v4/groups/" + platform, aliceApi))
+        Check(full.StatusCode == HttpStatusCode.BadRequest, "a group with a project is not deleted");
+    // Deleted the way ADR 0013 deletes a project: deliberately, as its own act, here through the store.
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        // By its creator, who owns it; a group Owner manages the group, not deletion of a project in it.
+        DeletedProject deleted = await store.DeleteProjectAsync(new(bobId, bobUsername, false, IdentityKind.BrowserSession), projectId);
+        Check(deleted.Id == projectId, "the project is deleted on its own terms");
+    }
+    using (HttpResponseMessage emptied = await ApiDelete(address, "/api/v4/groups/" + platform, aliceApi))
+        Check(emptied.StatusCode == HttpStatusCode.NoContent, "the emptied subgroup is deleted");
+    using (HttpResponseMessage emptied = await ApiDelete(address, "/api/v4/groups/" + team, aliceApi))
+        Check(emptied.StatusCode == HttpStatusCode.NoContent, "and then the parent");
+
+    // The browser family, briefly: the same groups through a session.
+    (HttpClient browser, string csrf) = await BrowserSession(address, "admin", adminPassword);
+    using (HttpRequestMessage create = new(HttpMethod.Post, "/api/groups") { Content = JsonContent.Create(new { name = "Ops", path = "ops" }) })
+    {
+        create.Headers.Add("Origin", address);
+        create.Headers.Add("X-Graft-CSRF", csrf);
+        using HttpResponseMessage response = await browser.SendAsync(create);
+        Check(response.StatusCode == HttpStatusCode.Created, "a group is created from the browser");
+    }
+    using (HttpResponseMessage listed = await browser.GetAsync("/api/groups"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await listed.Content.ReadAsStringAsync());
+        Check(listed.IsSuccessStatusCode && json.RootElement.EnumerateArray().Any(group => group.GetProperty("full_path").GetString() == "ops"), "and listed there");
+    }
+    browser.Dispose();
+}
+
 /// <summary>
 /// A second factor from an authenticator app. The code generator is first checked against RFC 6238's own test
 /// vectors, so that what the suite then types is what a real app would show; then enrolment in two steps,

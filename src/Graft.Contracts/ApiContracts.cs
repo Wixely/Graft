@@ -234,7 +234,40 @@ public sealed record PersonalAccessTokenResponse(
     bool Active,
     string ExpiresAt,
     string Token);
-public sealed record ProjectCreateRequest(string? Name, string? Path, string? Description, string? Visibility);
+public sealed record ProjectCreateRequest(string? Name, string? Path, string? Description, string? Visibility,
+    [property: JsonPropertyName("namespace_id")] long? NamespaceId = null);
+
+/// <summary>A group in GitLab's shape, as far as Graft has it.</summary>
+public sealed record GroupResponse(
+    long Id,
+    string Name,
+    string Path,
+    string Description,
+    string Visibility,
+    [property: JsonPropertyName("full_name")] string FullName,
+    [property: JsonPropertyName("full_path")] string FullPath,
+    [property: JsonPropertyName("parent_id")] long? ParentId,
+    [property: JsonPropertyName("web_url")] string WebUrl,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt,
+    [property: JsonPropertyName("projects_count")] long ProjectsCount,
+    [property: JsonPropertyName("subgroups_count")] long SubgroupsCount,
+    /// <summary>Graft's addition: the caller's own role in the group, inherited or direct, or null.</summary>
+    [property: JsonPropertyName("access_level")] int? AccessLevel);
+
+public sealed record GroupCreateRequest(string? Name, string? Path, string? Description, [property: JsonPropertyName("parent_id")] long? ParentId);
+
+/// <summary>A group member in GitLab's member shape; `access_level` is GitLab's number for the role.</summary>
+public sealed record GroupMemberResponse(
+    long Id,
+    string Username,
+    string Name,
+    [property: JsonPropertyName("access_level")] int AccessLevel,
+    string State,
+    /// <summary>Graft's addition: true when the role comes from an ancestor group.</summary>
+    bool Inherited);
+
+/// <summary>GitLab's member request: a user id and an access level; Graft also takes a username.</summary>
+public sealed record GroupMemberRequest([property: JsonPropertyName("user_id")] long? UserId, string? Username, [property: JsonPropertyName("access_level")] int? AccessLevel);
 public sealed record MembershipSetRequest(string Username, string Role);
 
 /// <summary>A project's human-facing text. A null field is left alone, so one can be changed without
@@ -491,6 +524,22 @@ public sealed record AuditPageResponse(
     long Total,
     int Page,
     int PerPage);
+
+/// <summary>GitLab's project audit event: who, which project, when, and the details Graft has.</summary>
+public sealed record AuditEventResponse(
+    long Id,
+    [property: JsonPropertyName("author_id")] long? AuthorId,
+    [property: JsonPropertyName("entity_id")] long EntityId,
+    [property: JsonPropertyName("entity_type")] string EntityType,
+    AuditEventDetailsResponse Details,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt);
+
+public sealed record AuditEventDetailsResponse(
+    [property: JsonPropertyName("author_name")] string? AuthorName,
+    [property: JsonPropertyName("custom_message")] string CustomMessage,
+    string Action,
+    [property: JsonPropertyName("target_type")] string TargetType,
+    [property: JsonPropertyName("target_id")] string? TargetId);
 
 /// <summary>
 /// An issue, in GitLab's shape. <c>iid</c> is the number people use and <c>id</c> is the row; GitLab
@@ -1128,6 +1177,14 @@ public sealed record MergeRequestChangesResponse(
 [JsonSerializable(typeof(PasswordResetCompleteRequest))]
 [JsonSerializable(typeof(PasswordResetLinkResponse))]
 [JsonSerializable(typeof(NotificationsResponse))]
+[JsonSerializable(typeof(GroupResponse))]
+[JsonSerializable(typeof(AuditEventResponse))]
+[JsonSerializable(typeof(AuditEventResponse[]))]
+[JsonSerializable(typeof(GroupResponse[]))]
+[JsonSerializable(typeof(GroupCreateRequest))]
+[JsonSerializable(typeof(GroupMemberResponse))]
+[JsonSerializable(typeof(GroupMemberResponse[]))]
+[JsonSerializable(typeof(GroupMemberRequest))]
 [JsonSerializable(typeof(NotifyByEmailRequest))]
 [JsonSerializable(typeof(SecondFactorSetupResponse))]
 [JsonSerializable(typeof(SecondFactorCodeRequest))]

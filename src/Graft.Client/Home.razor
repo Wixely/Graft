@@ -32,6 +32,14 @@ else
             <div class="panel-header"><h2>Create a private project</h2></div>
             <div class="panel-body">
                 <form class="form" @onsubmit="CreateProject" @onsubmit:preventDefault>
+                    @if (groups.Length > 0)
+                    {
+                        <label for="project-namespace">Namespace</label>
+                        <select id="project-namespace" @bind="namespaceId">
+                            <option value="">@Api.Username (your own)</option>
+                            @foreach (GroupResponse group in groups.Where(group => group.AccessLevel >= 30)) { <option value="@group.Id">@group.FullPath</option> }
+                        </select>
+                    }
                     <label for="project-name">Name</label>
                     <input id="project-name" @bind="name" required maxlength="200" />
                     <label for="project-path">Path</label>
@@ -99,12 +107,18 @@ else
                 return;
             }
             await LoadProjects();
+            await LoadGroups();
         }
         finally { loading = false; }
     }
 
     private async Task LoadProjects() =>
         projects = await Api.GetAsync("api/projects", ApiJson.Default.ProjectResponseArray) ?? [];
+
+    private GroupResponse[] groups = [];
+    private string namespaceId = "";
+
+    private async Task LoadGroups() => groups = await Api.GetAsync("api/groups", ApiJson.Default.GroupResponseArray) ?? [];
 
     private async Task CreateProject()
     {
@@ -113,7 +127,8 @@ else
         message = "";
         try
         {
-            ProjectCreateRequest request = new(name, string.IsNullOrWhiteSpace(path) ? null : path, description, "private");
+            ProjectCreateRequest request = new(name, string.IsNullOrWhiteSpace(path) ? null : path, description, "private",
+                long.TryParse(namespaceId, out long inGroup) ? inGroup : null);
             ApiResult result = await Api.PostAsync("api/projects", request, ApiJson.Default.ProjectCreateRequest, "Project created.");
             message = result.Message;
             messageKind = result.Ok ? "success" : "error";

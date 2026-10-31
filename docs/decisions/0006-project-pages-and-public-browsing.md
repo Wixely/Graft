@@ -120,4 +120,4 @@ Issues, releases and any other feature a page might expose do not exist. The pag
 
 Anonymous clone links that expire, are single use, or are pinned to one ref are a separate idea and are not this. `unlisted` is a permanent property of a project, not a credential, and it is not a substitute for a link that dies.
 
-Nested groups, GraphQL and the GitLab `/uploads/-/system/...` convention remain unclaimed, so the page and browser routes stay under Graft's own paths.
+Nested groups arrived with [ADR 0035](0035-groups.md) on 2026-10-30; GraphQL and the GitLab `/uploads/-/system/...` convention remain unclaimed, so the page and browser routes stay under Graft's own paths.

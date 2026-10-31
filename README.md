@@ -52,6 +52,16 @@ An account can ask for a code from an authenticator app after its password. The 
 else: no email, no phone number, recovery codes for the day the app is gone, and an administrator to remove it
 for the person who lost both. Tokens and SSH keys are unaffected. See [ADR 0034](docs/decisions/0034-second-factor.md).
 
+Projects can belong to a group rather than a person, and a group can hold groups. A role in a group is held
+on every group and project beneath it, so a team is granted once. A project under `team/platform` is
+`team/platform/api` to the API, to Git over HTTPS and to Git over SSH; in the browser its namespace travels as
+one encoded segment, and the natural address redirects there. See [ADR 0035](docs/decisions/0035-groups.md).
+
+Whoever may manage a project can read what has been done to it: the audit entries that name the project, its
+issues, proposals and comments, or its releases, packages, images and snippets, at the bottom of the settings
+tab and at GitLab's `audit_events` route. The whole trail stays the administrator's. See
+[ADR 0036](docs/decisions/0036-project-audit.md).
+
 Status as of **2026-10-22**: Graft hosts the conversation about the code, not just the code. A project now
 has issues, merge requests and comments on both, numbered from one within that project. Reading them
 follows the repository, so a public project's issues are readable by a stranger; writing on them needs
@@ -274,6 +284,7 @@ Linux static NativeAOT requires the separate toolchain/runbook; a Windows build 
 | `docs/` | Requirements, decisions, architecture questions, work queue and evidence |
 | `src/Graft.Core/`, `src/Graft.Storage/` | MVP authorization policy and DnaX/SQLite persistence |
 | `src/Graft.Git/`, `src/Graft.Server/` | Managed Git engine (bare Git repository on disk, loose and packed objects with delta compression, smart HTTP protocol versions 0 and 2, server-side object authoring and unified diff), markdown rendering and authenticated HTTPS/API host |
+| `src/Graft.Ssh/` | Dependency-free SSH server for Git over SSH: ECDH P-256, an ECDSA host key, AES-GCM and AES-CTR, Ed25519, ECDSA and RSA client keys (ADR 0031) |
 | `src/Graft.Client/`, `src/Graft.Contracts/` | Blazor WebAssembly client (themed UI, routed pages, rendered READMEs, commit diffs, clone menu, vendored DnaX upload and diagram modules) and source-generated wire contracts |
 | `src/Graft.Operations/`, `src/Graft.Admin/` | Quiescence lease, backup/restore, import inventory and NativeAOT administration CLI |
 | `deploy/` | systemd, optional container and isolated static-musl build definitions |

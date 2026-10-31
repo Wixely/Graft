@@ -4,7 +4,7 @@ namespace Graft.Storage;
 
 public static class GraftSchema
 {
-    public static DnaXMigrationManifest Manifest { get; } = new(21,
+    public static DnaXMigrationManifest Manifest { get; } = new(22,
     [
         DnaXMigration.Sql(1, "initial-identity-project-schema", "Create identity and private project schema", """
             CREATE TABLE Users (
@@ -691,6 +691,43 @@ public static class GraftSchema
             );
 
             CREATE INDEX IX_RecoveryCodes_User ON RecoveryCodes(UserId);
+            """),
+        // Groups.
+        //
+        // A group is a namespace with members, possibly under another group; its full path is materialised so a
+        // project under `team/platform` is found by one equality. A top-level group shares the namespace of
+        // usernames, checked in code at both creation points. A project under a group keeps its creator as
+        // OwnerUserId, and because Projects has carried UNIQUE (OwnerUserId, NormalizedSlug) since the first
+        // migration, which SQLite cannot drop in place, a group project's NormalizedSlug is stored prefixed by
+        // its group id and a slash, which no account's slug can contain; the index below keeps slugs unique
+        // within a group. Every lookup of a group project goes through its group. A workaround, and marked as one.
+        DnaXMigration.Sql(22, "groups", "Groups that own projects and may hold groups, with members and inherited roles", """
+            CREATE TABLE Groups (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                ParentGroupId INTEGER NULL REFERENCES Groups(Id),
+                Path TEXT NOT NULL,
+                NormalizedPath TEXT NOT NULL,
+                FullPath TEXT NOT NULL,
+                NormalizedFullPath TEXT NOT NULL UNIQUE,
+                Name TEXT NOT NULL,
+                Description TEXT NOT NULL DEFAULT '',
+                CreatedAtUtc TEXT NOT NULL
+            );
+
+            CREATE TABLE GroupMemberships (
+                GroupId INTEGER NOT NULL REFERENCES Groups(Id) ON DELETE CASCADE,
+                UserId INTEGER NOT NULL REFERENCES Users(Id) ON DELETE CASCADE,
+                Role INTEGER NOT NULL,
+                GrantedByUserId INTEGER NOT NULL REFERENCES Users(Id),
+                CreatedAtUtc TEXT NOT NULL,
+                PRIMARY KEY (GroupId, UserId)
+            );
+
+            ALTER TABLE Projects ADD COLUMN GroupId INTEGER NULL REFERENCES Groups(Id);
+
+            CREATE INDEX IX_Groups_Parent ON Groups(ParentGroupId, NormalizedPath);
+            CREATE INDEX IX_GroupMemberships_User ON GroupMemberships(UserId);
+            CREATE UNIQUE INDEX IX_Projects_Group_Slug ON Projects(GroupId, NormalizedSlug) WHERE GroupId IS NOT NULL;
             """)
     ]);
 }
