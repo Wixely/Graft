@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <AssemblyName>graft-runner</AssemblyName>
+    <RootNamespace>Graft.Runner</RootNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <IsAotCompatible>true</IsAotCompatible>
+    <PublishAot Condition="'$(GraftRunnerAot)' == 'true'">true</PublishAot>
+    <DebugType Condition="'$(Configuration)' == 'Release'">none</DebugType>
+    <RestorePackagesWithLockFile Condition="'$(RuntimeIdentifier)' == ''">true</RestorePackagesWithLockFile>
+    <NuGetLockFilePath Condition="'$(RuntimeIdentifier)' != ''">$(BaseIntermediateOutputPath)packages.$(RuntimeIdentifier).lock.json</NuGetLockFilePath>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Graft.Contracts/Graft.Contracts.csproj" />
+    <ProjectReference Include="../Graft.RunnerProtocol/Graft.RunnerProtocol.csproj" />
+    <!-- The visiting side of a CupriNet Shrine only: no overlay, no listener. See ADR 0037. -->
+    <PackageReference Include="CupriNet.Shrine" Version="0.6.2" />
+    <PackageReference Include="CupriNet.Alembic.BouncyCastle" Version="0.6.2" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Systemd" Version="10.0.12" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.12" />
+  </ItemGroup>
+</Project>

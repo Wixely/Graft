@@ -1,0 +1,206 @@
+@page "/-/admin/runners"
+@inject GraftApi Api
+@inject NavigationManager Navigation
+@inject IJSRuntime JS
+
+@* The runners this forge knows, and the place to make a new one. Making one hands over, once, the two install
+   scripts that carry the forge's Intonation and a one-time registration token: copy the right one to the
+   machine that will run jobs and run it there. *@
+
+<PageTitle>Runners &middot; Graft</PageTitle>
+
+@if (loading)
+{
+    <p role="status" class="secondary-text">Loading…</p>
+}
+else if (!Api.IsAdministrator)
+{
+    <div class="page-header"><div><h1>Administration</h1><p class="subtitle">This page requires an administrator account.</p></div></div>
+}
+else
+{
+    <div class="page-header">
+        <div>
+            <h1>Runners</h1>
+            <p class="subtitle">Machines that run pipeline jobs. Each reaches this forge over CupriNet from the link in its install script.</p>
+        </div>
+    </div>
+
+    <Banner Message="@message" Kind="@messageKind" />
+
+    <div class="panel">
+        <div class="panel-header"><h2>New runner</h2></div>
+        <div class="panel-body">
+            <form class="form" @onsubmit="Create" @onsubmit:preventDefault>
+                <label for="runner-description">Description</label>
+                <input id="runner-description" @bind="description" maxlength="200" placeholder="build box in the office" />
+                <div class="form-actions">
+                    <button type="submit" disabled="@busy">@(busy ? "Creating…" : "Create runner and install scripts")</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    @if (created is not null)
+    {
+        <div class="panel">
+            <div class="panel-header"><Icon Name="key" /><h2>Install runner #@created.Id</h2></div>
+            <div class="panel-body">
+                <div class="banner warning">
+                    <Icon Name="alert" />
+                    <span>
+                        Shown once. Each script holds a registration token, usable once until
+                        @created.TokenExpiresAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm"). Run it on the machine that will run jobs:
+                        as an administrator on Windows, or as root on Linux, to install a service.
+                    </span>
+                </div>
+                <p class="secondary-text">The forge answers runners as <span class="mono">@created.ShrineAddress</span>.</p>
+                <div class="form-actions">
+                    <button type="button" @onclick='() => Copy(created.InstallPowerShell, "ps1")'>
+                        <Icon Name="@(copied == "ps1" ? "check" : "copy")" />Copy the Windows script (install-graft-runner.ps1)
+                    </button>
+                    <button type="button" class="secondary" @onclick='() => Copy(created.InstallShell, "sh")'>
+                        <Icon Name="@(copied == "sh" ? "check" : "copy")" />Copy the Linux script (install-graft-runner.sh)
+                    </button>
+                </div>
+                @if (failed)
+                {
+                    <p class="field-hint danger-text">The clipboard refused the copy. The scripts are below; select and copy one yourself.</p>
+                    <label for="script-ps1">Windows</label>
+                    <textarea id="script-ps1" readonly rows="8" class="mono">@created.InstallPowerShell</textarea>
+                    <label for="script-sh">Linux</label>
+                    <textarea id="script-sh" readonly rows="8" class="mono">@created.InstallShell</textarea>
+                }
+                <p class="field-hint">
+                    Windows: <span class="mono">powershell -ExecutionPolicy Bypass -File install-graft-runner.ps1</span>.
+                    Linux: <span class="mono">sh install-graft-runner.sh</span>.
+                    Add <span class="mono">-NoService</span> or <span class="mono">--no-service</span> to register without installing a service.
+                </p>
+                <div class="form-actions"><button type="button" class="secondary" @onclick="Dismiss">Done</button></div>
+            </div>
+        </div>
+    }
+
+    <div class="panel">
+        <div class="panel-header"><Icon Name="settings" /><h2>Runners</h2><span class="spacer"></span><span class="label">@runners.Length</span></div>
+        @if (runners.Length == 0)
+        {
+            <p class="panel-empty">No runners yet.</p>
+        }
+        else
+        {
+            <div class="list">
+                @foreach (RunnerResponse runner in runners)
+                {
+                    <div class="list-item">
+                        <Icon Name="settings" />
+                        <span class="list-item-main">
+                            <strong>#@runner.Id @(runner.Name ?? runner.Description)</strong>
+                            <small>
+                                @(runner.Description.Length > 0 ? runner.Description + " · " : "")@(runner.Platform ?? "not registered yet")
+                                @(runner.ContactedAt is DateTimeOffset contacted ? " · last seen " + contacted.ToLocalTime().ToString("yyyy-MM-dd HH:mm") : "")
+                            </small>
+                        </span>
+                        <span class="label @(runner.Online ? "success" : "")">@StatusText(runner.Status)</span>
+                        <span class="list-item-actions">
+                            <button type="button" class="@(pendingDelete == runner.Id ? "danger" : "secondary")" @onclick="() => Delete(runner)" disabled="@busy">
+                                @(pendingDelete == runner.Id ? "Confirm remove" : "Remove")
+                            </button>
+                        </span>
+                    </div>
+                }
+            </div>
+        }
+    </div>
+}
+
+@code {
+    private RunnerResponse[] runners = [];
+    private RunnerCreatedResponse? created;
+    private string description = "";
+    private string copied = "";
+    private bool failed;
+    private long? pendingDelete;
+    private string message = "";
+    private string messageKind = "info";
+    private bool loading = true;
+    private bool busy;
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            if (!await Api.EnsureSessionAsync())
+            {
+                if (Api.Reachable) Navigation.NavigateTo("/-/login", replace: true);
+                return;
+            }
+            if (Api.IsAdministrator) await Load();
+        }
+        finally { loading = false; }
+    }
+
+    private async Task Load() => runners = await Api.GetAsync("api/admin/runners", ApiJson.Default.RunnerResponseArray) ?? [];
+
+    private async Task Create()
+    {
+        if (busy) return;
+        busy = true;
+        message = "";
+        created = null;
+        failed = false;
+        copied = "";
+        try
+        {
+            ApiResult<RunnerCreatedResponse> result = await Api.SendAsync(HttpMethod.Post, "api/admin/runners",
+                new RunnerCreateRequest(description.Trim(), "instance_type"), ApiJson.Default.RunnerCreateRequest, ApiJson.Default.RunnerCreatedResponse,
+                "Runner created. Copy its install script now; it is not shown again.");
+            message = result.Message;
+            messageKind = result.Ok ? "success" : "error";
+            if (result.Ok) { created = result.Value; description = ""; await Load(); }
+        }
+        finally { busy = false; }
+    }
+
+    private async Task Copy(string text, string which)
+    {
+        bool ok;
+        try { ok = await JS.InvokeAsync<bool>("graftClipboard.copy", text); }
+        catch (JSException) { ok = false; }
+        copied = ok ? which : "";
+        failed = !ok;
+    }
+
+    private void Dismiss()
+    {
+        created = null;
+        failed = false;
+        copied = "";
+        message = "";
+    }
+
+    private async Task Delete(RunnerResponse runner)
+    {
+        if (pendingDelete != runner.Id) { pendingDelete = runner.Id; return; }
+        if (busy) return;
+        busy = true;
+        pendingDelete = null;
+        try
+        {
+            ApiResult result = await Api.DeleteAsync($"api/admin/runners/{runner.Id}", $"Runner #{runner.Id} removed. Its credential no longer works.");
+            message = result.Message;
+            messageKind = result.Ok ? "success" : "error";
+            await Load();
+        }
+        finally { busy = false; }
+    }
+
+    private static string StatusText(string status) => status switch
+    {
+        "online" => "Online",
+        "offline" => "Offline",
+        "never_contacted" => "Waiting for its script",
+        "registration_expired" => "Script expired",
+        _ => status
+    };
+}

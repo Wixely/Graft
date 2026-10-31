@@ -9,6 +9,8 @@
     <Project Path="src/Graft.Git/Graft.Git.csproj" />
     <Project Path="src/Graft.Operations/Graft.Operations.csproj" />
     <Project Path="src/Graft.Ssh/Graft.Ssh.csproj" />
+    <Project Path="src/Graft.RunnerProtocol/Graft.RunnerProtocol.csproj" />
+    <Project Path="src/Graft.Runner/Graft.Runner.csproj" />
     <Project Path="src/Graft.Server/Graft.Server.csproj" />
     <Project Path="src/Graft.Storage/Graft.Storage.csproj" />
   </Folder>

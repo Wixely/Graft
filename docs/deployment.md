@@ -195,6 +195,40 @@ WEBHOOKS: off
 
 See [ADR 0016](decisions/0016-webhooks.md).
 
+### Optional runners
+
+Graft runs pipelines on its own runners, which reach the forge over CupriNet rather than HTTPS. It is off until a
+port is named:
+
+```sh
+GRAFT_RUNNER_PORT=7443
+GRAFT_RUNNER_HOST=graft.example.com
+GRAFT_RUNNER_DOWNLOADS=/srv/graft/runner-binaries
+```
+
+or `--runner-port`, `--runner-host` and `--runner-downloads`. The port is a second listener, on the same address
+as HTTPS, that runners dial directly; a reverse proxy in front of HTTPS does not carry it. `--runner-host` is the
+name runners are told to dial, defaulting to the host in `--origin`. The forge's runner identity, a CupriNet key,
+is created on first start in `runner-shrine/` beside the database and protected by the same key ring as
+everything else there; keep it with the database, or registered runners will no longer recognise the forge. The
+forge prints it at startup:
+
+```text
+RUNNERS: cupri port 7443 advertised as graft.example.com; shrine cupri1…; runner downloads from /srv/graft/runner-binaries
+```
+
+To add a runner, an administrator opens **Runners**, creates one, and copies the Windows or Linux install
+script to the machine that will run jobs. Each script carries the forge's Intonation, a signed link naming its
+key and address, and a one-time token, and both expire after a day. Run it as an administrator on Windows or as
+root on Linux and it installs the `GraftRunner` service or the `graft-runner` systemd unit; add `-NoService` or
+`--no-service` to register only. The script downloads the runner from `/-/runner/download/` when the downloads
+directory holds `graft-runner-win-x64.exe` or `graft-runner-linux-x64`; otherwise pass the binary with `-Binary`
+or `--binary`.
+
+A push that carries a `.gitlab-ci.yml` then makes a pipeline. Graft reads a strict subset of the format, and a
+file asking for anything else, such as `image` or `rules`, fails its pipeline naming the key. See
+[ADR 0037](decisions/0037-runners-over-cuprinet.md) for what runs and what does not.
+
 ### Optional email
 
 Graft sends nothing unless you name a mail server, and it works without one. With no mail, a forgotten

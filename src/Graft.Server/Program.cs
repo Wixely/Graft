@@ -33,7 +33,7 @@ if (args.Length == 1 && args[0] == "--licences")
 
 if (!Arguments.TryParse(args, out Arguments? parsedSettings))
 {
-    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>] [--mcp true|false] [--pages-origin <https origin>] [--recoverable-tokens true|false] [--webhooks true|false] [--ssh-port <0-65535>] [--ssh-host <name>] [--mail-smtp <smtp|smtp+starttls|smtps URL>] [--mail-from <address>] [--mail-password-file <UTF-8 path>].");
+    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>] [--mcp true|false] [--pages-origin <https origin>] [--recoverable-tokens true|false] [--webhooks true|false] [--ssh-port <0-65535>] [--ssh-host <name>] [--mail-smtp <smtp|smtp+starttls|smtps URL>] [--mail-from <address>] [--mail-password-file <UTF-8 path>] [--runner-port <0-65535>] [--runner-host <name>] [--runner-downloads <directory>].");
     Console.Error.WriteLine("       Graft.Server --licences  prints the third-party notices this build redistributes.");
     return 2;
 }
@@ -55,6 +55,8 @@ string? serverOrigin = null;
 // Git over SSH, started once the HTTP side is up so the clone URLs it advertises exist. Declared here because
 // the project response needs the port that was actually bound, which a test learns only after the start.
 Graft.Ssh.SshServer? sshServer = null;
+// Runners, when the operator named a port: a CupriNet Shrine runners reach from their install script's Intonation.
+Graft.Server.RunnerHost? runners = null;
 Graft.Ssh.SshHostKey? sshHostKey = null;
 const string SessionCookie = "__Host-graft-session";
 
@@ -872,6 +874,241 @@ app.MapGet("/api/graft/admin/audit", async context =>
     await context.Response.WriteAsJsonAsync(new AuditPageResponse(response, entries.Total, page, perPage),
         ApiJson.Default.AuditPageResponse, null, context.RequestAborted);
 });
+
+// ---------------------------------------------------------------------------------------------------
+// Runners and pipelines (ADR 0037). An administrator creates a runner and is handed, once, the registration
+// token and the two install scripts that carry it with the forge's Intonation. Pipelines are read by whoever
+// may browse the repository, and run by any registered runner.
+// ---------------------------------------------------------------------------------------------------
+
+app.MapPost("/api/v4/user/runners", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!identity.TokenScopes.HasFlag(TokenScope.Api)) { await ApiError(context, 403, "403 Forbidden: insufficient_scope"); return; }
+    if (!identity.IsAdministrator) { await ApiError(context, 403, "403 Forbidden: only an administrator creates runners on this forge"); return; }
+    await CreateRunner(context, identity);
+});
+
+app.MapGet("/api/v4/runners/all", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!await OnlyQuery(context)) return;
+    if (!identity.IsAdministrator) { await ApiError(context, 403, "403 Forbidden"); return; }
+    IReadOnlyList<RunnerInfo> list = await store.ListRunnersAsync(identity, context.RequestAborted);
+    await context.Response.WriteAsJsonAsync(list.Select(RunnerResponseFor).ToArray(), ApiJson.Default.RunnerResponseArray, null, context.RequestAborted);
+});
+
+app.MapDelete("/api/v4/runners/{runnerId:long}", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!identity.TokenScopes.HasFlag(TokenScope.Api) || !identity.IsAdministrator) { await ApiError(context, 403, "403 Forbidden"); return; }
+    long runnerId = Convert.ToInt64(context.Request.RouteValues["runnerId"], System.Globalization.CultureInfo.InvariantCulture);
+    if (await store.DeleteRunnerAsync(identity, runnerId, context.RequestAborted)) context.Response.StatusCode = StatusCodes.Status204NoContent;
+    else await ApiError(context, 404, "404 Runner Not Found");
+});
+
+app.MapGet("/api/admin/runners", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!browser.Value.Identity.IsAdministrator) { await ApiError(context, 403, "administrator"); return; }
+    if (!await OnlyQuery(context)) return;
+    IReadOnlyList<RunnerInfo> list = await store.ListRunnersAsync(browser.Value.Identity, context.RequestAborted);
+    await context.Response.WriteAsJsonAsync(list.Select(RunnerResponseFor).ToArray(), ApiJson.Default.RunnerResponseArray, null, context.RequestAborted);
+});
+
+app.MapPost("/api/admin/runners", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await BrowserWriter(context);
+    if (browser is null) return;
+    if (!browser.Value.Identity.IsAdministrator) { await ApiError(context, 403, "administrator"); return; }
+    await CreateRunner(context, browser.Value.Identity);
+});
+
+app.MapDelete("/api/admin/runners/{runnerId:long}", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await BrowserWriter(context);
+    if (browser is null) return;
+    if (!browser.Value.Identity.IsAdministrator) { await ApiError(context, 403, "administrator"); return; }
+    long runnerId = Convert.ToInt64(context.Request.RouteValues["runnerId"], System.Globalization.CultureInfo.InvariantCulture);
+    if (await store.DeleteRunnerAsync(browser.Value.Identity, runnerId, context.RequestAborted)) context.Response.StatusCode = StatusCodes.Status204NoContent;
+    else await ApiError(context, 404, "runner");
+});
+
+// Runner binaries for install scripts, from a directory the operator fills. Only the names the scripts ask for.
+app.MapGet("/-/runner/download/{file}", async context =>
+{
+    if (!await OnlyQuery(context)) return;
+    string file = context.Request.RouteValues["file"]?.ToString() ?? "";
+    string? platform = Graft.Server.RunnerInstallScripts.Platforms.FirstOrDefault(p => Graft.Server.RunnerInstallScripts.BinaryName(p) == file);
+    string? path = settings.RunnerDownloads is null || platform is null ? null : Path.Combine(settings.RunnerDownloads, file);
+    if (path is null || !File.Exists(path)) { context.Response.StatusCode = StatusCodes.Status404NotFound; return; }
+    await using FileStream content = File.OpenRead(path);
+    await WriteDownloadStream(context, content, file, "application/octet-stream");
+});
+
+foreach ((string root, bool browserFamily) in new[] { ("/api/projects/{projectId:long}", true), ("/api/v4/projects/{projectId}", false) })
+{
+    app.MapGet(root + "/pipelines", async context =>
+    {
+        var scope = await CiReader(context, browserFamily);
+        if (scope is null) return;
+        if (!await OnlyQuery(context, "page", "per_page")) return;
+        (int Page, int PerPage)? pagination = await Pagination(context);
+        if (pagination is null) return;
+        (IReadOnlyList<PipelineInfo> list, long total) = await store.ListPipelinesAsync(scope.Value.Identity, scope.Value.Details.Project.Id,
+            (pagination.Value.Page - 1) * pagination.Value.PerPage, pagination.Value.PerPage, context.RequestAborted);
+        SetPagination(context, pagination.Value.Page, pagination.Value.PerPage, total);
+        await context.Response.WriteAsJsonAsync(list.Select(pipeline => PipelineResponseFor(context, scope.Value.Details.Project, pipeline)).ToArray(),
+            ApiJson.Default.PipelineResponseArray, null, context.RequestAborted);
+    });
+
+    app.MapGet(root + "/pipelines/{pipelineId:long}", async context =>
+    {
+        var scope = await CiReader(context, browserFamily);
+        if (scope is null) return;
+        if (!await OnlyQuery(context)) return;
+        long pipelineId = Convert.ToInt64(context.Request.RouteValues["pipelineId"], System.Globalization.CultureInfo.InvariantCulture);
+        PipelineInfo? pipeline = await store.GetPipelineAsync(scope.Value.Identity, scope.Value.Details.Project.Id, pipelineId, context.RequestAborted);
+        if (pipeline is null) { await ApiError(context, 404, "404 Pipeline Not Found"); return; }
+        await context.Response.WriteAsJsonAsync(PipelineResponseFor(context, scope.Value.Details.Project, pipeline), ApiJson.Default.PipelineResponse, null, context.RequestAborted);
+    });
+
+    app.MapGet(root + "/pipelines/{pipelineId:long}/jobs", async context =>
+    {
+        var scope = await CiReader(context, browserFamily);
+        if (scope is null) return;
+        if (!await OnlyQuery(context, "page", "per_page")) return;
+        long pipelineId = Convert.ToInt64(context.Request.RouteValues["pipelineId"], System.Globalization.CultureInfo.InvariantCulture);
+        PipelineInfo? pipeline = await store.GetPipelineAsync(scope.Value.Identity, scope.Value.Details.Project.Id, pipelineId, context.RequestAborted);
+        if (pipeline is null) { await ApiError(context, 404, "404 Pipeline Not Found"); return; }
+        IReadOnlyList<CiJobInfo> jobs = await store.ListPipelineJobsAsync(scope.Value.Identity, scope.Value.Details.Project.Id, pipelineId, context.RequestAborted);
+        await context.Response.WriteAsJsonAsync(jobs.Select(job => JobResponseFor(context, scope.Value.Details.Project, pipeline, job)).ToArray(),
+            ApiJson.Default.JobResponseArray, null, context.RequestAborted);
+    });
+
+    app.MapGet(root + "/jobs/{jobId:long}", async context =>
+    {
+        var scope = await CiReader(context, browserFamily);
+        if (scope is null) return;
+        if (!await OnlyQuery(context)) return;
+        long jobId = Convert.ToInt64(context.Request.RouteValues["jobId"], System.Globalization.CultureInfo.InvariantCulture);
+        CiJobInfo? job = await store.GetJobAsync(scope.Value.Identity, scope.Value.Details.Project.Id, jobId, context.RequestAborted);
+        if (job is null) { await ApiError(context, 404, "404 Job Not Found"); return; }
+        PipelineInfo pipeline = (await store.GetPipelineAsync(scope.Value.Identity, scope.Value.Details.Project.Id, job.PipelineId, context.RequestAborted))!;
+        await context.Response.WriteAsJsonAsync(JobResponseFor(context, scope.Value.Details.Project, pipeline, job), ApiJson.Default.JobResponse, null, context.RequestAborted);
+    });
+
+    app.MapGet(root + "/jobs/{jobId:long}/trace", async context =>
+    {
+        var scope = await CiReader(context, browserFamily);
+        if (scope is null) return;
+        if (!await OnlyQuery(context)) return;
+        long jobId = Convert.ToInt64(context.Request.RouteValues["jobId"], System.Globalization.CultureInfo.InvariantCulture);
+        string? trace = await store.ReadTraceAsync(scope.Value.Identity, scope.Value.Details.Project.Id, jobId, context.RequestAborted);
+        if (trace is null) { await ApiError(context, 404, "404 Job Not Found"); return; }
+        context.Response.ContentType = "text/plain; charset=utf-8";
+        await context.Response.WriteAsync(trace, context.RequestAborted);
+    });
+}
+
+// GitLab's "run pipeline": a pipeline for the tip of a ref, by somebody who may push.
+app.MapPost("/api/v4/projects/{projectId}/pipeline", async context =>
+{
+    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.PushRepository);
+    if (project is null) return;
+    string reference = context.Request.Query["ref"].ToString();
+    if (reference.Length == 0 && context.Request.HasJsonContentType())
+        reference = (await context.Request.ReadFromJsonAsync(ApiJson.Default.PipelineCreateRequest, context.RequestAborted))?.Ref ?? "";
+    if (reference.Length == 0) { await ApiError(context, 400, "400 Bad Request: ref is required"); return; }
+    if (runners is null) { await ApiError(context, 400, "400 Bad Request: this forge runs no runners; start it with --runner-port"); return; }
+    string? sha = null;
+    await WithRepository(project.Endpoint, context, repository =>
+    {
+        sha = RepositoryView.ResolveCommit(repository, reference);
+        return Task.CompletedTask;
+    });
+    if (context.Response.HasStarted) return;
+    if (sha is null) { await ApiError(context, 400, "400 Bad Request: reference not found"); return; }
+    PipelineInfo? pipeline = await CreatePipelineFor(project.Details.Project, project.Identity?.UserId, reference, sha, "api");
+    if (pipeline is null) { await ApiError(context, 400, "400 Bad Request: there is no " + CiConfiguration.Path + " at " + reference); return; }
+    context.Response.StatusCode = StatusCodes.Status201Created;
+    await context.Response.WriteAsJsonAsync(PipelineResponseFor(context, project.Details.Project, pipeline), ApiJson.Default.PipelineResponse, null, context.RequestAborted);
+});
+
+/// <summary>The project a pipeline route names and the caller, for whoever may browse its repository.</summary>
+async Task<(ProjectDetails Details, AuthenticatedIdentity? Identity)?> CiReader(HttpContext context, bool browserFamily)
+{
+    if (!browserFamily)
+    {
+        ApiProject? project = await AuthorizeApiProject(context, ProjectAction.BrowseRepository);
+        return project is null ? null : (project.Details, project.Identity);
+    }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: false);
+    long projectId = Convert.ToInt64(context.Request.RouteValues["projectId"], System.Globalization.CultureInfo.InvariantCulture);
+    ProjectDetails? details = await store.GetReadyProjectAsync(projectId, context.RequestAborted);
+    if (details is null || !(await DecideFor(context, browser?.Identity, projectId, ProjectAction.BrowseRepository)).Allowed)
+    {
+        await ApiError(context, 404, "project");
+        return null;
+    }
+    return (details, browser?.Identity);
+}
+
+async Task CreateRunner(HttpContext context, AuthenticatedIdentity identity)
+{
+    if (runners is null) { await ApiError(context, 400, "400 Bad Request: this forge runs no runners; start it with --runner-port"); return; }
+    RunnerCreateRequest? request = null;
+    if (context.Request.HasJsonContentType())
+    {
+        try { request = await context.Request.ReadFromJsonAsync(ApiJson.Default.RunnerCreateRequest, context.RequestAborted); }
+        catch (JsonException) { await ApiError(context, 400, "400 Bad Request: body is not valid JSON"); return; }
+    }
+    if (request?.RunnerType is { Length: > 0 } type && type != "instance_type")
+    { await ApiError(context, 400, "400 Bad Request: Graft creates instance runners only; group and project runners are not implemented"); return; }
+    string description = request?.Description?.Trim() ?? "";
+    if (description.Length > 200) { await ApiError(context, 400, "400 Bad Request: description must be at most 200 characters"); return; }
+    RunnerRegistration registration = await store.CreateRunnerAsync(identity, description, context.RequestAborted);
+    // The Intonation lives as long as the token it travels with; after that the script is spent either way.
+    string intonation = runners.Intone(registration.Runner.RegistrationExpiresAtUtc - DateTimeOffset.UtcNow);
+    string origin = serverOrigin ?? Origin(context);
+    bool downloads = settings.RunnerDownloads is not null;
+    RunnerCreatedResponse response = new(registration.Runner.Id, registration.RegistrationToken, registration.Runner.RegistrationExpiresAtUtc,
+        intonation, runners.ShrineAddress,
+        Graft.Server.RunnerInstallScripts.PowerShell(origin, registration.Runner.Id, description, intonation, registration.RegistrationToken,
+            registration.Runner.RegistrationExpiresAtUtc, downloads),
+        Graft.Server.RunnerInstallScripts.Shell(origin, registration.Runner.Id, description, intonation, registration.RegistrationToken,
+            registration.Runner.RegistrationExpiresAtUtc, downloads));
+    context.Response.StatusCode = StatusCodes.Status201Created;
+    await context.Response.WriteAsJsonAsync(response, ApiJson.Default.RunnerCreatedResponse, null, context.RequestAborted);
+}
+
+static RunnerResponse RunnerResponseFor(RunnerInfo runner)
+{
+    // A runner asks for work at least every twenty seconds while it is up, so a minute and a half of silence is gone.
+    bool online = runner.ContactedAtUtc is DateTimeOffset contacted && DateTimeOffset.UtcNow - contacted < TimeSpan.FromSeconds(90);
+    string status = runner.ClaimedAtUtc is null
+        ? (runner.RegistrationExpiresAtUtc <= DateTimeOffset.UtcNow ? "registration_expired" : "never_contacted")
+        : online ? "online" : "offline";
+    return new(runner.Id, runner.Description, runner.Name, runner.Platform, runner.Version, "instance_type", true, true, false, online, status,
+        runner.ContactedAtUtc, runner.CreatedAtUtc);
+}
+
+PipelineResponse PipelineResponseFor(HttpContext context, ProjectInfo project, PipelineInfo pipeline) =>
+    new(pipeline.Id, pipeline.Iid, pipeline.ProjectId, pipeline.Ref, pipeline.Sha, pipeline.Status, pipeline.Source,
+        ProjectUrlFor(context, project) + "/-/pipelines/" + pipeline.Id.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        pipeline.CreatedAtUtc, pipeline.UpdatedAtUtc, pipeline.FinishedAtUtc, pipeline.Error);
+
+JobResponse JobResponseFor(HttpContext context, ProjectInfo project, PipelineInfo pipeline, CiJobInfo job) =>
+    new(job.Id, job.Name, job.Stage, job.Status, pipeline.Ref, job.AllowFailure, job.CreatedAtUtc, job.StartedAtUtc, job.FinishedAtUtc,
+        job.StartedAtUtc is DateTimeOffset started ? ((job.FinishedAtUtc ?? DateTimeOffset.UtcNow) - started).TotalSeconds : null,
+        new(pipeline.Id, pipeline.Iid, pipeline.ProjectId, pipeline.Ref, pipeline.Sha, pipeline.Status),
+        job.RunnerId is long runnerId ? new(runnerId, job.RunnerDescription ?? "") : null,
+        ProjectUrlFor(context, project) + "/-/jobs/" + job.Id.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        job.ExitCode, job.Failure);
 
 // A project's own view of the trail, for whoever may manage the project. The scoping rule lives in the store.
 app.MapGet("/api/projects/{projectId:long}/audit", async context =>
@@ -4460,6 +4697,63 @@ async Task NotifyPushAt(string origin, ProjectInfo project, AuthenticatedIdentit
     }
 }
 
+/// <summary>
+/// A pipeline for each branch a push moved forward, when this forge runs runners and the commit has a
+/// pipeline file. A file that cannot be read still makes a pipeline, failed, carrying the reason, so the person
+/// who pushed sees why nothing ran instead of seeing nothing.
+/// </summary>
+async Task CreatePushPipelines(ProjectInfo project, AuthenticatedIdentity? identity, List<(string Branch, string? From, string? To)> moved)
+{
+    if (runners is null) return;
+    foreach ((string branch, string? _, string? to) in moved)
+    {
+        if (to is null) continue;
+        try { await CreatePipelineFor(project, identity?.UserId, branch, to, "push"); }
+        catch (Exception exception) { app.Logger.LogWarning(exception, "pipeline for {Project} {Branch} was not created", project.Slug, branch); }
+    }
+}
+
+/// <summary>Reads the pipeline file at <paramref name="sha"/> and records the pipeline; null when there is no file.</summary>
+async Task<PipelineInfo?> CreatePipelineFor(ProjectInfo project, long? userId, string reference, string sha, string source)
+{
+    RepositoryEndpoint endpoint = EndpointFor(project);
+    byte[]? file;
+    await endpoint.Gate.WaitAsync();
+    try
+    {
+        GitFile? found;
+        try { found = RepositoryView.File(endpoint.Repository, sha, CiConfiguration.Path); }
+        catch (GitInputException) { found = null; }
+        file = found?.Content;
+    }
+    finally { endpoint.Gate.Release(); }
+    if (file is null) return null;
+    CiParseResult parsed;
+    try { parsed = CiConfiguration.Parse(new UTF8Encoding(false, true).GetString(file)); }
+    catch (DecoderFallbackException) { parsed = new(null, "The pipeline file is not UTF-8 text."); }
+    PipelineInfo pipeline = await store.CreatePipelineAsync(project.Id, userId, reference, sha, source, parsed);
+    runners?.Notify();
+    return pipeline;
+}
+
+/// <summary>The source a runner is sent for a job: the commit as a gzipped tar, under one directory, as the archive route serves it.</summary>
+async Task<byte[]?> ArchiveForJob(CiLease lease, CancellationToken cancellationToken)
+{
+    RepositoryEndpoint endpoint = EndpointFor(lease.Project);
+    await endpoint.Gate.WaitAsync(cancellationToken);
+    try
+    {
+        Repository repository = endpoint.Repository;
+        if (!repository.Objects.ContainsKey(lease.Pipeline.Sha)) return null;
+        IReadOnlyList<GitTreeEntry>? files = RepositoryView.FlatTree(repository, lease.Pipeline.Sha);
+        if (files is null) return null;
+        using MemoryStream output = new();
+        BuildTarGz(output, repository, files, "", lease.Pipeline.CreatedAtUtc, cancellationToken);
+        return output.ToArray();
+    }
+    finally { endpoint.Gate.Release(); }
+}
+
 /// <summary><c>ssh://git@host[:port]</c>, with the configured host name when there is one and the port only
 /// when it is not SSH's own.</summary>
 string SshBase(string requestHost)
@@ -6784,7 +7078,7 @@ app.MapPost("/{projectNamespace}/{project}.git/{service}", async context =>
 
         // The refs before and after, so a push can report which branches moved. Taken inside the lock, so
         // nothing else can move one between the two readings.
-        Dictionary<string, string>? before = service == "git-receive-pack" && webhooks is not null
+        Dictionary<string, string>? before = service == "git-receive-pack" && (webhooks is not null || runners is not null)
             ? new(authorized.Endpoint.Repository.Refs, StringComparer.Ordinal)
             : null;
 
@@ -6821,6 +7115,7 @@ app.MapPost("/{projectNamespace}/{project}.git/{service}", async context =>
             payload["via"] = "push";
         });
     }
+    await CreatePushPipelines(authorized.Project, authorized.Identity, pushed);
 });
 
 // The pages origin: a project's static site, served from a different hostname and nothing else.
@@ -7034,11 +7329,28 @@ Console.WriteLine(settings.Mail is null
 // already backs up and moves, and a server that changed its host key on every move would teach every
 // client to ignore the warning that matters. The fingerprint is printed so it can be checked from a known
 // place, which is the only honest answer to "is this the right server" on first connection.
+// Runners. The Shrine's key and the CupriNet node's identity live beside the database, protected by the same
+// key ring as recoverable tokens, so a runner that registered against this forge keeps finding it after a
+// restart or a move. The Intonation advertises the host the operator named, or the one in --origin.
+if (settings.RunnerPort >= 0)
+{
+    runners = await Graft.Server.RunnerHost.StartAsync(new Graft.Server.RunnerHostOptions(
+            settings.ListenAddress, settings.RunnerPort,
+            settings.RunnerHost ?? new Uri(serverOrigin!).Host,
+            Path.Combine(Path.GetDirectoryName(settings.Database)!, "runner-shrine"),
+            app.Services.GetRequiredService<IDataProtectionProvider>().CreateProtector("graft.runner.shrine.v1")),
+        store, ArchiveForJob, (text, exception) => app.Logger.LogInformation(exception, "{Message}", text));
+    app.Lifetime.ApplicationStopping.Register(() => runners.DisposeAsync().AsTask().GetAwaiter().GetResult());
+    Console.WriteLine("RUNNERS: cupri port " + runners.Port.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+        " advertised as " + (settings.RunnerHost ?? new Uri(serverOrigin!).Host) + "; shrine " + runners.ShrineAddress +
+        (settings.RunnerDownloads is null ? "; no runner downloads" : "; runner downloads from " + settings.RunnerDownloads));
+}
+else Console.WriteLine("RUNNERS: off");
 if (settings.SshPort >= 0)
 {
     sshHostKey = Graft.Ssh.SshHostKey.LoadOrCreate(Path.Combine(Path.GetDirectoryName(settings.Database)!, "ssh_host_ecdsa_key"));
     GitSshHost gitHost = new(store, settings.PublicBrowsing, GlobalNamespace, EndpointFor,
-        (project, identity, moved) => NotifyPushAt(serverOrigin!, project, identity, moved),
+        async (project, identity, moved) => { await NotifyPushAt(serverOrigin!, project, identity, moved); await CreatePushPipelines(project, identity, moved); },
         (text, exception) => app.Logger.LogInformation(exception, "{Message}", text));
     sshServer = new(new Graft.Ssh.SshServerOptions
     {
@@ -7905,12 +8217,13 @@ sealed record PendingSecret(long UserId, string Secret, DateTimeOffset ExpiresAt
 
 sealed record Arguments(string Database, string Repositories, IPAddress ListenAddress, int ListenPort, string? Origin,
     string? Certificate, string? CertificatePasswordFile, bool PublicBrowsing, bool PushToCreate, int SessionMinutes, bool Mcp,
-    string? PagesOrigin, bool RecoverableTokens, bool Webhooks, int SshPort, string? SshHost, MailSettings? Mail)
+    string? PagesOrigin, bool RecoverableTokens, bool Webhooks, int SshPort, string? SshHost, MailSettings? Mail,
+    int RunnerPort, string? RunnerHost, string? RunnerDownloads)
 {
     public static bool TryParse(string[] values, out Arguments? result)
     {
         result = null;
-        if (values.Length is < 4 or > 36 || values.Length % 2 != 0) return false;
+        if (values.Length is < 4 or > 42 || values.Length % 2 != 0) return false;
         string? database = null;
         string? repositories = null;
         string? listen = null;
@@ -7929,6 +8242,9 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         string? mailSmtp = null;
         string? mailFrom = null;
         string? mailPasswordFile = null;
+        string? runnerPort = null;
+        string? runnerHost = null;
+        string? runnerDownloads = null;
         HashSet<string> seen = new(StringComparer.Ordinal);
         for (int index = 0; index < values.Length; index += 2)
         {
@@ -7951,6 +8267,9 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             else if (values[index] == "--mail-smtp") mailSmtp = values[index + 1];
             else if (values[index] == "--mail-from") mailFrom = values[index + 1];
             else if (values[index] == "--mail-password-file") mailPasswordFile = values[index + 1];
+            else if (values[index] == "--runner-port") runnerPort = values[index + 1];
+            else if (values[index] == "--runner-host") runnerHost = values[index + 1];
+            else if (values[index] == "--runner-downloads") runnerDownloads = values[index + 1];
             else return false;
         }
         if (string.IsNullOrWhiteSpace(database) || string.IsNullOrWhiteSpace(repositories)) return false;
@@ -8027,6 +8346,18 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             if (!MailSettings.TryParse(mailSmtp, mailFrom, mailPassword, out mail)) return false;
         }
         else if (mailFrom is not null || mailPasswordFile is not null) return false;
+        // Runners reach the forge over CupriNet on a port of their own, off unless named, as SSH is. The host is what the
+        // Intonation advertises; the downloads directory is where runner binaries are served from for install scripts.
+        int runnerPortNumber = -1;
+        if (string.IsNullOrWhiteSpace(runnerPort)) runnerPort = null;
+        if (runnerPort is not null && (!int.TryParse(runnerPort, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out runnerPortNumber) ||
+            runnerPortNumber is < 0 or > 65535))
+            return false;
+        if (string.IsNullOrWhiteSpace(runnerHost)) runnerHost = null;
+        if (runnerHost is not null && (runnerHost.Length > 253 || Uri.CheckHostName(runnerHost) is UriHostNameType.Unknown or UriHostNameType.Basic)) return false;
+        if (string.IsNullOrWhiteSpace(runnerDownloads)) runnerDownloads = null;
+        if (runnerDownloads is not null && !Directory.Exists(runnerDownloads)) return false;
+        if (runnerPort is null && (runnerHost is not null || runnerDownloads is not null)) return false;
         if (certificatePasswordFile is not null && certificate is null) return false;
         if (!IPAddress.IsLoopback(address) && certificate is null) return false;
         if (!IPAddress.IsLoopback(address) && origin is null) return false;
@@ -8037,7 +8368,8 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             origin is null ? null : origin.TrimEnd('/'), certificate is null ? null : Path.GetFullPath(certificate),
             certificatePasswordFile is null ? null : Path.GetFullPath(certificatePasswordFile),
             publicBrowsing == "true", pushToCreate == "true", window, mcp == "true",
-            pagesOrigin, recoverableTokens == "true", webhooks == "true", sshPortNumber, sshHost, mail);
+            pagesOrigin, recoverableTokens == "true", webhooks == "true", sshPortNumber, sshHost, mail,
+            runnerPortNumber, runnerHost, runnerDownloads is null ? null : Path.GetFullPath(runnerDownloads));
         return true;
     }
 }
