@@ -72,7 +72,10 @@ public sealed record ProjectAccess(
     long OwnerUserId,
     ProjectVisibility Visibility,
     bool PagePublished,
-    ProjectRole? Membership);
+    ProjectRole? Membership,
+    /// <summary>The role the caller holds on the project through the group that owns it or any of that
+    /// group's ancestors, at its greatest. Null for a project under an account or a caller in no such group.</summary>
+    ProjectRole? GroupRole = null);
 
 [Flags]
 public enum TokenScope
@@ -162,6 +165,12 @@ public static class ProjectAuthorization
         {
             role = ProjectRole.Maintainer;
             source = "Owner";
+        }
+        else if (project.GroupRole is ProjectRole inherited && (project.Membership is null || inherited > project.Membership))
+        {
+            // A group grant is never less than a direct one takes away: the greater of the two stands.
+            role = inherited;
+            source = "Group membership";
         }
         else
         {
@@ -257,7 +266,10 @@ public sealed record ProjectInfo(long Id, long OwnerUserId, string Namespace, st
     bool PagePublished = false,
     /// <summary>The instance-wide name this project can also be reached by, without its owner in the path.
     /// Every stored project has one; it is empty only on a value built before the row was written.</summary>
-    string GlobalSlug = "");
+    string GlobalSlug = "",
+    /// <summary>The group that owns this project, when a group does; <see cref="Namespace"/> is then the group's
+    /// full path rather than an account name.</summary>
+    long? GroupId = null);
 /// <summary>
 /// A project that has just been deleted. Carries its storage directory because nothing else does any more:
 /// the row naming it is gone, so a caller that still has to remove the repository on disk has only this.
@@ -309,3 +321,32 @@ public sealed record SshKeyInfo(
     DateTimeOffset CreatedAtUtc,
     DateTimeOffset? ExpiresAtUtc,
     DateTimeOffset? LastUsedAtUtc);
+
+/// <summary>
+/// What a member of a group may do. The three project roles, and Owner, which belongs to groups alone: an
+/// Owner manages the group and acts as a Maintainer on its projects.
+/// </summary>
+public enum GroupRole
+{
+    Reporter = 10,
+    Developer = 20,
+    Maintainer = 30,
+    Owner = 40
+}
+
+/// <summary>A group: a namespace with members, under an account's namespace or another group.</summary>
+public sealed record Group(
+    long Id,
+    long? ParentId,
+    /// <summary>The last segment, as given.</summary>
+    string Path,
+    /// <summary>Every ancestor's path and this one, joined by <c>/</c>; what a project under it is addressed by.</summary>
+    string FullPath,
+    string Name,
+    string Description,
+    DateTimeOffset CreatedAtUtc,
+    long ProjectCount,
+    long SubgroupCount);
+
+/// <summary>One person's role in a group. <see cref="Inherited"/> says it comes from an ancestor rather than this group.</summary>
+public sealed record GroupMember(long UserId, string Username, GroupRole Role, bool Inherited);

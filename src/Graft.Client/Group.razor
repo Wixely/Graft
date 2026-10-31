@@ -1,0 +1,320 @@
+@page "/-/groups/{*Path}"
+@inject GraftApi Api
+@inject NavigationManager Navigation
+
+@* One group: its projects, its subgroups, its members, and what the signed-in person may do to each,
+   decided by the server and reflected here only in what is offered. *@
+
+<PageTitle>@(group?.FullPath ?? "Group") &middot; Graft</PageTitle>
+
+@if (loading)
+{
+    <p role="status" class="secondary-text">Loading…</p>
+}
+else if (group is null)
+{
+    <div class="page-header"><div><h1>Group</h1><p class="subtitle">There is no group you can see at this address.</p></div></div>
+    <Banner Message="@message" Kind="error" />
+}
+else
+{
+    <div class="page-header">
+        <div>
+            <h1>@group.Name</h1>
+            <p class="subtitle">
+                <span class="mono">@group.FullPath</span>
+                @if (group.Description.Length > 0) { <span> &middot; @group.Description</span> }
+                @if (group.AccessLevel is int level) { <span> &middot; you are @Groups.RoleName(level)</span> }
+            </p>
+        </div>
+        <div class="page-header-actions">
+            @if (group.ParentId is not null)
+            {
+                <a class="button secondary" href="/-/groups/@string.Join('/', group.FullPath.Split('/')[..^1])"><Icon Name="chevron-left" />Parent group</a>
+            }
+            <a class="button secondary" href="/-/groups"><Icon Name="folder" />All groups</a>
+        </div>
+    </div>
+
+    <Banner Message="@message" Kind="@messageKind" />
+
+    <div class="tabs">
+        <button type="button" class="@(tab == "projects" ? "active" : "")" @onclick='() => tab = "projects"'>Projects</button>
+        <button type="button" class="@(tab == "subgroups" ? "active" : "")" @onclick='() => tab = "subgroups"'>Subgroups</button>
+        <button type="button" class="@(tab == "members" ? "active" : "")" @onclick='() => tab = "members"'>Members</button>
+        @if (IsOwner) { <button type="button" class="@(tab == "settings" ? "active" : "")" @onclick='() => tab = "settings"'>Settings</button> }
+    </div>
+
+    @if (tab == "projects")
+    {
+        @if (CanCreateProject)
+        {
+            <div class="panel">
+                <div class="panel-header"><h2>New project in @group.FullPath</h2></div>
+                <div class="panel-body">
+                    <form class="form" @onsubmit="CreateProject" @onsubmit:preventDefault>
+                        <label for="project-name">Name</label>
+                        <input id="project-name" @bind="projectName" required maxlength="200" />
+                        <label for="project-path">Path</label>
+                        <input id="project-path" @bind="projectPath" minlength="2" maxlength="39" placeholder="from the name if left empty" />
+                        <div class="form-actions">
+                            <button type="submit" disabled="@busy">@(busy ? "Creating…" : "Create project")</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        }
+        <div class="panel">
+            <div class="panel-header"><Icon Name="repository" /><h2>Projects</h2><span class="spacer"></span><span class="label">@projects.Length</span></div>
+            @if (projects.Length == 0)
+            {
+                <p class="panel-empty">No projects in this group yet.</p>
+            }
+            else
+            {
+                <div class="list">
+                    @foreach (ProjectResponse project in projects)
+                    {
+                        @* The namespace travels as one encoded segment, which is the form the project pages answer to. *@
+                        <a class="list-item" href="/@Uri.EscapeDataString(project.Namespace.FullPath)/@project.Path">
+                            <Icon Name="repository" />
+                            <span class="list-item-main"><strong>@project.Name</strong><small>@project.PathWithNamespace</small></span>
+                            <Icon Name="chevron-right" />
+                        </a>
+                    }
+                </div>
+            }
+        </div>
+    }
+    else if (tab == "subgroups")
+    {
+        @if (IsOwner)
+        {
+            <div class="panel">
+                <div class="panel-header"><h2>New subgroup</h2></div>
+                <div class="panel-body">
+                    <form class="form" @onsubmit="CreateSubgroup" @onsubmit:preventDefault>
+                        <label for="subgroup-name">Name</label>
+                        <input id="subgroup-name" @bind="subgroupName" required maxlength="200" />
+                        <label for="subgroup-path">Path</label>
+                        <input id="subgroup-path" @bind="subgroupPath" minlength="2" maxlength="39" placeholder="from the name if left empty" />
+                        <div class="form-actions">
+                            <button type="submit" disabled="@busy">@(busy ? "Creating…" : "Create subgroup")</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        }
+        <div class="panel">
+            <div class="panel-header"><Icon Name="folder" /><h2>Subgroups</h2><span class="spacer"></span><span class="label">@subgroups.Length</span></div>
+            @if (subgroups.Length == 0)
+            {
+                <p class="panel-empty">No groups inside this one.</p>
+            }
+            else
+            {
+                <div class="list">
+                    @foreach (GroupResponse child in subgroups)
+                    {
+                        <a class="list-item" href="/-/groups/@child.FullPath">
+                            <Icon Name="folder" />
+                            <span class="list-item-main"><strong>@child.Name</strong><small>@child.FullPath &middot; @child.ProjectsCount projects</small></span>
+                            <Icon Name="chevron-right" />
+                        </a>
+                    }
+                </div>
+            }
+        </div>
+    }
+    else if (tab == "members")
+    {
+        @if (IsOwner)
+        {
+            <div class="panel">
+                <div class="panel-header"><h2>Add or change a member</h2></div>
+                <div class="panel-body">
+                    <p class="secondary-text">A role here is held in every group and on every project beneath this one.</p>
+                    <form class="form" @onsubmit="SetMember" @onsubmit:preventDefault>
+                        <label for="member-username">Username</label>
+                        <input id="member-username" @bind="memberUsername" required maxlength="39" />
+                        <label for="member-role">Role</label>
+                        <select id="member-role" @bind="memberLevel">
+                            <option value="20">Reporter</option>
+                            <option value="30">Developer</option>
+                            <option value="40">Maintainer</option>
+                            <option value="50">Owner</option>
+                        </select>
+                        <div class="form-actions">
+                            <button type="submit" disabled="@busy">Set role</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        }
+        <div class="panel">
+            <div class="panel-header"><Icon Name="user" /><h2>Members</h2><span class="spacer"></span><span class="label">@members.Length</span></div>
+            <div class="list">
+                @foreach (GroupMemberResponse member in members)
+                {
+                    <div class="list-item">
+                        <Icon Name="user" />
+                        <span class="list-item-main">
+                            <strong>@member.Username</strong>
+                            <small>@Groups.RoleName(member.AccessLevel)@(member.Inherited ? " · from a group above" : "")</small>
+                        </span>
+                        @if (IsOwner && !member.Inherited)
+                        {
+                            <span class="list-item-actions">
+                                <button type="button" class="@(pendingRemoval == member.Id ? "danger" : "secondary")" @onclick="() => RemoveMember(member)" disabled="@busy">
+                                    @(pendingRemoval == member.Id ? "Confirm remove" : "Remove")
+                                </button>
+                            </span>
+                        }
+                    </div>
+                }
+            </div>
+        </div>
+    }
+    else if (tab == "settings")
+    {
+        <div class="panel">
+            <div class="panel-header"><Icon Name="alert" /><h2>Delete this group</h2></div>
+            <div class="panel-body">
+                <p class="secondary-text">
+                    Only an empty group can be deleted: move or delete its projects and subgroups first. Deleting a
+                    group never deletes a project.
+                </p>
+                <div class="form-actions">
+                    <button type="button" class="danger" @onclick="DeleteGroup" disabled="@(busy || group.ProjectsCount > 0 || group.SubgroupsCount > 0)">
+                        @(pendingDelete ? "Confirm delete" : "Delete group")
+                    </button>
+                </div>
+            </div>
+        </div>
+    }
+}
+
+@code {
+    [Parameter] public string? Path { get; set; }
+
+    private GroupResponse? group;
+    private ProjectResponse[] projects = [];
+    private GroupResponse[] subgroups = [];
+    private GroupMemberResponse[] members = [];
+    private string tab = "projects";
+    private string projectName = "";
+    private string projectPath = "";
+    private string subgroupName = "";
+    private string subgroupPath = "";
+    private string memberUsername = "";
+    private int memberLevel = 30;
+    private long? pendingRemoval;
+    private bool pendingDelete;
+    private string message = "";
+    private string messageKind = "info";
+    private bool loading = true;
+    private bool busy;
+
+    private bool IsOwner => group?.AccessLevel == 50 || Api.IsAdministrator;
+    private bool CanCreateProject => group?.AccessLevel >= 30 || Api.IsAdministrator;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        loading = true;
+        try
+        {
+            if (!await Api.EnsureSessionAsync())
+            {
+                if (Api.Reachable) Navigation.NavigateTo("/-/login", replace: true);
+                return;
+            }
+            await Load();
+        }
+        finally { loading = false; }
+    }
+
+    private string Encoded => Uri.EscapeDataString(Path ?? "");
+
+    private async Task Load()
+    {
+        group = await Api.GetAsync($"api/groups/{Encoded}", ApiJson.Default.GroupResponse);
+        if (group is null) return;
+        projects = await Api.GetAsync($"api/groups/{group.Id}/projects", ApiJson.Default.ProjectResponseArray) ?? [];
+        subgroups = await Api.GetAsync($"api/groups/{group.Id}/subgroups", ApiJson.Default.GroupResponseArray) ?? [];
+        members = await Api.GetAsync($"api/groups/{group.Id}/members", ApiJson.Default.GroupMemberResponseArray) ?? [];
+    }
+
+    private void Report(ApiResult result)
+    {
+        message = result.Message;
+        messageKind = result.Ok ? "success" : "error";
+    }
+
+    private async Task CreateProject()
+    {
+        if (busy || group is null) return;
+        busy = true;
+        try
+        {
+            Report(await Api.PostAsync("api/projects", new ProjectCreateRequest(projectName, string.IsNullOrWhiteSpace(projectPath) ? null : projectPath, "", "private", group.Id),
+                ApiJson.Default.ProjectCreateRequest, "Project created."));
+            if (messageKind == "success") { projectName = ""; projectPath = ""; await Load(); }
+        }
+        finally { busy = false; }
+    }
+
+    private async Task CreateSubgroup()
+    {
+        if (busy || group is null) return;
+        busy = true;
+        try
+        {
+            Report(await Api.PostAsync("api/groups", new GroupCreateRequest(subgroupName, string.IsNullOrWhiteSpace(subgroupPath) ? null : subgroupPath, "", group.Id),
+                ApiJson.Default.GroupCreateRequest, "Subgroup created."));
+            if (messageKind == "success") { subgroupName = ""; subgroupPath = ""; await Load(); }
+        }
+        finally { busy = false; }
+    }
+
+    private async Task SetMember()
+    {
+        if (busy || group is null) return;
+        busy = true;
+        try
+        {
+            Report(await Api.PostAsync($"api/groups/{group.Id}/members", new GroupMemberRequest(null, memberUsername.Trim(), memberLevel),
+                ApiJson.Default.GroupMemberRequest, $"{memberUsername.Trim()} is a {Groups.RoleName(memberLevel)} here."));
+            if (messageKind == "success") { memberUsername = ""; await Load(); }
+        }
+        finally { busy = false; }
+    }
+
+    private async Task RemoveMember(GroupMemberResponse member)
+    {
+        if (pendingRemoval != member.Id) { pendingRemoval = member.Id; return; }
+        if (busy || group is null) return;
+        busy = true;
+        pendingRemoval = null;
+        try
+        {
+            Report(await Api.DeleteAsync($"api/groups/{group.Id}/members/{member.Id}", $"{member.Username} removed."));
+            await Load();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task DeleteGroup()
+    {
+        if (!pendingDelete) { pendingDelete = true; return; }
+        if (busy || group is null) return;
+        busy = true;
+        pendingDelete = false;
+        try
+        {
+            ApiResult result = await Api.DeleteAsync($"api/groups/{group.Id}", "Group deleted.");
+            Report(result);
+            if (result.Ok) Navigation.NavigateTo("/-/groups");
+        }
+        finally { busy = false; }
+    }
+}

@@ -91,10 +91,11 @@ public sealed partial class GraftStore
         if (!read.Allowed) throw new UnauthorizedAccessException(read.Explanation);
         AuthenticatedIdentity? live = identity is null ? null : await FindLiveIdentityAsync(db, null, identity, cancellationToken);
         IEnumerable<ProjectDetailsRow> rows = await db.QueryAsync<ProjectDetailsRow>("""
-            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.Description, p.StorageId, p.CreatedAtUtc,
+            SELECT p.Id, p.OwnerUserId, COALESCE(g.FullPath, u.Username) AS Namespace, p.GroupId, p.Slug, p.Name, p.Description, p.StorageId, p.CreatedAtUtc,
                    p.DefaultBranch, p.Visibility, p.PagePublished, p.GlobalSlug
             FROM Projects p
             JOIN Users u ON u.Id = p.OwnerUserId
+            LEFT JOIN Groups g ON g.Id = p.GroupId
             WHERE p.ForkedFromProjectId = @ForkedFrom AND
             """ + VisibleProjectClause + """
 

@@ -92,10 +92,13 @@ internal sealed partial class GitSshHost(
         string trimmed = path.Trim('/');
         if (trimmed.EndsWith(".git", StringComparison.Ordinal)) trimmed = trimmed[..^4];
         string[] segments = trimmed.Split('/');
-        if (segments.Length != 2 || segments.Any(segment => segment.Length == 0)) return null;
-        return string.Equals(segments[0], globalNamespace, StringComparison.OrdinalIgnoreCase)
+        // The last segment is the project; everything before it is the namespace, an account or a group's
+        // full path, which may itself have several segments.
+        if (segments.Length < 2 || segments.Any(segment => segment.Length == 0)) return null;
+        string ns = string.Join('/', segments[..^1]);
+        return segments.Length == 2 && string.Equals(ns, globalNamespace, StringComparison.OrdinalIgnoreCase)
             ? await store.FindReadyProjectByGlobalSlugAsync(segments[1], cancellationToken)
-            : await store.FindReadyProjectAsync(segments[0], segments[1], cancellationToken);
+            : await store.FindReadyProjectAsync(ns, segments[^1], cancellationToken);
     }
 
     /// <summary>Protocol version 2 upload-pack: the capability list, then one command per request until EOF.</summary>

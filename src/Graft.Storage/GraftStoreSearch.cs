@@ -39,10 +39,11 @@ public sealed partial class GraftStore
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
         AuthenticatedIdentity? live = identity is null ? null : await FindLiveIdentityAsync(db, null, identity, cancellationToken);
         IEnumerable<ProjectDetailsRow> rows = await db.QueryAsync<ProjectDetailsRow>("""
-            SELECT p.Id, p.OwnerUserId, u.Username AS Namespace, p.Slug, p.Name, p.Description, p.StorageId, p.CreatedAtUtc,
+            SELECT p.Id, p.OwnerUserId, COALESCE(g.FullPath, u.Username) AS Namespace, p.GroupId, p.Slug, p.Name, p.Description, p.StorageId, p.CreatedAtUtc,
                    p.DefaultBranch, p.Visibility, p.PagePublished, p.GlobalSlug
             FROM Projects p
             JOIN Users u ON u.Id = p.OwnerUserId
+            LEFT JOIN Groups g ON g.Id = p.GroupId
             WHERE
             """ + VisibleProjectClause + """
 
@@ -70,10 +71,11 @@ public sealed partial class GraftStore
             SELECT i.Id, i.ProjectId, i.Iid, i.AuthorUserId, a.Username AS AuthorUsername, i.Title, i.Description,
                    i.State, i.CreatedAtUtc, i.UpdatedAtUtc, i.ClosedAtUtc, i.DueDate, i.Confidential, i.TimeEstimateSeconds,
                    0 AS TimeSpentSeconds, i.MilestoneId, NULL AS MilestoneIid, NULL AS MilestoneTitle, 0 AS Comments,
-                   u.Username AS Namespace, p.Slug
+                   COALESCE(g.FullPath, u.Username) AS Namespace, p.GroupId, p.Slug
             FROM Issues i
             JOIN Projects p ON p.Id = i.ProjectId
             JOIN Users u ON u.Id = p.OwnerUserId
+            LEFT JOIN Groups g ON g.Id = p.GroupId
             JOIN Users a ON a.Id = i.AuthorUserId
             WHERE
             """ + VisibleProjectClause + """
@@ -104,10 +106,11 @@ public sealed partial class GraftStore
                    m.SourceProjectId, NULL AS SourceSlug, NULL AS SourceNamespace,
                    m.CreatedAtUtc, m.UpdatedAtUtc, m.ClosedAtUtc, m.Draft, m.TimeEstimateSeconds, 0 AS TimeSpentSeconds,
                    m.MilestoneId, NULL AS MilestoneIid, NULL AS MilestoneTitle, 0 AS Comments, p.ApprovalsRequired,
-                   u.Username AS Namespace, p.Slug
+                   COALESCE(g.FullPath, u.Username) AS Namespace, p.GroupId, p.Slug
             FROM MergeRequests m
             JOIN Projects p ON p.Id = m.ProjectId
             JOIN Users u ON u.Id = p.OwnerUserId
+            LEFT JOIN Groups g ON g.Id = p.GroupId
             JOIN Users a ON a.Id = m.AuthorUserId
             WHERE
             """ + VisibleProjectClause + """

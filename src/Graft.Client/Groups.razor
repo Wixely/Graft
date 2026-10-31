@@ -1,0 +1,132 @@
+@page "/-/groups"
+@inject GraftApi Api
+@inject NavigationManager Navigation
+
+@* The groups the signed-in person belongs to, at any level, and a form to start a new top-level one. A
+   group is a namespace with members: its projects are reached by its path, and a role in it is held on
+   every project and group beneath. *@
+
+<PageTitle>Groups &middot; Graft</PageTitle>
+
+@if (loading)
+{
+    <p role="status" class="secondary-text">Loading…</p>
+}
+else if (!Api.Authenticated)
+{
+    <div class="page-header"><div><h1>Groups</h1><p class="subtitle">Sign in to see your groups.</p></div></div>
+}
+else
+{
+    <div class="page-header">
+        <div>
+            <h1>Groups</h1>
+            <p class="subtitle">A group owns projects and may hold groups. A role in it reaches everything beneath.</p>
+        </div>
+        <div class="page-header-actions">
+            <button type="button" class="@(creating ? "secondary" : "")" @onclick="() => creating = !creating">@(creating ? "Cancel" : "New group")</button>
+        </div>
+    </div>
+
+    <Banner Message="@message" Kind="@messageKind" />
+
+    @if (creating)
+    {
+        <div class="panel">
+            <div class="panel-header"><h2>New group</h2></div>
+            <div class="panel-body">
+                <form class="form" @onsubmit="CreateGroup" @onsubmit:preventDefault>
+                    <label for="group-name">Name</label>
+                    <input id="group-name" @bind="name" required maxlength="200" />
+                    <label for="group-path">Path</label>
+                    <input id="group-path" @bind="path" minlength="2" maxlength="39" placeholder="from the name if left empty" />
+                    <p class="field-hint">A top-level group's path shares the namespace of account names and cannot take one.</p>
+                    <label for="group-description">Description</label>
+                    <input id="group-description" @bind="description" maxlength="2000" />
+                    <div class="form-actions">
+                        <button type="submit" disabled="@busy">@(busy ? "Creating…" : "Create group")</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    }
+
+    <div class="panel">
+        <div class="panel-header"><Icon Name="folder" /><h2>Your groups</h2><span class="spacer"></span><span class="label">@groups.Length</span></div>
+        @if (groups.Length == 0)
+        {
+            <p class="panel-empty">You are in no group yet.</p>
+        }
+        else
+        {
+            <div class="list">
+                @foreach (GroupResponse group in groups)
+                {
+                    <a class="list-item" href="/-/groups/@group.FullPath">
+                        <Icon Name="folder" />
+                        <span class="list-item-main">
+                            <strong>@group.FullPath</strong>
+                            <small>@group.Name &middot; @group.ProjectsCount @(group.ProjectsCount == 1 ? "project" : "projects") &middot; @group.SubgroupsCount @(group.SubgroupsCount == 1 ? "subgroup" : "subgroups")@(group.AccessLevel is int level ? " · " + RoleName(level) : "")</small>
+                        </span>
+                        <Icon Name="chevron-right" />
+                    </a>
+                }
+            </div>
+        }
+    </div>
+}
+
+@code {
+    private GroupResponse[] groups = [];
+    private bool creating;
+    private string name = "";
+    private string path = "";
+    private string description = "";
+    private string message = "";
+    private string messageKind = "info";
+    private bool loading = true;
+    private bool busy;
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            if (!await Api.EnsureSessionAsync())
+            {
+                if (Api.Reachable) Navigation.NavigateTo("/-/login", replace: true);
+                return;
+            }
+            await Load();
+        }
+        finally { loading = false; }
+    }
+
+    private async Task Load() => groups = await Api.GetAsync("api/groups", ApiJson.Default.GroupResponseArray) ?? [];
+
+    private async Task CreateGroup()
+    {
+        if (busy) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync("api/groups", new GroupCreateRequest(name, string.IsNullOrWhiteSpace(path) ? null : path, description, null),
+                ApiJson.Default.GroupCreateRequest, "Group created.");
+            message = result.Message;
+            messageKind = result.Ok ? "success" : "error";
+            if (!result.Ok) return;
+            name = ""; path = ""; description = ""; creating = false;
+            await Load();
+        }
+        finally { busy = false; }
+    }
+
+    public static string RoleName(int accessLevel) => accessLevel switch
+    {
+        20 => "Reporter",
+        30 => "Developer",
+        40 => "Maintainer",
+        50 => "Owner",
+        _ => "Member"
+    };
+}
