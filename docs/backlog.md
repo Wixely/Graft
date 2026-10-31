@@ -124,7 +124,17 @@ Then the first of the four large items, in the order the user gave:
 
 ## Near, and small
 
-Nothing is here at the moment. Everything below needs a decision before it is built.
+Taken top down. Added on 2026-10-31: making "the runner works on Windows, Linux and in Docker" true. Today only
+the Windows runner is tested.
+
+1. Publish the linux-x64 runner, NativeAOT, static musl like the forge.
+2. Run the acceptance suite with the Linux runner, then run the runner on the Linux 3.10.108 host.
+3. Exercise the install scripts' service paths: the `graft-runner` systemd unit and the `GraftRunner` Windows
+   service. The suite runs the runner directly, so neither has been run.
+4. A runner container image in `deploy/container`, and a test of a runner against a forge running in a
+   container with its runner port published.
+
+Jobs inside containers (`image:`) is not on this list; it is in the section below and needs a decision.
 
 ## Larger, and worth deciding deliberately
 
