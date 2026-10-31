@@ -1,0 +1,192 @@
+@page "/{Namespace}/{Slug}/-/pipelines"
+@page "/{Namespace}/{Slug}/-/pipelines/{PipelineId:long}"
+@page "/{Namespace}/{Slug}/-/jobs/{JobId:long}"
+@page "/projects/{Slug}/-/pipelines"
+@page "/projects/{Slug}/-/pipelines/{PipelineId:long}"
+@page "/projects/{Slug}/-/jobs/{JobId:long}"
+@inject GraftApi Api
+@inject NavigationManager Navigation
+@implements IDisposable
+
+@* A project's pipelines: one per push that carried a .gitlab-ci.yml, with its jobs and their logs. A pipeline
+   whose file could not be run says why. While anything is still running the page reads again every few
+   seconds; it stops once everything shown has finished. *@
+
+<PageTitle>Pipelines &middot; Graft</PageTitle>
+
+@if (loading)
+{
+    <p role="status" class="secondary-text">Loading…</p>
+}
+else if (projectId == 0)
+{
+    <div class="page-header"><div><h1>Pipelines</h1><p class="subtitle">@message</p></div></div>
+}
+else
+{
+    <div class="page-header">
+        <div>
+            <h1>Pipelines</h1>
+            <p class="subtitle"><a href="@ProjectUrl">@projectName</a> &middot; one for each push that carries a <span class="mono">.gitlab-ci.yml</span>.</p>
+        </div>
+    </div>
+
+    <Banner Message="@message" Kind="error" />
+
+    <div class="panel">
+        <div class="panel-header"><Icon Name="commit" /><h2>Pipelines</h2><span class="spacer"></span><span class="label">@pipelines.Length</span></div>
+        @if (pipelines.Length == 0)
+        {
+            <p class="panel-empty">No pipelines yet. Push a commit with a .gitlab-ci.yml, and register a runner to run it.</p>
+        }
+        else
+        {
+            <div class="list">
+                @foreach (PipelineResponse pipeline in pipelines)
+                {
+                    <a class="list-item @(pipeline.Id == selected?.Id ? "active" : "")" href="@($"{ProjectUrl}/-/pipelines/{pipeline.Id}")">
+                        <span class="label @StatusClass(pipeline.Status)">@pipeline.Status</span>
+                        <span class="list-item-main">
+                            <strong>#@pipeline.Iid on @pipeline.Ref</strong>
+                            <small class="mono">@pipeline.Sha[..8] &middot; @pipeline.Source &middot; @pipeline.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")</small>
+                        </span>
+                        <Icon Name="chevron-right" />
+                    </a>
+                }
+            </div>
+        }
+    </div>
+
+    @if (selected is not null)
+    {
+        <div class="panel">
+            <div class="panel-header"><h2>Pipeline #@selected.Iid</h2><span class="spacer"></span><span class="label @StatusClass(selected.Status)">@selected.Status</span></div>
+            @if (selected.Error is not null)
+            {
+                <div class="panel-body">
+                    <div class="banner error"><Icon Name="alert" /><span>The pipeline file could not be run: @selected.Error</span></div>
+                </div>
+            }
+            else
+            {
+                <div class="list">
+                    @foreach (JobResponse job in jobs)
+                    {
+                        <button type="button" class="list-item @(job.Id == shownJob ? "active" : "")" @onclick="() => ShowJob(job.Id)">
+                            <span class="label @StatusClass(job.Status)">@job.Status</span>
+                            <span class="list-item-main">
+                                <strong>@job.Name</strong>
+                                <small>
+                                    stage @job.Stage
+                                    @(job.Runner is not null ? " · runner #" + job.Runner.Id : "")
+                                    @(job.Duration is double seconds ? " · " + seconds.ToString("0") + " s" : "")
+                                    @(job.ExitCode is int code ? " · exit " + code : "")
+                                    @(job.AllowFailure ? " · allowed to fail" : "")
+                                </small>
+                            </span>
+                        </button>
+                    }
+                </div>
+            }
+        </div>
+    }
+
+    @if (shownJob is long jobId)
+    {
+        <div class="panel">
+            <div class="panel-header"><Icon Name="file" /><h2>Log of @(jobs.FirstOrDefault(job => job.Id == jobId)?.Name ?? "job " + jobId)</h2></div>
+            <div class="panel-body">
+                <pre class="file-view"><code>@(trace.Length == 0 ? "No output yet." : trace)</code></pre>
+            </div>
+        </div>
+    }
+}
+
+@code {
+    [Parameter] public string Namespace { get; set; } = "";
+    [Parameter] public string Slug { get; set; } = "";
+    [Parameter] public long? PipelineId { get; set; }
+    [Parameter] public long? JobId { get; set; }
+
+    private long projectId;
+    private string projectName = "";
+    private PipelineResponse[] pipelines = [];
+    private PipelineResponse? selected;
+    private JobResponse[] jobs = [];
+    private long? shownJob;
+    private string trace = "";
+    private string message = "";
+    private bool loading = true;
+    private Timer? refresh;
+
+    private bool ViaSlug => Namespace.Length == 0;
+    private string ProjectUrl => ViaSlug
+        ? $"/projects/{Uri.EscapeDataString(Slug)}"
+        : $"/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
+
+    protected override async Task OnParametersSetAsync()
+    {
+        loading = true;
+        message = "";
+        try
+        {
+            await Api.EnsureSessionAsync();
+            string path = ViaSlug
+                ? $"api/graft/slugs/{Uri.EscapeDataString(Slug)}"
+                : $"api/browser/projects/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
+            (bool reached, RepositoryPageResponse? page) = await Api.GetOptionalAsync(path, ApiJson.Default.RepositoryPageResponse);
+            if (!reached) { message = "Graft could not be reached."; return; }
+            if (page is null) { message = "That repository could not be found."; return; }
+            projectId = page.Project.Id;
+            projectName = page.Project.NameWithNamespace;
+            await Load();
+        }
+        finally { loading = false; }
+        refresh ??= new Timer(_ => InvokeAsync(Tick), null, TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(3));
+    }
+
+    private async Task Load()
+    {
+        pipelines = await Api.GetAsync($"api/projects/{projectId}/pipelines?per_page=50", ApiJson.Default.PipelineResponseArray) ?? [];
+        if (JobId is long jobId)
+        {
+            JobResponse? job = await Api.GetAsync($"api/projects/{projectId}/jobs/{jobId}", ApiJson.Default.JobResponse);
+            if (job is null) { message = "That job could not be found."; return; }
+            selected = pipelines.FirstOrDefault(pipeline => pipeline.Id == job.Pipeline.Id)
+                ?? await Api.GetAsync($"api/projects/{projectId}/pipelines/{job.Pipeline.Id}", ApiJson.Default.PipelineResponse);
+            shownJob = jobId;
+        }
+        else
+        {
+            selected = PipelineId is long id
+                ? pipelines.FirstOrDefault(pipeline => pipeline.Id == id) ?? await Api.GetAsync($"api/projects/{projectId}/pipelines/{id}", ApiJson.Default.PipelineResponse)
+                : pipelines.FirstOrDefault();
+        }
+        jobs = selected is null ? [] : await Api.GetAsync($"api/projects/{projectId}/pipelines/{selected.Id}/jobs", ApiJson.Default.JobResponseArray) ?? [];
+        if (shownJob is long shown) trace = await Api.GetTextAsync($"api/projects/{projectId}/jobs/{shown}/trace") is (true, string text) ? text : "";
+    }
+
+    private async Task ShowJob(long jobId)
+    {
+        shownJob = jobId;
+        trace = await Api.GetTextAsync($"api/projects/{projectId}/jobs/{jobId}/trace") is (true, string text) ? text : "";
+    }
+
+    /// <summary>Reads again while something shown is still going, and stops once it has all finished.</summary>
+    private async Task Tick()
+    {
+        bool live = pipelines.Any(pipeline => pipeline.Status is "pending" or "running") || jobs.Any(job => job.Status is "pending" or "running");
+        if (!live || projectId == 0) return;
+        await Load();
+        StateHasChanged();
+    }
+
+    private static string StatusClass(string status) => status switch
+    {
+        "success" => "success",
+        "failed" => "danger",
+        _ => ""
+    };
+
+    public void Dispose() => refresh?.Dispose();
+}

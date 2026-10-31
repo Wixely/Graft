@@ -1,6 +1,6 @@
 # Next-agent handoff
 
-Updated: 2026-10-30. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
+Updated: 2026-10-31. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the user.
 
 ## Added on 2026-10-30: the three small things, before the large list
 
@@ -27,6 +27,43 @@ as their own entries and decision records as each lands.
 
 Git suite 947 to 951 managed. The native publish was not repeated for this entry. No migration, no new
 route, no new tool.
+
+## Added on 2026-10-31: Graft's own runner, over CupriNet
+
+The user asked for a runner, then that it use CupriMark and CupriNet, then that Graft give out install scripts
+carrying the Intonation a runner connects with. [ADR 0037](decisions/0037-runners-over-cuprinet.md) has the
+reasoning, the conditions and the long list of what is not done; this is what exists.
+
+- **Shape.** `src/Graft.RunnerProtocol` is shared: the CupriMark catalogue both sides negotiate against, the
+  `graft-runners` network name, routes and headers. `src/Graft.Runner` is `graft-runner register|run [--once]`,
+  a console app that also runs as a Windows service or under systemd. The forge's side is `RunnerHost.cs`
+  (a CupriNet Shrine on `--runner-port`, its key in `runner-shrine/` beside the database) and
+  `RunnerInstallScripts.cs`. Runners, pipelines, jobs and logs are migration 23 and `GraftStoreCi.cs`.
+- **Packages.** CupriNet.Hosting 0.6.2 in the forge, CupriNet.Shrine 0.6.2 in the runner, CupriMark 0.2.0 in
+  the protocol, packed from their release tags into the local ignored feed; the recipe is in the ADR.
+- **Install scripts.** Creating a runner (Runners page, or `POST /api/v4/user/runners`) returns, once, a
+  PowerShell and a POSIX script, each with the Intonation and a one-time token valid for a day. A script
+  downloads the runner from `--runner-downloads` or takes `-Binary`/`--binary`, registers, and installs a
+  service unless told not to.
+- **Pipelines.** A push carrying `.gitlab-ci.yml` makes one, when runners are on. The file is read by a
+  hand-written strict subset reader (`CiConfiguration.cs`); anything else fails the pipeline naming the key.
+  Jobs lease stage by stage; a disallowed failure skips later stages. Source travels to the runner as a
+  CupriNet relic; output streams back about once a second. GitLab's pipelines, jobs and trace routes, a
+  Pipelines page, and `POST ./pipeline`. Rows GL-047 and GL-048.
+- **Found while building**, from CupriNet's own code and design docs: an Intonation advertises the node's
+  overlay port, not the Shrine port, so the forge runs its own listener and advertises that; CupriNode turns
+  on gossip, decoy traffic and address discovery by default, all turned off here; CupriNet has its own
+  `IDataProtector`.
+
+Verified: a spike first (Intonation to Shrine to request and 300 KB relic, managed and NativeAOT); a smoke run
+on a live forge; the Git suite 1130 to **1168** managed, and **1168** again against the NativeAOT forge with
+the NativeAOT runner; MCP suite 104. Both native publishes have zero trimming or AOT warnings (forge 70 MB,
+runner 10.7 MB). Not run by any test: the Windows service and systemd paths of the scripts, the Linux runner
+build, the Linux 3.10.108 host, and the browser pages.
+
+Next action, owner implementation agent: publish the runner for linux-x64 (static musl, like the forge) and
+run it against a forge; owner user: approve or decline the GitHub Packages feed, which now covers CupriNet and
+CupriMark as well as DnaX.
 
 ## Added on 2026-10-30, sixth entry: a project's own view of the audit trail
 

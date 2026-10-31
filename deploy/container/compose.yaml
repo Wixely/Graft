@@ -86,6 +86,14 @@ services:
       - ${GRAFT_MAIL_FROM:-}
       - --mail-password-file
       - ${GRAFT_MAIL_PASSWORD_FILE:-}
+      # Runners. Empty means none. A runner reaches the forge over CupriNet on this port, from the install script
+      # an administrator copies from the Runners page; publish the port below. See docs/decisions/0037-runners-over-cuprinet.md.
+      - --runner-port
+      - ${GRAFT_RUNNER_PORT:-}
+      - --runner-host
+      - ${GRAFT_RUNNER_HOST:-}
+      - --runner-downloads
+      - ${GRAFT_RUNNER_DOWNLOADS:-}
     ports:
       - "127.0.0.1:8443:8443"
       # Uncomment with GRAFT_SSH_PORT=2222 to reach Git over SSH; nothing in front of HTTPS carries it.

@@ -35,7 +35,11 @@
     <ProjectReference Include="../Graft.Operations/Graft.Operations.csproj" />
     <ProjectReference Include="../Graft.Storage/Graft.Storage.csproj" />
     <ProjectReference Include="../Graft.Ssh/Graft.Ssh.csproj" />
+    <ProjectReference Include="../Graft.RunnerProtocol/Graft.RunnerProtocol.csproj" />
     <PackageReference Include="DnaX.Uploads" Version="10.0.0-alpha.13" />
+    <!-- The runner transport: a Shrine runners reach from the Intonation in their install script. Restored from the
+         local feed until the authenticated GitHub Packages feed is approved; see ADR 0037. -->
+    <PackageReference Include="CupriNet.Hosting" Version="0.6.2" />
     <PackageReference Include="Markdig" Version="1.4.0" />
     <PackageReference Include="Microsoft.Extensions.Hosting.Systemd" Version="10.0.12" />
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.12" />

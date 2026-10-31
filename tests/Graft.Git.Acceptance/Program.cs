@@ -32,6 +32,9 @@ bool pushToCreate = false;
 bool webhooksEnabled = false;
 // The mail server a restart points the forge at, or null for a forge that sends nothing, which is the default.
 string? mailSmtpUrl = null;
+// The runner port and downloads directory a restart points the forge at, or null for a forge with no runners.
+string? runnerDownloads = null;
+bool runnersEnabled = false;
 Process? server = null;
 Task? outputReader = null;
 Task<string>? errorReader = null;
@@ -234,6 +237,7 @@ try
     await CheckSsh(address, aliceIdentity, bob.Username);
     await CheckEmptyRepository(address, aliceIdentity, alicePassword);
     address = await CheckWebhooks(address, aliceIdentity);
+    address = await CheckRunners(address, aliceIdentity, bob.Username);
     await CheckProjectAudit(address, aliceIdentity, bob.Username, "carol", alicePassword);
     await CheckGroups(address, aliceIdentity, bob.Username, "carol", adminPassword);
     await CheckSecondFactor(address, bob.Username, bobPassword, adminPassword);
@@ -331,6 +335,16 @@ ProcessStartInfo ServerStart()
     // Git over SSH on whatever port is free; the server prints the one it bound and the SSH check reads it.
     start.ArgumentList.Add("--ssh-port");
     start.ArgumentList.Add("0");
+    if (runnersEnabled)
+    {
+        start.ArgumentList.Add("--runner-port");
+        start.ArgumentList.Add("0");
+        if (runnerDownloads is not null)
+        {
+            start.ArgumentList.Add("--runner-downloads");
+            start.ArgumentList.Add(runnerDownloads);
+        }
+    }
     if (mailSmtpUrl is not null)
     {
         start.ArgumentList.Add("--mail-smtp");
@@ -6017,6 +6031,263 @@ async Task CheckFetching(string address, AuthenticatedIdentity alice, string str
 /// The empty-repository page, which used to report a 404 from the browse endpoint and which the browser
 /// then described as a permission problem.
 /// </summary>
+/// <summary>
+/// Runners over CupriNet (ADR 0037). The forge hands an administrator an install script carrying its Intonation
+/// and a one-time token; the script is run as an operator would run it, with the real runner; a push with a
+/// pipeline file makes jobs that the runner fetches, runs and reports over the Shrine, stage by stage. Refusals
+/// are driven too: no runners configured, the wrong caller, a spent token, a file Graft does not run, a stranger,
+/// and a runner that was removed.
+/// </summary>
+async Task<string> CheckRunners(string address, AuthenticatedIdentity alice, string bobUsername)
+{
+    string runnerExe = Environment.GetEnvironmentVariable("GRAFT_RUNNER") ??
+        Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "src", "Graft.Runner", "bin", "Debug", "net10.0",
+            OperatingSystem.IsWindows() ? "graft-runner.exe" : "graft-runner"));
+    Check(File.Exists(runnerExe), "the runner the suite drives exists at " + runnerExe);
+
+    string adminApi;
+    string aliceApi;
+    string adminReadApi;
+    string bobApi;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        UserAccount admin = Required(await store.FindActiveUserAsync("admin"), "admin account");
+        AuthenticatedIdentity adminIdentity = new(admin.Id, admin.Username, true, IdentityKind.BrowserSession);
+        adminApi = (await store.CreateTokenAsync(adminIdentity, "runners-admin", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        adminReadApi = (await store.CreateTokenAsync(adminIdentity, "runners-admin-read", TokenScope.ReadApi, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        aliceApi = (await store.CreateTokenAsync(alice, "runners-alice", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        UserAccount bob = Required(await store.FindActiveUserAsync(bobUsername), "bob account");
+        bobApi = (await store.CreateTokenAsync(new(bob.Id, bob.Username, false, IdentityKind.BrowserSession), "runners-bob", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+    }
+
+    Check(serverLines.Any(line => line == "RUNNERS: off"), "a forge given no runner port says it runs no runners");
+    using (HttpResponseMessage off = await ApiPostJson(address, "/api/v4/user/runners", adminApi, """{"description":"nowhere"}"""))
+        Check(off.StatusCode == HttpStatusCode.BadRequest, "and refuses to create one, saying how to turn them on");
+
+    // With runners, and a downloads directory holding a stand-in binary for the scripts to name.
+    runnerDownloads = Path.Combine(root, "runner-downloads");
+    Directory.CreateDirectory(runnerDownloads);
+    File.WriteAllText(Path.Combine(runnerDownloads, "graft-runner-win-x64.exe"), "stand-in runner binary");
+    await StopServer();
+    runnersEnabled = true;
+    address = await StartServer();
+    string runnersLine = serverLines.LastOrDefault(line => line.StartsWith("RUNNERS: cupri port ", StringComparison.Ordinal)) ?? "";
+    Check(runnersLine.Contains("shrine cupri1", StringComparison.Ordinal), "a forge with a runner port announces its Shrine address");
+    string shrineAddress = runnersLine[(runnersLine.IndexOf("shrine ", StringComparison.Ordinal) + 7)..].Split(';')[0];
+
+    using (HttpResponseMessage download = await ApiGet(address, "/-/runner/download/graft-runner-win-x64.exe", null))
+        Check(download.IsSuccessStatusCode && await download.Content.ReadAsStringAsync() == "stand-in runner binary", "runner binaries are served from the downloads directory");
+    using (HttpResponseMessage other = await ApiGet(address, "/-/runner/download/..%2Fgraft.db", null))
+        Check(other.StatusCode == HttpStatusCode.NotFound, "and nothing else is");
+
+    using (HttpResponseMessage notAdmin = await ApiPostJson(address, "/api/v4/user/runners", aliceApi, """{"description":"mine"}"""))
+        Check(notAdmin.StatusCode == HttpStatusCode.Forbidden, "only an administrator creates a runner");
+    using (HttpResponseMessage readOnly = await ApiPostJson(address, "/api/v4/user/runners", adminReadApi, """{"description":"mine"}"""))
+        Check(readOnly.StatusCode == HttpStatusCode.Forbidden, "and not with a read-only token");
+    using (HttpResponseMessage group = await ApiPostJson(address, "/api/v4/user/runners", adminApi, """{"runner_type":"group_type"}"""))
+        Check(group.StatusCode == HttpStatusCode.BadRequest, "group runners are refused by name");
+    long runnerId;
+    string intonation;
+    string registrationToken;
+    string powerShell;
+    string shell;
+    using (HttpResponseMessage created = await ApiPostJson(address, "/api/v4/user/runners", adminApi, """{"description":"suite runner","runner_type":"instance_type"}"""))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStringAsync());
+        Check(created.StatusCode == HttpStatusCode.Created, "an administrator creates a runner");
+        runnerId = json.RootElement.GetProperty("id").GetInt64();
+        registrationToken = json.RootElement.GetProperty("token").GetString()!;
+        intonation = json.RootElement.GetProperty("intonation").GetString()!;
+        powerShell = json.RootElement.GetProperty("install_powershell").GetString()!;
+        shell = json.RootElement.GetProperty("install_shell").GetString()!;
+        Check(registrationToken.StartsWith("graft_rreg_", StringComparison.Ordinal) && intonation.StartsWith("cuprinet://intone/", StringComparison.Ordinal) &&
+            json.RootElement.GetProperty("shrine_address").GetString() == shrineAddress,
+            "with a one-time token, a CupriNet Intonation and the Shrine address the forge announced");
+        Check(powerShell.Contains("$Intonation = '" + intonation + "'", StringComparison.Ordinal) && powerShell.Contains("$Token = '" + registrationToken + "'", StringComparison.Ordinal) &&
+            shell.Contains("INTONATION='" + intonation + "'", StringComparison.Ordinal) && shell.Contains("TOKEN='" + registrationToken + "'", StringComparison.Ordinal),
+            "both install scripts carry the Intonation and the token");
+        Check(powerShell.Contains("/-/runner/download/graft-runner-win-x64.exe", StringComparison.Ordinal) &&
+            shell.Contains("/-/runner/download/graft-runner-$PLATFORM", StringComparison.Ordinal), "and download the runner from this forge when not given one");
+    }
+    string scripts = Path.Combine(root, "runner-scripts");
+    Directory.CreateDirectory(scripts);
+    string ps1 = Path.Combine(scripts, "install-graft-runner.ps1");
+    string sh = Path.Combine(scripts, "install-graft-runner.sh");
+    File.WriteAllText(ps1, powerShell);
+    File.WriteAllText(sh, shell);
+    (int shExit, _, string shErrors) = await RunTool("sh", scripts, ["-n", sh]);
+    Check(shExit == 0, "the shell script is valid POSIX shell (" + shErrors.Trim() + ")");
+    if (OperatingSystem.IsWindows())
+    {
+        (int parseExit, _, string parseOut) = await RunTool("powershell.exe", scripts, ["-NoProfile", "-Command",
+            "$e = $null; [System.Management.Automation.Language.Parser]::ParseFile('" + ps1 + "', [ref]$null, [ref]$e) | Out-Null; if ($e.Count) { $e | ForEach-Object { $_.Message }; exit 1 }"]);
+        Check(parseExit == 0, "the PowerShell script parses (" + parseOut.Trim() + ")");
+    }
+
+    // The operator's step: run the script with the runner already on disk, registering without a service.
+    string runnerHome = Path.Combine(root, "runner-home");
+    string config = Path.Combine(runnerHome, "runner.json");
+    (int installExit, string installOut, string installErrors) = OperatingSystem.IsWindows()
+        ? await RunTool("powershell.exe", scripts, ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1, "-InstallDir", runnerHome, "-Binary", runnerExe, "-NoService"])
+        : await RunTool("sh", scripts, [sh, "--dir", runnerHome, "--binary", runnerExe, "--no-service"]);
+    Check(installExit == 0 && installOut.Contains("Registered as runner #" + runnerId, StringComparison.Ordinal) && File.Exists(config),
+        "the install script registers the runner over CupriNet (" + installOut.Trim() + installErrors.Trim() + ")");
+    Check(!File.ReadAllText(config).Contains(registrationToken, StringComparison.Ordinal) && File.ReadAllText(config).Contains(shrineAddress, StringComparison.Ordinal),
+        "the runner keeps the Shrine it pinned and a credential, not the spent token");
+    (int againExit, _, string againErrors) = await RunTool(runnerExe, scripts, ["register", "--intonation", intonation, "--token", registrationToken,
+        "--config", Path.Combine(scripts, "second.json")]);
+    Check(againExit != 0 && againErrors.Contains("not valid", StringComparison.Ordinal), "the same token does not register twice");
+    (int badExit, _, string badErrors) = await RunTool(runnerExe, scripts, ["register", "--intonation", "cuprinet://intone/AAAA", "--token", registrationToken,
+        "--config", Path.Combine(scripts, "third.json")]);
+    Check(badExit != 0 && badErrors.Contains("Intonation", StringComparison.Ordinal), "a damaged Intonation is refused before anything is sent");
+    using (HttpResponseMessage listed = await ApiGet(address, "/api/v4/runners/all", adminApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await listed.Content.ReadAsStringAsync());
+        JsonElement row = json.RootElement.EnumerateArray().First(item => item.GetProperty("id").GetInt64() == runnerId);
+        Check(row.GetProperty("platform").GetString()!.StartsWith(OperatingSystem.IsWindows() ? "windows-" : "linux-", StringComparison.Ordinal) &&
+            row.GetProperty("status").GetString() == "online", "the forge lists the runner online, with the platform it reported");
+    }
+    using (HttpResponseMessage hidden = await ApiGet(address, "/api/v4/runners/all", aliceApi))
+        Check(hidden.StatusCode == HttpStatusCode.Forbidden, "and lists runners to administrators only");
+
+    // A pipeline: a passing job, a failure, an allowed failure, and a later stage the failure skips.
+    long projectId;
+    using (HttpResponseMessage created = await ApiPostJson(address, "/api/v4/projects", aliceApi, """{"name":"citest","path":"citest"}"""))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStringAsync());
+        projectId = json.RootElement.GetProperty("id").GetInt64();
+    }
+    string prefix = "/api/v4/projects/" + projectId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    bool windows = OperatingSystem.IsWindows();
+    string work = Path.Combine(root, "ci-work");
+    Directory.CreateDirectory(work);
+    await Git(work, ["init", "--initial-branch=main"]);
+    File.WriteAllText(Path.Combine(work, "README.md"), "content from the checkout\n");
+    File.WriteAllText(Path.Combine(work, ".gitlab-ci.yml"), windows ? """
+        stages: [build, test, deploy]
+        variables:
+          GREETING: hello-from-graft
+        build:
+          stage: build
+          script:
+            - Get-Content README.md
+            - echo $env:GREETING
+            - echo "job $env:CI_JOB_NAME on $env:CI_COMMIT_REF_NAME"
+        test:
+          stage: test
+          script:
+            - echo failing on purpose
+            - exit 3
+        lint:
+          stage: test
+          allow_failure: true
+          script: exit 1
+        deploy:
+          stage: deploy
+          script: echo must never run
+        """ : """
+        stages: [build, test, deploy]
+        variables:
+          GREETING: hello-from-graft
+        build:
+          stage: build
+          script:
+            - cat README.md
+            - echo $GREETING
+            - echo "job $CI_JOB_NAME on $CI_COMMIT_REF_NAME"
+        test:
+          stage: test
+          script:
+            - echo failing on purpose
+            - exit 3
+        lint:
+          stage: test
+          allow_failure: true
+          script: exit 1
+        deploy:
+          stage: deploy
+          script: echo must never run
+        """);
+    await Git(work, ["add", "."]);
+    await Git(work, ["commit", "-m", "A pipeline"]);
+    await Git(work, ["push", AuthenticatedUrl(address, "alice", aliceApi, "alice/citest.git"), "main"]);
+    long pipelineId;
+    using (HttpResponseMessage listed = await ApiGet(address, prefix + "/pipelines", aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await listed.Content.ReadAsStringAsync());
+        Check(listed.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 1 && json.RootElement[0].GetProperty("status").GetString() == "pending" &&
+            json.RootElement[0].GetProperty("source").GetString() == "push" && json.RootElement[0].GetProperty("ref").GetString() == "main",
+            "a push carrying a pipeline file makes a pending pipeline");
+        pipelineId = json.RootElement[0].GetProperty("id").GetInt64();
+    }
+    using (HttpResponseMessage anonymous = await ApiGet(address, prefix + "/pipelines", null))
+        Check(anonymous.StatusCode == HttpStatusCode.NotFound, "a private project's pipelines are not shown to a stranger");
+
+    (int runExit, string runOut, string runErrors) = await RunTool(runnerExe, scripts, ["run", "--config", config, "--once"]);
+    Check(runExit == 1 && runOut.Contains("Job ", StringComparison.Ordinal), "the runner runs the jobs and reports that one failed (" + runErrors.Trim() + ")");
+    Dictionary<string, JsonElement> jobs = [];
+    using (HttpResponseMessage listed = await ApiGet(address, prefix + "/pipelines/" + pipelineId + "/jobs", aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await listed.Content.ReadAsStringAsync());
+        foreach (JsonElement job in json.RootElement.EnumerateArray()) jobs[job.GetProperty("name").GetString()!] = job.Clone();
+    }
+    Check(jobs["build"].GetProperty("status").GetString() == "success" && jobs["build"].GetProperty("runner").GetProperty("id").GetInt64() == runnerId,
+        "the first stage's job succeeded, on the registered runner");
+    Check(jobs["test"].GetProperty("status").GetString() == "failed" && jobs["test"].GetProperty("exit_code").GetInt32() == 3,
+        "the failing job failed with its exit code");
+    Check(jobs["lint"].GetProperty("status").GetString() == "failed" && jobs["lint"].GetProperty("allow_failure").GetBoolean(),
+        "the job allowed to fail failed without stopping the stage");
+    Check(jobs["deploy"].GetProperty("status").GetString() == "skipped", "and the later stage was skipped because of the failure that was not allowed");
+    using (HttpResponseMessage pipeline = await ApiGet(address, prefix + "/pipelines/" + pipelineId, aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await pipeline.Content.ReadAsStringAsync());
+        Check(json.RootElement.GetProperty("status").GetString() == "failed" && json.RootElement.GetProperty("finished_at").ValueKind == JsonValueKind.String,
+            "the pipeline failed and finished");
+    }
+    using (HttpResponseMessage trace = await ApiGet(address, prefix + "/jobs/" + jobs["build"].GetProperty("id").GetInt64() + "/trace", aliceApi))
+    {
+        string text = await trace.Content.ReadAsStringAsync();
+        Check(text.Contains("content from the checkout", StringComparison.Ordinal) && text.Contains("hello-from-graft", StringComparison.Ordinal) &&
+            text.Contains("job build on main", StringComparison.Ordinal) && text.Contains("$ ", StringComparison.Ordinal),
+            "the build log shows each command, the source fetched over CupriNet, the pipeline variable and the CI variables");
+    }
+    using (HttpResponseMessage trace = await ApiGet(address, prefix + "/jobs/" + jobs["test"].GetProperty("id").GetInt64() + "/trace", aliceApi))
+        Check((await trace.Content.ReadAsStringAsync()).Contains("exited with 3", StringComparison.Ordinal), "and the failing log says how it failed");
+
+    // A file Graft does not run is a failed pipeline that says why, not silence.
+    File.WriteAllText(Path.Combine(work, ".gitlab-ci.yml"), "build:\n  image: alpine\n  script: echo hi\n");
+    await Git(work, ["commit", "-am", "Ask for an image"]);
+    await Git(work, ["push", AuthenticatedUrl(address, "alice", aliceApi, "alice/citest.git"), "main"]);
+    using (HttpResponseMessage listed = await ApiGet(address, prefix + "/pipelines", aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await listed.Content.ReadAsStringAsync());
+        JsonElement newest = json.RootElement[0];
+        Check(newest.GetProperty("status").GetString() == "failed" && newest.GetProperty("error").GetString()!.Contains("'image'", StringComparison.Ordinal),
+            "a pipeline file asking for something Graft does not run fails, naming it");
+    }
+
+    // A pipeline on request, by somebody who may push; not by a stranger.
+    using (HttpResponseMessage stranger = await ApiPostJson(address, prefix + "/pipeline?ref=main", bobApi, "{}"))
+        Check(stranger.StatusCode == HttpStatusCode.NotFound, "a stranger cannot run a pipeline");
+    using (HttpResponseMessage requested = await ApiPostJson(address, prefix + "/pipeline?ref=main", aliceApi, "{}"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await requested.Content.ReadAsStringAsync());
+        Check(requested.StatusCode == HttpStatusCode.Created && json.RootElement.GetProperty("source").GetString() == "api",
+            "the project's owner runs one through GitLab's pipeline route");
+    }
+
+    // Removing the runner stops its credential at once.
+    using (HttpResponseMessage removed = await ApiDelete(address, "/api/v4/runners/" + runnerId, adminApi))
+        Check(removed.StatusCode == HttpStatusCode.NoContent, "an administrator removes the runner");
+    (int goneExit, _, string goneErrors) = await RunTool(runnerExe, scripts, ["run", "--config", config, "--once"]);
+    Check(goneExit != 0 && goneErrors.Contains("no longer accepts", StringComparison.Ordinal), "and the removed runner is refused by the forge");
+
+    await StopServer();
+    runnersEnabled = false;
+    runnerDownloads = null;
+    return await StartServer();
+}
+
 /// <summary>
 /// A project's own view of the audit trail: what is the project's business and nothing else, for a Maintainer,
 /// through the browser's route and GitLab's `audit_events` shape; refused to a Developer and to a stranger.

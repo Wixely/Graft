@@ -2,6 +2,27 @@
   "version": 1,
   "dependencies": {
     "net10.0": {
+      "CupriNet.Hosting": {
+        "type": "Direct",
+        "requested": "[0.6.2, )",
+        "resolved": "0.6.2",
+        "contentHash": "OlbXzNpng/pMeoWgqkKgDBi/Vv4y0W7Hucfhd6GQT9dR6B0TQ4INQ6JgZ6+IzE/cBAbIVgDKYdqDHNdh0cnACg==",
+        "dependencies": {
+          "CupriNet.Abstractions": "0.6.2",
+          "CupriNet.Alembic": "0.6.2",
+          "CupriNet.Alembic.BouncyCastle": "0.6.2",
+          "CupriNet.Arcanum": "0.6.2",
+          "CupriNet.Codex": "0.6.2",
+          "CupriNet.Concordance": "0.6.2",
+          "CupriNet.Conjunction": "0.6.2",
+          "CupriNet.Core": "0.6.2",
+          "CupriNet.Persistence": "0.6.2",
+          "CupriNet.Rites": "0.6.2",
+          "CupriNet.Shrine": "0.6.2",
+          "CupriNet.Traversal": "0.6.2",
+          "CupriNet.Vessel": "0.6.2"
+        }
+      },
       "DnaX.Uploads": {
         "type": "Direct",
         "requested": "[10.0.0-alpha.13, )",
@@ -36,6 +57,169 @@
         "contentHash": "3JelDMuFIwFzXybsh6K30G6wXu5gmqKnuRnieqgBMuR0FkqqXRv4B+NYZuPgthSyNq5UwRyvv2U2VJBE3RD3PQ==",
         "dependencies": {
           "ModelContextProtocol": "[2.2.0]"
+        }
+      },
+      "BouncyCastle.Cryptography": {
+        "type": "Transitive",
+        "resolved": "2.6.2",
+        "contentHash": "7oWOcvnntmMKNzDLsdxAYqApt+AjpRpP2CShjMfIa3umZ42UQMvH0tl1qAliYPNYO6vTdcGMqnRrCPmsfzTI1w=="
+      },
+      "CupriMark": {
+        "type": "Transitive",
+        "resolved": "0.2.0",
+        "contentHash": "0hHkPzvWhdFNu/RTTrqxDIGy50RU26E5ymWxrt8ILRzAgh/OFp8EAhezbSxqGj/HzX4e0YEgM5X/zINF5R9iFw=="
+      },
+      "CupriNet.Abstractions": {
+        "type": "Transitive",
+        "resolved": "0.6.2",
+        "contentHash": "YB9B5uFZGZTw91aP/ouRnjSaUfwaLkTenZ49GemrhKUDveJX9NtqqxPq9p7JXc9CflfJw7oJkFsC+u6myeP+/Q=="
+      },
+      "CupriNet.Alembic": {
+        "type": "Transitive",
+        "resolved": "0.6.2",
+        "contentHash": "m9GT2gaWIaAj+EYMqJJRGtBkz6syce7y1BRrxCuVY0CzQBHfJeZNC6Fv1LaPyWfCNf/VpuLQ7md/L5UUDW4jRw==",
+        "dependencies": {
+          "CupriNet.Abstractions": "0.6.2"
+        }
+      },
+      "CupriNet.Alembic.BouncyCastle": {
+        "type": "Transitive",
+        "resolved": "0.6.2",
+        "contentHash": "LfV++9kmKqIdgRmqMPn0BB3NUFrOjnukC/D+ENdKaLOkN2P9tAGBT8raGo716BmcGAqINTc+rUzo+98NF9+imQ==",
+        "dependencies": {
+          "BouncyCastle.Cryptography": "2.6.2",
+          "CupriNet.Alembic": "0.6.2"
+        }
+      },
+      "CupriNet.Arcanum": {
+        "type": "Transitive",
+        "resolved": "0.6.2",
+        "contentHash": "vAh8Uz8VdW/0j9tR2y64rvLQhhXG1Gxauh4jThrW96lEHvhb51OZV7hfwFZFHmkhK4YNWtJPe1ezyUKNpKwFMA==",
+        "dependencies": {
+          "CupriNet.Abstractions": "0.6.2",
+          "CupriNet.Alembic": "0.6.2",
+          "CupriNet.Codex": "0.6.2",
+          "CupriNet.Concordance": "0.6.2",
+          "CupriNet.Core": "0.6.2",
+          "CupriNet.Marks": "0.6.2",
+          "CupriNet.Vessel": "0.6.2"
+        }
+      },
+      "CupriNet.Codex": {
+        "type": "Transitive",
+        "resolved": "0.6.2",
+        "contentHash": "yZL+yBKMBEiBucMO52tlBez+GQ/Tz7GMc4aJ3RhcsHYFEplxtGy8bgRw8J6ADdWY7bRNcXZLi2yHe36/HnfxNA==",
+        "dependencies": {
+          "CupriNet.Abstractions": "0.6.2"
+        }
+      },
+      "CupriNet.Concordance": {
+        "type": "Transitive",
+        "resolved": "0.6.2",
+        "contentHash": "gZl8ZphBX85whEx3N5L9CWN5fDfLjMN8BMIFha/FWusnlVEsa7Ji0bDCPFpQWFcopDpH8/WKmMUlkFx+qFLl5A==",
+        "dependencies": {
+          "CupriNet.Abstractions": "0.6.2",
+          "CupriNet.Alembic": "0.6.2",
+          "CupriNet.Codex": "0.6.2",
+          "CupriNet.Core": "0.6.2",
+          "CupriNet.Vessel": "0.6.2"
+        }
+      },
+      "CupriNet.Conjunction": {
+        "type": "Transitive",
+        "resolved": "0.6.2",
+        "contentHash": "7hN6esDgg8YSitaapiXR4deAhmzB0C0YdiqbfFEi8oE1qohMQqZ2Vm6eywQJo/w8elPSOl0RgBe+q8oE02wcYw==",
+        "dependencies": {
+          "CupriNet.Abstractions": "0.6.2",
+          "CupriNet.Alembic": "0.6.2",
+          "CupriNet.Codex": "0.6.2",
+          "CupriNet.Core": "0.6.2",
+          "CupriNet.Marks": "0.6.2",
+          "CupriNet.Noise": "0.6.2",
+          "CupriNet.Vessel": "0.6.2"
+        }
+      },
+      "CupriNet.Core": {
+        "type": "Transitive",
+        "resolved": "0.6.2",
+        "contentHash": "HlBnzU2fEZTKTzGMb0P+wxXEqVFLmtyg28dJlkpIL42bHyet1HpFTlxfDF2Iic69XFwX5+WnRGRuzSD/nG805w==",
+        "dependencies": {
+          "CupriNet.Abstractions": "0.6.2",
+          "CupriNet.Alembic": "0.6.2",
+          "CupriNet.Codex": "0.6.2",
+          "CupriNet.Marks": "0.6.2"
+        }
+      },
+      "CupriNet.Marks": {
+        "type": "Transitive",
+        "resolved": "0.6.2",
+        "contentHash": "3O5x317wL6Lk7+1bsexEikLb63OqBpPacCAZmQqBHabH/Fezrem6PaLEh81FpgLMYPRhMXbFT+XehQfyyNLHhQ==",
+        "dependencies": {
+          "CupriMark": "0.2.0",
+          "CupriNet.Alembic": "0.6.2"
+        }
+      },
+      "CupriNet.Noise": {
+        "type": "Transitive",
+        "resolved": "0.6.2",
+        "contentHash": "vab+SnPAZOkVkmUUtxYOLCjWD7yfAVFCgTs+LIWubjNeieghhNSbP2znlS3nCx76myPwdEp1WceeVcOsGZTtpQ==",
+        "dependencies": {
+          "CupriNet.Alembic": "0.6.2"
+        }
+      },
+      "CupriNet.Persistence": {
+        "type": "Transitive",
+        "resolved": "0.6.2",
+        "contentHash": "lQf/AfykFFb+jOju8DgSzDhTPkxdz5PW9ScZ/G9cNO9nGdjapZvjvbnVFFC/TiNKssxQbIlcpSxKYkwm9TV5vA==",
+        "dependencies": {
+          "CupriNet.Abstractions": "0.6.2",
+          "CupriNet.Alembic": "0.6.2"
+        }
+      },
+      "CupriNet.Rites": {
+        "type": "Transitive",
+        "resolved": "0.6.2",
+        "contentHash": "ZDFNqgRTCzOOucIFV3NcsWdeocfOfUOVLpVUiKfxEjrQN2QnoXaFfrT5aHLako6NqDDYfv4ROt8OXCQZqB3h+Q==",
+        "dependencies": {
+          "CupriNet.Abstractions": "0.6.2",
+          "CupriNet.Alembic": "0.6.2",
+          "CupriNet.Codex": "0.6.2",
+          "CupriNet.Marks": "0.6.2",
+          "CupriNet.Vessel": "0.6.2"
+        }
+      },
+      "CupriNet.Shrine": {
+        "type": "Transitive",
+        "resolved": "0.6.2",
+        "contentHash": "iKHj8gNZoFU4LfPbYvml3uNpRRAfKycUoOYdhlsi1XmmDkOSdHGp0SDEu2S6IaJCfYfWozxmGTv4PmG90tSb2A==",
+        "dependencies": {
+          "CupriNet.Abstractions": "0.6.2",
+          "CupriNet.Alembic": "0.6.2",
+          "CupriNet.Conjunction": "0.6.2",
+          "CupriNet.Core": "0.6.2",
+          "CupriNet.Rites": "0.6.2",
+          "CupriNet.Vessel": "0.6.2"
+        }
+      },
+      "CupriNet.Traversal": {
+        "type": "Transitive",
+        "resolved": "0.6.2",
+        "contentHash": "SZeEllJtPspcj0cWLzI10myhtTs1rqTCbffdgh0mv22HMEOKzriOFmc2BZXMa7APofFHbITi8TEklyesx7ANSw==",
+        "dependencies": {
+          "CupriNet.Abstractions": "0.6.2",
+          "CupriNet.Alembic": "0.6.2",
+          "CupriNet.Codex": "0.6.2",
+          "CupriNet.Core": "0.6.2",
+          "CupriNet.Marks": "0.6.2",
+          "CupriNet.Vessel": "0.6.2"
+        }
+      },
+      "CupriNet.Vessel": {
+        "type": "Transitive",
+        "resolved": "0.6.2",
+        "contentHash": "C1vQP0TYb3VsFYMM2JU9r7GaPZbPxf1aJC9EVd+aKVFUrGw/FDv3/nNS9l1OYBcVtGg9L9dM6zndp3mFLElSbw==",
+        "dependencies": {
+          "CupriNet.Codex": "0.6.2"
         }
       },
       "Dapper": {
@@ -154,6 +338,12 @@
         "dependencies": {
           "Graft.Git": "[1.0.0, )",
           "Microsoft.Data.Sqlite": "[10.0.12, )"
+        }
+      },
+      "graft.runnerprotocol": {
+        "type": "Project",
+        "dependencies": {
+          "CupriMark": "[0.2.0, )"
         }
       },
       "graft.ssh": {

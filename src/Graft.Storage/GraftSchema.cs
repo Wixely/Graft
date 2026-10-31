@@ -4,7 +4,7 @@ namespace Graft.Storage;
 
 public static class GraftSchema
 {
-    public static DnaXMigrationManifest Manifest { get; } = new(22,
+    public static DnaXMigrationManifest Manifest { get; } = new(23,
     [
         DnaXMigration.Sql(1, "initial-identity-project-schema", "Create identity and private project schema", """
             CREATE TABLE Users (
@@ -728,6 +728,77 @@ public static class GraftSchema
             CREATE INDEX IX_Groups_Parent ON Groups(ParentGroupId, NormalizedPath);
             CREATE INDEX IX_GroupMemberships_User ON GroupMemberships(UserId);
             CREATE UNIQUE INDEX IX_Projects_Group_Slug ON Projects(GroupId, NormalizedSlug) WHERE GroupId IS NOT NULL;
+            """),
+        // Runners and pipelines.
+        //
+        // A runner is created by an administrator with a one-time registration token that expires, and claims
+        // it once, receiving a credential kept here only as a digest. A pipeline is what one push asked for; a
+        // pipeline file that cannot be run is still a pipeline, failed, with the reason, so the push is not
+        // silently ignored. A job carries its script as JSON and a token digest while a runner holds it. A
+        // job's log is appended in order and bounded.
+        DnaXMigration.Sql(23, "runners-pipelines", "Runners, pipelines, jobs and job logs", """
+            CREATE TABLE Runners (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                Description TEXT NOT NULL,
+                RegistrationDigest TEXT NULL UNIQUE,
+                RegistrationExpiresAtUtc TEXT NOT NULL,
+                CredentialDigest TEXT NULL UNIQUE,
+                Name TEXT NULL,
+                Platform TEXT NULL,
+                Version TEXT NULL,
+                CreatedByUserId INTEGER NOT NULL REFERENCES Users(Id),
+                CreatedAtUtc TEXT NOT NULL,
+                ClaimedAtUtc TEXT NULL,
+                ContactedAtUtc TEXT NULL
+            );
+
+            CREATE TABLE Pipelines (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                Iid INTEGER NOT NULL,
+                Ref TEXT NOT NULL,
+                Sha TEXT NOT NULL,
+                Status TEXT NOT NULL,
+                Source TEXT NOT NULL,
+                Error TEXT NULL,
+                CreatedByUserId INTEGER NULL REFERENCES Users(Id) ON DELETE SET NULL,
+                CreatedAtUtc TEXT NOT NULL,
+                UpdatedAtUtc TEXT NOT NULL,
+                FinishedAtUtc TEXT NULL,
+                UNIQUE (ProjectId, Iid)
+            );
+
+            CREATE TABLE Jobs (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                PipelineId INTEGER NOT NULL REFERENCES Pipelines(Id) ON DELETE CASCADE,
+                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                Name TEXT NOT NULL,
+                Stage TEXT NOT NULL,
+                StageIndex INTEGER NOT NULL,
+                Script TEXT NOT NULL,
+                Variables TEXT NOT NULL,
+                AllowFailure INTEGER NOT NULL DEFAULT 0,
+                Status TEXT NOT NULL,
+                RunnerId INTEGER NULL REFERENCES Runners(Id) ON DELETE SET NULL,
+                TokenDigest TEXT NULL UNIQUE,
+                ExitCode INTEGER NULL,
+                Failure TEXT NULL,
+                TraceLength INTEGER NOT NULL DEFAULT 0,
+                CreatedAtUtc TEXT NOT NULL,
+                StartedAtUtc TEXT NULL,
+                FinishedAtUtc TEXT NULL
+            );
+
+            CREATE TABLE JobTraces (
+                JobId INTEGER NOT NULL REFERENCES Jobs(Id) ON DELETE CASCADE,
+                Sequence INTEGER NOT NULL,
+                Text TEXT NOT NULL,
+                PRIMARY KEY (JobId, Sequence)
+            );
+
+            CREATE INDEX IX_Pipelines_Project ON Pipelines(ProjectId, Id);
+            CREATE INDEX IX_Jobs_Pending ON Jobs(Status, Id);
+            CREATE INDEX IX_Jobs_Pipeline ON Jobs(PipelineId, StageIndex);
             """)
     ]);
 }

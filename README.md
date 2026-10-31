@@ -57,6 +57,13 @@ on every group and project beneath it, so a team is granted once. A project unde
 `team/platform/api` to the API, to Git over HTTPS and to Git over SSH; in the browser its namespace travels as
 one encoded segment, and the natural address redirects there. See [ADR 0035](docs/decisions/0035-groups.md).
 
+Graft runs pipelines on runners of its own. An administrator creates a runner and copies an install script to
+the build machine; the script carries the forge's CupriNet Intonation and a one-time token, registers the runner
+and installs it as a service. The runner then reaches the forge over CupriNet, pinning the forge's key, with no
+certificate, DNS name or HTTPS route needed, fetches each job's source over the same connection, and streams the
+log back. A push carrying `.gitlab-ci.yml` makes a pipeline, run stage by stage; Graft reads a strict subset of
+the format and names anything else it is asked for. See [ADR 0037](docs/decisions/0037-runners-over-cuprinet.md).
+
 Whoever may manage a project can read what has been done to it: the audit entries that name the project, its
 issues, proposals and comments, or its releases, packages, images and snippets, at the bottom of the settings
 tab and at GitLab's `audit_events` route. The whole trail stays the administrator's. See
@@ -285,6 +292,7 @@ Linux static NativeAOT requires the separate toolchain/runbook; a Windows build 
 | `src/Graft.Core/`, `src/Graft.Storage/` | MVP authorization policy and DnaX/SQLite persistence |
 | `src/Graft.Git/`, `src/Graft.Server/` | Managed Git engine (bare Git repository on disk, loose and packed objects with delta compression, smart HTTP protocol versions 0 and 2, server-side object authoring and unified diff), markdown rendering and authenticated HTTPS/API host |
 | `src/Graft.Ssh/` | Dependency-free SSH server for Git over SSH: ECDH P-256, an ECDSA host key, AES-GCM and AES-CTR, Ed25519, ECDSA and RSA client keys (ADR 0031) |
+| `src/Graft.Runner/`, `src/Graft.RunnerProtocol/` | The Graft runner (`graft-runner`, NativeAOT) and the protocol it shares with the forge: CupriNet transport, CupriMark version negotiation (ADR 0037) |
 | `src/Graft.Client/`, `src/Graft.Contracts/` | Blazor WebAssembly client (themed UI, routed pages, rendered READMEs, commit diffs, clone menu, vendored DnaX upload and diagram modules) and source-generated wire contracts |
 | `src/Graft.Operations/`, `src/Graft.Admin/` | Quiescence lease, backup/restore, import inventory and NativeAOT administration CLI |
 | `deploy/` | systemd, optional container and isolated static-musl build definitions |

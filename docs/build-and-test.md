@@ -40,7 +40,7 @@ dotnet publish tests\Graft.Acceptance\Graft.Acceptance.csproj -c Release -r win-
 
 The package-preparation script verifies the exact public source tag and commit before packing. This local process does not replace the durable-feed release gate. See [MVP-04 evidence](validation/2026-09-19-mvp04-accounts-permissions.md).
 
-MVP-06 extends the ordinary Git client workflow with GitLab-style REST reads, browser-session APIs, embedded Blazor assets and repository browsing against the same disposable database/repository root. Git must be on `PATH`; the harness isolates Git configuration and disables certificate verification only for its ephemeral loopback certificate. Since 2026-10-30 the suite also drives Git over SSH, so `ssh`, `ssh-keygen` and `ssh-keyscan` must be on `PATH` too; Git for Windows and Windows OpenSSH both provide them.
+MVP-06 extends the ordinary Git client workflow with GitLab-style REST reads, browser-session APIs, embedded Blazor assets and repository browsing against the same disposable database/repository root. Git must be on `PATH`; the harness isolates Git configuration and disables certificate verification only for its ephemeral loopback certificate. Since 2026-10-30 the suite also drives Git over SSH, so `ssh`, `ssh-keygen` and `ssh-keyscan` must be on `PATH` too; Git for Windows and Windows OpenSSH both provide them. Since 2026-10-31 it also drives the runner: build `src/Graft.Runner` first, or point `GRAFT_RUNNER` at a runner binary, such as a NativeAOT one published with `-p:GraftRunnerAot=true`.
 
 ```powershell
 dotnet build tests\Graft.Git.Acceptance\Graft.Git.Acceptance.csproj -c Debug
