@@ -63,6 +63,9 @@ and installs it as a service. The runner then reaches the forge over CupriNet, p
 certificate, DNS name or HTTPS route needed, fetches each job's source over the same connection, and streams the
 log back. A push carrying `.gitlab-ci.yml` makes a pipeline, run stage by stage; Graft reads a strict subset of
 the format and names anything else it is asked for. See [ADR 0037](docs/decisions/0037-runners-over-cuprinet.md).
+A job can keep artifacts, downloadable from its page and GitLab's job artifacts route. Sources and artifacts go
+whole up to 80 MiB and in verified, resumable chunks above it, a line the operator can move or turn off
+([ADR 0038](docs/decisions/0038-chunked-runner-transfers-and-artifacts.md)).
 
 Whoever may manage a project can read what has been done to it: the audit entries that name the project, its
 issues, proposals and comments, or its releases, packages, images and snippets, at the bottom of the settings

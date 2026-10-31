@@ -63,7 +63,10 @@ public sealed record CiJobInfo(
     string? Failure,
     DateTimeOffset CreatedAtUtc,
     DateTimeOffset? StartedAtUtc,
-    DateTimeOffset? FinishedAtUtc);
+    DateTimeOffset? FinishedAtUtc,
+    /// <summary>The size of the job's kept artifacts archive, or null when it kept none.</summary>
+    long? ArtifactsBytes = null,
+    string? ArtifactsSha256 = null);
 
 /// <summary>
 /// A job handed to a runner: what to run, against which commit of which project, and the token that lets the
@@ -75,4 +78,5 @@ public sealed record CiLease(
     ProjectInfo Project,
     IReadOnlyList<string> Script,
     IReadOnlyDictionary<string, string> Variables,
-    string JobToken);
+    string JobToken,
+    IReadOnlyList<string> ArtifactPaths);

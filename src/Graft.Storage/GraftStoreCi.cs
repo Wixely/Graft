@@ -160,10 +160,10 @@ public sealed partial class GraftStore
         if (parsed.Plan is CiPlan plan)
             foreach (CiJobDefinition job in plan.Jobs)
                 await db.ExecuteAsync("""
-                    INSERT INTO Jobs (PipelineId, ProjectId, Name, Stage, StageIndex, Script, Variables, AllowFailure, Status, CreatedAtUtc)
-                    VALUES (@PipelineId, @ProjectId, @Name, @Stage, @StageIndex, @Script, @Variables, @AllowFailure, 'pending', @CreatedAtUtc);
+                    INSERT INTO Jobs (PipelineId, ProjectId, Name, Stage, StageIndex, Script, Variables, AllowFailure, Status, CreatedAtUtc, ArtifactPaths)
+                    VALUES (@PipelineId, @ProjectId, @Name, @Stage, @StageIndex, @Script, @Variables, @AllowFailure, 'pending', @CreatedAtUtc, @ArtifactPaths);
                     """, new JobInsertParameters(id, projectId, job.Name, job.Stage, job.StageIndex, EncodeLines(job.Script),
-                        EncodeVariables(job.Variables), job.AllowFailure ? 1 : 0, now), transaction);
+                        EncodeVariables(job.Variables), job.AllowFailure ? 1 : 0, now, EncodeLines(job.ArtifactPaths ?? [])), transaction);
         await transaction.CommitAsync(cancellationToken);
         return (await PipelineByIdAsync(db, null, id))!;
     }
@@ -251,7 +251,7 @@ public sealed partial class GraftStore
         await transaction.CommitAsync(cancellationToken);
         PipelineInfo pipeline = (await PipelineByIdAsync(db, null, job.PipelineId))!;
         ProjectInfo project = (await GetReadyProjectAsync(job.ProjectId, cancellationToken))!.Project;
-        return new(ToJob(job), pipeline, project, DecodeLines(job.Script), DecodeVariables(job.Variables), token);
+        return new(ToJob(job), pipeline, project, DecodeLines(job.Script), DecodeVariables(job.Variables), token, DecodeLines(job.ArtifactPaths));
     }
 
     /// <summary>The outcome of appending to a job's log.</summary>
@@ -296,6 +296,36 @@ public sealed partial class GraftStore
         await CompleteJobAsync(db, transaction, jobId, succeeded ? CiStatus.Success : CiStatus.Failed, exitCode, Bounded(failure, 1000), Now());
         await transaction.CommitAsync(cancellationToken);
         return true;
+    }
+
+    /// <summary>
+    /// Records the artifacts archive a running job uploaded, once its bytes are stored and verified. False when the
+    /// token is not this running job's. A second upload replaces the first.
+    /// </summary>
+    public async Task<bool> RecordArtifactsAsync(long jobId, string jobToken, long bytes, string sha256, CancellationToken cancellationToken = default)
+    {
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
+        if (await JobForTokenAsync(db, transaction, jobId, jobToken) is null) return false;
+        await db.ExecuteAsync("UPDATE Jobs SET ArtifactsBytes = @Bytes, ArtifactsSha256 = @Sha256 WHERE Id = @Id;",
+            new ArtifactRecordParameters(jobId, bytes, sha256), transaction);
+        await transaction.CommitAsync(cancellationToken);
+        return true;
+    }
+
+    /// <summary>The project a job belongs to, or null when there is no such job.</summary>
+    public async Task<long?> FindJobProjectIdAsync(long jobId, CancellationToken cancellationToken = default)
+    {
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        return await db.ExecuteScalarAsync<long?>("SELECT ProjectId FROM Jobs WHERE Id = @Id;", new IdParameters(jobId));
+    }
+
+    /// <summary>Whether this token belongs to this running job, for a caller about to accept bytes for it.</summary>
+    public async Task<bool> IsRunningJobTokenAsync(long jobId, string jobToken, CancellationToken cancellationToken = default)
+    {
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        await using SqliteTransaction transaction = db.BeginTransaction(deferred: true);
+        return await JobForTokenAsync(db, transaction, jobId, jobToken) is not null;
     }
 
     /// <summary>Fails a job the server could not hand over, such as one whose source is too large to send.</summary>
@@ -359,7 +389,8 @@ public sealed partial class GraftStore
         """;
     private const string JobSelect = """
         SELECT j.Id, j.PipelineId, j.ProjectId, j.Name, j.Stage, j.StageIndex, j.Script, j.Variables, j.AllowFailure, j.Status, j.RunnerId,
-               r.Description AS RunnerDescription, j.ExitCode, j.Failure, j.CreatedAtUtc, j.StartedAtUtc, j.FinishedAtUtc
+               r.Description AS RunnerDescription, j.ExitCode, j.Failure, j.CreatedAtUtc, j.StartedAtUtc, j.FinishedAtUtc,
+               j.ArtifactPaths, j.ArtifactsBytes, j.ArtifactsSha256
         FROM Jobs j
         LEFT JOIN Runners r ON r.Id = j.RunnerId
         """;
@@ -385,7 +416,8 @@ public sealed partial class GraftStore
 
     private static CiJobInfo ToJob(JobRow row) => new(row.Id, row.PipelineId, row.ProjectId, row.Name, row.Stage, (int)row.StageIndex, row.Status,
         row.AllowFailure != 0, row.RunnerId, row.RunnerDescription, row.ExitCode is null ? null : (int)row.ExitCode.Value, row.Failure,
-        Instant(row.CreatedAtUtc), row.StartedAtUtc is null ? null : Instant(row.StartedAtUtc), row.FinishedAtUtc is null ? null : Instant(row.FinishedAtUtc));
+        Instant(row.CreatedAtUtc), row.StartedAtUtc is null ? null : Instant(row.StartedAtUtc), row.FinishedAtUtc is null ? null : Instant(row.FinishedAtUtc),
+        row.ArtifactsBytes, row.ArtifactsSha256);
 
     private static string? Bounded(string? value, int maximum)
     {
@@ -438,7 +470,7 @@ internal sealed record RunnerClaimParameters(long Id, string CredentialDigest, s
 internal sealed record PipelineInsertParameters(long ProjectId, long Iid, string Ref, string Sha, string Status, string Source, string? Error, long? CreatedByUserId,
     string NowUtc, string? FinishedAtUtc);
 internal sealed record JobInsertParameters(long PipelineId, long ProjectId, string Name, string Stage, int StageIndex, string Script, string Variables,
-    int AllowFailure, string CreatedAtUtc);
+    int AllowFailure, string CreatedAtUtc, string ArtifactPaths);
 internal sealed record ScopedPageParameters(long Id, int Take, int Skip);
 internal sealed record PipelineJobsParameters(long PipelineId, long ProjectId);
 internal sealed record JobLeaseParameters(long Id, long RunnerId, string TokenDigest, string NowUtc);
@@ -453,5 +485,7 @@ internal sealed record RunnerRow(long Id, string Description, string? Name, stri
 internal sealed record PipelineRow(long Id, long ProjectId, long Iid, string Ref, string Sha, string Status, string Source, string? Error, string CreatedAtUtc,
     string UpdatedAtUtc, string? FinishedAtUtc);
 internal sealed record JobRow(long Id, long PipelineId, long ProjectId, string Name, string Stage, long StageIndex, string Script, string Variables, long AllowFailure,
-    string Status, long? RunnerId, string? RunnerDescription, long? ExitCode, string? Failure, string CreatedAtUtc, string? StartedAtUtc, string? FinishedAtUtc);
+    string Status, long? RunnerId, string? RunnerDescription, long? ExitCode, string? Failure, string CreatedAtUtc, string? StartedAtUtc, string? FinishedAtUtc,
+    string ArtifactPaths, long? ArtifactsBytes, string? ArtifactsSha256);
 internal sealed record JobTokenRow(long Id, long TraceLength);
+internal sealed record ArtifactRecordParameters(long Id, long Bytes, string Sha256);

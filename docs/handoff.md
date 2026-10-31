@@ -28,6 +28,34 @@ as their own entries and decision records as each lands.
 Git suite 947 to 951 managed. The native publish was not repeated for this entry. No migration, no new
 route, no new tool.
 
+## Added on 2026-10-31, second entry: chunked runner transfers, and artifacts
+
+The user asked that "all transfers (including artifacts) should use a chunked approach like DNAX. single file
+transfers above 80mb should be chunked", then "optional, configurable". I read that as the runner's transfers:
+a job's source going down and its artifacts coming back. Git, LFS, package and registry wire formats and the
+browser's DnaX uploads are unchanged. [ADR 0038](decisions/0038-chunked-runner-transfers-and-artifacts.md) has
+the design.
+
+- **Policy.** `--runner-chunk-threshold <MiB|0|off>` (default 80) and `--runner-chunk-size <1-64>` (default 8).
+  At or below the threshold a file goes whole and hash-checked, at most 256 MiB; above it, in chunks each with a
+  SHA-256, resumed from what the receiver kept. The forge decides and prints the policy on its `RUNNERS:` line.
+- **Code.** `Transfers.cs` in the protocol project holds the constants and helpers. `RunnerHost.cs` stages
+  sources in `runner-transfers/sources` and keeps uploads with a journal in `runner-transfers/uploads`.
+  `ForgeLink.cs` in the runner reconnects per request and holds the download, zip and upload logic, plus
+  `ArtifactGlob`. Migration 24 adds the artifact columns to Jobs.
+- **Artifacts.** `artifacts: paths:` in the pipeline file, kept from successful jobs as
+  `artifacts/<job id>.zip` in the project's repository directory. GitLab's `artifacts_file` and
+  `GET .../jobs/:id/artifacts` with ranges; a link on the Pipelines page. Row GL-048.
+- **Test knob.** `GRAFT_RUNNER_FAULT_DROP_EVERY=n` makes the runner drop its connection before every n-th relic
+  fetch or chunk commit. Counting pieces too would stop any chunk of more than n steps from ever completing.
+
+Verified: the Git suite 1168 to **1188** managed, and **1188** again against the NativeAOT forge with the
+NativeAOT runner. Both native publishes have zero trimming or AOT warnings. Not tested: resuming an upload across
+a forge restart, though the journal is built for it; the browser link.
+
+Next action, owner implementation agent: publish the runner for linux-x64 and run it against a forge, as before.
+Owner user: decide whether artifacts should expire and whether later stages should receive earlier artifacts.
+
 ## Added on 2026-10-31: Graft's own runner, over CupriNet
 
 The user asked for a runner, then that it use CupriMark and CupriNet, then that Graft give out install scripts

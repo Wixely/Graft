@@ -10,7 +10,9 @@ public sealed record CiJobDefinition(
     int StageIndex,
     IReadOnlyList<string> Script,
     IReadOnlyDictionary<string, string> Variables,
-    bool AllowFailure);
+    bool AllowFailure,
+    /// <summary>What the job keeps after a successful run, as paths relative to the source; empty for nothing.</summary>
+    IReadOnlyList<string>? ArtifactPaths = null);
 
 /// <summary>A pipeline file read into the jobs it asks for, in stage order.</summary>
 public sealed record CiPlan(IReadOnlyList<string> Stages, IReadOnlyList<CiJobDefinition> Jobs);
@@ -53,7 +55,7 @@ public static class CiConfiguration
     private static readonly HashSet<string> TopLevelRefused = new(StringComparer.Ordinal)
         { "default", "include", "workflow", "image", "services", "cache", "before_script", "after_script", "pages", "spec" };
     private static readonly HashSet<string> JobKeys = new(StringComparer.Ordinal)
-        { "stage", "script", "before_script", "variables", "allow_failure" };
+        { "stage", "script", "before_script", "variables", "allow_failure", "artifacts" };
 
     public static CiParseResult Parse(string text)
     {
@@ -89,7 +91,7 @@ public static class CiConfiguration
             if (value is not YamlMap job) throw new CiYamlException("Job '" + name + "' must be a mapping with at least a script.");
             foreach ((string key, _) in job.Entries)
                 if (!JobKeys.Contains(key))
-                    throw new CiYamlException("Job '" + name + "' uses '" + key + "', which Graft does not run yet. Supported: stage, script, before_script, variables, allow_failure.");
+                    throw new CiYamlException("Job '" + name + "' uses '" + key + "', which Graft does not run yet. Supported: stage, script, before_script, variables, allow_failure, artifacts.");
             if (!job.TryGet("script", out YamlNode? scriptNode)) throw new CiYamlException("Job '" + name + "' has no script.");
             List<string> script = [];
             if (job.TryGet("before_script", out YamlNode? before)) script.AddRange(Lines(before, name, "before_script"));
@@ -114,12 +116,35 @@ public static class CiConfiguration
             if (job.TryGet("variables", out YamlNode? jobVariables))
                 foreach ((string key, string val) in Variables(jobVariables, "Job '" + name + "' variables"))
                     variables[key] = val;
-            jobs.Add(new(name, stage, stageIndex, script, variables, allowFailure));
+            List<string> artifactPaths = job.TryGet("artifacts", out YamlNode? artifactsNode) ? ArtifactPaths(artifactsNode, name) : [];
+            jobs.Add(new(name, stage, stageIndex, script, variables, allowFailure, artifactPaths));
             if (jobs.Count > MaximumJobs) throw new CiYamlException("The pipeline has more than 50 jobs.");
         }
         if (jobs.Count == 0) throw new CiYamlException("The pipeline file defines no jobs.");
         // Stable: jobs keep the order the file gives them within a stage.
         return new(stages, [.. jobs.OrderBy(job => job.StageIndex)]);
+    }
+
+    /// <summary>
+    /// <c>artifacts: paths:</c>, and nothing else of GitLab's artifact settings yet. A path is relative to the source,
+    /// may use <c>*</c> and <c>**</c>, and may not climb out of it.
+    /// </summary>
+    private static List<string> ArtifactPaths(YamlNode node, string job)
+    {
+        if (node is not YamlMap map) throw new CiYamlException("Job '" + job + "' artifacts must be a mapping with paths.");
+        foreach ((string key, _) in map.Entries)
+            if (key != "paths")
+                throw new CiYamlException("Job '" + job + "' artifacts uses '" + key + "', which Graft does not run yet. Supported: paths.");
+        if (!map.TryGet("paths", out YamlNode? paths)) throw new CiYamlException("Job '" + job + "' artifacts has no paths.");
+        List<string> result = Strings(paths, "Job '" + job + "' artifacts paths");
+        if (result.Count is 0 or > 50) throw new CiYamlException("Job '" + job + "' artifacts lists between 1 and 50 paths.");
+        foreach (string path in result)
+        {
+            string normal = path.Replace('\\', '/').Trim();
+            if (normal.Length == 0 || normal.StartsWith('/') || normal.Contains(':') || normal.Split('/').Any(part => part == ".."))
+                throw new CiYamlException("Job '" + job + "' artifacts path '" + path + "' must stay inside the source directory.");
+        }
+        return result;
     }
 
     private static string Scalar(YamlNode node, string what) =>

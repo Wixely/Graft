@@ -129,8 +129,9 @@ Nothing is here at the moment. Everything below needs a decision before it is bu
 ## Larger, and worth deciding deliberately
 
 **The rest of continuous integration.** The first slice exists ([ADR 0037](decisions/0037-runners-over-cuprinet.md)):
-Graft's own runner over CupriNet, install scripts, and a strict subset of `.gitlab-ci.yml`. Still absent:
-containers, artifacts, caches, `rules` and the rest of the format, retry and cancel, group and project runners,
+Graft's own runner over CupriNet, install scripts, a strict subset of `.gitlab-ci.yml`, and artifacts with
+chunked, resumable transfers ([ADR 0038](decisions/0038-chunked-runner-transfers-and-artifacts.md)). Still absent:
+containers, artifact expiry and passing artifacts between stages, caches, `rules` and the rest of the format, retry and cancel, group and project runners,
 detecting a runner that dropped mid-job, and GitLab's runner API for the official `gitlab-runner`.
 
 **GraphQL.** GitLab's newer clients increasingly prefer it. Not implemented, and implementing a useful

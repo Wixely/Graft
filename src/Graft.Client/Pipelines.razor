@@ -82,6 +82,7 @@ else
                                     @(job.Duration is double seconds ? " · " + seconds.ToString("0") + " s" : "")
                                     @(job.ExitCode is int code ? " · exit " + code : "")
                                     @(job.AllowFailure ? " · allowed to fail" : "")
+                                    @(job.ArtifactsFile is not null ? " · artifacts" : "")
                                 </small>
                             </span>
                         </button>
@@ -94,7 +95,15 @@ else
     @if (shownJob is long jobId)
     {
         <div class="panel">
-            <div class="panel-header"><Icon Name="file" /><h2>Log of @(jobs.FirstOrDefault(job => job.Id == jobId)?.Name ?? "job " + jobId)</h2></div>
+            <div class="panel-header">
+                <Icon Name="file" /><h2>Log of @(jobs.FirstOrDefault(job => job.Id == jobId)?.Name ?? "job " + jobId)</h2>
+                @if (jobs.FirstOrDefault(job => job.Id == jobId)?.ArtifactsFile is JobArtifactsFileResponse artifacts)
+                {
+                    <a class="button secondary" href="@($"/api/projects/{projectId}/jobs/{jobId}/artifacts")" download="@artifacts.Filename">
+                        <Icon Name="download" />Artifacts (@artifacts.Size bytes)
+                    </a>
+                }
+            </div>
             <div class="panel-body">
                 <pre class="file-view"><code>@(trace.Length == 0 ? "No output yet." : trace)</code></pre>
             </div>

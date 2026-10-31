@@ -24,8 +24,49 @@ public sealed record RunnerJobResponse(
     string Sha,
     string[] Script,
     Dictionary<string, string> Variables,
-    string Archive,
-    [property: JsonPropertyName("archive_bytes")] long ArchiveBytes);
+    /// <summary>The commit's source, as one relic or as chunks; see <see cref="TransferDescriptor"/>.</summary>
+    TransferDescriptor Source,
+    /// <summary>The paths the job keeps after a successful run; empty for nothing.</summary>
+    string[] Artifacts,
+    /// <summary>The forge's chunking rule, which the runner follows for anything it sends.</summary>
+    TransferPolicy Transfer);
+
+/// <summary>
+/// When a transfer is chunked and how big a chunk is. <c>threshold</c> is in bytes; a file larger than it is chunked;
+/// -1 means chunking is off and every file goes whole.
+/// </summary>
+public sealed record TransferPolicy(long Threshold, [property: JsonPropertyName("chunk_size")] long ChunkSize);
+
+/// <summary>
+/// A file the forge offers for download. Whole: one relic named <c>name</c>. Chunked: one relic per chunk, named
+/// <c>name.00000</c> onward, each <c>chunk_size</c> long but the last, each with its SHA-256. The whole file's
+/// SHA-256 is checked either way.
+/// </summary>
+public sealed record TransferDescriptor(
+    string Name,
+    long Size,
+    string Sha256,
+    bool Chunked,
+    [property: JsonPropertyName("chunk_size")] long ChunkSize,
+    [property: JsonPropertyName("chunk_sha256")] string[] ChunkSha256);
+
+/// <summary>Opens or reopens an upload of a job's artifacts archive.</summary>
+public sealed record ArtifactUploadRequest(long Size, string Sha256);
+
+/// <summary>
+/// Where an upload stands. Chunked: the forge has durably kept everything below <c>committed_offset</c>, and the
+/// runner sends from there. Whole: the runner sends from <c>received_offset</c> on the same session and from zero
+/// after any interruption.
+/// </summary>
+public sealed record ArtifactUploadResponse(
+    [property: JsonPropertyName("upload_id")] string UploadId,
+    bool Chunked,
+    [property: JsonPropertyName("chunk_size")] long ChunkSize,
+    [property: JsonPropertyName("committed_offset")] long CommittedOffset,
+    [property: JsonPropertyName("received_offset")] long ReceivedOffset);
+
+/// <summary>Closes a chunk: its index and the SHA-256 of its bytes.</summary>
+public sealed record ArtifactChunkCommit(int Index, string Sha256);
 
 /// <summary>A piece of a job's log, at the offset where the runner believes the log ends.</summary>
 public sealed record RunnerTraceRequest(long Offset, string Text);
@@ -88,6 +129,9 @@ public sealed record JobPipelineResponse(long Id, long Iid, [property: JsonPrope
 
 public sealed record JobRunnerResponse(long Id, string Description);
 
+/// <summary>GitLab's description of a job's artifacts archive.</summary>
+public sealed record JobArtifactsFileResponse(string Filename, long Size);
+
 /// <summary>A job in GitLab's shape, with Graft's <c>exit_code</c> and <c>failure</c>.</summary>
 public sealed record JobResponse(
     long Id,
@@ -104,7 +148,8 @@ public sealed record JobResponse(
     JobRunnerResponse? Runner,
     [property: JsonPropertyName("web_url")] string WebUrl,
     [property: JsonPropertyName("exit_code")] int? ExitCode,
-    string? Failure);
+    string? Failure,
+    [property: JsonPropertyName("artifacts_file")] JobArtifactsFileResponse? ArtifactsFile = null);
 
 /// <summary>GitLab's request to run a pipeline for a ref.</summary>
 public sealed record PipelineCreateRequest(string? Ref);

@@ -214,7 +214,7 @@ everything else there; keep it with the database, or registered runners will no 
 forge prints it at startup:
 
 ```text
-RUNNERS: cupri port 7443 advertised as graft.example.com; shrine cupri1…; runner downloads from /srv/graft/runner-binaries
+RUNNERS: cupri port 7443 advertised as graft.example.com; shrine cupri1…; runner downloads from /srv/graft/runner-binaries; transfers chunked above 80 MiB in 8 MiB chunks
 ```
 
 To add a runner, an administrator opens **Runners**, creates one, and copies the Windows or Linux install
@@ -224,6 +224,13 @@ root on Linux and it installs the `GraftRunner` service or the `graft-runner` sy
 `--no-service` to register only. The script downloads the runner from `/-/runner/download/` when the downloads
 directory holds `graft-runner-win-x64.exe` or `graft-runner-linux-x64`; otherwise pass the binary with `-Binary`
 or `--binary`.
+
+Files between the forge and its runners, a job's source and its artifacts, go whole up to 80 MiB and in
+verified, resumable chunks of 8 MiB above it. `--runner-chunk-threshold <MiB>` (`GRAFT_RUNNER_CHUNK_THRESHOLD`)
+moves the line, `0` chunks everything and `off` chunks nothing; `--runner-chunk-size <1-64>`
+(`GRAFT_RUNNER_CHUNK_SIZE`) sets the chunk. Transfers in progress live in `runner-transfers/` beside the
+database, and a job's artifacts are kept as `artifacts/<job id>.zip` in the project's repository directory, so
+they are backed up with it. See [ADR 0038](decisions/0038-chunked-runner-transfers-and-artifacts.md).
 
 A push that carries a `.gitlab-ci.yml` then makes a pipeline. Graft reads a strict subset of the format, and a
 file asking for anything else, such as `image` or `rules`, fails its pipeline naming the key. See
