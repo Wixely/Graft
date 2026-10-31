@@ -78,7 +78,7 @@ public sealed class RunnerAgent(RunnerConfig config, string home)
     private static readonly TimeSpan JobTimeout = TimeSpan.FromHours(1);
 
     private static readonly BouncyCastleSuite Suite = new();
-    private readonly SemaphoreSlim consulting = new(1, 1);
+    private readonly ForgeLink link = new(config);
 
     // ------------------------------------------------------------------------------------------------
     // Registration
@@ -96,7 +96,7 @@ public sealed class RunnerAgent(RunnerConfig config, string home)
         if (endpoints.Length == 0) throw new RunnerException("The Intonation carries no address this runner can reach.");
 
         RunnerConfig pending = new(Protocol.Network, link.ShrineAddress!, Convert.ToBase64String(shrine.Span), endpoints, 0, "", name);
-        await using ShrineSession session = await ConnectAsync(pending, cancellationToken);
+        await using ShrineSession session = await ForgeLink.ConnectAsync(pending, cancellationToken);
         byte[] body = JsonSerializer.SerializeToUtf8Bytes(new RunnerRegisterRequest(token.Trim(), name, Platform(), Version), ApiJson.Default.RunnerRegisterRequest);
         OracleResponse response = await session.ConsultAsync(Request(Protocol.Routes.Register, body, null), cancellationToken);
         if (response.Status != 201) throw new RunnerException("The forge refused the registration: " + ErrorText(response));
@@ -119,10 +119,11 @@ public sealed class RunnerAgent(RunnerConfig config, string home)
     {
         bool allSucceeded = true;
         TimeSpan backoff = TimeSpan.FromSeconds(2);
+        await using ForgeLink owned = link;
         while (!cancellationToken.IsCancellationRequested)
         {
-            ShrineSession session;
-            try { session = await ConnectAsync(config, cancellationToken); }
+            OracleResponse response;
+            try { response = await link.ConsultAsync(Request(Protocol.Routes.RequestJob, [], config.Credential), cancellationToken); }
             catch (Exception exception) when (exception is not OperationCanceledException and not RunnerException)
             {
                 if (once) throw new RunnerException("Could not reach the forge: " + exception.Message);
@@ -132,56 +133,66 @@ public sealed class RunnerAgent(RunnerConfig config, string home)
                 continue;
             }
             backoff = TimeSpan.FromSeconds(2);
-            await using (session)
+            if (response.Status == 204)
             {
-                try
-                {
-                    while (!cancellationToken.IsCancellationRequested)
-                    {
-                        OracleResponse response = await ConsultAsync(session, Request(Protocol.Routes.RequestJob, [], config.Credential), cancellationToken);
-                        if (response.Status == 204)
-                        {
-                            if (once) return allSucceeded ? 0 : 1;
-                            continue;
-                        }
-                        if (response.Status == 401) throw new RunnerException("The forge no longer accepts this runner's credential: " + ErrorText(response));
-                        if (response.Status == 426) throw new RunnerException("This runner and the forge share no protocol version: " + ErrorText(response));
-                        if (response.Status != 200) throw new InvalidOperationException("the forge answered " + response.Status + ": " + ErrorText(response));
-                        RunnerJobResponse job = JsonSerializer.Deserialize(response.Body, ApiJson.Default.RunnerJobResponse)
-                            ?? throw new InvalidOperationException("the forge sent an empty job");
-                        allSucceeded &= await RunJobAsync(session, job, cancellationToken);
-                    }
-                }
-                catch (Exception exception) when (exception is not OperationCanceledException and not RunnerException)
-                {
-                    if (once) throw new RunnerException("Lost the forge: " + exception.Message);
-                    Console.Error.WriteLine("Lost the forge (" + exception.Message + "); reconnecting.");
-                }
+                if (once) return allSucceeded ? 0 : 1;
+                continue;
             }
+            if (response.Status == 401) throw new RunnerException("The forge no longer accepts this runner's credential: " + ErrorText(response));
+            if (response.Status == 426) throw new RunnerException("This runner and the forge share no protocol version: " + ErrorText(response));
+            if (response.Status != 200)
+            {
+                if (once) throw new RunnerException("The forge answered " + response.Status + ": " + ErrorText(response));
+                Console.Error.WriteLine("The forge answered " + response.Status + " (" + ErrorText(response) + "); asking again.");
+                await Task.Delay(backoff, cancellationToken);
+                continue;
+            }
+            RunnerJobResponse job = JsonSerializer.Deserialize(response.Body, ApiJson.Default.RunnerJobResponse)
+                ?? throw new RunnerException("The forge sent an empty job.");
+            allSucceeded &= await RunJobAsync(job, cancellationToken);
         }
         return allSucceeded ? 0 : 1;
     }
 
     /// <summary>Runs one job to its end and reports it. True when it succeeded.</summary>
-    private async Task<bool> RunJobAsync(ShrineSession session, RunnerJobResponse job, CancellationToken cancellationToken)
+    private async Task<bool> RunJobAsync(RunnerJobResponse job, CancellationToken cancellationToken)
     {
         Console.WriteLine("Job " + job.JobId + " (" + job.Name + ") for " + job.Project + " at " + job.Sha[..8]);
         string workspace = Path.Combine(home, "builds", job.JobId.ToString(System.Globalization.CultureInfo.InvariantCulture));
-        TraceWriter trace = new(this, session, job);
+        TraceWriter trace = new(link, job);
+        RunnerTransfers transfers = new(link, home, trace.Line);
         int? exitCode = null;
         string? failure = null;
+        string? source = null;
+        string? artifacts = null;
         try
         {
             if (Directory.Exists(workspace)) Directory.Delete(workspace, recursive: true);
             Directory.CreateDirectory(workspace);
             trace.Line("Graft runner " + Version + " on " + config.Name + " (" + Platform() + ")");
-            trace.Line("Fetching " + job.Project + " at " + job.Sha);
-            byte[] archive = await session.FetchRelicAsync(job.Archive, cancellationToken: cancellationToken);
-            using (MemoryStream compressed = new(archive))
-            using (GZipStream tar = new(compressed, CompressionMode.Decompress))
+            trace.Line("Fetching " + job.Project + " at " + job.Sha + ", " + job.Source.Size + " bytes" + (job.Source.Chunked ? ", chunked" : ""));
+            source = await transfers.DownloadAsync(job.Source, cancellationToken);
+            await using (FileStream compressed = File.OpenRead(source))
+            await using (GZipStream tar = new(compressed, CompressionMode.Decompress))
                 await TarFile.ExtractToDirectoryAsync(tar, workspace, overwriteFiles: true, cancellationToken);
+            File.Delete(source);
             exitCode = await ExecuteAsync(job, workspace, trace, cancellationToken);
             if (exitCode != 0) failure = "The script exited with " + exitCode + ".";
+            else if (job.Artifacts.Length > 0)
+            {
+                // As GitLab's default: artifacts are kept from a job that succeeded.
+                trace.Line("Uploading artifacts");
+                artifacts = transfers.CollectArtifacts(job.JobId, workspace, job.Artifacts);
+                if (artifacts is not null)
+                {
+                    await transfers.UploadAsync(job.JobId, job.JobToken, artifacts, cancellationToken);
+                    trace.Line("Artifacts uploaded");
+                }
+            }
+        }
+        catch (RunnerException exception)
+        {
+            failure = exception.Message;
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
@@ -196,8 +207,23 @@ public sealed class RunnerAgent(RunnerConfig config, string home)
         await trace.FlushAsync(cancellationToken);
         bool succeeded = failure is null;
         byte[] body = JsonSerializer.SerializeToUtf8Bytes(new RunnerFinishRequest(succeeded ? "success" : "failed", exitCode, failure), ApiJson.Default.RunnerFinishRequest);
-        OracleResponse finished = await ConsultAsync(session, Request(Protocol.Routes.JobPrefix + job.JobId + "/finish", body, job.JobToken), cancellationToken);
-        if (finished.Status != 200) Console.Error.WriteLine("The forge did not accept the result of job " + job.JobId + ": " + ErrorText(finished));
+        // The result matters more than anything else the runner sends, so it is retried over new connections.
+        for (int attempt = 1; ; attempt++)
+        {
+            try
+            {
+                OracleResponse finished = await link.ConsultAsync(Request(Protocol.Routes.JobPrefix + job.JobId + "/finish", body, job.JobToken), cancellationToken);
+                if (finished.Status != 200) Console.Error.WriteLine("The forge did not accept the result of job " + job.JobId + ": " + ErrorText(finished));
+                break;
+            }
+            catch (Exception exception) when (exception is not OperationCanceledException && attempt < 8)
+            {
+                Console.Error.WriteLine("Could not report job " + job.JobId + " (" + exception.Message + "); trying again.");
+                await Task.Delay(TimeSpan.FromSeconds(Math.Min(30, attempt * 2)), cancellationToken);
+            }
+        }
+        foreach (string? leftover in new[] { source, artifacts })
+            if (leftover is not null) try { File.Delete(leftover); } catch (IOException) { }
         try { Directory.Delete(workspace, recursive: true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
         Console.WriteLine("Job " + job.JobId + (succeeded ? " succeeded" : " failed"));
         return succeeded;
@@ -281,40 +307,7 @@ public sealed class RunnerAgent(RunnerConfig config, string home)
     // The connection
     // ------------------------------------------------------------------------------------------------
 
-    private static async Task<ShrineSession> ConnectAsync(RunnerConfig config, CancellationToken cancellationToken)
-    {
-        Sigil shrine = new(Convert.FromBase64String(config.ShrineSigil));
-        Exception? last = null;
-        foreach (RunnerEndpoint endpoint in config.Endpoints)
-        {
-            try
-            {
-                using CancellationTokenSource connect = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                connect.CancelAfter(TimeSpan.FromSeconds(15));
-                IVessel vessel = await TcpVessel.ConnectAsync(endpoint.Host, endpoint.Port, cancellationToken: connect.Token);
-                return await Pilgrimage.OverVesselAsync(vessel, shrine, new Concordium(config.Network), Suite, enableToll: true, cancellationToken);
-            }
-            catch (Exception exception) when (exception is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
-            {
-                last = exception;
-            }
-        }
-        throw new IOException("no address of the forge answered as " + config.ShrineAddress + (last is null ? "" : " (" + last.Message + ")"), last);
-    }
-
-    private async Task<OracleResponse> ConsultAsync(ShrineSession session, OracleRequest request, CancellationToken cancellationToken)
-    {
-        await consulting.WaitAsync(cancellationToken);
-        try { return await session.ConsultAsync(request, cancellationToken); }
-        finally { consulting.Release(); }
-    }
-
-    private static OracleRequest Request(string path, byte[] body, string? authorization)
-    {
-        List<OracleHeader> headers = [new(Protocol.VersionHeader, Protocol.Advertised), new("content-type", "application/json")];
-        if (authorization is not null) headers.Add(new(Protocol.AuthorizationHeader, authorization));
-        return new OracleRequest { Method = "POST", Path = path, Headers = headers, Body = body };
-    }
+    private static OracleRequest Request(string path, byte[] body, string? authorization) => RunnerTransfers.Request(path, body, authorization);
 
     private static string ErrorText(OracleResponse response)
     {
@@ -340,8 +333,7 @@ public sealed class RunnerAgent(RunnerConfig config, string home)
     /// </summary>
     private sealed class TraceWriter
     {
-        private readonly RunnerAgent agent;
-        private readonly ShrineSession session;
+        private readonly ForgeLink link;
         private readonly RunnerJobResponse job;
         private readonly StringBuilder pending = new();
         private readonly object gate = new();
@@ -349,10 +341,9 @@ public sealed class RunnerAgent(RunnerConfig config, string home)
         private long offset;
         private Task sending = Task.CompletedTask;
 
-        public TraceWriter(RunnerAgent agent, ShrineSession session, RunnerJobResponse job)
+        public TraceWriter(ForgeLink link, RunnerJobResponse job)
         {
-            this.agent = agent;
-            this.session = session;
+            this.link = link;
             this.job = job;
             timer = new Timer(_ => Kick(), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
         }
@@ -400,7 +391,7 @@ public sealed class RunnerAgent(RunnerConfig config, string home)
             byte[] body = JsonSerializer.SerializeToUtf8Bytes(new RunnerTraceRequest(offset, chunk), ApiJson.Default.RunnerTraceRequest);
             try
             {
-                OracleResponse response = await agent.ConsultAsync(session, Request(Protocol.Routes.JobPrefix + job.JobId + "/trace", body, job.JobToken), cancellationToken);
+                OracleResponse response = await link.ConsultAsync(Request(Protocol.Routes.JobPrefix + job.JobId + "/trace", body, job.JobToken), cancellationToken);
                 if (response.Status == 202) offset += chunk.Length;
                 else Console.Error.WriteLine("The forge did not take a piece of the log: " + ErrorText(response));
             }

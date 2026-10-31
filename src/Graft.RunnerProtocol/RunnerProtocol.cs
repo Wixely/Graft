@@ -85,6 +85,6 @@ public static class RunnerProtocol
         public const string JobPrefix = "/runner/v1/jobs/";
     }
 
-    /// <summary>The relic name a job's source archive is served under.</summary>
-    public static string ArchiveRelic(long jobId) => "job-" + jobId.ToString(CultureInfo.InvariantCulture) + ".tar.gz";
+    /// <summary>The relic name a job's source archive is served under; chunks add <c>.00000</c> onward.</summary>
+    public static string ArchiveRelic(long jobId) => "job-" + jobId.ToString(CultureInfo.InvariantCulture) + "-source.tar.gz";
 }

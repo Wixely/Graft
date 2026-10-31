@@ -94,6 +94,12 @@ services:
       - ${GRAFT_RUNNER_HOST:-}
       - --runner-downloads
       - ${GRAFT_RUNNER_DOWNLOADS:-}
+      # Files between forge and runner go whole up to this many MiB and in resumable chunks above it; 0 chunks
+      # everything, off chunks nothing. Empty means 80 MiB and 8 MiB chunks. See docs/decisions/0038-chunked-runner-transfers-and-artifacts.md.
+      - --runner-chunk-threshold
+      - ${GRAFT_RUNNER_CHUNK_THRESHOLD:-}
+      - --runner-chunk-size
+      - ${GRAFT_RUNNER_CHUNK_SIZE:-}
     ports:
       - "127.0.0.1:8443:8443"
       # Uncomment with GRAFT_SSH_PORT=2222 to reach Git over SSH; nothing in front of HTTPS carries it.

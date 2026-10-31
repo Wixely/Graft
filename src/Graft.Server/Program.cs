@@ -33,7 +33,7 @@ if (args.Length == 1 && args[0] == "--licences")
 
 if (!Arguments.TryParse(args, out Arguments? parsedSettings))
 {
-    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>] [--mcp true|false] [--pages-origin <https origin>] [--recoverable-tokens true|false] [--webhooks true|false] [--ssh-port <0-65535>] [--ssh-host <name>] [--mail-smtp <smtp|smtp+starttls|smtps URL>] [--mail-from <address>] [--mail-password-file <UTF-8 path>] [--runner-port <0-65535>] [--runner-host <name>] [--runner-downloads <directory>].");
+    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>] [--mcp true|false] [--pages-origin <https origin>] [--recoverable-tokens true|false] [--webhooks true|false] [--ssh-port <0-65535>] [--ssh-host <name>] [--mail-smtp <smtp|smtp+starttls|smtps URL>] [--mail-from <address>] [--mail-password-file <UTF-8 path>] [--runner-port <0-65535>] [--runner-host <name>] [--runner-downloads <directory>] [--runner-chunk-threshold <MiB|off>] [--runner-chunk-size <1-64 MiB>].");
     Console.Error.WriteLine("       Graft.Server --licences  prints the third-party notices this build redistributes.");
     return 2;
 }
@@ -1013,6 +1013,21 @@ foreach ((string root, bool browserFamily) in new[] { ("/api/projects/{projectId
         context.Response.ContentType = "text/plain; charset=utf-8";
         await context.Response.WriteAsync(trace, context.RequestAborted);
     });
+
+    // GitLab's "download the artifacts archive". Ranges are honoured, so a large archive can be fetched in
+    // pieces and an interrupted download resumed, as a runner's transfers are (ADR 0038).
+    app.MapGet(root + "/jobs/{jobId:long}/artifacts", async context =>
+    {
+        var scope = await CiReader(context, browserFamily);
+        if (scope is null) return;
+        if (!await OnlyQuery(context)) return;
+        long jobId = Convert.ToInt64(context.Request.RouteValues["jobId"], System.Globalization.CultureInfo.InvariantCulture);
+        CiJobInfo? job = await store.GetJobAsync(scope.Value.Identity, scope.Value.Details.Project.Id, jobId, context.RequestAborted);
+        string path = ArtifactsPathFor(scope.Value.Details.Project, jobId);
+        if (job?.ArtifactsBytes is null || !File.Exists(path)) { await ApiError(context, 404, "404 Not Found"); return; }
+        Microsoft.Net.Http.Headers.EntityTagHeaderValue? tag = job.ArtifactsSha256 is { } sha ? new("\"" + sha + "\"") : null;
+        await Results.File(path, "application/zip", "artifacts.zip", lastModified: null, entityTag: tag, enableRangeProcessing: true).ExecuteAsync(context);
+    });
 }
 
 // GitLab's "run pipeline": a pipeline for the tip of a ref, by somebody who may push.
@@ -1108,7 +1123,8 @@ JobResponse JobResponseFor(HttpContext context, ProjectInfo project, PipelineInf
         new(pipeline.Id, pipeline.Iid, pipeline.ProjectId, pipeline.Ref, pipeline.Sha, pipeline.Status),
         job.RunnerId is long runnerId ? new(runnerId, job.RunnerDescription ?? "") : null,
         ProjectUrlFor(context, project) + "/-/jobs/" + job.Id.ToString(System.Globalization.CultureInfo.InvariantCulture),
-        job.ExitCode, job.Failure);
+        job.ExitCode, job.Failure,
+        job.ArtifactsBytes is long artifactsBytes ? new JobArtifactsFileResponse("artifacts.zip", artifactsBytes) : null);
 
 // A project's own view of the trail, for whoever may manage the project. The scoping rule lives in the store.
 app.MapGet("/api/projects/{projectId:long}/audit", async context =>
@@ -4737,22 +4753,25 @@ async Task<PipelineInfo?> CreatePipelineFor(ProjectInfo project, long? userId, s
 }
 
 /// <summary>The source a runner is sent for a job: the commit as a gzipped tar, under one directory, as the archive route serves it.</summary>
-async Task<byte[]?> ArchiveForJob(CiLease lease, CancellationToken cancellationToken)
+async Task<bool> ArchiveForJob(CiLease lease, Stream output, CancellationToken cancellationToken)
 {
     RepositoryEndpoint endpoint = EndpointFor(lease.Project);
     await endpoint.Gate.WaitAsync(cancellationToken);
     try
     {
         Repository repository = endpoint.Repository;
-        if (!repository.Objects.ContainsKey(lease.Pipeline.Sha)) return null;
+        if (!repository.Objects.ContainsKey(lease.Pipeline.Sha)) return false;
         IReadOnlyList<GitTreeEntry>? files = RepositoryView.FlatTree(repository, lease.Pipeline.Sha);
-        if (files is null) return null;
-        using MemoryStream output = new();
+        if (files is null) return false;
         BuildTarGz(output, repository, files, "", lease.Pipeline.CreatedAtUtc, cancellationToken);
-        return output.ToArray();
+        return true;
     }
     finally { endpoint.Gate.Release(); }
 }
+
+/// <summary>Where a job's artifacts archive is kept: beside the project's repository, as its LFS objects and packages are.</summary>
+string ArtifactsPathFor(ProjectInfo project, long jobId) =>
+    Path.Combine(settings.Repositories, project.StorageId, "artifacts", jobId.ToString(System.Globalization.CultureInfo.InvariantCulture) + ".zip");
 
 /// <summary><c>ssh://git@host[:port]</c>, with the configured host name when there is one and the port only
 /// when it is not SSH's own.</summary>
@@ -7338,12 +7357,18 @@ if (settings.RunnerPort >= 0)
             settings.ListenAddress, settings.RunnerPort,
             settings.RunnerHost ?? new Uri(serverOrigin!).Host,
             Path.Combine(Path.GetDirectoryName(settings.Database)!, "runner-shrine"),
-            app.Services.GetRequiredService<IDataProtectionProvider>().CreateProtector("graft.runner.shrine.v1")),
+            app.Services.GetRequiredService<IDataProtectionProvider>().CreateProtector("graft.runner.shrine.v1"),
+            settings.RunnerChunkThreshold, settings.RunnerChunkBytes,
+            Path.Combine(Path.GetDirectoryName(settings.Database)!, "runner-transfers"),
+            ArtifactsPathFor),
         store, ArchiveForJob, (text, exception) => app.Logger.LogInformation(exception, "{Message}", text));
     app.Lifetime.ApplicationStopping.Register(() => runners.DisposeAsync().AsTask().GetAwaiter().GetResult());
     Console.WriteLine("RUNNERS: cupri port " + runners.Port.ToString(System.Globalization.CultureInfo.InvariantCulture) +
         " advertised as " + (settings.RunnerHost ?? new Uri(serverOrigin!).Host) + "; shrine " + runners.ShrineAddress +
-        (settings.RunnerDownloads is null ? "; no runner downloads" : "; runner downloads from " + settings.RunnerDownloads));
+        (settings.RunnerDownloads is null ? "; no runner downloads" : "; runner downloads from " + settings.RunnerDownloads) +
+        (settings.RunnerChunkThreshold < 0 ? "; transfers whole only" :
+            "; transfers chunked above " + (settings.RunnerChunkThreshold / (1024 * 1024)).ToString(System.Globalization.CultureInfo.InvariantCulture) +
+            " MiB in " + (settings.RunnerChunkBytes / (1024 * 1024)).ToString(System.Globalization.CultureInfo.InvariantCulture) + " MiB chunks"));
 }
 else Console.WriteLine("RUNNERS: off");
 if (settings.SshPort >= 0)
@@ -8218,12 +8243,12 @@ sealed record PendingSecret(long UserId, string Secret, DateTimeOffset ExpiresAt
 sealed record Arguments(string Database, string Repositories, IPAddress ListenAddress, int ListenPort, string? Origin,
     string? Certificate, string? CertificatePasswordFile, bool PublicBrowsing, bool PushToCreate, int SessionMinutes, bool Mcp,
     string? PagesOrigin, bool RecoverableTokens, bool Webhooks, int SshPort, string? SshHost, MailSettings? Mail,
-    int RunnerPort, string? RunnerHost, string? RunnerDownloads)
+    int RunnerPort, string? RunnerHost, string? RunnerDownloads, long RunnerChunkThreshold, long RunnerChunkBytes)
 {
     public static bool TryParse(string[] values, out Arguments? result)
     {
         result = null;
-        if (values.Length is < 4 or > 42 || values.Length % 2 != 0) return false;
+        if (values.Length is < 4 or > 46 || values.Length % 2 != 0) return false;
         string? database = null;
         string? repositories = null;
         string? listen = null;
@@ -8245,6 +8270,8 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         string? runnerPort = null;
         string? runnerHost = null;
         string? runnerDownloads = null;
+        string? runnerChunkThreshold = null;
+        string? runnerChunkSize = null;
         HashSet<string> seen = new(StringComparer.Ordinal);
         for (int index = 0; index < values.Length; index += 2)
         {
@@ -8270,6 +8297,8 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             else if (values[index] == "--runner-port") runnerPort = values[index + 1];
             else if (values[index] == "--runner-host") runnerHost = values[index + 1];
             else if (values[index] == "--runner-downloads") runnerDownloads = values[index + 1];
+            else if (values[index] == "--runner-chunk-threshold") runnerChunkThreshold = values[index + 1];
+            else if (values[index] == "--runner-chunk-size") runnerChunkSize = values[index + 1];
             else return false;
         }
         if (string.IsNullOrWhiteSpace(database) || string.IsNullOrWhiteSpace(repositories)) return false;
@@ -8358,6 +8387,26 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         if (string.IsNullOrWhiteSpace(runnerDownloads)) runnerDownloads = null;
         if (runnerDownloads is not null && !Directory.Exists(runnerDownloads)) return false;
         if (runnerPort is null && (runnerHost is not null || runnerDownloads is not null)) return false;
+        // Files between forge and runner go whole up to the threshold and in verified, resumable chunks above it
+        // (ADR 0038): 80 MiB unless the operator says otherwise, 0 to chunk everything, off to chunk nothing.
+        if (string.IsNullOrWhiteSpace(runnerChunkThreshold)) runnerChunkThreshold = null;
+        if (string.IsNullOrWhiteSpace(runnerChunkSize)) runnerChunkSize = null;
+        long chunkThreshold = Graft.RunnerProtocol.Transfers.DefaultThresholdBytes;
+        if (runnerChunkThreshold == "off") chunkThreshold = -1;
+        else if (runnerChunkThreshold is not null)
+        {
+            if (!long.TryParse(runnerChunkThreshold, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out long mebibytes) ||
+                mebibytes > 4096) return false;
+            chunkThreshold = mebibytes * 1024 * 1024;
+        }
+        long chunkBytes = Graft.RunnerProtocol.Transfers.DefaultChunkBytes;
+        if (runnerChunkSize is not null)
+        {
+            if (!long.TryParse(runnerChunkSize, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out long mebibytes) ||
+                mebibytes is < 1 or > 64) return false;
+            chunkBytes = mebibytes * 1024 * 1024;
+        }
+        if (runnerPort is null && (runnerChunkThreshold is not null || runnerChunkSize is not null)) return false;
         if (certificatePasswordFile is not null && certificate is null) return false;
         if (!IPAddress.IsLoopback(address) && certificate is null) return false;
         if (!IPAddress.IsLoopback(address) && origin is null) return false;
@@ -8369,7 +8418,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             certificatePasswordFile is null ? null : Path.GetFullPath(certificatePasswordFile),
             publicBrowsing == "true", pushToCreate == "true", window, mcp == "true",
             pagesOrigin, recoverableTokens == "true", webhooks == "true", sshPortNumber, sshHost, mail,
-            runnerPortNumber, runnerHost, runnerDownloads is null ? null : Path.GetFullPath(runnerDownloads));
+            runnerPortNumber, runnerHost, runnerDownloads is null ? null : Path.GetFullPath(runnerDownloads), chunkThreshold, chunkBytes);
         return true;
     }
 }

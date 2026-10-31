@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.IO.Compression;
 using System.Net;
 using System.Net.Http.Json;
 using System.Reflection;
@@ -35,6 +36,8 @@ string? mailSmtpUrl = null;
 // The runner port and downloads directory a restart points the forge at, or null for a forge with no runners.
 string? runnerDownloads = null;
 bool runnersEnabled = false;
+string? runnerChunkThreshold = null;
+string? runnerChunkSize = null;
 Process? server = null;
 Task? outputReader = null;
 Task<string>? errorReader = null;
@@ -343,6 +346,16 @@ ProcessStartInfo ServerStart()
         {
             start.ArgumentList.Add("--runner-downloads");
             start.ArgumentList.Add(runnerDownloads);
+        }
+        if (runnerChunkThreshold is not null)
+        {
+            start.ArgumentList.Add("--runner-chunk-threshold");
+            start.ArgumentList.Add(runnerChunkThreshold);
+        }
+        if (runnerChunkSize is not null)
+        {
+            start.ArgumentList.Add("--runner-chunk-size");
+            start.ArgumentList.Add(runnerChunkSize);
         }
     }
     if (mailSmtpUrl is not null)
@@ -6073,6 +6086,8 @@ async Task<string> CheckRunners(string address, AuthenticatedIdentity alice, str
     address = await StartServer();
     string runnersLine = serverLines.LastOrDefault(line => line.StartsWith("RUNNERS: cupri port ", StringComparison.Ordinal)) ?? "";
     Check(runnersLine.Contains("shrine cupri1", StringComparison.Ordinal), "a forge with a runner port announces its Shrine address");
+    Check(runnersLine.Contains("transfers chunked above 80 MiB in 8 MiB chunks", StringComparison.Ordinal),
+        "and, unless told otherwise, chunks runner transfers above 80 MiB");
     string shrineAddress = runnersLine[(runnersLine.IndexOf("shrine ", StringComparison.Ordinal) + 7)..].Split(';')[0];
 
     using (HttpResponseMessage download = await ApiGet(address, "/-/runner/download/graft-runner-win-x64.exe", null))
@@ -6173,11 +6188,19 @@ async Task<string> CheckRunners(string address, AuthenticatedIdentity alice, str
             - Get-Content README.md
             - echo $env:GREETING
             - echo "job $env:CI_JOB_NAME on $env:CI_COMMIT_REF_NAME"
+            - New-Item -ItemType Directory -Force out | Out-Null
+            - '[System.IO.File]::WriteAllText("$env:CI_PROJECT_DIR/out/result.txt", "artifact-from-build")'
+          artifacts:
+            paths:
+              - out/
+              - nothing-here/*.log
         test:
           stage: test
           script:
             - echo failing on purpose
             - exit 3
+          artifacts:
+            paths: [README.md]
         lint:
           stage: test
           allow_failure: true
@@ -6195,11 +6218,19 @@ async Task<string> CheckRunners(string address, AuthenticatedIdentity alice, str
             - cat README.md
             - echo $GREETING
             - echo "job $CI_JOB_NAME on $CI_COMMIT_REF_NAME"
+            - mkdir -p out
+            - printf '%s' artifact-from-build > out/result.txt
+          artifacts:
+            paths:
+              - out/
+              - nothing-here/*.log
         test:
           stage: test
           script:
             - echo failing on purpose
             - exit 3
+          artifacts:
+            paths: [README.md]
         lint:
           stage: test
           allow_failure: true
@@ -6253,6 +6284,132 @@ async Task<string> CheckRunners(string address, AuthenticatedIdentity alice, str
     }
     using (HttpResponseMessage trace = await ApiGet(address, prefix + "/jobs/" + jobs["test"].GetProperty("id").GetInt64() + "/trace", aliceApi))
         Check((await trace.Content.ReadAsStringAsync()).Contains("exited with 3", StringComparison.Ordinal), "and the failing log says how it failed");
+
+    // Artifacts: what the passing job's paths matched, sent whole because it is small, kept, and served back.
+    long buildJobId = jobs["build"].GetProperty("id").GetInt64();
+    Check(jobs["build"].TryGetProperty("artifacts_file", out JsonElement artifactsFile) && artifactsFile.ValueKind == JsonValueKind.Object &&
+        artifactsFile.GetProperty("filename").GetString() == "artifacts.zip" && artifactsFile.GetProperty("size").GetInt64() > 0,
+        "the passing job lists its artifacts archive, as GitLab's artifacts_file");
+    Check(!jobs["test"].TryGetProperty("artifacts_file", out JsonElement failedArtifacts) || failedArtifacts.ValueKind == JsonValueKind.Null,
+        "and the failing job keeps none, as GitLab's default is");
+    using (HttpResponseMessage trace = await ApiGet(address, prefix + "/jobs/" + buildJobId + "/trace", aliceApi))
+    {
+        string text = await trace.Content.ReadAsStringAsync();
+        Check(text.Contains("nothing-here/*.log: no matching files", StringComparison.Ordinal) && text.Contains("Artifacts uploaded", StringComparison.Ordinal),
+            "the log warns of a pattern that matched nothing and says the artifacts were uploaded");
+    }
+    byte[] smallZip;
+    string? smallTag;
+    using (HttpResponseMessage download = await ApiGet(address, prefix + "/jobs/" + buildJobId + "/artifacts", aliceApi))
+    {
+        smallZip = await download.Content.ReadAsByteArrayAsync();
+        smallTag = download.Headers.ETag?.Tag;
+        Check(download.IsSuccessStatusCode && download.Content.Headers.ContentType?.MediaType == "application/zip" &&
+            smallZip.Length == artifactsFile.GetProperty("size").GetInt64(), "the archive downloads through GitLab's job artifacts route");
+    }
+    using (ZipArchive zip = new(new MemoryStream(smallZip), ZipArchiveMode.Read))
+    {
+        ZipArchiveEntry? entry = zip.GetEntry("out/result.txt");
+        using StreamReader reader = entry is null ? new(new MemoryStream()) : new(entry.Open());
+        Check(entry is not null && reader.ReadToEnd() == "artifact-from-build" && zip.Entries.Count == 1,
+            "holding exactly the file the job wrote under the directory it named");
+    }
+    Check(smallTag == "\"" + Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(smallZip)) + "\"",
+        "its entity tag is the SHA-256 the runner declared and the forge checked");
+    using (HttpResponseMessage anonymous = await ApiGet(address, prefix + "/jobs/" + buildJobId + "/artifacts", null))
+        Check(anonymous.StatusCode == HttpStatusCode.NotFound, "a private project's artifacts are not served to a stranger");
+    using (HttpResponseMessage none = await ApiGet(address, prefix + "/jobs/" + jobs["test"].GetProperty("id").GetInt64() + "/artifacts", aliceApi))
+        Check(none.StatusCode == HttpStatusCode.NotFound, "and a job without artifacts has none to download");
+
+    // Chunked, both ways: with a 1 MiB threshold and 1 MiB chunks, a source of a few MiB of incompressible content
+    // and artifacts of the same size both travel in verified chunks; the runner is made to drop its connection
+    // every few steps, and both transfers resume and arrive intact.
+    await StopServer();
+    runnerChunkThreshold = "1";
+    runnerChunkSize = "1";
+    address = await StartServer();
+    Check(serverLines.LastOrDefault(line => line.StartsWith("RUNNERS: cupri port ", StringComparison.Ordinal))?.Contains("transfers chunked above 1 MiB in 1 MiB chunks", StringComparison.Ordinal) == true,
+        "the operator sets the chunking threshold and chunk size");
+    // The suite gives the runner port as 0, so a restart binds another; point the registered runner at it, as an
+    // operator who moved the port would.
+    string restartedLine = serverLines.Last(line => line.StartsWith("RUNNERS: cupri port ", StringComparison.Ordinal));
+    string newPort = restartedLine["RUNNERS: cupri port ".Length..].Split(' ')[0];
+    File.WriteAllText(config, Regex.Replace(File.ReadAllText(config), "\"port\": *\\d+", "\"port\": " + newPort));
+    byte[] blob = new byte[3_500_000];
+    new Random(37).NextBytes(blob);
+    Directory.CreateDirectory(Path.Combine(work, "data", "deep"));
+    File.WriteAllBytes(Path.Combine(work, "data", "deep", "blob.bin"), blob);
+    File.WriteAllText(Path.Combine(work, ".gitlab-ci.yml"), """
+        carry:
+          script: echo carrying
+          artifacts:
+            paths: ["data/**/*.bin"]
+        """);
+    await Git(work, ["add", "."]);
+    await Git(work, ["commit", "-m", "Something large"]);
+    await Git(work, ["push", AuthenticatedUrl(address, "alice", aliceApi, "alice/citest.git"), "main"]);
+    (int chunkedExit, string chunkedOut, string chunkedErrors) = await RunTool(runnerExe, scripts, ["run", "--config", config, "--once"],
+        new Dictionary<string, string> { ["GRAFT_RUNNER_FAULT_DROP_EVERY"] = "3" });
+    Check(chunkedExit == 0, "the runner fetches a chunked source and sends chunked artifacts through dropped connections (" + chunkedOut.Trim() + chunkedErrors.Trim() + ")");
+    long carryJobId;
+    using (HttpResponseMessage listed = await ApiGet(address, prefix + "/pipelines", aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await listed.Content.ReadAsStringAsync());
+        long newest = json.RootElement[0].GetProperty("id").GetInt64();
+        using HttpResponseMessage jobList = await ApiGet(address, prefix + "/pipelines/" + newest + "/jobs", aliceApi);
+        using JsonDocument jobJson = JsonDocument.Parse(await jobList.Content.ReadAsStringAsync());
+        JsonElement carry = jobJson.RootElement[0];
+        carryJobId = carry.GetProperty("id").GetInt64();
+        Check(carry.GetProperty("status").GetString() == "success" && carry.GetProperty("artifacts_file").GetProperty("size").GetInt64() > 3 * 1024 * 1024,
+            "the job succeeded and kept artifacts of more than three chunks");
+    }
+    using (HttpResponseMessage trace = await ApiGet(address, prefix + "/jobs/" + carryJobId + "/trace", aliceApi))
+    {
+        string text = await trace.Content.ReadAsStringAsync();
+        Check(text.Contains("chunked", StringComparison.Ordinal) && text.Contains("Fetched the source in 4 chunks", StringComparison.Ordinal),
+            "the source came in chunks");
+        Check(text.Contains("Sending artifacts in 4 chunks of 1 MiB", StringComparison.Ordinal), "and the artifacts went in chunks");
+        Check(text.Contains("Fetching chunk 3 of 4 failed (the connection was dropped on purpose", StringComparison.Ordinal),
+            "the source download resumed at the chunk it was missing after the connection dropped");
+        Check(text.Contains("Resuming the artifacts at byte 2097152", StringComparison.Ordinal),
+            "and the upload resumed from the chunks the forge had committed");
+    }
+    byte[] bigZip;
+    using (HttpResponseMessage download = await ApiGet(address, prefix + "/jobs/" + carryJobId + "/artifacts", aliceApi))
+    {
+        bigZip = await download.Content.ReadAsByteArrayAsync();
+        Check(download.IsSuccessStatusCode && download.Headers.ETag?.Tag == "\"" + Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(bigZip)) + "\"",
+            "the chunked archive is whole and matches its SHA-256");
+    }
+    using (ZipArchive zip = new(new MemoryStream(bigZip), ZipArchiveMode.Read))
+    {
+        ZipArchiveEntry? entry = zip.GetEntry("data/deep/blob.bin");
+        using MemoryStream copy = new();
+        if (entry is not null) using (Stream stream = entry.Open()) stream.CopyTo(copy);
+        Check(entry is not null && copy.ToArray().AsSpan().SequenceEqual(blob), "and holds, byte for byte, the file the ** pattern matched");
+    }
+    using (HttpClient rangeClient = new(new HttpClientHandler { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false }) { BaseAddress = new(address) })
+    using (HttpRequestMessage ranged = new(HttpMethod.Get, prefix + "/jobs/" + carryJobId + "/artifacts"))
+    {
+        ranged.Headers.Add("PRIVATE-TOKEN", aliceApi);
+        ranged.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(1_000_000, 1_000_099);
+        using HttpResponseMessage partial = await rangeClient.SendAsync(ranged);
+        byte[] part = await partial.Content.ReadAsByteArrayAsync();
+        Check(partial.StatusCode == HttpStatusCode.PartialContent && part.AsSpan().SequenceEqual(bigZip.AsSpan(1_000_000, 100)),
+            "and a range of it can be fetched, so a large download can resume");
+    }
+
+    // Chunking off: everything goes whole, and the forge says so.
+    await StopServer();
+    runnerChunkThreshold = "off";
+    runnerChunkSize = null;
+    address = await StartServer();
+    Check(serverLines.LastOrDefault(line => line.StartsWith("RUNNERS: cupri port ", StringComparison.Ordinal))?.Contains("transfers whole only", StringComparison.Ordinal) == true,
+        "chunking can be turned off");
+    restartedLine = serverLines.Last(line => line.StartsWith("RUNNERS: cupri port ", StringComparison.Ordinal));
+    newPort = restartedLine["RUNNERS: cupri port ".Length..].Split(' ')[0];
+    File.WriteAllText(config, Regex.Replace(File.ReadAllText(config), "\"port\": *\\d+", "\"port\": " + newPort));
+    runnerChunkThreshold = null;
 
     // A file Graft does not run is a failed pipeline that says why, not silence.
     File.WriteAllText(Path.Combine(work, ".gitlab-ci.yml"), "build:\n  image: alpine\n  script: echo hi\n");
@@ -7264,7 +7421,7 @@ async Task CheckSsh(string address, AuthenticatedIdentity alice, string bobUsern
     Check(true, "while the account's other keys still do");
 }
 
-async Task<(int ExitCode, string Output, string Errors)> RunTool(string file, string directory, string[] arguments)
+async Task<(int ExitCode, string Output, string Errors)> RunTool(string file, string directory, string[] arguments, IReadOnlyDictionary<string, string>? environment = null)
 {
     ProcessStartInfo start = new(file)
     {
@@ -7275,6 +7432,7 @@ async Task<(int ExitCode, string Output, string Errors)> RunTool(string file, st
         RedirectStandardError = true
     };
     foreach (string argument in arguments) start.ArgumentList.Add(argument);
+    if (environment is not null) foreach ((string key, string value) in environment) start.Environment[key] = value;
     using Process process = Process.Start(start)!;
     Task<string> output = process.StandardOutput.ReadToEndAsync();
     Task<string> errors = process.StandardError.ReadToEndAsync();

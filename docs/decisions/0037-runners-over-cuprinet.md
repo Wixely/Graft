@@ -69,7 +69,7 @@ slice does not turn on.
 Graft reads `.gitlab-ci.yml` with a reader of its own, because it takes no YAML dependency and the common .NET
 ones reflect at run time, which NativeAOT refuses. Supported: `stages`, top-level `variables`, and jobs with
 `stage`, `script`, `before_script`, `variables` and `allow_failure`; hidden jobs are not run, as on GitLab.
-Anything else, `image`, `rules`, `include`, `artifacts` and the rest, fails the pipeline with the key named,
+Anything else, `image`, `rules`, `include` and the rest, fails the pipeline with the key named,
 rather than running the file as though it had asked for less. Anchors, aliases, merge keys and flow mappings are
 refused by name too.
 
@@ -94,7 +94,7 @@ the release tags `v0.6.2` and `v0.2.0` exactly as each project's release workflo
 
 ## What is not done
 
-Containers and images; services; caches and artifacts; `rules`, `only`, `except`, `needs`, `when`, `parallel`,
+Containers and images; services; caches; artifacts beyond `paths` ([ADR 0038](0038-chunked-runner-transfers-and-artifacts.md)); `rules`, `only`, `except`, `needs`, `when`, `parallel`,
 `extends`, `include`, `after_script`, `timeout`; manual jobs; cancelling or retrying a job; job timeouts other
 than the hour; group and project runners and runner tags; GitLab's runner API; a runner that drops mid-job is
 not detected until it returns, so its job stays running; pipelines from commits made in the browser or by a

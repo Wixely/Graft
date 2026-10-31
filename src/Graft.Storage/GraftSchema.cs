@@ -4,7 +4,7 @@ namespace Graft.Storage;
 
 public static class GraftSchema
 {
-    public static DnaXMigrationManifest Manifest { get; } = new(23,
+    public static DnaXMigrationManifest Manifest { get; } = new(24,
     [
         DnaXMigration.Sql(1, "initial-identity-project-schema", "Create identity and private project schema", """
             CREATE TABLE Users (
@@ -799,6 +799,13 @@ public static class GraftSchema
             CREATE INDEX IX_Pipelines_Project ON Pipelines(ProjectId, Id);
             CREATE INDEX IX_Jobs_Pending ON Jobs(Status, Id);
             CREATE INDEX IX_Jobs_Pipeline ON Jobs(PipelineId, StageIndex);
+            """),
+        // Artifacts. A job lists what it keeps; the archive it uploads is stored beside the repository, and the
+        // row records its size and hash so a download can be checked against what the runner sent.
+        DnaXMigration.Sql(24, "job-artifacts", "What a job keeps, and the archive it kept", """
+            ALTER TABLE Jobs ADD COLUMN ArtifactPaths TEXT NOT NULL DEFAULT '[]';
+            ALTER TABLE Jobs ADD COLUMN ArtifactsBytes INTEGER NULL;
+            ALTER TABLE Jobs ADD COLUMN ArtifactsSha256 TEXT NULL;
             """)
     ]);
 }
