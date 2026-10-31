@@ -2,6 +2,24 @@
 
 Updated: 2026-10-31. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the project owner.
 
+## Added on 2026-10-31, third entry: deletion by push, and refusals with reasons
+
+An agent cleaning up merged branches on the live deployment was refused "without explaining why". Cause: the
+engine refused any deleting command and did not advertise `delete-refs`, so Git refused on the client; and any
+other refused push was a bare HTTP 400. Deletion by push is now allowed, configurably.
+[ADR 0039](decisions/0039-deletion-by-push.md).
+
+- **Switch.** `--push-delete true|false`, `GRAFT_PUSH_DELETE`, on by default; printed as `PUSH DELETE:` at
+  startup. Applied per repository as `Repository.AcceptsDeletion` in `EndpointFor`, so HTTPS and SSH both follow it.
+- **Engine.** `Repository.Receive` judges each command in `Judge` and reports `ng <ref> <reason>`; only a malformed
+  request or pack refuses the whole push. Without `report-status` it stays all or nothing. Never the default branch.
+- **SSH.** The moved-branch list now includes deleted branches, as HTTPS's `Moved` did, for webhooks.
+
+Verified: Git suite 1188 to **1196** managed, engine self-checks 44, MCP suite 104. Not done: a NativeAOT
+publish of this change, and the live deployment, which needs the new build.
+
+Next action, owner operator: redeploy the forge, then retry the two remote deletions, or delete them in the browser now.
+
 ## Added on 2026-10-30: the three small things, before the large list
 
 After a review of what was left, the order set was: fix the three small things first, then build SSH, email

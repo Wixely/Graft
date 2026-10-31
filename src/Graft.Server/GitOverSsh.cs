@@ -136,8 +136,8 @@ internal sealed partial class GitSshHost(
         // A client with nothing to push sends a flush and goes away.
         if (commands is null || commands.Length <= 4) return 0;
 
-        // A pack follows unless every command is a deletion, which the engine refuses by name but which must
-        // reach it rather than leave this waiting for a pack that is not coming.
+        // A pack follows unless every command is a deletion, which must reach the engine rather than leave
+        // this waiting for a pack that is not coming.
         bool expectPack = false;
         foreach (string line in PacketLines(commands))
         {
@@ -154,11 +154,13 @@ internal sealed partial class GitSshHost(
         Dictionary<string, string> before = new(repository.Refs, StringComparer.Ordinal);
         byte[] report = repository.Receive(request, cancellationToken);
         await command.Output.WriteAsync(report, cancellationToken);
+        // Created, moved and deleted branches alike; a deleted one reports no new commit, as over HTTP.
         List<(string Branch, string? From, string? To)> moved = [];
-        foreach ((string name, string id) in repository.Refs)
+        foreach (string name in before.Keys.Union(repository.Refs.Keys, StringComparer.Ordinal))
         {
             if (!name.StartsWith("refs/heads/", StringComparison.Ordinal)) continue;
             string? old = before.GetValueOrDefault(name);
+            string? id = repository.Refs.GetValueOrDefault(name);
             if (old != id) moved.Add((name["refs/heads/".Length..], old, id));
         }
         if (moved.Count > 0)

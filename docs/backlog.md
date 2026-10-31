@@ -122,6 +122,13 @@ Then the first of the four large items, in the order given:
   exist, on the settings tab and at GitLab's `audit_events` route. The whole trail stays the administrator's.
   [ADR 0036](decisions/0036-project-audit.md).
 
+## Closed on 2026-10-31
+
+- **Deleting a branch by push, and refusals that say why.** An agent cleaning up merged branches on the live
+  deployment was refused with no reason. `git push --delete` now works unless the operator turns it off with
+  `--push-delete false`, with the forge's rules, and every refused reference in a push is reported by Git with
+  its reason instead of a bare HTTP 400. [ADR 0039](decisions/0039-deletion-by-push.md).
+
 ## Near, and small
 
 Taken top down. Added on 2026-10-31: making "the runner works on Windows, Linux and in Docker" true. Today only

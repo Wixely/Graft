@@ -33,7 +33,7 @@ if (args.Length == 1 && args[0] == "--licences")
 
 if (!Arguments.TryParse(args, out Arguments? parsedSettings))
 {
-    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>] [--mcp true|false] [--pages-origin <https origin>] [--recoverable-tokens true|false] [--webhooks true|false] [--ssh-port <0-65535>] [--ssh-host <name>] [--mail-smtp <smtp|smtp+starttls|smtps URL>] [--mail-from <address>] [--mail-password-file <UTF-8 path>] [--runner-port <0-65535>] [--runner-host <name>] [--runner-downloads <directory>] [--runner-chunk-threshold <MiB|off>] [--runner-chunk-size <1-64 MiB>].");
+    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>] [--mcp true|false] [--pages-origin <https origin>] [--recoverable-tokens true|false] [--webhooks true|false] [--ssh-port <0-65535>] [--ssh-host <name>] [--mail-smtp <smtp|smtp+starttls|smtps URL>] [--mail-from <address>] [--mail-password-file <UTF-8 path>] [--runner-port <0-65535>] [--runner-host <name>] [--runner-downloads <directory>] [--runner-chunk-threshold <MiB|off>] [--runner-chunk-size <1-64 MiB>] [--push-delete true|false].");
     Console.Error.WriteLine("       Graft.Server --licences  prints the third-party notices this build redistributes.");
     return 2;
 }
@@ -7337,6 +7337,9 @@ else Console.WriteLine("MCP: off");
 Console.WriteLine("TOKENS: " + (settings.RecoverableTokens
     ? "secrets kept and readable by their owner with a password"
     : "secrets unrecoverable once issued"));
+Console.WriteLine("PUSH DELETE: " + (settings.PushDelete
+    ? "on; a push may delete a branch or tag, except the default branch"
+    : "off; branches and tags are deleted on the forge"));
 Console.WriteLine(settings.PagesOrigin is null ? "PAGES: off" : "PAGES: " + settings.PagesOrigin + "/<project-slug>/");
 Console.WriteLine("WEBHOOKS: " + (settings.Webhooks
     ? "on; a project Maintainer can make this server call an address of their choosing"
@@ -7799,6 +7802,7 @@ RepositoryEndpoint EndpointFor(ProjectInfo project)
     // stored preference is reapplied on every use rather than only when the repository is first opened.
     // Doing it here covers the Git transport as well, which needs it to advertise the right HEAD symref.
     endpoint.Repository.PreferredDefaultBranch = project.DefaultBranch;
+    endpoint.Repository.AcceptsDeletion = settings.PushDelete;
     return endpoint;
 }
 
@@ -8243,12 +8247,12 @@ sealed record PendingSecret(long UserId, string Secret, DateTimeOffset ExpiresAt
 sealed record Arguments(string Database, string Repositories, IPAddress ListenAddress, int ListenPort, string? Origin,
     string? Certificate, string? CertificatePasswordFile, bool PublicBrowsing, bool PushToCreate, int SessionMinutes, bool Mcp,
     string? PagesOrigin, bool RecoverableTokens, bool Webhooks, int SshPort, string? SshHost, MailSettings? Mail,
-    int RunnerPort, string? RunnerHost, string? RunnerDownloads, long RunnerChunkThreshold, long RunnerChunkBytes)
+    int RunnerPort, string? RunnerHost, string? RunnerDownloads, long RunnerChunkThreshold, long RunnerChunkBytes, bool PushDelete)
 {
     public static bool TryParse(string[] values, out Arguments? result)
     {
         result = null;
-        if (values.Length is < 4 or > 46 || values.Length % 2 != 0) return false;
+        if (values.Length is < 4 or > 48 || values.Length % 2 != 0) return false;
         string? database = null;
         string? repositories = null;
         string? listen = null;
@@ -8272,6 +8276,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         string? runnerDownloads = null;
         string? runnerChunkThreshold = null;
         string? runnerChunkSize = null;
+        string? pushDelete = null;
         HashSet<string> seen = new(StringComparer.Ordinal);
         for (int index = 0; index < values.Length; index += 2)
         {
@@ -8299,6 +8304,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             else if (values[index] == "--runner-downloads") runnerDownloads = values[index + 1];
             else if (values[index] == "--runner-chunk-threshold") runnerChunkThreshold = values[index + 1];
             else if (values[index] == "--runner-chunk-size") runnerChunkSize = values[index + 1];
+            else if (values[index] == "--push-delete") pushDelete = values[index + 1];
             else return false;
         }
         if (string.IsNullOrWhiteSpace(database) || string.IsNullOrWhiteSpace(repositories)) return false;
@@ -8407,6 +8413,10 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             chunkBytes = mebibytes * 1024 * 1024;
         }
         if (runnerPort is null && (runnerChunkThreshold is not null || runnerChunkSize is not null)) return false;
+        // Whether a push may delete a branch or tag (ADR 0039). On by default, because the same person can already delete
+        // it through the forge; off makes the forge the only way. Empty means unset, as above.
+        if (string.IsNullOrWhiteSpace(pushDelete)) pushDelete = null;
+        if (pushDelete is not null and not "true" and not "false") return false;
         if (certificatePasswordFile is not null && certificate is null) return false;
         if (!IPAddress.IsLoopback(address) && certificate is null) return false;
         if (!IPAddress.IsLoopback(address) && origin is null) return false;
@@ -8418,7 +8428,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             certificatePasswordFile is null ? null : Path.GetFullPath(certificatePasswordFile),
             publicBrowsing == "true", pushToCreate == "true", window, mcp == "true",
             pagesOrigin, recoverableTokens == "true", webhooks == "true", sshPortNumber, sshHost, mail,
-            runnerPortNumber, runnerHost, runnerDownloads is null ? null : Path.GetFullPath(runnerDownloads), chunkThreshold, chunkBytes);
+            runnerPortNumber, runnerHost, runnerDownloads is null ? null : Path.GetFullPath(runnerDownloads), chunkThreshold, chunkBytes, pushDelete != "false");
         return true;
     }
 }

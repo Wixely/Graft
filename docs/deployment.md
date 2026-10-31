@@ -103,6 +103,14 @@ Compose mounts the certificate and password as read-only secrets. **Those files 
 
 The port is bound to host loopback. The image uses the .NET 10 Ubuntu runtime-deps base and is separate from the static-musl legacy-host artifact. Pinning the base by digest remains release work.
 
+### Deleting branches by push
+
+A push may delete a branch or tag, so `git push --delete <branch>` works, with the rules of deleting on the forge:
+the permission to push, and never the default branch. It is on unless the operator says `--push-delete false`
+(`GRAFT_PUSH_DELETE=false`), after which branches and tags are deleted only through the browser or the API. The
+forge prints which on startup as `PUSH DELETE: on` or `off`. A refused reference, for this or any other reason, is
+reported by Git beside the reference with the reason. See [ADR 0039](decisions/0039-deletion-by-push.md).
+
 ### Optional MCP endpoint
 
 The forge hosts its own Model Context Protocol endpoint, at `/mcp` on the same port and certificate as everything else. It is off unless the operator asks for it: `--mcp true` on the command line, or in the container deployment

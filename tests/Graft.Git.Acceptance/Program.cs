@@ -38,6 +38,8 @@ string? runnerDownloads = null;
 bool runnersEnabled = false;
 string? runnerChunkThreshold = null;
 string? runnerChunkSize = null;
+// Whether a push may delete a reference. Left unsaid unless false, so the default is what the suite exercises.
+bool pushDelete = true;
 Process? server = null;
 Task? outputReader = null;
 Task<string>? errorReader = null;
@@ -235,6 +237,7 @@ try
     await CheckLargeFiles(address, aliceIdentity);
     await CheckPackages(address, aliceIdentity, "carol");
     await CheckCompressedGitRequests(address, aliceIdentity);
+    address = await CheckPushDeletion(address, aliceIdentity);
     await CheckGitEngine(address, aliceIdentity);
     await CheckFetching(address, aliceIdentity, "carol");
     await CheckSsh(address, aliceIdentity, bob.Username);
@@ -357,6 +360,11 @@ ProcessStartInfo ServerStart()
             start.ArgumentList.Add("--runner-chunk-size");
             start.ArgumentList.Add(runnerChunkSize);
         }
+    }
+    if (!pushDelete)
+    {
+        start.ArgumentList.Add("--push-delete");
+        start.ArgumentList.Add("false");
     }
     if (mailSmtpUrl is not null)
     {
@@ -7390,6 +7398,11 @@ async Task CheckSsh(string address, AuthenticatedIdentity alice, string bobUsern
     string lsRemote = await Git(root, ["-c", "core.sshCommand=" + Ssh(ed25519), "ls-remote", remote]);
     Check(lsRemote.Contains("refs/heads/main", StringComparison.Ordinal) && lsRemote.Contains("refs/tags/v1-ssh", StringComparison.Ordinal),
         "ls-remote over SSH lists the branch and the tag");
+    await Git(work, ["branch", "ssh-done"]);
+    await Git(work, ["-c", "core.sshCommand=" + Ssh(ed25519), "push", remote, "ssh-done"]);
+    await Git(work, ["-c", "core.sshCommand=" + Ssh(ed25519), "push", remote, "--delete", "ssh-done"]);
+    Check(!(await Git(root, ["-c", "core.sshCommand=" + Ssh(ed25519), "ls-remote", remote])).Contains("refs/heads/ssh-done", StringComparison.Ordinal),
+        "a push over SSH that only deletes a branch, and so carries no pack, deletes it");
 
     // Use is recorded only once a signature has verified.
     using (HttpResponseMessage key = await ApiGet(address, "/api/v4/user/keys/" + ed25519Id, aliceReadApi))
@@ -7496,6 +7509,81 @@ async Task CheckEmptyRepository(string address, AuthenticatedIdentity alice, str
 /// negotiation. That is what happens once two histories have diverged, which is why a clone of a new
 /// repository worked and a pull against a busy one did not.
 /// </summary>
+/// <summary>
+/// Deleting a branch or tag by push (ADR 0039): on by default, with the forge's rules, a reason Git prints for
+/// every refused reference, and off when the operator says so.
+/// </summary>
+async Task<string> CheckPushDeletion(string address, AuthenticatedIdentity alice)
+{
+    string pushToken;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        await store.CreateProjectWithRepositoryAsync(alice, "pruning", "Pruning branches",
+            (project, cancellation) => { cancellation.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, project.StorageId)); return Task.CompletedTask; });
+        pushToken = (await store.CreateTokenAsync(alice, "pruning-git",
+            TokenScope.ReadRepository | TokenScope.WriteRepository, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+    }
+    string work = Path.Combine(root, "pruning");
+    Directory.CreateDirectory(work);
+    await Git(work, ["init", "--initial-branch=main"]);
+    File.WriteAllText(Path.Combine(work, "one.txt"), "one\n");
+    await Git(work, ["add", "."]);
+    await Git(work, ["commit", "-m", "One"]);
+    await Git(work, ["branch", "merged"]);
+    await Git(work, ["branch", "feature/done"]);
+    await Git(work, ["branch", "kept"]);
+    await Git(work, ["tag", "v0-mistake"]);
+    await Git(work, ["remote", "add", "origin", AuthenticatedUrl(address, "alice", pushToken, "alice/pruning.git")]);
+    await Git(work, ["push", "origin", "main", "merged", "feature/done", "kept", "v0-mistake"]);
+
+    string Advertised(string listing, string name) =>
+        listing.Split('\n').FirstOrDefault(line => line.EndsWith("\t" + name, StringComparison.Ordinal)) ?? "";
+
+    await Git(work, ["push", "origin", "--delete", "merged", "feature/done", "v0-mistake"]);
+    string listed = await Git(work, ["ls-remote", "origin"]);
+    Check(Advertised(listed, "refs/heads/merged").Length == 0 && Advertised(listed, "refs/heads/feature/done").Length == 0 &&
+        Advertised(listed, "refs/tags/v0-mistake").Length == 0 && Advertised(listed, "refs/heads/kept").Length > 0,
+        "a push deletes two branches, one with a slash in its name, and a tag, and leaves the rest");
+
+    (int defaultExit, _, string defaultErrors) = await RunGit(work, ["push", "origin", "--delete", "main"]);
+    Check(defaultExit != 0 && defaultErrors.Contains("this is the default branch", StringComparison.Ordinal) &&
+        Advertised(await Git(work, ["ls-remote", "origin"]), "refs/heads/main").Length > 0,
+        "deleting the default branch by push is refused, and Git prints why");
+
+    // One push, one command refused and one applied: the refused one says why and does not take the other with it.
+    await Git(work, ["branch", "fresh"]);
+    (int mixedExit, _, string mixedErrors) = await RunGit(work, ["push", "origin", "fresh", ":main"]);
+    Check(mixedExit != 0 && mixedErrors.Contains("this is the default branch", StringComparison.Ordinal) &&
+        Advertised(await Git(work, ["ls-remote", "origin"]), "refs/heads/fresh").Length > 0,
+        "a refused command in a push is reported by name while the others are applied");
+
+    // Every refusal is reported beside its reference now, not only deletions: a forced rewrite used to be a bare HTTP 400.
+    File.WriteAllText(Path.Combine(work, "two.txt"), "two\n");
+    await Git(work, ["add", "."]);
+    await Git(work, ["commit", "-m", "Two"]);
+    await Git(work, ["push", "origin", "main"]);
+    await Git(work, ["reset", "--hard", "HEAD~1"]);
+    (int forcedExit, _, string forcedErrors) = await RunGit(work, ["push", "--force", "origin", "main"]);
+    Check(forcedExit != 0 && forcedErrors.Contains("push a fast-forward", StringComparison.Ordinal),
+        "a forced rewrite is refused with a reason Git prints (" + Redact(forcedErrors.Trim()) + ")");
+    await Git(work, ["pull", "-q", "origin", "main"]);
+
+    // Off: the forge does not offer deletion, so Git will not ask, and the branch stays.
+    await StopServer();
+    pushDelete = false;
+    address = await StartServer();
+    Check(serverLines.Any(line => line.StartsWith("PUSH DELETE: off", StringComparison.Ordinal)), "the forge says when deletion by push is off");
+    await Git(work, ["remote", "set-url", "origin", AuthenticatedUrl(address, "alice", pushToken, "alice/pruning.git")]);
+    (int offExit, _, _) = await RunGit(work, ["push", "origin", "--delete", "kept"]);
+    Check(offExit != 0 && Advertised(await Git(work, ["ls-remote", "origin"]), "refs/heads/kept").Length > 0,
+        "with --push-delete false a push cannot delete a branch");
+    await StopServer();
+    pushDelete = true;
+    address = await StartServer();
+    Check(serverLines.Any(line => line.StartsWith("PUSH DELETE: on", StringComparison.Ordinal)), "and it is on again by default");
+    return address;
+}
+
 async Task CheckCompressedGitRequests(string address, AuthenticatedIdentity alice)
 {
     long projectId;

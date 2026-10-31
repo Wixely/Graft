@@ -20,6 +20,11 @@ public static class SelfChecks
             catch (GitInputException) { return; }
             throw new InvalidOperationException("Accepted invalid input: " + name);
         });
+        // A command refused on its own merits is reported by name in the status report rather than thrown, as Git does.
+        void Refused(string name, string reference, Func<byte[]> action) => Check(name, () =>
+        {
+            if (!Encoding.ASCII.GetString(action()).Contains("ng " + reference + " ")) throw new InvalidOperationException("Accepted invalid input: " + name);
+        });
         try
         {
             var empty = new Dictionary<string, GitObject>();
@@ -122,17 +127,31 @@ public static class SelfChecks
                 repository.Receive(Push([(Limits.Zero, commit.Id, "refs/heads/main")], firstPack));
                 Require(repository.Refs["refs/heads/main"] == commit.Id);
             });
-            Reject("stale ref", () => repository.Receive(Push([(Limits.Zero, commit.Id, "refs/heads/main")], Pack.Write([]))));
+            Refused("stale ref", "refs/heads/main", () => repository.Receive(Push([(Limits.Zero, commit.Id, "refs/heads/main")], Pack.Write([]))));
             Reject("duplicate ref", () => repository.Receive(Push([(commit.Id, commit.Id, "refs/heads/main"), (commit.Id, commit.Id, "refs/heads/main")], Pack.Write([]))));
-            Reject("branch points at blob", () => repository.Receive(Push([(Limits.Zero, blob.Id, "refs/heads/blob")], packed)));
+            Refused("branch points at blob", "refs/heads/blob", () => repository.Receive(Push([(Limits.Zero, blob.Id, "refs/heads/blob")], packed)));
             Reject("traversal ref", () => repository.Receive(Push([(Limits.Zero, commit.Id, "refs/heads/../escape")], Pack.Write([]))));
-            Reject("ref prefix collision", () => repository.Receive(Push([(Limits.Zero, commit.Id, "refs/heads/main/topic")], Pack.Write([]))));
+            Refused("ref prefix collision", "refs/heads/main/topic", () => repository.Receive(Push([(Limits.Zero, commit.Id, "refs/heads/main/topic")], Pack.Write([]))));
             var missing = Commit(Limits.Zero, commit.Id, "missing tree");
             Reject("missing reachable tree", () => repository.Receive(Push([(commit.Id, missing.Id, "refs/heads/main")], Pack.Write([missing]))));
             var unrelated = Commit(tree.Id, null, "unrelated");
-            Reject("non fast forward", () => repository.Receive(Push([(commit.Id, unrelated.Id, "refs/heads/main")], Pack.Write([unrelated]))));
-            Reject("batch all or nothing", () => repository.Receive(Push([(Limits.Zero, commit.Id, "refs/heads/good"), (Limits.Zero, blob.Id, "refs/heads/bad")], packed)));
+            Refused("non fast forward", "refs/heads/main", () => repository.Receive(Push([(commit.Id, unrelated.Id, "refs/heads/main")], Pack.Write([unrelated]))));
+            Refused("deletion off unless the host allows it", "refs/heads/main", () => repository.Receive(Push([(commit.Id, Limits.Zero, "refs/heads/main")], [])));
             Check("rejected pushes leave objects and refs untouched", () => Require(repository.Refs.Count == 1 && repository.Objects.Count == 2 && repository.Refs["refs/heads/main"] == commit.Id));
+            Check("a refused command does not hold back the others, as in Git without atomic", () =>
+            {
+                var batch = new Repository();
+                batch.Receive(Push([(Limits.Zero, commit.Id, "refs/heads/main")], firstPack));
+                var report = Encoding.ASCII.GetString(batch.Receive(Push([(Limits.Zero, commit.Id, "refs/heads/good"), (Limits.Zero, blob.Id, "refs/heads/bad")], packed)));
+                Require(report.Contains("ok refs/heads/good\n") && report.Contains("ng refs/heads/bad ") && batch.Refs.ContainsKey("refs/heads/good") && !batch.Refs.ContainsKey("refs/heads/bad"));
+            });
+            Check("deletion by push when allowed, never the default branch", () =>
+            {
+                var pruned = new Repository { AcceptsDeletion = true };
+                pruned.Receive(Push([(Limits.Zero, commit.Id, "refs/heads/main"), (Limits.Zero, commit.Id, "refs/heads/done")], firstPack));
+                var report = Encoding.ASCII.GetString(pruned.Receive(Push([(commit.Id, Limits.Zero, "refs/heads/done"), (commit.Id, Limits.Zero, "refs/heads/main")], [])));
+                Require(report.Contains("ok refs/heads/done\n") && report.Contains("ng refs/heads/main ") && !pruned.Refs.ContainsKey("refs/heads/done") && pruned.Refs.ContainsKey("refs/heads/main"));
+            });
             Reject("unadvertised upload want", () =>
             {
                 using var request = new MemoryStream(); Packet.Write(request, "want " + tree.Id + "\n"); Packet.Flush(request); Packet.Write(request, "done\n"); repository.Upload(request.ToArray());

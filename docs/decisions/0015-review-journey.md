@@ -4,6 +4,7 @@
 - Status: Accepted, implemented
 - Source: A walk through the merge request journey that found what each step was missing, each gap taken on to close
 - Review trigger: Any proposal to move a line comment when its code moves, to let a stale approval count, to let an author approve their own proposal, or to delete a branch that a project opens at
+- Superseded in part: deletion by push, [ADR 0039](0039-deletion-by-push.md) (2026-10-31). Branches may now be deleted by a push as well as on the forge, with the same rules; the agent rule below is unchanged.
 
 ## What the journey was missing
 

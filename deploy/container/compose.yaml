@@ -51,6 +51,9 @@ services:
       - ${GRAFT_PUBLIC_BROWSING:-false}
       - --push-to-create
       - ${GRAFT_PUSH_TO_CREATE:-false}
+      # Whether a push may delete a branch or tag, with the forge's rules. Empty means on. See docs/decisions/0039-deletion-by-push.md.
+      - --push-delete
+      - ${GRAFT_PUSH_DELETE:-}
       - --session-minutes
       - ${GRAFT_SESSION_MINUTES:-720}
       # The Model Context Protocol endpoint, served by the forge itself at /mcp on the same port and

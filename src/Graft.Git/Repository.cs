@@ -177,7 +177,7 @@ public sealed class Repository
         // repository's actual default rather than assuming one name.
         var head = DefaultBranch;
         var capabilities = receive
-            ? "report-status ofs-delta " + Agent
+            ? "report-status " + (AcceptsDeletion ? "delete-refs " : "") + "ofs-delta " + Agent
             : "multi_ack_detailed ofs-delta include-tag " + Agent + (head is null ? "" : " symref=HEAD:refs/heads/" + head);
         using var output = new MemoryStream();
         if (serviceHeader)
@@ -247,14 +247,14 @@ public sealed class Repository
             if (sections.Length == 2)
                 foreach (var cap in sections[1].Split(' ', StringSplitOptions.RemoveEmptyEntries))
                 {
-                    Limits.Require(cap is "report-status" or "ofs-delta" || cap.StartsWith("agent=", StringComparison.Ordinal), "unsupported-capability");
+                    Limits.Require(cap is "report-status" or "ofs-delta" || (cap == "delete-refs" && AcceptsDeletion) ||
+                        cap.StartsWith("agent=", StringComparison.Ordinal), "unsupported-capability");
                     requested.Add(cap);
                 }
             var parts = sections[0].Split(' ');
-            Limits.Require(parts.Length == 3 && Limits.IsId(parts[0]) && Limits.IsId(parts[1]) && Limits.IsClientRef(parts[2]), "ref-command");
-            Limits.Require(parts[1] != Limits.Zero, "deletion-unsupported");
+            Limits.Require(parts.Length == 3 && Limits.IsId(parts[0]) && Limits.IsId(parts[1]) && Limits.IsClientRef(parts[2]) &&
+                !(parts[0] == Limits.Zero && parts[1] == Limits.Zero), "ref-command");
             Limits.Require(commands.All(c => c.Name != parts[2]), "duplicate-ref");
-            Limits.Require(Refs.GetValueOrDefault(parts[2], Limits.Zero) == parts[0], "stale-ref");
             commands.Add((parts[0], parts[1], parts[2]));
         }
         Limits.Require(commands.Count > 0, "empty-update");
@@ -266,42 +266,96 @@ public sealed class Repository
         Limits.Require(stagedObjects.Count <= Limits.ObjectCount && stagedObjects.Values.Sum(obj => (long)obj.Size) <= Limits.ExpandedBytes, "repository-budget");
         // Validate even unreachable submitted objects before making any of the batch visible.
         Graph.Walk(stagedObjects, pack.Objects.Keys, cancellationToken);
+
+        // Each command is judged on its own, as Git's receive-pack does without the atomic capability: the ones
+        // that pass are applied and the ones that do not are reported by name with the reason, which Git prints
+        // beside the reference. Only a malformed request or pack refuses the whole push.
         var stagedRefs = new Dictionary<string, string>(Refs, StringComparer.Ordinal);
+        var refusals = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var command in commands)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            Limits.Require(stagedObjects.ContainsKey(command.New), "missing-ref-object");
-            Graph.Walk(stagedObjects, [command.New], cancellationToken);
-            if (command.Name.StartsWith("refs/heads/", StringComparison.Ordinal))
-            {
-                Limits.Require(stagedObjects[command.New].Type == 1, "branch-not-commit");
-                if (command.Old != Limits.Zero)
-                    Limits.Require(Graph.IsAncestor(stagedObjects, command.Old, command.New, cancellationToken), "non-fast-forward");
-            }
-            else Limits.Require(command.Old == Limits.Zero || command.Old == command.New, "tag-replacement");
-            stagedRefs[command.Name] = command.New;
+            string? refusal = Judge(command, stagedObjects, stagedRefs, cancellationToken);
+            if (refusal is not null) { refusals[command.Name] = refusal; continue; }
+            if (command.New == Limits.Zero) stagedRefs.Remove(command.Name);
+            else stagedRefs[command.Name] = command.New;
         }
         Limits.Require(stagedRefs.Count <= Limits.RefCount, "ref-count");
         foreach (var name in stagedRefs.Keys)
             Limits.Require(!stagedRefs.Keys.Any(other => other.StartsWith(name + "/", StringComparison.Ordinal)), "ref-prefix-conflict");
+        // A client that did not ask for a report cannot be told which command failed, so for it the push stays
+        // all or nothing, as it always was.
+        if (refusals.Count > 0 && !requested.Contains("report-status")) throw new GitInputException(refusals.Values.First());
         cancellationToken.ThrowIfCancellationRequested();
-        persistence?.Commit(stagedObjects, stagedRefs, HeadOf(stagedRefs, PreferredDefaultBranch), cancellationToken);
-        Objects = stagedObjects;
-        Refs = stagedRefs;
-        OffsetDeltas += pack.OffsetDeltas;
-        ReferenceDeltas += pack.ReferenceDeltas;
-        // Housekeeping at the end of a receive, as Git does it: the client waits a moment longer and the
-        // repository opens quickly next time.
-        if (persistence is not null && persistence.LooseObjectCount >= AutoRepackLooseObjects) Repack(cancellationToken);
+        if (refusals.Count < commands.Count)
+        {
+            persistence?.Commit(stagedObjects, stagedRefs, HeadOf(stagedRefs, PreferredDefaultBranch), cancellationToken);
+            Objects = stagedObjects;
+            Refs = stagedRefs;
+            OffsetDeltas += pack.OffsetDeltas;
+            ReferenceDeltas += pack.ReferenceDeltas;
+            // Housekeeping at the end of a receive, as Git does it: the client waits a moment longer and the
+            // repository opens quickly next time.
+            if (persistence is not null && persistence.LooseObjectCount >= AutoRepackLooseObjects) Repack(cancellationToken);
+        }
         using var output = new MemoryStream();
         if (requested.Contains("report-status"))
         {
             Packet.Write(output, "unpack ok\n");
-            foreach (var command in commands) Packet.Write(output, "ok " + command.Name + "\n");
+            foreach (var command in commands)
+                Packet.Write(output, refusals.TryGetValue(command.Name, out string? reason)
+                    ? "ng " + command.Name + " " + RefusalText(reason) + "\n"
+                    : "ok " + command.Name + "\n");
             Packet.Flush(output);
         }
         return output.ToArray();
     }
+
+    /// <summary>
+    /// Whether this repository accepts a push that deletes a branch or tag. Off unless the host turns it on. The
+    /// rules are those of deleting through the forge: the permission to push, and never the default branch.
+    /// </summary>
+    public bool AcceptsDeletion { get; set; }
+
+    /// <summary>The reason one push command is refused, as a code, or null when it may be applied.</summary>
+    private string? Judge((string Old, string New, string Name) command, Dictionary<string, GitObject> objects,
+        Dictionary<string, string> refs, CancellationToken cancellationToken)
+    {
+        if (refs.GetValueOrDefault(command.Name, Limits.Zero) != command.Old) return "stale-ref";
+        bool branch = command.Name.StartsWith("refs/heads/", StringComparison.Ordinal);
+        if (command.New == Limits.Zero)
+        {
+            if (!AcceptsDeletion) return "deletion-unsupported";
+            if (branch && HeadOf(refs, PreferredDefaultBranch) == command.Name["refs/heads/".Length..]) return "branch-is-default";
+            return null;
+        }
+        if (!objects.ContainsKey(command.New)) return "missing-ref-object";
+        Graph.Walk(objects, [command.New], cancellationToken);
+        if (branch)
+        {
+            if (objects[command.New].Type != 1) return "branch-not-commit";
+            if (command.Old != Limits.Zero && !Graph.IsAncestor(objects, command.Old, command.New, cancellationToken)) return "non-fast-forward";
+        }
+        else if (command.Old != Limits.Zero && command.Old != command.New) return "tag-replacement";
+        if (refs.Keys.Any(other => other != command.Name &&
+                (other.StartsWith(command.Name + "/", StringComparison.Ordinal) || command.Name.StartsWith(other + "/", StringComparison.Ordinal))))
+            return "ref-prefix-conflict";
+        return null;
+    }
+
+    /// <summary>What Git prints beside a refused reference. One line, no newline, as the status report requires.</summary>
+    private string RefusalText(string code) => code switch
+    {
+        "stale-ref" => "the reference changed since you fetched; fetch and try again",
+        "deletion-unsupported" => "this forge does not delete references by push; delete it on the forge",
+        "branch-is-default" => "this is the default branch; choose another default first",
+        "missing-ref-object" => "the pushed commit is not in the pack",
+        "branch-not-commit" => "a branch must point at a commit",
+        "non-fast-forward" => "this forge does not rewrite a branch; push a fast-forward",
+        "tag-replacement" => AcceptsDeletion ? "a tag is not moved; delete it and push it again" : "a tag is not moved",
+        "ref-prefix-conflict" => "the name conflicts with an existing reference",
+        _ => code
+    };
 
     public byte[] Upload(byte[] body, CancellationToken cancellationToken = default)
     {
