@@ -169,14 +169,18 @@ public sealed partial class GraftStore
     }
 
     public async Task<(IReadOnlyList<PipelineInfo> Pipelines, long Total)> ListPipelinesAsync(AuthenticatedIdentity? actor, long projectId, int skip, int take,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default, IReadOnlyCollection<string>? statuses = null)
     {
         if (skip < 0 || take is < 1 or > 100) throw new ArgumentOutOfRangeException(nameof(take));
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
         await RequireCiReaderAsync(db, actor, projectId, cancellationToken);
-        IEnumerable<PipelineRow> rows = await db.QueryAsync<PipelineRow>(PipelineSelect + " WHERE ProjectId = @Id ORDER BY Id DESC LIMIT @Take OFFSET @Skip;",
+        // Statuses are matched against a fixed list, never interpolated, so the filter is built from known words only.
+        string[] known = [.. (statuses ?? []).Where(status => status is CiStatus.Created or CiStatus.Pending or CiStatus.Running or CiStatus.Success
+            or CiStatus.Failed or CiStatus.Skipped or CiStatus.Canceled).Distinct(StringComparer.Ordinal)];
+        string filter = known.Length == 0 ? "" : " AND Status IN (" + string.Join(", ", known.Select(status => "'" + status + "'")) + ")";
+        IEnumerable<PipelineRow> rows = await db.QueryAsync<PipelineRow>(PipelineSelect + " WHERE ProjectId = @Id" + filter + " ORDER BY Id DESC LIMIT @Take OFFSET @Skip;",
             new ScopedPageParameters(projectId, take, skip));
-        long total = await db.ExecuteScalarAsync<long>("SELECT COUNT(*) FROM Pipelines WHERE ProjectId = @Id;", new IdParameters(projectId));
+        long total = await db.ExecuteScalarAsync<long>("SELECT COUNT(*) FROM Pipelines WHERE ProjectId = @Id" + filter + ";", new IdParameters(projectId));
         return (rows.Select(ToPipeline).ToArray(), total);
     }
 
@@ -192,7 +196,7 @@ public sealed partial class GraftStore
     {
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
         await RequireCiReaderAsync(db, actor, projectId, cancellationToken);
-        IEnumerable<JobRow> rows = await db.QueryAsync<JobRow>(JobSelect + " WHERE j.PipelineId = @PipelineId AND j.ProjectId = @ProjectId ORDER BY j.StageIndex, j.Id;",
+        IEnumerable<JobRow> rows = await db.QueryAsync<JobRow>(JobSelect + " WHERE j.PipelineId = @PipelineId AND j.ProjectId = @ProjectId AND j.Retried = 0 ORDER BY j.StageIndex, j.Id;",
             new PipelineJobsParameters(pipelineId, projectId));
         return rows.Select(ToJob).ToArray();
     }
@@ -235,7 +239,7 @@ public sealed partial class GraftStore
             WHERE j.Status = 'pending' AND p.Status IN ('pending', 'running')
               AND NOT EXISTS (
                   SELECT 1 FROM Jobs e
-                  WHERE e.PipelineId = j.PipelineId AND e.StageIndex < j.StageIndex
+                  WHERE e.PipelineId = j.PipelineId AND e.StageIndex < j.StageIndex AND e.Retried = 0
                     AND NOT (e.Status = 'success' OR (e.Status = 'failed' AND e.AllowFailure = 1)))
             ORDER BY j.Id
             LIMIT 1;
@@ -345,21 +349,37 @@ public sealed partial class GraftStore
             UPDATE Jobs SET Status = @Status, ExitCode = @ExitCode, Failure = @Failure, TokenDigest = NULL, FinishedAtUtc = @NowUtc
             WHERE Id = @Id AND Status IN ('pending', 'running');
             """, new JobFinishParameters(jobId, status, exitCode, failure, now), transaction);
-        if (status == CiStatus.Failed && job.AllowFailure == 0)
-            await db.ExecuteAsync("""
-                UPDATE Jobs SET Status = 'skipped', FinishedAtUtc = @NowUtc WHERE PipelineId = @PipelineId AND StageIndex > @StageIndex AND Status = 'pending';
-                """, new SkipLaterParameters(job.PipelineId, job.StageIndex, now), transaction);
-        long open = await db.ExecuteScalarAsync<long>("SELECT COUNT(*) FROM Jobs WHERE PipelineId = @Id AND Status IN ('pending', 'running');",
-            new IdParameters(job.PipelineId), transaction);
+        // A canceled job blocks what comes after it as a failure that is not allowed does.
+        if ((status == CiStatus.Failed && job.AllowFailure == 0) || status == CiStatus.Canceled)
+            await SkipLaterAsync(db, transaction, job.PipelineId, job.StageIndex, now);
+        await SettlePipelineAsync(db, transaction, job.PipelineId, now);
+    }
+
+    private static Task SkipLaterAsync(SqliteConnection db, SqliteTransaction transaction, long pipelineId, long stageIndex, string now) =>
+        db.ExecuteAsync("""
+            UPDATE Jobs SET Status = 'skipped', FinishedAtUtc = @NowUtc
+            WHERE PipelineId = @PipelineId AND StageIndex > @StageIndex AND Status = 'pending' AND Retried = 0;
+            """, new SkipLaterParameters(pipelineId, stageIndex, now), transaction);
+
+    /// <summary>
+    /// Settles a pipeline from its jobs' latest attempts: still open while one is pending or running, otherwise failed
+    /// when one failed that was not allowed to, canceled when one was canceled, and successful otherwise.
+    /// </summary>
+    private static async Task SettlePipelineAsync(SqliteConnection db, SqliteTransaction transaction, long pipelineId, string now)
+    {
+        long open = await db.ExecuteScalarAsync<long>("SELECT COUNT(*) FROM Jobs WHERE PipelineId = @Id AND Retried = 0 AND Status IN ('pending', 'running');",
+            new IdParameters(pipelineId), transaction);
         if (open > 0)
         {
-            await db.ExecuteAsync("UPDATE Pipelines SET UpdatedAtUtc = @NowUtc WHERE Id = @Id;", new TouchKeyParameters(job.PipelineId, now), transaction);
+            await db.ExecuteAsync("UPDATE Pipelines SET UpdatedAtUtc = @NowUtc WHERE Id = @Id;", new TouchKeyParameters(pipelineId, now), transaction);
             return;
         }
-        long failed = await db.ExecuteScalarAsync<long>("SELECT COUNT(*) FROM Jobs WHERE PipelineId = @Id AND Status = 'failed' AND AllowFailure = 0;",
-            new IdParameters(job.PipelineId), transaction);
+        long failed = await db.ExecuteScalarAsync<long>("SELECT COUNT(*) FROM Jobs WHERE PipelineId = @Id AND Retried = 0 AND Status = 'failed' AND AllowFailure = 0;",
+            new IdParameters(pipelineId), transaction);
+        long canceled = await db.ExecuteScalarAsync<long>("SELECT COUNT(*) FROM Jobs WHERE PipelineId = @Id AND Retried = 0 AND Status = 'canceled';",
+            new IdParameters(pipelineId), transaction);
         await db.ExecuteAsync("UPDATE Pipelines SET Status = @Status, UpdatedAtUtc = @NowUtc, FinishedAtUtc = @NowUtc WHERE Id = @Id;",
-            new PipelineSettleParameters(job.PipelineId, failed > 0 ? CiStatus.Failed : CiStatus.Success, now), transaction);
+            new PipelineSettleParameters(pipelineId, failed > 0 ? CiStatus.Failed : canceled > 0 ? CiStatus.Canceled : CiStatus.Success, now), transaction);
     }
 
     private static async Task<JobTokenRow?> JobForTokenAsync(SqliteConnection db, SqliteTransaction transaction, long jobId, string jobToken)

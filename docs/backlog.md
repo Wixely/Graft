@@ -124,6 +124,9 @@ Then the first of the four large items, in the order given:
 
 ## Closed on 2026-11-01
 
+- **Every LabCoat call answered, retry and cancel, and the directory.** The 39 missing routes, the crashing commit diff,
+  project permissions, job and pipeline retry and cancel down to the runner, with Pipelines page buttons, and `/users`
+  empty for members and complete for administrators. [ADR 0041](decisions/0041-labcoat-routes-retry-cancel-directory.md).
 - **GitLab clients could not read Graft's lists or send it writes.** Found by reading LabCoat: `/api/v4` issue and
   merge-request lists and search answered objects instead of bare arrays, writes needed JSON, members needed a
   username, lists had no `Link` and refused `order_by`. All fixed. [ADR 0040](decisions/0040-gitlab-request-and-list-shapes.md).
@@ -143,11 +146,8 @@ Added on 2026-11-01, first in line: the GitLab clients in use, LabCoat and Comee
 
 1. Read Comeet's traffic (Android, `com.monokaijs.comeet`, closed source): its APK from a phone, or a log
    of the `/api/v4` requests Graft has no route for, with the client's user agent. GraphQL only if it sends some.
-2. The 39 LabCoat calls with no route, most-used first: `events`, the cross-project `issues` and `merge_requests`,
-   `users` and `users/:id`, merge-request `discussions`, `commits` and `approvals`, job and pipeline `retry` and
-   `cancel`, `star`, award emoji, `uploads`, `repository/contributors`, a single commit, deleting an issue. Then the
-   filters LabCoat sends that Graft refuses: `scope` and `iids` on issues and merge requests, `membership` and
-   `starred` on projects.
+2. Point LabCoat itself at a forge and walk its screens; every call now has a route (ADR 0041), but no screen has
+   been seen working.
 
 Added on 2026-10-31: making "the runner works on Windows, Linux and in Docker" true. Today only
 the Windows runner is tested.
@@ -166,7 +166,7 @@ Jobs inside containers (`image:`) is not on this list; it is in the section belo
 **The rest of continuous integration.** The first slice exists ([ADR 0037](decisions/0037-runners-over-cuprinet.md)):
 Graft's own runner over CupriNet, install scripts, a strict subset of `.gitlab-ci.yml`, and artifacts with
 chunked, resumable transfers ([ADR 0038](decisions/0038-chunked-runner-transfers-and-artifacts.md)). Still absent:
-containers, artifact expiry and passing artifacts between stages, caches, `rules` and the rest of the format, retry and cancel, group and project runners,
+containers, artifact expiry and passing artifacts between stages, caches, `rules` and the rest of the format, group and project runners (retry and cancel exist since ADR 0041),
 detecting a runner that dropped mid-job, and GitLab's runner API for the official `gitlab-runner`.
 
 **GraphQL.** GitLab's newer clients increasingly prefer it. Not implemented, and implementing a useful

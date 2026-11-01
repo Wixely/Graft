@@ -373,6 +373,7 @@ legend { padding: 0 4px; font-size: 13px; font-weight: 600; }
 .label.accent { color: var(--accent); background: var(--accent-subtle); border-color: var(--accent-border); }
 .label.danger { color: var(--danger); background: var(--danger-subtle); border-color: var(--danger); }
 .label.success { color: var(--success); background: var(--success-subtle); border-color: var(--success); }
+.label.warning { color: var(--warning); background: var(--warning-subtle); border-color: var(--warning); }
 
 /* Lists: project cards, member rows, token rows. One row idiom, bordered and separated. */
 

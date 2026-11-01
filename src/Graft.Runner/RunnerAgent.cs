@@ -159,7 +159,9 @@ public sealed class RunnerAgent(RunnerConfig config, string home)
     {
         Console.WriteLine("Job " + job.JobId + " (" + job.Name + ") for " + job.Project + " at " + job.Sha[..8]);
         string workspace = Path.Combine(home, "builds", job.JobId.ToString(System.Globalization.CultureInfo.InvariantCulture));
-        TraceWriter trace = new(link, job);
+        // Canceled from the forge: the log writer hears it and this ends whatever the job is doing.
+        using CancellationTokenSource jobScope = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        TraceWriter trace = new(link, job, jobScope.Cancel);
         RunnerTransfers transfers = new(link, home, trace.Line);
         int? exitCode = null;
         string? failure = null;
@@ -171,12 +173,12 @@ public sealed class RunnerAgent(RunnerConfig config, string home)
             Directory.CreateDirectory(workspace);
             trace.Line("Graft runner " + Version + " on " + config.Name + " (" + Platform() + ")");
             trace.Line("Fetching " + job.Project + " at " + job.Sha + ", " + job.Source.Size + " bytes" + (job.Source.Chunked ? ", chunked" : ""));
-            source = await transfers.DownloadAsync(job.Source, cancellationToken);
+            source = await transfers.DownloadAsync(job.Source, jobScope.Token);
             await using (FileStream compressed = File.OpenRead(source))
             await using (GZipStream tar = new(compressed, CompressionMode.Decompress))
-                await TarFile.ExtractToDirectoryAsync(tar, workspace, overwriteFiles: true, cancellationToken);
+                await TarFile.ExtractToDirectoryAsync(tar, workspace, overwriteFiles: true, jobScope.Token);
             File.Delete(source);
-            exitCode = await ExecuteAsync(job, workspace, trace, cancellationToken);
+            exitCode = await ExecuteAsync(job, workspace, trace, jobScope.Token);
             if (exitCode != 0) failure = "The script exited with " + exitCode + ".";
             else if (job.Artifacts.Length > 0)
             {
@@ -185,7 +187,7 @@ public sealed class RunnerAgent(RunnerConfig config, string home)
                 artifacts = transfers.CollectArtifacts(job.JobId, workspace, job.Artifacts);
                 if (artifacts is not null)
                 {
-                    await transfers.UploadAsync(job.JobId, job.JobToken, artifacts, cancellationToken);
+                    await transfers.UploadAsync(job.JobId, job.JobToken, artifacts, jobScope.Token);
                     trace.Line("Artifacts uploaded");
                 }
             }
@@ -194,6 +196,10 @@ public sealed class RunnerAgent(RunnerConfig config, string home)
         {
             failure = exception.Message;
         }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && trace.Canceled)
+        {
+            failure = "Canceled from the forge.";
+        }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
             failure = "The job ran past its time limit of " + JobTimeout.TotalMinutes + " minutes and was stopped.";
@@ -201,6 +207,16 @@ public sealed class RunnerAgent(RunnerConfig config, string home)
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
             failure = "The runner could not run the job: " + exception.Message;
+        }
+        if (trace.Canceled)
+        {
+            // The forge already holds the result; the job's token is gone, so there is nothing to report or send.
+            await trace.StopAsync();
+            foreach (string? leftover in new[] { source, artifacts })
+                if (leftover is not null) try { File.Delete(leftover); } catch (IOException) { }
+            try { Directory.Delete(workspace, recursive: true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+            Console.WriteLine("Job " + job.JobId + " was canceled from the forge and stopped");
+            return false;
         }
         if (failure is not null) trace.Line("ERROR: " + failure);
         else trace.Line("Job succeeded");
@@ -335,16 +351,22 @@ public sealed class RunnerAgent(RunnerConfig config, string home)
     {
         private readonly ForgeLink link;
         private readonly RunnerJobResponse job;
+        private readonly Action canceled;
+        private DateTimeOffset lastContact = DateTimeOffset.UtcNow;
+
+        /// <summary>True once the forge has said the job was canceled.</summary>
+        public bool Canceled { get; private set; }
         private readonly StringBuilder pending = new();
         private readonly object gate = new();
         private readonly Timer timer;
         private long offset;
         private Task sending = Task.CompletedTask;
 
-        public TraceWriter(ForgeLink link, RunnerJobResponse job)
+        public TraceWriter(ForgeLink link, RunnerJobResponse job, Action canceled)
         {
             this.link = link;
             this.job = job;
+            this.canceled = canceled;
             timer = new Timer(_ => Kick(), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
         }
 
@@ -358,9 +380,22 @@ public sealed class RunnerAgent(RunnerConfig config, string home)
         {
             lock (gate)
             {
-                if (pending.Length == 0 || !sending.IsCompleted) return;
+                if (Canceled || !sending.IsCompleted) return;
+                // A job that prints nothing still checks in every few seconds, with an empty piece of log, so a cancel reaches it.
+                if (pending.Length == 0 && DateTimeOffset.UtcNow - lastContact < CheckInterval) return;
                 sending = SendAsync(CancellationToken.None);
             }
+        }
+
+        private static readonly TimeSpan CheckInterval = TimeSpan.FromSeconds(5);
+
+        /// <summary>Stops sending, for a job the forge has canceled.</summary>
+        public async Task StopAsync()
+        {
+            await timer.DisposeAsync();
+            Task inFlight;
+            lock (gate) inFlight = sending;
+            try { await inFlight; } catch (Exception exception) when (exception is not OperationCanceledException) { }
         }
 
         public async Task FlushAsync(CancellationToken cancellationToken)
@@ -384,7 +419,7 @@ public sealed class RunnerAgent(RunnerConfig config, string home)
             string chunk;
             lock (gate)
             {
-                if (pending.Length == 0) return;
+                if (Canceled) return;
                 chunk = pending.Length > 64 * 1024 ? pending.ToString(0, 64 * 1024) : pending.ToString();
                 pending.Remove(0, chunk.Length);
             }
@@ -392,7 +427,14 @@ public sealed class RunnerAgent(RunnerConfig config, string home)
             try
             {
                 OracleResponse response = await link.ConsultAsync(Request(Protocol.Routes.JobPrefix + job.JobId + "/trace", body, job.JobToken), cancellationToken);
+                lastContact = DateTimeOffset.UtcNow;
                 if (response.Status == 202) offset += chunk.Length;
+                else if (response.Status == 410)
+                {
+                    Canceled = true;
+                    Console.WriteLine("  The forge canceled job " + job.JobId + "; stopping it");
+                    canceled();
+                }
                 else Console.Error.WriteLine("The forge did not take a piece of the log: " + ErrorText(response));
             }
             catch (Exception exception) when (exception is not OperationCanceledException)

@@ -115,6 +115,10 @@ McpEndpoint mcpEndpoint = new();
 // and "/api/v4/projects/:id/uploads", so squatting either would block later compatibility work. Unmatched
 // paths beneath "/api/" already return 404 rather than the SPA shell.
 const string UploadPrefix = "/api/graft/uploads";
+// Where token authentication leaves the caller, so a response built later can say what that caller may do.
+const string ApiIdentityKey = "graft.api-identity";
+// The largest file a project upload may be: enough for a screenshot or a log, not a release.
+const long MaximumUploadBytes = 10 * 1024 * 1024;
 
 // The email domain a server-authored merge commit is attributed to. Graft holds no email addresses, and a
 // commit needs one, so this says plainly where the identity came from rather than inventing a plausible
@@ -374,6 +378,40 @@ app.Use(async (context, next) =>
     request.ContentLength = body.Length;
     request.Headers.Remove("Transfer-Encoding");
     await next(context);
+});
+
+
+// Files attached to a project's Markdown, at GitLab's `/<namespace>/<project>/uploads/<secret>/<name>`. Read by whoever
+// may read the project's conversation, signed in through the browser or with a token. Served with a sandbox and no
+// sniffing, and anything but an image or plain text as an attachment, because the bytes are a participant's.
+app.Use(async (context, next) =>
+{
+    string[] segments = context.Request.Path.Value?.Trim('/').Split('/') ?? [];
+    int at = segments.Length - 3;
+    if (!(HttpMethods.IsGet(context.Request.Method) || HttpMethods.IsHead(context.Request.Method)) || at < 2 || segments[at] != "uploads" ||
+        segments[at + 1].Length != 32 || !segments[at + 1].All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f') ||
+        segments[0] is "api" or "-" || context.Request.Path.StartsWithSegments(UploadPrefix))
+    { await next(context); return; }
+    string slug = segments[at - 1];
+    string projectNamespace = string.Join('/', segments[..(at - 1)]);
+    string name = Uri.UnescapeDataString(segments[at + 2]);
+    AuthenticatedIdentity? identity = null;
+    string token = context.Request.Headers["PRIVATE-TOKEN"].ToString();
+    if (token.Length == 0 && context.Request.Headers.Authorization.ToString() is { } bearer && bearer.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+        token = bearer[7..];
+    if (token.Length > 0) identity = await store.ResolveTokenAsync(token, context.RequestAborted);
+    else identity = (await AuthenticateBrowser(context, writeError: false))?.Identity;
+    ProjectInfo? project = null;
+    try { project = await store.FindReadyProjectAsync(projectNamespace, slug, context.RequestAborted); }
+    catch (ArgumentException) { }
+    ProjectUpload? upload = project is null ? null : await store.FindUploadAsync(identity, project.Id, segments[at + 1], name, context.RequestAborted);
+    string? path = upload is null ? null : UploadPathFor(project!, upload.Secret, upload.FileName);
+    if (path is null || !File.Exists(path)) { context.Response.StatusCode = StatusCodes.Status404NotFound; return; }
+    context.Response.Headers.ContentSecurityPolicy = "sandbox; default-src 'none'";
+    context.Response.Headers.XContentTypeOptions = "nosniff";
+    context.Response.Headers.CacheControl = "private, max-age=86400";
+    bool inline = upload!.ContentType.StartsWith("image/", StringComparison.Ordinal) || upload.ContentType.StartsWith("text/plain", StringComparison.Ordinal);
+    await Results.File(path, upload.ContentType, inline ? null : upload.FileName, enableRangeProcessing: true).ExecuteAsync(context);
 });
 
 // Only the upload group opts into the authentication stack. UseAntiforgery validates automatically for
@@ -1020,11 +1058,30 @@ foreach ((string root, bool browserFamily) in new[] { ("/api/projects/{projectId
     {
         var scope = await CiReader(context, browserFamily);
         if (scope is null) return;
-        if (!await OnlyQuery(context, "page", "per_page")) return;
+        if (!await OnlyQuery(context, "page", "per_page", "scope", "status")) return;
         (int Page, int PerPage)? pagination = await Pagination(context);
         if (pagination is null) return;
-        (IReadOnlyList<PipelineInfo> list, long total) = await store.ListPipelinesAsync(scope.Value.Identity, scope.Value.Details.Project.Id,
-            (pagination.Value.Page - 1) * pagination.Value.PerPage, pagination.Value.PerPage, context.RequestAborted);
+        // GitLab's `scope` picks by state, and `status` by one status. Every pipeline here is for a branch or a commit, so
+        // `branches` is all of them; `tags` is not distinguished and is refused rather than answered wrongly.
+        string[]? statuses = context.Request.Query["scope"].ToString() switch
+        {
+            "" or "branches" => null,
+            "running" => [CiStatus.Running],
+            "pending" => [CiStatus.Pending],
+            "finished" => [CiStatus.Success, CiStatus.Failed, CiStatus.Canceled, CiStatus.Skipped],
+            _ => []
+        };
+        if (statuses is { Length: 0 }) { await ApiError(context, 400, "scope must be running, pending, finished or branches"); return; }
+        string status = context.Request.Query["status"].ToString();
+        if (status.Length > 0)
+        {
+            if (status is not (CiStatus.Created or CiStatus.Pending or CiStatus.Running or CiStatus.Success or CiStatus.Failed or CiStatus.Canceled or CiStatus.Skipped))
+            { await ApiError(context, 400, "status is not a pipeline status"); return; }
+            statuses = statuses is null ? [status] : [.. statuses.Where(s => s == status)];
+            if (statuses.Length == 0) statuses = ["none"];
+        }
+        (IReadOnlyList<PipelineInfo> list, long total) = statuses is ["none"] ? ([], 0) : await store.ListPipelinesAsync(scope.Value.Identity, scope.Value.Details.Project.Id,
+            (pagination.Value.Page - 1) * pagination.Value.PerPage, pagination.Value.PerPage, context.RequestAborted, statuses);
         SetPagination(context, pagination.Value.Page, pagination.Value.PerPage, total);
         await context.Response.WriteAsJsonAsync(list.Select(pipeline => PipelineResponseFor(context, scope.Value.Details.Project, pipeline)).ToArray(),
             ApiJson.Default.PipelineResponseArray, null, context.RequestAborted);
@@ -1092,6 +1149,153 @@ foreach ((string root, bool browserFamily) in new[] { ("/api/projects/{projectId
         Microsoft.Net.Http.Headers.EntityTagHeaderValue? tag = job.ArtifactsSha256 is { } sha ? new("\"" + sha + "\"") : null;
         await Results.File(path, "application/zip", "artifacts.zip", lastModified: null, entityTag: tag, enableRangeProcessing: true).ExecuteAsync(context);
     });
+}
+
+// A project's jobs, newest first, for GitLab's clients. `scope` names one status or several (`scope[]`), as GitLab's does.
+app.MapGet("/api/v4/projects/{projectId}/jobs", async context =>
+{
+    var scope = await CiReader(context, browserFamily: false);
+    if (scope is null) return;
+    if (!await OnlyQuery(context, "page", "per_page", "scope", "scope[]")) return;
+    (int Page, int PerPage)? pagination = await Pagination(context);
+    if (pagination is null) return;
+    string[] statuses = [.. context.Request.Query["scope"].Concat(context.Request.Query["scope[]"])
+        .SelectMany(value => (value ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))];
+    string? unknown = statuses.FirstOrDefault(status => status is not (CiStatus.Created or CiStatus.Pending or CiStatus.Running or CiStatus.Success
+        or CiStatus.Failed or CiStatus.Canceled or CiStatus.Skipped));
+    if (unknown is not null) { await ApiError(context, 400, "scope: " + unknown + " is not a job status"); return; }
+    (IReadOnlyList<CiJobInfo> jobs, long total) = await store.ListProjectJobsAsync(scope.Value.Identity, scope.Value.Details.Project.Id, statuses,
+        (pagination.Value.Page - 1) * pagination.Value.PerPage, pagination.Value.PerPage, context.RequestAborted);
+    Dictionary<long, PipelineInfo> pipelines = [];
+    List<JobResponse> response = [];
+    foreach (CiJobInfo job in jobs)
+    {
+        if (!pipelines.TryGetValue(job.PipelineId, out PipelineInfo? pipeline))
+            pipelines[job.PipelineId] = pipeline = (await store.GetPipelineAsync(scope.Value.Identity, scope.Value.Details.Project.Id, job.PipelineId, context.RequestAborted))!;
+        response.Add(JobResponseFor(context, scope.Value.Details.Project, pipeline, job));
+    }
+    SetPagination(context, pagination.Value.Page, pagination.Value.PerPage, total);
+    await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.JobResponseArray, null, context.RequestAborted);
+});
+
+// Retrying and canceling are for whoever may start a pipeline, which is whoever may push. Erasing a job and deleting
+// artifacts destroy what a run left behind, so they are a Maintainer's. Each is on GitLab's route and on the browser's.
+foreach ((string root, bool browserFamily) in new[] { ("/api/projects/{projectId:long}", true), ("/api/v4/projects/{projectId}", false) })
+{
+    app.MapPost(root + "/jobs/{jobId:long}/cancel", async context =>
+    {
+        var scope = await CiWriter(context, browserFamily, ProjectAction.PushRepository);
+        if (scope is null) return;
+        CiJobInfo? job = await store.CancelJobAsync(scope.Value.Details.Project.Id, RouteId(context, "jobId"), context.RequestAborted);
+        await WriteJob(context, scope.Value, job, StatusCodes.Status201Created);
+    });
+
+    app.MapPost(root + "/jobs/{jobId:long}/retry", async context =>
+    {
+        var scope = await CiWriter(context, browserFamily, ProjectAction.PushRepository);
+        if (scope is null) return;
+        CiJobInfo? job;
+        try { job = await store.RetryJobAsync(scope.Value.Details.Project.Id, RouteId(context, "jobId"), context.RequestAborted); }
+        catch (InvalidOperationException error) { await ApiError(context, 403, "403 Forbidden: " + error.Message); return; }
+        await WriteJob(context, scope.Value, job, StatusCodes.Status201Created);
+    });
+
+    app.MapPost(root + "/jobs/{jobId:long}/erase", async context =>
+    {
+        var scope = await CiWriter(context, browserFamily, ProjectAction.ManageProject);
+        if (scope is null) return;
+        long jobId = RouteId(context, "jobId");
+        CiJobInfo? job;
+        try { job = await store.EraseJobAsync(scope.Value.Details.Project.Id, jobId, context.RequestAborted); }
+        catch (InvalidOperationException error) { await ApiError(context, 403, "403 Forbidden: " + error.Message); return; }
+        if (job is not null) DeleteArtifactsFile(scope.Value.Details.Project, jobId);
+        await WriteJob(context, scope.Value, job is null ? null : job with { ArtifactsBytes = null, ArtifactsSha256 = null }, StatusCodes.Status201Created);
+    });
+
+    app.MapDelete(root + "/jobs/{jobId:long}/artifacts", async context =>
+    {
+        var scope = await CiWriter(context, browserFamily, ProjectAction.ManageProject);
+        if (scope is null) return;
+        long jobId = RouteId(context, "jobId");
+        bool? had = await store.ForgetJobArtifactsAsync(scope.Value.Details.Project.Id, jobId, context.RequestAborted);
+        if (had is null) { await ApiError(context, 404, "404 Job Not Found"); return; }
+        DeleteArtifactsFile(scope.Value.Details.Project, jobId);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    });
+
+    app.MapPost(root + "/pipelines/{pipelineId:long}/cancel", async context =>
+    {
+        var scope = await CiWriter(context, browserFamily, ProjectAction.PushRepository);
+        if (scope is null) return;
+        PipelineInfo? pipeline = await store.CancelPipelineAsync(scope.Value.Details.Project.Id, RouteId(context, "pipelineId"), context.RequestAborted);
+        await WritePipeline(context, scope.Value, pipeline);
+    });
+
+    app.MapPost(root + "/pipelines/{pipelineId:long}/retry", async context =>
+    {
+        var scope = await CiWriter(context, browserFamily, ProjectAction.PushRepository);
+        if (scope is null) return;
+        PipelineInfo? pipeline;
+        try { pipeline = await store.RetryPipelineAsync(scope.Value.Details.Project.Id, RouteId(context, "pipelineId"), context.RequestAborted); }
+        catch (InvalidOperationException error) { await ApiError(context, 400, "400 Bad Request: " + error.Message); return; }
+        await WritePipeline(context, scope.Value, pipeline);
+    });
+}
+
+// GitLab's "delete project artifacts": every finished job's archive in the project.
+app.MapDelete("/api/v4/projects/{projectId}/artifacts", async context =>
+{
+    var scope = await CiWriter(context, browserFamily: false, ProjectAction.ManageProject);
+    if (scope is null) return;
+    foreach (long jobId in await store.ForgetProjectArtifactsAsync(scope.Value.Details.Project.Id, context.RequestAborted))
+        DeleteArtifactsFile(scope.Value.Details.Project, jobId);
+    context.Response.StatusCode = StatusCodes.Status202Accepted;
+});
+
+/// <summary>The project a CI write names and the caller, for whoever holds <paramref name="action"/> there; else the refusal is written.</summary>
+async Task<(ProjectDetails Details, AuthenticatedIdentity Identity)?> CiWriter(HttpContext context, bool browserFamily, ProjectAction action)
+{
+    if (!browserFamily)
+    {
+        AuthenticatedIdentity? caller = await RequireApiWriter(context);
+        if (caller is null) return null;
+        ApiProject? project = await AuthorizeApiProject(context, action);
+        return project is null ? null : (project.Details, caller);
+    }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await BrowserWriter(context);
+    if (browser is null) return null;
+    long projectId = RouteId(context, "projectId");
+    ProjectDetails? details = await store.GetReadyProjectAsync(projectId, context.RequestAborted);
+    if (details is null || !(await DecideFor(context, browser.Value.Identity, projectId, ProjectAction.BrowseRepository)).Allowed)
+    { await ApiError(context, 404, "project"); return null; }
+    PermissionDecision decision = await DecideFor(context, browser.Value.Identity, projectId, action);
+    if (!decision.Allowed) { await ApiError(context, 403, decision.Explanation); return null; }
+    return (details, browser.Value.Identity);
+}
+
+static long RouteId(HttpContext context, string name) =>
+    Convert.ToInt64(context.Request.RouteValues[name], System.Globalization.CultureInfo.InvariantCulture);
+
+async Task WriteJob(HttpContext context, (ProjectDetails Details, AuthenticatedIdentity Identity) scope, CiJobInfo? job, int status)
+{
+    if (job is null) { await ApiError(context, 404, "404 Job Not Found"); return; }
+    PipelineInfo pipeline = (await store.GetPipelineAsync(scope.Identity, scope.Details.Project.Id, job.PipelineId, context.RequestAborted))!;
+    context.Response.StatusCode = status;
+    await context.Response.WriteAsJsonAsync(JobResponseFor(context, scope.Details.Project, pipeline, job), ApiJson.Default.JobResponse, null, context.RequestAborted);
+}
+
+async Task WritePipeline(HttpContext context, (ProjectDetails Details, AuthenticatedIdentity Identity) scope, PipelineInfo? pipeline)
+{
+    if (pipeline is null) { await ApiError(context, 404, "404 Pipeline Not Found"); return; }
+    context.Response.StatusCode = StatusCodes.Status201Created;
+    await context.Response.WriteAsJsonAsync(PipelineResponseFor(context, scope.Details.Project, pipeline), ApiJson.Default.PipelineResponse, null, context.RequestAborted);
+}
+
+void DeleteArtifactsFile(ProjectInfo project, long jobId)
+{
+    try { File.Delete(ArtifactsPathFor(project, jobId)); }
+    catch (IOException error) { app.Logger.LogWarning(error, "artifacts of job {Job} were not removed", jobId); }
+    catch (UnauthorizedAccessException error) { app.Logger.LogWarning(error, "artifacts of job {Job} were not removed", jobId); }
 }
 
 // GitLab's "run pipeline": a pipeline for the tip of a ref, by somebody who may push.
@@ -2383,9 +2587,15 @@ app.MapPost("/api/v4/todos/{todoId:long}/mark_as_done", async context =>
     if (!identity.TokenScopes.HasFlag(TokenScope.Api)) { await ApiError(context, 403, "403 Forbidden: insufficient_scope"); return; }
     long todoId = Convert.ToInt64(context.Request.RouteValues["todoId"], System.Globalization.CultureInfo.InvariantCulture);
     if (!await store.MarkNotificationReadAsync(identity, todoId, context.RequestAborted)) { await ApiError(context, 404, "404 Todo Not Found"); return; }
-    NotificationPage page = await store.ListNotificationsAsync(identity, false, 1, 100, context.RequestAborted);
-    Notification? marked = page.Items.FirstOrDefault(note => note.Id == todoId);
-    if (marked is null) { context.Response.StatusCode = StatusCodes.Status204NoContent; return; }
+    // GitLab answers with the to-do, and clients read it, so it is found however far back it is.
+    Notification? marked = null;
+    for (int page = 1; marked is null && page <= 100; page++)
+    {
+        NotificationPage found = await store.ListNotificationsAsync(identity, false, page, 100, context.RequestAborted);
+        marked = found.Items.FirstOrDefault(note => note.Id == todoId);
+        if (found.Items.Count < 100) break;
+    }
+    if (marked is null) { await ApiError(context, 404, "404 Todo Not Found"); return; }
     context.Response.StatusCode = StatusCodes.Status201Created;
     await context.Response.WriteAsJsonAsync(TodoFor(context, marked), ApiJson.Default.TodoResponse, null, context.RequestAborted);
 });
@@ -2764,10 +2974,29 @@ app.MapGet("/api/v4/projects", async context =>
 {
     AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
     if (identity is null) return;
-    if (!await OnlyQuery(context, "page", "per_page")) return;
+    if (!await OnlyQuery(context, "page", "per_page", "membership", "starred", "search")) return;
     (int Page, int PerPage)? pagination = await Pagination(context);
     if (pagination is null) return;
     (int page, int perPage) = pagination.Value;
+    // The listing is always the projects the caller belongs to, which is what `membership=true` asks for. `starred`
+    // narrows it to what the caller starred and `search` to a name or path; both are filtered here, bounded by what a
+    // person can belong to or star.
+    string membership = context.Request.Query["membership"].ToString();
+    if (membership is not ("" or "true")) { await ApiError(context, 400, "membership: only true is supported; the listing is the projects you belong to"); return; }
+    string starred = context.Request.Query["starred"].ToString();
+    if (starred is not ("" or "true" or "false")) { await ApiError(context, 400, "starred must be true or false"); return; }
+    string search = context.Request.Query["search"].ToString().Trim();
+    if (starred == "true" || search.Length > 0)
+    {
+        IEnumerable<ProjectDetails> candidates = starred == "true"
+            ? await ReadableProjects(context, identity, await store.ListStarredProjectIdsAsync(identity, context.RequestAborted))
+            : await store.SearchProjectsAsync(identity, search, false, 100, context.RequestAborted);
+        if (search.Length > 0)
+            candidates = candidates.Where(project => project.Project.Name.Contains(search, StringComparison.OrdinalIgnoreCase) ||
+                (project.Project.Namespace + "/" + project.Project.Slug).Contains(search, StringComparison.OrdinalIgnoreCase));
+        await WriteProjectPage(context, [.. candidates], page, perPage);
+        return;
+    }
     ProjectPage projects = await store.ListAccessibleProjectsAsync(identity, (page - 1) * perPage, perPage, context.RequestAborted);
     List<ProjectResponse> response = [];
     foreach (ProjectDetails project in projects.Projects)
@@ -3256,18 +3485,11 @@ app.MapGet("/api/v4/projects/{projectId}/repository/commits/{sha}/diff", async c
         try { diff = RepositoryDiff.ForCommit(repository, commitId, parent); }
         catch (GitInputException) { await ApiError(context, 404, "404 Commit Not Found"); return; }
 
-        DiffFileResponse[] files = diff.Files.Select(file => new DiffFileResponse(
-            file.Path, file.Status, file.OldMode, file.NewMode, file.IsBinary, file.TooLarge,
-            file.Added, file.Removed,
-            file.Hunks.Select(hunk => new DiffHunkResponse(HunkHeader(hunk),
-                hunk.Lines.Select(line => new DiffLineResponse(
-                    line.Kind.ToString(), line.Text, line.OldLine, line.NewLine, line.NoNewline)).ToArray()))
-                .ToArray())).ToArray();
-
-        CommitDiffResponse response = new(await ProjectResponseForLocked(context, project.Details, repository),
-            CommitResponseFor(context, project.Details, diff.Commit),
-            diff.ParentId, files, diff.Truncated, files.Sum(file => file.Added), files.Sum(file => file.Removed));
-        await context.Response.WriteAsJsonAsync(response, ApiJson.Default.CommitDiffResponse, null, context.RequestAborted);
+        // GitLab's shape, an array of files with the unified text, which its clients read (ADR 0041). What Graft adds
+        // is in headers: whether the list was cut short, and which parent it was measured against.
+        context.Response.Headers["X-Graft-Truncated"] = diff.Truncated ? "true" : "false";
+        if (diff.ParentId is not null) context.Response.Headers["X-Graft-Compared-Against"] = diff.ParentId;
+        await context.Response.WriteAsJsonAsync(GitLabDiffs(diff.Files), ApiJson.Default.GitLabDiffResponseArray, null, context.RequestAborted);
     });
 });
 
@@ -3793,10 +4015,41 @@ async Task<MergeAnalysis> AnalyseProposal(HttpContext context, ProjectDetails pr
     finally { endpoint.Gate.Release(); }
 }
 
+// GitLab's list filters that name the caller or pick items by number: `scope` (all, created_by_me, assigned_to_me),
+// `author_username`, `iids` and, for merge requests, `wip`. Null after writing the refusal.
+async Task<GitLabListFilter?> ReadGitLabListFilter(HttpContext context, AuthenticatedIdentity? identity)
+{
+    string scope = context.Request.Query["scope"].ToString();
+    string? author = Optional(context, "author_username");
+    string? assignee = null;
+    switch (scope)
+    {
+        case "" or "all": break;
+        case "created_by_me" or "created-by-me" or "assigned_to_me" or "assigned-to-me":
+            if (identity is null) { await ApiError(context, 400, "scope " + scope + " needs a signed-in caller"); return null; }
+            if (scope.StartsWith("created", StringComparison.Ordinal)) author = identity.Username; else assignee = identity.Username;
+            break;
+        default: await ApiError(context, 400, "scope must be all, created_by_me or assigned_to_me"); return null;
+    }
+    List<long> iids = [];
+    foreach (string? value in context.Request.Query["iids"].Concat(context.Request.Query["iids[]"]))
+        foreach (string part in (value ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (!long.TryParse(part, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out long iid))
+            { await ApiError(context, 400, "iids must be numbers"); return null; }
+            iids.Add(iid);
+        }
+    bool? draft = context.Request.Query["wip"].ToString() switch { "" => null, "yes" => true, "no" => false, _ => (bool?)null };
+    if (context.Request.Query["wip"].ToString() is not ("" or "yes" or "no")) { await ApiError(context, 400, "wip must be yes or no"); return null; }
+    return new(author, assignee, iids.Count == 0 ? null : iids, draft);
+}
+
 // The browser reads a page object; GitLab's route answers a bare array, with the totals in X-Total and Link, as its clients expect.
 async Task ListIssues(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity, bool gitLab = false)
 {
-    if (!await OnlyQuery(context, "state", "page", "per_page", "labels", "without_labels", "milestone_id", "assignee_username", "search", "confidential")) return;
+    if (!await OnlyQuery(context, "state", "page", "per_page", "labels", "without_labels", "milestone_id", "assignee_username", "search", "confidential", "scope", "iids", "iids[]", "author_username")) return;
+    GitLabListFilter? extra = await ReadGitLabListFilter(context, identity);
+    if (extra is null) return;
     if (!TryReadState(context.Request.Query["state"].ToString(), out CollaborationState? state, merged: false))
     { await ApiError(context, 400, "state must be opened, closed or all"); return; }
     (int Page, int PerPage)? pagination = await Pagination(context);
@@ -3813,7 +4066,7 @@ async Task ListIssues(HttpContext context, ProjectDetails project, Authenticated
     { await ApiError(context, 400, "confidential must be true or false"); return; }
     IssueFilter filter = new(state,
         LabelList(Optional(context, "labels")), LabelList(Optional(context, "without_labels")),
-        Optional(context, "milestone_id"), Optional(context, "assignee_username"), Optional(context, "search"), confidential);
+        Optional(context, "milestone_id"), extra.Assignee ?? Optional(context, "assignee_username"), Optional(context, "search"), confidential, extra.Author, extra.Iids);
 
     IssuePage issues;
     try { issues = await store.ListIssuesAsync(identity, project.Project.Id, filter, (page - 1) * perPage, perPage, context.RequestAborted); }
@@ -3980,14 +4233,17 @@ async Task CreateNote(HttpContext context, ProjectDetails project, Authenticated
 
 async Task ListMergeRequests(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity, bool gitLab = false)
 {
-    if (!await OnlyQuery(context, "state", "page", "per_page", "labels", "milestone_id", "assignee_username", "reviewer_username", "search")) return;
+    if (!await OnlyQuery(context, "state", "page", "per_page", "labels", "milestone_id", "assignee_username", "reviewer_username", "search", "scope", "iids", "iids[]", "author_username", "wip")) return;
+    GitLabListFilter? extra = await ReadGitLabListFilter(context, identity);
+    if (extra is null) return;
     if (!TryReadState(context.Request.Query["state"].ToString(), out CollaborationState? state, merged: true))
     { await ApiError(context, 400, "state must be opened, closed, merged or all"); return; }
     (int Page, int PerPage)? pagination = await Pagination(context);
     if (pagination is null) return;
     (int page, int perPage) = pagination.Value;
     MergeFilter filter = new(state, LabelList(Optional(context, "labels")), Optional(context, "milestone_id"),
-        Optional(context, "assignee_username"), Optional(context, "reviewer_username"), Optional(context, "search"));
+        extra.Assignee ?? Optional(context, "assignee_username"), Optional(context, "reviewer_username"), Optional(context, "search"),
+        extra.Author, extra.Iids, extra.Draft);
 
     MergeProposalPage proposals;
     try { proposals = await store.ListMergeProposalsAsync(identity, project.Project.Id, filter, (page - 1) * perPage, perPage, context.RequestAborted); }
@@ -4134,11 +4390,11 @@ async Task MergeRequestChanges(HttpContext context, ProjectDetails project, Auth
         file.OldMode, file.NewMode, file.IsBinary, file.TooLarge, file.Added, file.Removed,
         [.. file.Hunks.Select(hunk => new DiffHunkResponse(HunkHeader(hunk),
             [.. hunk.Lines.Select(line => new DiffLineResponse(line.Kind.ToString(), line.Text, line.OldLine, line.NewLine, line.NoNewline))]))]))];
-    await context.Response.WriteAsJsonAsync(new MergeRequestChangesResponse(
-        await FullMergeResponse(context, project, proposal),
+    MergeRequestResponse full = await FullMergeResponse(context, project, proposal);
+    await WriteWithMergeRequest(context, new MergeRequestChangesResponse(full,
         analysis.BaseCommitId, analysis.SourceCommitId, analysis.TargetCommitId,
         response, truncated, response.Sum(file => file.Added), response.Sum(file => file.Removed)),
-        ApiJson.Default.MergeRequestChangesResponse, null, context.RequestAborted);
+        ApiJson.Default.MergeRequestChangesResponse, full, files);
 }
 
 // Merging writes to the target branch, so it needs exactly what a push to that branch needs. The store
@@ -4270,11 +4526,11 @@ async Task AcceptMergeRequest(HttpContext context, ProjectDetails project, Authe
         payload["by"] = identity.Username;
         payload["via"] = "merge";
     });
-    await context.Response.WriteAsJsonAsync(new MergeResultResponse(
-        await MergeResponseFor(context, project, merged, await AnalyseProposal(context, project, merged)),
+    MergeRequestResponse mergedResponse = await MergeResponseFor(context, project, merged, await AnalyseProposal(context, project, merged));
+    await WriteWithMergeRequest(context, new MergeResultResponse(mergedResponse,
         outcome.Kind switch { MergeKind.FastForward => "fast_forward", MergeKind.Squash => "squash", _ => "three_way" },
         outcome.CommitId, sourceRemoved),
-        ApiJson.Default.MergeResultResponse, null, context.RequestAborted);
+        ApiJson.Default.MergeResultResponse, mergedResponse, null);
 }
 
 // The permission a push needs is re-checked here as well as at the route, because the browser family
@@ -7034,6 +7290,743 @@ app.MapPost("/api/projects/{projectId:long}/housekeeping", async context =>
     });
 });
 
+// ---------------------------------------------------------------------------------------------------
+// What GitLab's clients ask for that Graft did not answer (ADR 0041): the user directory, activity feeds, stars,
+// reactions, merge request discussions, approvals and commits, a single commit, contributors, snippet comments,
+// milestone issues, the cross-project issue and merge request lists, deleting an issue, and uploads.
+// ---------------------------------------------------------------------------------------------------
+
+// The directory is the administrator's. Anybody else searching it finds nobody, and looking a person up by id finds
+// only themselves: Graft does not let its users enumerate one another.
+app.MapGet("/api/v4/users", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!await OnlyQuery(context, "search", "username", "page", "per_page", "active")) return;
+    (int Page, int PerPage)? pagination = await Pagination(context);
+    if (pagination is null) return;
+    string username = context.Request.Query["username"].ToString();
+    IReadOnlyList<UserAccount> found = await store.SearchDirectoryAsync(identity, username.Length > 0 ? username : context.Request.Query["search"].ToString(),
+        context.RequestAborted);
+    if (username.Length > 0) found = [.. found.Where(user => string.Equals(user.Username, username, StringComparison.OrdinalIgnoreCase))];
+    List<UserResponse> response = [];
+    foreach (UserAccount user in found.Skip((pagination.Value.Page - 1) * pagination.Value.PerPage).Take(pagination.Value.PerPage))
+        response.Add(await AuthorFor(context, user.Id, user.Username));
+    SetPagination(context, pagination.Value.Page, pagination.Value.PerPage, found.Count);
+    await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.UserResponseArray, null, context.RequestAborted);
+});
+
+app.MapGet("/api/v4/users/{userId:long}", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!await OnlyQuery(context)) return;
+    UserAccount? user = await store.FindDirectoryUserAsync(identity, RouteId(context, "userId"), context.RequestAborted);
+    if (user is null) { await ApiError(context, 404, "404 User Not Found"); return; }
+    await context.Response.WriteAsJsonAsync(await AuthorFor(context, user.Id, user.Username), ApiJson.Default.UserResponse, null, context.RequestAborted);
+});
+
+// GitLab's "user projects": the projects in that person's own namespace, those the caller may read.
+app.MapGet("/api/v4/users/{userId:long}/projects", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!await OnlyQuery(context, "page", "per_page")) return;
+    (int Page, int PerPage)? pagination = await Pagination(context);
+    if (pagination is null) return;
+    long userId = RouteId(context, "userId");
+    if (await store.FindDirectoryUserAsync(identity, userId, context.RequestAborted) is null) { await ApiError(context, 404, "404 User Not Found"); return; }
+    List<ProjectDetails> projects = await ReadableProjects(context, identity, await store.ListPersonalProjectIdsAsync(userId, context.RequestAborted));
+    await WriteProjectPage(context, projects, pagination.Value.Page, pagination.Value.PerPage);
+});
+
+// Activity: what the caller did, what a person did, and what happened in a project, newest first.
+app.MapGet("/api/v4/events", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    await WriteUserActivity(context, identity, identity.UserId);
+});
+
+app.MapGet("/api/v4/users/{userId:long}/events", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    await WriteUserActivity(context, identity, RouteId(context, "userId"));
+});
+
+app.MapGet("/api/v4/projects/{projectId}/events", async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    if (!await OnlyQuery(context, "page", "per_page")) return;
+    (int Page, int PerPage)? pagination = await Pagination(context);
+    if (pagination is null) return;
+    (IReadOnlyList<ActivityEvent> events, long total) = await store.ListProjectActivityAsync(scope.Value.Identity, scope.Value.Details.Project.Id,
+        (pagination.Value.Page - 1) * pagination.Value.PerPage, pagination.Value.PerPage, context.RequestAborted);
+    List<EventResponse> response = [];
+    foreach (ActivityEvent item in events) response.Add(await EventResponseFor(context, item));
+    SetPagination(context, pagination.Value.Page, pagination.Value.PerPage, total);
+    await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.EventResponseArray, null, context.RequestAborted);
+});
+
+async Task WriteUserActivity(HttpContext context, AuthenticatedIdentity identity, long userId)
+{
+    if (!await OnlyQuery(context, "page", "per_page")) return;
+    (int Page, int PerPage)? pagination = await Pagination(context);
+    if (pagination is null) return;
+    var activity = await store.ListUserActivityAsync(identity, userId, (pagination.Value.Page - 1) * pagination.Value.PerPage,
+        pagination.Value.PerPage, context.RequestAborted);
+    if (activity is null) { await ApiError(context, 404, "404 User Not Found"); return; }
+    List<EventResponse> response = [];
+    foreach (ActivityEvent item in activity.Value.Events) response.Add(await EventResponseFor(context, item));
+    SetPagination(context, pagination.Value.Page, pagination.Value.PerPage, activity.Value.Total);
+    await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.EventResponseArray, null, context.RequestAborted);
+}
+
+async Task<EventResponse> EventResponseFor(HttpContext context, ActivityEvent item)
+{
+    UserResponse? author = item.AuthorUserId is long authorId ? await AuthorFor(context, authorId, item.AuthorUsername ?? "") : null;
+    long sourceId = item.Id / 8;
+    switch (item.Kind)
+    {
+        case ActivityKind.Pushed:
+            string action = item.BeforeSha is null ? "pushed new" : item.AfterSha is null ? "deleted" : "pushed to";
+            bool tag = item.Ref!.StartsWith("refs/tags/", StringComparison.Ordinal);
+            string name = item.Ref.StartsWith("refs/heads/", StringComparison.Ordinal) ? item.Ref[11..] : tag ? item.Ref[10..] : item.Ref;
+            return new(item.Id, item.ProjectId, action, null, null, null, null, item.AuthorUserId, author, item.AuthorUsername, item.CreatedAtUtc,
+                new(item.CommitCount, item.BeforeSha is null ? "created" : item.AfterSha is null ? "removed" : "pushed", tag ? "tag" : "branch",
+                    item.BeforeSha, item.AfterSha, name, item.CommitTitle), null);
+        case ActivityKind.Commented:
+            NoteResponse note = new(sourceId, item.Body ?? "", author ?? await AuthorFor(context, 0, ""), item.CreatedAtUtc);
+            return new(item.Id, item.ProjectId, "commented on", sourceId, item.TargetIid, "Note", item.TargetTitle, item.AuthorUserId, author,
+                item.AuthorUsername, item.CreatedAtUtc, null, note);
+        default:
+            return new(item.Id, item.ProjectId, item.Kind == ActivityKind.MergeRequestMerged ? "accepted" : "opened", item.TargetId, item.TargetIid,
+                item.Kind == ActivityKind.IssueOpened ? "Issue" : "MergeRequest", item.TargetTitle, item.AuthorUserId, author, item.AuthorUsername,
+                item.CreatedAtUtc, null, null);
+    }
+}
+
+// Stars. Anybody who may read a project may star it; GitLab answers both with the project.
+foreach (bool starring in new[] { true, false })
+    app.MapPost("/api/v4/projects/{projectId}/" + (starring ? "star" : "unstar"), async context =>
+    {
+        AuthenticatedIdentity? caller = await RequireApiWriter(context);
+        if (caller is null) return;
+        ApiProject? project = await AuthorizeApiProject(context, ProjectAction.ReadCollaboration);
+        if (project is null) return;
+        await store.SetStarAsync(caller, project.Details.Project.Id, starring, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status201Created;
+        await context.Response.WriteAsJsonAsync(await ProjectResponseFor(context, project.Details), ApiJson.Default.ProjectResponse, null, context.RequestAborted);
+    });
+
+// Reactions on comments, beneath the issue or merge request the comment is on.
+foreach ((string family, CommentSubject subject) in new[] { ("issues", CommentSubject.Issue), ("merge_requests", CommentSubject.MergeRequest) })
+{
+    string notes = "/api/v4/projects/{projectId}/" + family + "/{iid:long}/notes/{noteId:long}/award_emoji";
+    app.MapGet(notes, async context =>
+    {
+        var scope = await ReactionScope(context, subject);
+        if (scope is null) return;
+        if (!await OnlyQuery(context, "page", "per_page")) return;
+        IReadOnlyList<AwardEmoji> awards = await store.ListAwardsAsync(scope.Value.Identity, scope.Value.Details.Project.Id, RouteId(context, "noteId"), context.RequestAborted);
+        List<AwardEmojiResponse> response = [];
+        foreach (AwardEmoji award in awards) response.Add(await AwardResponseFor(context, award));
+        await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.AwardEmojiResponseArray, null, context.RequestAborted);
+    });
+
+    app.MapPost(notes, async context =>
+    {
+        var scope = await ReactionScope(context, subject);
+        if (scope is null) return;
+        if (scope.Value.Identity is null) { await ApiError(context, 401, "401 Unauthorized"); return; }
+        if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+        AwardEmojiRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.AwardEmojiRequest, context.RequestAborted);
+        try
+        {
+            AwardEmoji award = await store.AddAwardAsync(scope.Value.Identity, scope.Value.Details.Project.Id, RouteId(context, "noteId"),
+                request?.Name ?? "", context.RequestAborted);
+            context.Response.StatusCode = StatusCodes.Status201Created;
+            await context.Response.WriteAsJsonAsync(await AwardResponseFor(context, award), ApiJson.Default.AwardEmojiResponse, null, context.RequestAborted);
+        }
+        catch (ArgumentException error) { await ApiError(context, 400, "400 Bad Request: " + error.Message); }
+        catch (CollaborationConflictException error) { await ApiError(context, 404, "404 Award Emoji Name has already been taken: " + error.Message); }
+        catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Note Not Found"); }
+        catch (UnauthorizedAccessException error) { await ApiError(context, 403, "403 Forbidden: " + error.Message); }
+    });
+
+    app.MapDelete(notes + "/{awardId:long}", async context =>
+    {
+        var scope = await ReactionScope(context, subject);
+        if (scope is null) return;
+        if (scope.Value.Identity is null) { await ApiError(context, 401, "401 Unauthorized"); return; }
+        try
+        {
+            if (!await store.RemoveAwardAsync(scope.Value.Identity, scope.Value.Details.Project.Id, RouteId(context, "noteId"), RouteId(context, "awardId"), context.RequestAborted))
+            { await ApiError(context, 404, "404 Award Emoji Not Found"); return; }
+            context.Response.StatusCode = StatusCodes.Status204NoContent;
+        }
+        catch (UnauthorizedAccessException error) { await ApiError(context, 403, "403 Forbidden: " + error.Message); }
+    });
+}
+
+// The comment must be on the issue or merge request the path names, and that item must be one the caller may see,
+// which for a confidential issue is narrower than the project.
+async Task<(ProjectDetails Details, AuthenticatedIdentity? Identity)?> ReactionScope(HttpContext context, CommentSubject subject)
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return null;
+    long projectId = scope.Value.Details.Project.Id;
+    bool visible = subject == CommentSubject.Issue
+        ? await store.FindIssueAsync(scope.Value.Identity, projectId, Number(context), context.RequestAborted) is not null
+        : await store.FindMergeProposalAsync(scope.Value.Identity, projectId, Number(context), null, context.RequestAborted) is not null;
+    if (!visible || !await store.CommentBelongsToAsync(projectId, subject, Number(context), RouteId(context, "noteId"), context.RequestAborted))
+    { await ApiError(context, 404, "404 Note Not Found"); return null; }
+    return scope;
+}
+
+async Task<AwardEmojiResponse> AwardResponseFor(HttpContext context, AwardEmoji award) =>
+    new(award.Id, award.Name, await AuthorFor(context, award.UserId, award.Username), award.CreatedAtUtc, award.CreatedAtUtc, award.CommentId, "Note");
+
+// Merge request discussions: Graft's threads in GitLab's shape. A thread is its first comment and the replies to it.
+app.MapGet("/api/v4/projects/{projectId}/merge_requests/{iid:long}/discussions", async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    if (!await OnlyQuery(context, "page", "per_page")) return;
+    MergeProposal? proposal = await store.FindMergeProposalAsync(scope.Value.Identity, scope.Value.Details.Project.Id, Number(context), null, context.RequestAborted);
+    if (proposal is null) { await ApiError(context, 404, "404 Merge Request Not Found"); return; }
+    try
+    {
+        IReadOnlyList<Comment> comments = await AllComments(context, scope.Value.Details, scope.Value.Identity, CommentSubject.MergeRequest);
+        List<DiscussionResponse> response = [];
+        foreach (Comment root in comments.Where(comment => comment.ParentId is null))
+            response.Add(await DiscussionFor(context, proposal, root, [.. comments.Where(comment => comment.ParentId == root.Id)]));
+        await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.DiscussionResponseArray, null, context.RequestAborted);
+    }
+    catch (CollaborationNotFoundException error) { await ApiError(context, 404, error.Message); }
+});
+
+// Starts a thread, on the merge request or on a line of its diff. A position comes as GitLab's `position` object or as
+// the flat `position[...]` fields a form carries; Graft anchors it to the source tip, as it does every line comment.
+app.MapPost("/api/v4/projects/{projectId}/merge_requests/{iid:long}/discussions", async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    if (scope.Value.Identity is null) { await ApiError(context, 401, "401 Unauthorized"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    using JsonDocument document = await JsonDocument.ParseAsync(context.Request.Body, cancellationToken: context.RequestAborted);
+    JsonElement body = document.RootElement;
+    string? text = JsonText(body, "body");
+    if (text is not { Length: > 0 }) { await ApiError(context, 400, "400 Bad Request: body is required"); return; }
+    string? Position(string name) => body.TryGetProperty("position", out JsonElement nested) && nested.ValueKind == JsonValueKind.Object
+        ? JsonText(nested, name) : JsonText(body, "position[" + name + "]");
+    string? newPath = Position("new_path"), oldPath = Position("old_path"), newLine = Position("new_line"), oldLine = Position("old_line");
+    string? path = newPath ?? oldPath;
+    int? line = int.TryParse(newLine ?? oldLine, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out int parsedLine) ? parsedLine : null;
+    DiffSide? side = path is null ? null : newLine is not null ? DiffSide.New : DiffSide.Old;
+    if (path is not null && line is null) { await ApiError(context, 400, "400 Bad Request: a position needs new_line or old_line"); return; }
+    string? anchor = path is null ? null : await SourceTip(context, scope.Value.Details, scope.Value.Identity, Number(context));
+    if (path is not null && anchor is null) { await ApiError(context, 409, "the source branch no longer resolves, so there is no diff to anchor to"); return; }
+    await AddDiscussionComment(context, scope.Value.Details, scope.Value.Identity, text, path, line, side, anchor, null);
+});
+
+app.MapPost("/api/v4/projects/{projectId}/merge_requests/{iid:long}/discussions/{discussionId:long}/notes", async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    if (scope.Value.Identity is null) { await ApiError(context, 401, "401 Unauthorized"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    long discussionId = RouteId(context, "discussionId");
+    if (!await store.CommentBelongsToAsync(scope.Value.Details.Project.Id, CommentSubject.MergeRequest, Number(context), discussionId, context.RequestAborted))
+    { await ApiError(context, 404, "404 Discussion Not Found"); return; }
+    using JsonDocument document = await JsonDocument.ParseAsync(context.Request.Body, cancellationToken: context.RequestAborted);
+    string? text = JsonText(document.RootElement, "body");
+    if (text is not { Length: > 0 }) { await ApiError(context, 400, "400 Bad Request: body is required"); return; }
+    await AddDiscussionComment(context, scope.Value.Details, scope.Value.Identity, text, null, null, null, null, discussionId);
+});
+
+// Resolves or reopens a thread; `resolved` comes in the body or the query string.
+app.MapMethods("/api/v4/projects/{projectId}/merge_requests/{iid:long}/discussions/{discussionId:long}", ["PUT"], async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    if (scope.Value.Identity is null) { await ApiError(context, 401, "401 Unauthorized"); return; }
+    long discussionId = RouteId(context, "discussionId");
+    long projectId = scope.Value.Details.Project.Id;
+    if (!await store.CommentBelongsToAsync(projectId, CommentSubject.MergeRequest, Number(context), discussionId, context.RequestAborted))
+    { await ApiError(context, 404, "404 Discussion Not Found"); return; }
+    string? resolved = null;
+    if (context.Request.HasJsonContentType())
+    {
+        using JsonDocument document = await JsonDocument.ParseAsync(context.Request.Body, cancellationToken: context.RequestAborted);
+        resolved = JsonText(document.RootElement, "resolved");
+    }
+    if (resolved is not ("true" or "false")) { await ApiError(context, 400, "400 Bad Request: resolved must be true or false"); return; }
+    try
+    {
+        await store.SetThreadResolvedAsync(scope.Value.Identity, projectId, discussionId, resolved == "true", context.RequestAborted);
+        MergeProposal proposal = (await store.FindMergeProposalAsync(scope.Value.Identity, projectId, Number(context), null, context.RequestAborted))!;
+        IReadOnlyList<Comment> comments = await AllComments(context, scope.Value.Details, scope.Value.Identity, CommentSubject.MergeRequest);
+        Comment root = comments.First(comment => comment.Id == discussionId || comment.Id == comments.First(c => c.Id == discussionId).ParentId);
+        await context.Response.WriteAsJsonAsync(await DiscussionFor(context, proposal, root, [.. comments.Where(comment => comment.ParentId == root.Id)]),
+            ApiJson.Default.DiscussionResponse, null, context.RequestAborted);
+    }
+    catch (CollaborationNotFoundException error) { await ApiError(context, 404, error.Message); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, "403 Forbidden: " + error.Message); }
+});
+
+async Task AddDiscussionComment(HttpContext context, ProjectDetails project, AuthenticatedIdentity identity, string text, string? path, int? line,
+    DiffSide? side, string? anchor, long? parentId)
+{
+    try
+    {
+        Comment comment = await store.AddCommentAsync(identity, project.Project.Id, CommentSubject.MergeRequest, Number(context),
+            text, path, line, side, anchor, parentId, context.RequestAborted);
+        await Notify(context, project.Project, WebhookEvent.Comment, payload =>
+        {
+            payload["action"] = "created";
+            payload["subject"] = "merge_request";
+            payload["iid"] = Number(context);
+            payload["author"] = comment.AuthorUsername;
+            payload["path"] = comment.Path;
+            payload["line"] = comment.Line;
+        });
+        MergeProposal proposal = (await store.FindMergeProposalAsync(identity, project.Project.Id, Number(context), null, context.RequestAborted))!;
+        context.Response.StatusCode = StatusCodes.Status201Created;
+        if (parentId is null)
+            await context.Response.WriteAsJsonAsync(await DiscussionFor(context, proposal, comment, []), ApiJson.Default.DiscussionResponse, null, context.RequestAborted);
+        else
+        {
+            IReadOnlyList<Comment> comments = await AllComments(context, project, identity, CommentSubject.MergeRequest);
+            Comment root = comments.FirstOrDefault(c => c.Id == comment.ParentId) ?? comment;
+            await context.Response.WriteAsJsonAsync(await DiscussionNoteFor(context, proposal, comment, root), ApiJson.Default.DiscussionNoteResponse, null, context.RequestAborted);
+        }
+    }
+    catch (CollaborationNotFoundException error) { await ApiError(context, 404, error.Message); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, "403 Forbidden: " + error.Message); }
+    catch (ArgumentException error) { await ApiError(context, 400, "400 Bad Request: " + error.Message); }
+}
+
+async Task<IReadOnlyList<Comment>> AllComments(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity, CommentSubject subject)
+{
+    List<Comment> all = [];
+    for (int skip = 0; ; skip += 100)
+    {
+        IReadOnlyList<Comment> page = await store.ListCommentsAsync(identity, project.Project.Id, subject, Number(context), skip, 100, context.RequestAborted);
+        all.AddRange(page);
+        if (page.Count < 100 || skip >= 10_000) return all;
+    }
+}
+
+async Task<DiscussionResponse> DiscussionFor(HttpContext context, MergeProposal proposal, Comment root, IReadOnlyList<Comment> replies)
+{
+    List<DiscussionNoteResponse> notes = [await DiscussionNoteFor(context, proposal, root, root)];
+    foreach (Comment reply in replies) notes.Add(await DiscussionNoteFor(context, proposal, reply, root));
+    return new(root.Id.ToString(System.Globalization.CultureInfo.InvariantCulture), replies.Count == 0 && root.Path is null, notes);
+}
+
+async Task<DiscussionNoteResponse> DiscussionNoteFor(HttpContext context, MergeProposal proposal, Comment comment, Comment root)
+{
+    UserResponse? resolvedBy = null;
+    if (root.ResolvedByUsername is { } resolver)
+    {
+        UserAccount? account = null;
+        try { account = await store.FindActiveUserAsync(resolver, context.RequestAborted); } catch (ArgumentException) { }
+        resolvedBy = await AuthorFor(context, account?.Id ?? 0, resolver);
+    }
+    NotePositionResponse? position = comment.Path is null ? null : new(null, comment.AnchorCommitSha, null, comment.Path, comment.Path, "text",
+        comment.Side == DiffSide.Old ? comment.Line : null, comment.Side == DiffSide.New ? comment.Line : null);
+    return new(comment.Id, comment.Path is not null ? "DiffNote" : root.Id == comment.Id && comment.ParentId is null ? null : "DiscussionNote",
+        comment.Body, await AuthorFor(context, comment.AuthorUserId, comment.AuthorUsername), comment.CreatedAtUtc, comment.EditedAtUtc ?? comment.CreatedAtUtc,
+        false, proposal.Id, "MergeRequest", proposal.Iid, true, root.ResolvedAtUtc is not null, resolvedBy, root.ResolvedAtUtc, position);
+}
+
+static string? JsonText(JsonElement element, string name) =>
+    element.ValueKind == JsonValueKind.Object && element.TryGetProperty(name, out JsonElement value)
+        ? value.ValueKind switch
+        {
+            JsonValueKind.String => value.GetString(),
+            JsonValueKind.Number => value.GetRawText(),
+            JsonValueKind.True => "true",
+            JsonValueKind.False => "false",
+            _ => null
+        }
+        : null;
+
+// GitLab's approval state: current approvals only, each as `{user}`, and what is left.
+app.MapGet("/api/v4/projects/{projectId}/merge_requests/{iid:long}/approvals", async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    if (!await OnlyQuery(context)) return;
+    string? tip = await SourceTip(context, scope.Value.Details, scope.Value.Identity, Number(context));
+    MergeProposal? proposal = await store.FindMergeProposalAsync(scope.Value.Identity, scope.Value.Details.Project.Id, Number(context), tip, context.RequestAborted);
+    if (proposal is null) { await ApiError(context, 404, "404 Merge Request Not Found"); return; }
+    List<ApprovalUserResponse> approvedBy = [];
+    foreach (Approval approval in (proposal.Approvals ?? []).Where(approval => approval.Current))
+        approvedBy.Add(new(await AuthorFor(context, approval.UserId, approval.Username)));
+    int left = Math.Max(0, proposal.ApprovalsRequired - approvedBy.Count);
+    await context.Response.WriteAsJsonAsync(new MergeRequestApprovalsResponse(proposal.Id, proposal.Iid, proposal.ProjectId, proposal.Title,
+        StateText(proposal.State), left == 0, proposal.ApprovalsRequired, left, approvedBy), ApiJson.Default.MergeRequestApprovalsResponse, null, context.RequestAborted);
+});
+
+// The commits a merge request brings: on its source since where it left the target, newest first.
+app.MapGet("/api/v4/projects/{projectId}/merge_requests/{iid:long}/commits", async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    if (!await OnlyQuery(context, "page", "per_page")) return;
+    MergeProposal? proposal = await store.FindMergeProposalAsync(scope.Value.Identity, scope.Value.Details.Project.Id, Number(context), null, context.RequestAborted);
+    if (proposal is null) { await ApiError(context, 404, "404 Merge Request Not Found"); return; }
+    if (!(await DecideFor(context, scope.Value.Identity, scope.Value.Details.Project.Id, ProjectAction.BrowseRepository)).Allowed)
+    { await ApiError(context, 404, "404 Merge Request Not Found"); return; }
+    await EnsureSource(context, scope.Value.Details, proposal);
+    List<CommitResponse> response = [];
+    await WithRepository(EndpointFor(scope.Value.Details.Project), context, repository =>
+    {
+        MergeAnalysis analysis = RepositoryMerge.Analyse(repository, proposal.SourceReference, proposal.TargetBranch, context.RequestAborted);
+        if (analysis.SourceCommitId is not null)
+            foreach (GitCommit commit in CommitsSince(repository, analysis.BaseCommitId, analysis.SourceCommitId, 1000, context.RequestAborted))
+                response.Add(CommitResponseFor(context, scope.Value.Details, commit));
+        return Task.CompletedTask;
+    });
+    if (context.Response.HasStarted) return;
+    SetPagination(context, 1, Math.Max(response.Count, 1), response.Count);
+    await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.CommitResponseArray, null, context.RequestAborted);
+});
+
+// Nothing is ever set to merge when a pipeline succeeds here, so there is nothing to cancel; the merge request is
+// answered as it stands, which is what GitLab answers once the setting is off.
+app.MapPost("/api/v4/projects/{projectId}/merge_requests/{iid:long}/cancel_merge_when_pipeline_succeeds", async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    if (scope.Value.Identity is null) { await ApiError(context, 401, "401 Unauthorized"); return; }
+    MergeProposal? proposal = await store.FindMergeProposalAsync(scope.Value.Identity, scope.Value.Details.Project.Id, Number(context), null, context.RequestAborted);
+    if (proposal is null) { await ApiError(context, 404, "404 Merge Request Not Found"); return; }
+    if (proposal.State != CollaborationState.Opened) { await ApiError(context, 406, "406 Not Acceptable: the merge request is not open"); return; }
+    await context.Response.WriteAsJsonAsync(await FullMergeResponse(context, scope.Value.Details, proposal), ApiJson.Default.MergeRequestResponse, null, context.RequestAborted);
+});
+
+// One commit, by id or by a name that resolves to one, as GitLab's "get a single commit".
+app.MapGet("/api/v4/projects/{projectId}/repository/commits/{sha}", async context =>
+{
+    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.BrowseRepository);
+    if (project is null) return;
+    if (!await OnlyQuery(context, "stats")) return;
+    string revision = Uri.UnescapeDataString(context.Request.RouteValues["sha"]?.ToString() ?? "");
+    await WithRepository(project.Endpoint, context, async repository =>
+    {
+        string? id = RepositoryView.ResolveCommit(repository, revision);
+        if (id is null) { await ApiError(context, 404, "404 Commit Not Found"); return; }
+        await context.Response.WriteAsJsonAsync(CommitResponseFor(context, project.Details, RepositoryView.ReadCommit(repository, id)),
+            ApiJson.Default.CommitResponse, null, context.RequestAborted);
+    });
+});
+
+// Who committed to the default branch, by name and address, most commits first. Lines added and removed are not
+// counted, because that is a diff of every commit; they are reported as zero.
+app.MapGet("/api/v4/projects/{projectId}/repository/contributors", async context =>
+{
+    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.BrowseRepository);
+    if (project is null) return;
+    if (!await OnlyQuery(context, "page", "per_page", "ref")) return;
+    ContributorResponse[] response = [];
+    await WithRepository(project.Endpoint, context, repository =>
+    {
+        string revision = context.Request.Query["ref"].ToString() is { Length: > 0 } wanted ? wanted : repository.DefaultBranch ?? "HEAD";
+        response = [.. RepositoryView.Commits(repository, revision, 0, 10_000)
+            .GroupBy(commit => (commit.Author.Name, commit.Author.Email))
+            .Select(group => new ContributorResponse(group.Key.Name, group.Key.Email, group.Count(), 0, 0))
+            .OrderByDescending(contributor => contributor.Commits).ThenBy(contributor => contributor.Name, StringComparer.Ordinal)];
+        return Task.CompletedTask;
+    });
+    if (context.Response.HasStarted) return;
+    await context.Response.WriteAsJsonAsync(response, ApiJson.Default.ContributorResponseArray, null, context.RequestAborted);
+});
+
+// Comments on a snippet: flat, by participants, read wherever the snippet is.
+app.MapGet("/api/v4/projects/{projectId}/snippets/{snippetId:long}/notes", async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    if (!await OnlyQuery(context, "page", "per_page")) return;
+    try
+    {
+        IReadOnlyList<SnippetNote> notes = await store.ListSnippetNotesAsync(scope.Value.Identity, scope.Value.Details.Project.Id, RouteId(context, "snippetId"), context.RequestAborted);
+        List<NoteResponse> response = [];
+        foreach (SnippetNote note in notes) response.Add(new(note.Id, note.Body, await AuthorFor(context, note.AuthorUserId, note.AuthorUsername), note.CreatedAtUtc));
+        await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.NoteResponseArray, null, context.RequestAborted);
+    }
+    catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Snippet Not Found"); }
+});
+
+app.MapPost("/api/v4/projects/{projectId}/snippets/{snippetId:long}/notes", async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    if (scope.Value.Identity is null) { await ApiError(context, 401, "401 Unauthorized"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    NoteCreateRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.NoteCreateRequest, context.RequestAborted);
+    try
+    {
+        SnippetNote note = await store.AddSnippetNoteAsync(scope.Value.Identity, scope.Value.Details.Project.Id, RouteId(context, "snippetId"),
+            request?.Body ?? "", context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status201Created;
+        await context.Response.WriteAsJsonAsync(new NoteResponse(note.Id, note.Body, await AuthorFor(context, note.AuthorUserId, note.AuthorUsername), note.CreatedAtUtc),
+            ApiJson.Default.NoteResponse, null, context.RequestAborted);
+    }
+    catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Snippet Not Found"); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, "403 Forbidden: " + error.Message); }
+    catch (ArgumentException error) { await ApiError(context, 400, "400 Bad Request: " + error.Message); }
+});
+
+// A milestone's issues, by the milestone's id as GitLab addresses it.
+app.MapGet("/api/v4/projects/{projectId}/milestones/{milestoneId:long}/issues", async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    if (!await OnlyQuery(context, "page", "per_page")) return;
+    (int Page, int PerPage)? pagination = await Pagination(context);
+    if (pagination is null) return;
+    IssuePage issues = await store.ListIssuesAsync(scope.Value.Identity, scope.Value.Details.Project.Id,
+        new IssueFilter(Milestone: RouteId(context, "milestoneId").ToString(System.Globalization.CultureInfo.InvariantCulture)),
+        (pagination.Value.Page - 1) * pagination.Value.PerPage, pagination.Value.PerPage, context.RequestAborted);
+    List<IssueResponse> response = [];
+    foreach (Issue issue in issues.Issues) response.Add(await IssueResponseFor(context, scope.Value.Details, issue));
+    SetPagination(context, pagination.Value.Page, pagination.Value.PerPage, issues.Total);
+    await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.IssueResponseArray, null, context.RequestAborted);
+});
+
+// Deleting an issue, for the project's owner or an administrator, as GitLab gives it to the Owner role.
+app.MapDelete("/api/v4/projects/{projectId}/issues/{iid:long}", async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    if (scope.Value.Identity is null) { await ApiError(context, 401, "401 Unauthorized"); return; }
+    try
+    {
+        await store.DeleteIssueAsync(scope.Value.Identity, scope.Value.Details.Project.Id, Number(context), context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Issue Not Found"); }
+    catch (InvalidOperationException error) { await ApiError(context, 403, "403 Forbidden: " + error.Message); }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "404 Project Not Found"); }
+});
+
+// The issues and merge requests across every project the caller belongs to. `scope` defaults to created_by_me, as on
+// GitLab; the lists are gathered per project, newest change first, from at most the first five hundred projects.
+foreach (bool issues in new[] { true, false })
+    app.MapGet(issues ? "/api/v4/issues" : "/api/v4/merge_requests", async context =>
+    {
+        AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+        if (identity is null) return;
+        if (!await OnlyQuery(context, "state", "scope", "page", "per_page", "labels", "search", "author_username", "assignee_username", "wip", "iids", "iids[]")) return;
+        if (!TryReadState(context.Request.Query["state"].ToString(), out CollaborationState? state, merged: !issues))
+        { await ApiError(context, 400, issues ? "state must be opened, closed or all" : "state must be opened, closed, merged or all"); return; }
+        (int Page, int PerPage)? pagination = await Pagination(context);
+        if (pagination is null) return;
+        if (context.Request.Query["scope"].ToString().Length == 0)
+        {
+            Dictionary<string, Microsoft.Extensions.Primitives.StringValues> query = new(context.Request.Query, StringComparer.Ordinal) { ["scope"] = "created_by_me" };
+            context.Request.Query = new QueryCollection(query);
+        }
+        GitLabListFilter? extra = await ReadGitLabListFilter(context, identity);
+        if (extra is null) return;
+        List<ProjectDetails> projects = [];
+        for (int skip = 0; skip < 500; skip += 100)
+        {
+            ProjectPage page = await store.ListAccessibleProjectsAsync(identity, skip, 100, context.RequestAborted);
+            projects.AddRange(page.Projects);
+            if (page.Projects.Count < 100) break;
+        }
+        List<(DateTimeOffset Updated, Func<Task<object>> Render)> found = [];
+        foreach (ProjectDetails project in projects)
+        {
+            try
+            {
+                if (issues)
+                {
+                    IssueFilter filter = new(state, LabelList(Optional(context, "labels")), null, null, extra.Assignee ?? Optional(context, "assignee_username"),
+                        Optional(context, "search"), null, extra.Author, extra.Iids);
+                    foreach (Issue issue in (await store.ListIssuesAsync(identity, project.Project.Id, filter, 0, 100, context.RequestAborted)).Issues)
+                        found.Add((issue.UpdatedAtUtc, async () => await IssueResponseFor(context, project, issue)));
+                }
+                else
+                {
+                    MergeFilter filter = new(state, LabelList(Optional(context, "labels")), null, extra.Assignee ?? Optional(context, "assignee_username"), null,
+                        Optional(context, "search"), extra.Author, extra.Iids, extra.Draft);
+                    foreach (MergeProposal proposal in (await store.ListMergeProposalsAsync(identity, project.Project.Id, filter, 0, 100, context.RequestAborted)).Proposals)
+                        found.Add((proposal.UpdatedAtUtc, async () => await MergeResponseFor(context, project, proposal, null)));
+                }
+            }
+            catch (UnauthorizedAccessException) { }
+            catch (ArgumentException error) { await ApiError(context, 400, error.Message); return; }
+        }
+        List<object> rendered = [];
+        foreach (var item in found.OrderByDescending(item => item.Updated).Skip((pagination.Value.Page - 1) * pagination.Value.PerPage).Take(pagination.Value.PerPage))
+            rendered.Add(await item.Render());
+        SetPagination(context, pagination.Value.Page, pagination.Value.PerPage, found.Count);
+        if (issues) await context.Response.WriteAsJsonAsync([.. rendered.Cast<IssueResponse>()], ApiJson.Default.IssueResponseArray, null, context.RequestAborted);
+        else await context.Response.WriteAsJsonAsync([.. rendered.Cast<MergeRequestResponse>()], ApiJson.Default.MergeRequestResponseArray, null, context.RequestAborted);
+    });
+
+// Files attached to Markdown. A participant uploads one; it is kept beside the project's repository and served at
+// GitLab's `/<project>/uploads/<secret>/<name>` to whoever may read the project's conversation.
+app.MapPost("/api/v4/projects/{projectId}/uploads", async context =>
+{
+    AuthenticatedIdentity? caller = await RequireApiWriter(context);
+    if (caller is null) return;
+    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.WriteCollaboration);
+    if (project is null) return;
+    if (!context.Request.HasFormContentType) { await ApiError(context, 400, "400 Bad Request: send the file as multipart form data named file"); return; }
+    if (context.Request.ContentLength > MaximumUploadBytes + 64 * 1024) { await ApiError(context, 413, "413 Request Entity Too Large: a file is at most 10 MiB"); return; }
+    IFormCollection form = await context.Request.ReadFormAsync(context.RequestAborted);
+    IFormFile? file = form.Files.GetFile("file");
+    if (file is null || file.Length == 0) { await ApiError(context, 400, "400 Bad Request: file is required"); return; }
+    if (file.Length > MaximumUploadBytes) { await ApiError(context, 413, "413 Request Entity Too Large: a file is at most 10 MiB"); return; }
+    string name = new([.. Path.GetFileName(file.FileName ?? "").Select(c => char.IsLetterOrDigit(c) || c is '.' or '-' or '_' ? c : '_')]);
+    name = name.Trim('.');
+    if (name.Length == 0) name = "file";
+    if (name.Length > 120) name = name[^120..];
+    string secret = Convert.ToHexStringLower(System.Security.Cryptography.RandomNumberGenerator.GetBytes(16));
+    string target = UploadPathFor(project.Details.Project, secret, name);
+    Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+    await using (FileStream output = new(target, FileMode.CreateNew, FileAccess.Write))
+        await file.CopyToAsync(output, context.RequestAborted);
+    string contentType = UploadContentType(name);
+    ProjectUpload upload;
+    try { upload = await store.RecordUploadAsync(caller, project.Details.Project.Id, secret, name, contentType, file.Length, context.RequestAborted); }
+    catch (UnauthorizedAccessException error) { File.Delete(target); await ApiError(context, 403, "403 Forbidden: " + error.Message); return; }
+    string url = "/uploads/" + secret + "/" + Uri.EscapeDataString(name);
+    string alt = Path.GetFileNameWithoutExtension(name);
+    context.Response.StatusCode = StatusCodes.Status201Created;
+    await context.Response.WriteAsJsonAsync(new ProjectUploadResponse(upload.Id, alt, url,
+        "/" + project.Details.Project.Namespace + "/" + project.Details.Project.Slug + url,
+        (contentType.StartsWith("image/", StringComparison.Ordinal) ? "!" : "") + "[" + alt + "](" + url + ")"),
+        ApiJson.Default.ProjectUploadResponse, null, context.RequestAborted);
+});
+
+string UploadPathFor(ProjectInfo project, string secret, string name) =>
+    Path.Combine(settings.Repositories, project.StorageId, "uploads", secret, name);
+
+// What an upload is served as. Images by their own type, so Markdown can show them; everything else as bytes to save.
+static string UploadContentType(string name) => Path.GetExtension(name).ToLowerInvariant() switch
+{
+    ".png" => "image/png",
+    ".jpg" or ".jpeg" => "image/jpeg",
+    ".gif" => "image/gif",
+    ".webp" => "image/webp",
+    ".pdf" => "application/pdf",
+    ".txt" or ".log" or ".md" => "text/plain; charset=utf-8",
+    _ => "application/octet-stream"
+};
+
+// The commits on `tip` that `since` does not have, newest first, at most `limit`.
+static IReadOnlyList<GitCommit> CommitsSince(Repository repository, string? since, string tip, int limit, CancellationToken cancellationToken)
+{
+    HashSet<string> excluded = [];
+    if (since is not null)
+    {
+        Stack<string> walk = new([since]);
+        while (walk.TryPop(out string? id))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!excluded.Add(id) || !repository.Objects.ContainsKey(id)) continue;
+            foreach (string parent in RepositoryView.ReadCommit(repository, id).ParentIds) walk.Push(parent);
+        }
+    }
+    List<GitCommit> commits = [];
+    HashSet<string> seen = [];
+    Stack<string> pending = new([tip]);
+    while (pending.TryPop(out string? id) && commits.Count < limit)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (excluded.Contains(id) || !seen.Add(id) || !repository.Objects.ContainsKey(id)) continue;
+        GitCommit commit = RepositoryView.ReadCommit(repository, id);
+        commits.Add(commit);
+        foreach (string parent in commit.ParentIds) pending.Push(parent);
+    }
+    return [.. commits.OrderByDescending(commit => commit.Committer.When)];
+}
+
+// GitLab's diff shape for a list of changed files: modes as strings, "0" for a side that is absent, and the unified text.
+static GitLabDiffResponse[] GitLabDiffs(IEnumerable<DiffFile> files) => [.. files.Select(file => new GitLabDiffResponse(
+    file.Path, file.Path, file.OldMode ?? "0", file.NewMode ?? "0", UnifiedText(file),
+    file.Status == "added", false, file.Status == "deleted", file.TooLarge, file.Status, file.Added, file.Removed, file.IsBinary))];
+
+static string UnifiedText(DiffFile file)
+{
+    if (file.IsBinary || file.TooLarge) return "";
+    StringBuilder text = new();
+    foreach (DiffHunk hunk in file.Hunks)
+    {
+        text.Append(HunkHeader(hunk)).Append('\n');
+        foreach (DiffLine line in hunk.Lines)
+        {
+            text.Append(line.Kind).Append(line.Text).Append('\n');
+            if (line.NoNewline) text.Append("\\ No newline at end of file\n");
+        }
+    }
+    return text.ToString();
+}
+
+// A Graft response that carries a merge request, answered as GitLab answers: the merge request's own fields at the top
+// level, beside Graft's, which stay, so GitLab's clients and Graft's read the same body.
+async Task WriteWithMergeRequest<T>(HttpContext context, T value, System.Text.Json.Serialization.Metadata.JsonTypeInfo<T> type,
+    MergeRequestResponse mergeRequest, IReadOnlyList<DiffFile>? changes)
+{
+    System.Text.Json.Nodes.JsonObject node = JsonSerializer.SerializeToNode(value, type)!.AsObject();
+    System.Text.Json.Nodes.JsonObject fields = JsonSerializer.SerializeToNode(mergeRequest, ApiJson.Default.MergeRequestResponse)!.AsObject();
+    foreach (string key in fields.Select(pair => pair.Key).ToArray())
+    {
+        if (node.ContainsKey(key)) continue;
+        System.Text.Json.Nodes.JsonNode? field = fields[key];
+        fields.Remove(key);
+        node[key] = field;
+    }
+    if (changes is not null) node["changes"] = JsonSerializer.SerializeToNode(GitLabDiffs(changes), ApiJson.Default.GitLabDiffResponseArray);
+    await context.Response.WriteAsJsonAsync(node, ApiJson.Default.JsonObject, null, context.RequestAborted);
+}
+
+// Records what a push did to each branch, for the activity feed: how many commits arrived and the newest one's title.
+async Task RecordPushes(ProjectInfo project, AuthenticatedIdentity? identity, List<(string Branch, string? From, string? To)> moved)
+{
+    if (moved.Count == 0) return;
+    try { await RecordPushesUnguarded(project, identity, moved); }
+    catch (Exception exception) when (exception is not OperationCanceledException) { app.Logger.LogWarning(exception, "push for {Project} was not recorded", project.Slug); }
+}
+
+async Task RecordPushesUnguarded(ProjectInfo project, AuthenticatedIdentity? identity, List<(string Branch, string? From, string? To)> moved)
+{
+    List<PushRecord> records = [];
+    RepositoryEndpoint endpoint = EndpointFor(project);
+    await endpoint.Gate.WaitAsync();
+    try
+    {
+        foreach ((string branch, string? from, string? to) in moved)
+        {
+            int count = 0;
+            string? title = null;
+            if (to is not null && endpoint.Repository.Objects.ContainsKey(to))
+            {
+                try
+                {
+                    count = CommitsSince(endpoint.Repository, from, to, 1000, CancellationToken.None).Count;
+                    title = RepositoryView.ReadCommit(endpoint.Repository, to).Title;
+                }
+                catch (GitInputException) { }
+            }
+            records.Add(new("refs/heads/" + branch, from, to, count, title));
+        }
+    }
+    finally { endpoint.Gate.Release(); }
+    try { await store.RecordPushAsync(project.Id, identity?.UserId, records); }
+    catch (Exception exception) when (exception is not OperationCanceledException) { app.Logger.LogWarning(exception, "push for {Project} was not recorded", project.Slug); }
+}
+
 app.Map("/api/v4/{**path}", context => ApiError(context, 404, "404 API endpoint not found"));
 
 app.MapGet("/{projectNamespace}/{project}.git/info/refs", async context =>
@@ -7236,7 +8229,7 @@ app.MapPost("/{projectNamespace}/{project}.git/{service}", async context =>
 
         // The refs before and after, so a push can report which branches moved. Taken inside the lock, so
         // nothing else can move one between the two readings.
-        Dictionary<string, string>? before = service == "git-receive-pack" && (webhooks is not null || runners is not null)
+        Dictionary<string, string>? before = service == "git-receive-pack"
             ? new(authorized.Endpoint.Repository.Refs, StringComparer.Ordinal)
             : null;
 
@@ -7273,6 +8266,7 @@ app.MapPost("/{projectNamespace}/{project}.git/{service}", async context =>
             payload["via"] = "push";
         });
     }
+    await RecordPushes(authorized.Project, authorized.Identity, pushed);
     await CreatePushPipelines(authorized.Project, authorized.Identity, pushed);
 });
 
@@ -7517,7 +8511,9 @@ if (settings.SshPort >= 0)
 {
     sshHostKey = Graft.Ssh.SshHostKey.LoadOrCreate(Path.Combine(Path.GetDirectoryName(settings.Database)!, "ssh_host_ecdsa_key"));
     GitSshHost gitHost = new(store, settings.PublicBrowsing, GlobalNamespace, EndpointFor,
-        async (project, identity, moved) => { await NotifyPushAt(serverOrigin!, project, identity, moved); await CreatePushPipelines(project, identity, moved); },
+        async (project, identity, moved) => { await NotifyPushAt(serverOrigin!, project, identity, moved); await CreatePushPipelines(project, identity, moved);
+            // The SSH host calls this while it still holds the repository, which RecordPushes reads; so after, not inside.
+            _ = Task.Run(() => RecordPushes(project, identity, moved)); },
         (text, exception) => app.Logger.LogInformation(exception, "{Message}", text));
     sshServer = new(new Graft.Ssh.SshServerOptions
     {
@@ -7683,6 +8679,7 @@ async Task<AuthenticatedIdentity?> AuthenticateApi(HttpContext context, bool req
         await ApiError(context, 403, "403 Forbidden: insufficient_scope");
         return null;
     }
+    context.Items[ApiIdentityKey] = identity;
     return identity;
 }
 
@@ -7846,6 +8843,7 @@ async Task<(bool Failed, AuthenticatedIdentity? Identity)> AuthenticateApiOption
         await ApiError(context, 401, "401 Unauthorized");
         return (true, null);
     }
+    context.Items[ApiIdentityKey] = identity;
     return (false, identity);
 }
 
@@ -7975,6 +8973,9 @@ async Task<ProjectResponse> ProjectResponseForLocked(HttpContext context, Projec
         ? AvatarUrl(context, AvatarOwner.Project, details.Project.Id)
         : null;
     ForkInfo forks = await store.GetForkInfoAsync(details.Project.Id, context.RequestAborted);
+    long stars = await store.CountStarsAsync(details.Project.Id, context.RequestAborted);
+    ProjectPermissionsResponse? permissions = await PermissionsFor(context, details);
+    UserResponse? owner = details.Project.GroupId is null ? await AuthorFor(context, details.Project.OwnerUserId, details.Project.Namespace) : null;
     return new(details.Project.Id, details.Description, details.Project.Name,
         details.Project.Namespace + " / " + details.Project.Name, details.Project.Slug, path, details.CreatedAtUtc,
         defaultBranch, VisibilityName(details.Project.Visibility),
@@ -7987,7 +8988,40 @@ async Task<ProjectResponse> ProjectResponseForLocked(HttpContext context, Projec
         details.Project.GlobalSlug,
         details.Project.GlobalSlug.Length == 0 ? "" : origin + GlobalPrefix + "/" + Uri.EscapeDataString(details.Project.GlobalSlug),
         forks.UpstreamId is long upstreamId ? new ForkedFromResponse(upstreamId, forks.UpstreamPath!, origin + "/" + forks.UpstreamPath) : null,
-        forks.ForksCount);
+        forks.ForksCount, stars, permissions, owner);
+}
+
+// The projects among these ids that the caller may read, in the order given.
+async Task<List<ProjectDetails>> ReadableProjects(HttpContext context, AuthenticatedIdentity identity, IReadOnlyList<long> ids)
+{
+    List<ProjectDetails> readable = [];
+    foreach (long id in ids)
+        if (await store.GetReadyProjectAsync(id, context.RequestAborted) is { } project &&
+            (await DecideFor(context, identity, id, ProjectAction.ReadCollaboration)).Allowed)
+            readable.Add(project);
+    return readable;
+}
+
+// One page of an in-memory project list, in GitLab's shape with its paging headers.
+async Task WriteProjectPage(HttpContext context, IReadOnlyList<ProjectDetails> projects, int page, int perPage)
+{
+    List<ProjectResponse> response = [];
+    foreach (ProjectDetails project in projects.Skip((page - 1) * perPage).Take(perPage)) response.Add(await ProjectResponseFor(context, project));
+    SetPagination(context, page, perPage, projects.Count);
+    await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.ProjectResponseArray, null, context.RequestAborted);
+}
+
+// GitLab's access level for whoever is asking, read from the identity the API authentication left on the request: 50 for
+// the owner or an administrator, then 40, 30 and 20 for what the caller may do, and nothing for a caller with no role.
+async Task<ProjectPermissionsResponse?> PermissionsFor(HttpContext context, ProjectDetails details)
+{
+    if (context.Items[ApiIdentityKey] is not AuthenticatedIdentity identity) return null;
+    int level = identity.IsAdministrator || identity.UserId == details.Project.OwnerUserId ? 50
+        : (await DecideFor(context, identity, details.Project.Id, ProjectAction.ManageProject)).Allowed ? 40
+        : (await DecideFor(context, identity, details.Project.Id, ProjectAction.PushRepository)).Allowed ? 30
+        : (await DecideFor(context, identity, details.Project.Id, ProjectAction.WriteCollaboration)).Allowed ? 20
+        : 0;
+    return level == 0 ? null : new(new(level, 3), null);
 }
 
 /// <summary>
@@ -8593,3 +9627,5 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         return true;
     }
 }
+
+sealed record GitLabListFilter(string? Author, string? Assignee, IReadOnlyList<long>? Iids, bool? Draft);

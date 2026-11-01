@@ -239,6 +239,7 @@ try
     await CheckCompressedGitRequests(address, aliceIdentity);
     address = await CheckPushDeletion(address, aliceIdentity);
     await CheckGitLabClientShapes(address, aliceIdentity, bob.Username);
+    await CheckClientSurfaces(address, aliceIdentity, bob.Username);
     await CheckGitEngine(address, aliceIdentity);
     await CheckFetching(address, aliceIdentity, "carol");
     await CheckSsh(address, aliceIdentity, bob.Username);
@@ -6334,6 +6335,106 @@ async Task<string> CheckRunners(string address, AuthenticatedIdentity alice, str
     using (HttpResponseMessage none = await ApiGet(address, prefix + "/jobs/" + jobs["test"].GetProperty("id").GetInt64() + "/artifacts", aliceApi))
         Check(none.StatusCode == HttpStatusCode.NotFound, "and a job without artifacts has none to download");
 
+    // A project's jobs, by status, as GitLab's clients list them.
+    using (HttpResponseMessage failedJobs = await ApiGet(address, prefix + "/jobs?scope[]=failed", aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await failedJobs.Content.ReadAsStringAsync());
+        Check(failedJobs.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 2 &&
+            json.RootElement.EnumerateArray().All(job => job.GetProperty("status").GetString() == "failed") && HeaderTotal(failedJobs) == 2,
+            "a project's jobs are listed by status");
+    }
+
+    // Retrying a job is a new attempt: the old one keeps its result and drops out of the pipeline's list, and what its
+    // failure had skipped is queued again.
+    long testJobId = jobs["test"].GetProperty("id").GetInt64();
+    long retriedTestId;
+    using (HttpResponseMessage retried = await ApiPost(address, prefix + "/jobs/" + testJobId + "/retry", aliceApi, new { }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await retried.Content.ReadAsStringAsync());
+        retriedTestId = retried.IsSuccessStatusCode ? json.RootElement.GetProperty("id").GetInt64() : 0;
+        Check(retried.StatusCode == HttpStatusCode.Created && retriedTestId != testJobId && json.RootElement.GetProperty("status").GetString() == "pending" &&
+            json.RootElement.GetProperty("name").GetString() == "test", "retrying a failed job queues a new attempt of it");
+    }
+    using (HttpResponseMessage again = await ApiPost(address, prefix + "/jobs/" + testJobId + "/retry", aliceApi, new { }))
+        Check(again.StatusCode == HttpStatusCode.Forbidden, "an attempt already retried is not retried twice");
+    using (HttpResponseMessage listed = await ApiGet(address, prefix + "/pipelines/" + pipelineId + "/jobs", aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await listed.Content.ReadAsStringAsync());
+        Dictionary<string, JsonElement> latest = json.RootElement.EnumerateArray().ToDictionary(job => job.GetProperty("name").GetString()!, job => job.Clone());
+        Check(json.RootElement.GetArrayLength() == 4 && latest["test"].GetProperty("id").GetInt64() == retriedTestId &&
+            latest["deploy"].GetProperty("status").GetString() == "pending", "the pipeline lists the new attempt, and the stage it had skipped is queued again");
+    }
+    using (HttpResponseMessage pipeline = await ApiGet(address, prefix + "/pipelines/" + pipelineId, aliceApi))
+        Check((await pipeline.Content.ReadAsStringAsync()).Contains("\"status\":\"pending\"", StringComparison.Ordinal), "and the pipeline is open again");
+    (int retryExit, _, string retryErrors) = await RunTool(runnerExe, scripts, ["run", "--config", config, "--once"]);
+    using (HttpResponseMessage pipeline = await ApiGet(address, prefix + "/pipelines/" + pipelineId, aliceApi))
+        Check(retryExit == 1 && (await pipeline.Content.ReadAsStringAsync()).Contains("\"status\":\"failed\"", StringComparison.Ordinal),
+            "the runner runs the new attempt, which fails as before, and the pipeline settles failed (" + retryErrors.Trim() + ")");
+
+    // Retrying the pipeline retries what failed in it; canceling it then ends what is pending.
+    using (HttpResponseMessage retried = await ApiPost(address, prefix + "/pipelines/" + pipelineId + "/retry", aliceApi, new { }))
+        Check(retried.StatusCode == HttpStatusCode.Created && (await retried.Content.ReadAsStringAsync()).Contains("\"status\":\"pending\"", StringComparison.Ordinal),
+            "retrying a pipeline queues what failed in it");
+    using (HttpResponseMessage canceled = await ApiPost(address, prefix + "/pipelines/" + pipelineId + "/cancel", aliceApi, new { }))
+        Check(canceled.StatusCode == HttpStatusCode.Created && (await canceled.Content.ReadAsStringAsync()).Contains("\"status\":\"canceled\"", StringComparison.Ordinal),
+            "canceling it ends what was pending, and the pipeline is canceled");
+    using (HttpResponseMessage listed = await ApiGet(address, prefix + "/pipelines/" + pipelineId + "/jobs", aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await listed.Content.ReadAsStringAsync());
+        Check(json.RootElement.EnumerateArray().Any(job => job.GetProperty("status").GetString() == "canceled") &&
+            json.RootElement.EnumerateArray().All(job => job.GetProperty("status").GetString() is not ("pending" or "running")),
+            "its jobs that had not run are canceled");
+    }
+    using (HttpResponseMessage readOnly = await ApiPost(address, prefix + "/pipelines/" + pipelineId + "/retry", bobApi, new { }))
+        Check(readOnly.StatusCode is HttpStatusCode.Forbidden or HttpStatusCode.NotFound, "somebody who may not push to the project does not retry its pipeline");
+
+    // Canceling a running job reaches the runner, which stops the job's process and moves on.
+    File.WriteAllText(Path.Combine(work, ".gitlab-ci.yml"), windows
+        ? "wait:\n  script:\n    - Write-Output started\n    - Start-Sleep -Seconds 300\n"
+        : "wait:\n  script:\n    - echo started\n    - sleep 300\n");
+    await Git(work, ["commit", "-am", "A job that waits"]);
+    await Git(work, ["push", AuthenticatedUrl(address, "alice", aliceApi, "alice/citest.git"), "main"]);
+    long waitingPipeline;
+    using (HttpResponseMessage listed = await ApiGet(address, prefix + "/pipelines", aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await listed.Content.ReadAsStringAsync());
+        waitingPipeline = json.RootElement[0].GetProperty("id").GetInt64();
+    }
+    Stopwatch waited = Stopwatch.StartNew();
+    Task<(int, string, string)> waitingRunner = RunTool(runnerExe, scripts, ["run", "--config", config, "--once"]);
+    long waitingJob = 0;
+    for (int poll = 0; poll < 120 && waitingJob == 0; poll++)
+    {
+        using HttpResponseMessage listed = await ApiGet(address, prefix + "/pipelines/" + waitingPipeline + "/jobs", aliceApi);
+        using JsonDocument json = JsonDocument.Parse(await listed.Content.ReadAsStringAsync());
+        JsonElement job = json.RootElement[0];
+        if (job.GetProperty("status").GetString() == "running") waitingJob = job.GetProperty("id").GetInt64();
+        else await Task.Delay(500);
+    }
+    Check(waitingJob != 0, "the waiting job starts on the runner");
+    await Task.Delay(1500);
+    using (HttpResponseMessage canceled = await ApiPost(address, prefix + "/jobs/" + waitingJob + "/cancel", aliceApi, new { }))
+        Check(canceled.StatusCode == HttpStatusCode.Created && (await canceled.Content.ReadAsStringAsync()).Contains("\"status\":\"canceled\"", StringComparison.Ordinal),
+            "a running job is canceled from the forge");
+    (int, string, string) stopped = await waitingRunner.WaitAsync(TimeSpan.FromSeconds(90));
+    Check(waited.Elapsed < TimeSpan.FromSeconds(120) && stopped.Item2.Contains("canceled from the forge", StringComparison.Ordinal),
+        "the runner hears of it within seconds, stops the job instead of waiting five minutes, and moves on (" + stopped.Item3.Trim() + ")");
+    using (HttpResponseMessage pipeline = await ApiGet(address, prefix + "/pipelines/" + waitingPipeline, aliceApi))
+        Check((await pipeline.Content.ReadAsStringAsync()).Contains("\"status\":\"canceled\"", StringComparison.Ordinal), "and its pipeline is canceled");
+    using (HttpResponseMessage trace = await ApiGet(address, prefix + "/jobs/" + waitingJob + "/trace", aliceApi))
+        Check((await trace.Content.ReadAsStringAsync()).Contains("started", StringComparison.Ordinal), "keeping the log it wrote before it was stopped");
+
+    // Erasing a job removes its log and artifacts; deleting artifacts removes every archive. Both are a Maintainer's.
+    using (HttpResponseMessage erased = await ApiPost(address, prefix + "/jobs/" + waitingJob + "/erase", aliceApi, new { }))
+        Check(erased.StatusCode == HttpStatusCode.Created, "a finished job is erased");
+    using (HttpResponseMessage trace = await ApiGet(address, prefix + "/jobs/" + waitingJob + "/trace", aliceApi))
+        Check((await trace.Content.ReadAsStringAsync()).Length == 0, "and its log is gone");
+    using (HttpResponseMessage cleared = await ApiDelete(address, prefix + "/artifacts", aliceApi))
+        Check(cleared.StatusCode == HttpStatusCode.Accepted, "a project's artifacts are deleted");
+    using (HttpResponseMessage gone = await ApiGet(address, prefix + "/jobs/" + buildJobId + "/artifacts", aliceApi))
+        Check(gone.StatusCode == HttpStatusCode.NotFound, "and the build's archive is no longer served");
+
+
     // Chunked, both ways: with a 1 MiB threshold and 1 MiB chunks, a source of a few MiB of incompressible content
     // and artifacts of the same size both travel in verified chunks; the runner is made to drop its connection
     // every few steps, and both transfers resume and arrive intact.
@@ -7514,6 +7615,249 @@ async Task CheckEmptyRepository(string address, AuthenticatedIdentity alice, str
 /// negotiation. That is what happens once two histories have diverged, which is why a clone of a new
 /// repository worked and a pull against a busy one did not.
 /// </summary>
+/// <summary>
+/// The surfaces LabCoat reads that Graft did not answer (ADR 0041): project filters and permissions, stars, the user
+/// directory, activity, reactions, discussions, approvals, commits, contributors, snippet comments, milestone issues,
+/// the cross-project lists, deleting an issue, and uploads.
+/// </summary>
+async Task CheckClientSurfaces(string address, AuthenticatedIdentity alice, string bobUsername)
+{
+    string api, adminApi, bobApi;
+    long projectId, bobId;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        ProjectInfo created = await store.CreateProjectWithRepositoryAsync(alice, "labcoat-surfaces", "LabCoat surfaces",
+            (project, cancellation) => { cancellation.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, project.StorageId)); return Task.CompletedTask; });
+        projectId = created.Id;
+        api = (await store.CreateTokenAsync(alice, "surfaces", TokenScope.Api | TokenScope.ReadRepository | TokenScope.WriteRepository, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        UserAccount admin = Required(await store.FindActiveUserAsync("admin"), "admin account");
+        adminApi = (await store.CreateTokenAsync(new(admin.Id, admin.Username, true, IdentityKind.BrowserSession), "surfaces-admin", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        UserAccount bob = Required(await store.FindActiveUserAsync(bobUsername), "bob account");
+        bobId = bob.Id;
+        bobApi = (await store.CreateTokenAsync(new(bob.Id, bob.Username, false, IdentityKind.BrowserSession), "surfaces-bob", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+    }
+    string prefix = "/api/v4/projects/" + projectId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    string work = Path.Combine(root, "labcoat-surfaces");
+    Directory.CreateDirectory(work);
+    await Git(work, ["init", "--initial-branch=main"]);
+    File.WriteAllText(Path.Combine(work, "README.md"), "# Surfaces\n");
+    await Git(work, ["add", "."]);
+    await Git(work, ["commit", "-m", "First"]);
+    await Git(work, ["remote", "add", "origin", AuthenticatedUrl(address, "alice", api, "alice/labcoat-surfaces.git")]);
+    await Git(work, ["push", "origin", "main"]);
+    await Git(work, ["checkout", "-b", "feature"]);
+    File.WriteAllText(Path.Combine(work, "README.md"), "# Surfaces\n\nA second line.\n");
+    await Git(work, ["commit", "-am", "Add a line"]);
+    await Git(work, ["push", "origin", "feature"]);
+    string featureSha = (await Git(work, ["rev-parse", "HEAD"])).Trim();
+
+    async Task<JsonElement> Json(HttpResponseMessage response)
+    {
+        using JsonDocument document = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        return document.RootElement.Clone();
+    }
+
+    // Projects: the membership filter LabCoat's home screen sends, search, the caller's access level, and stars.
+    using (HttpResponseMessage listed = await ApiGet(address, "/api/v4/projects?membership=true&order_by=last_activity_at&per_page=100", api))
+    {
+        JsonElement json = await Json(listed);
+        JsonElement mine = json.EnumerateArray().FirstOrDefault(project => project.GetProperty("id").GetInt64() == projectId);
+        Check(listed.IsSuccessStatusCode && mine.ValueKind == JsonValueKind.Object &&
+            mine.GetProperty("permissions").GetProperty("project_access").GetProperty("access_level").GetInt32() == 50 &&
+            mine.GetProperty("owner").GetProperty("username").GetString() == alice.Username,
+            "membership=true lists the caller's projects, each saying the caller's access level and its owner" + " (" + (mine.ValueKind == JsonValueKind.Object ? mine.GetRawText()[..Math.Min(600, mine.GetRawText().Length)] : json.GetArrayLength() + " projects") + ")");
+    }
+    using (HttpResponseMessage found = await ApiGet(address, "/api/v4/projects?search=surfaces", api))
+        Check((await Json(found)).EnumerateArray().Any(project => project.GetProperty("id").GetInt64() == projectId), "projects are searched by name");
+    using (HttpResponseMessage starred = await ApiPost(address, prefix + "/star", api, new { }))
+        Check(starred.StatusCode == HttpStatusCode.Created && (await Json(starred)).GetProperty("star_count").GetInt64() == 1, "a project is starred and counts it");
+    using (HttpResponseMessage listed = await ApiGet(address, "/api/v4/projects?starred=true", api))
+    {
+        JsonElement json = await Json(listed);
+        Check(json.GetArrayLength() == 1 && json[0].GetProperty("id").GetInt64() == projectId, "starred=true lists what the caller starred");
+    }
+    using (HttpResponseMessage unstarred = await ApiPost(address, prefix + "/unstar", api, new { }))
+        Check((await Json(unstarred)).GetProperty("star_count").GetInt64() == 0, "and unstarring takes the star back");
+
+    // The directory: empty for a member, everybody for an administrator, and a person always finds themselves.
+    using (HttpResponseMessage listed = await ApiGet(address, "/api/v4/users?search=" + bobUsername, api))
+        Check(listed.IsSuccessStatusCode && (await Json(listed)).GetArrayLength() == 0, "a member searching the directory finds nobody");
+    using (HttpResponseMessage listed = await ApiGet(address, "/api/v4/users?search=" + bobUsername, adminApi))
+        Check((await Json(listed)).EnumerateArray().Any(user => user.GetProperty("id").GetInt64() == bobId), "an administrator finds anybody");
+    using (HttpResponseMessage self = await ApiGet(address, "/api/v4/users/" + alice.UserId, api))
+        Check(self.IsSuccessStatusCode && (await Json(self)).GetProperty("username").GetString() == alice.Username, "a person looks themselves up by id");
+    using (HttpResponseMessage other = await ApiGet(address, "/api/v4/users/" + bobId, api))
+        Check(other.StatusCode == HttpStatusCode.NotFound, "but not somebody else");
+    using (HttpResponseMessage projects = await ApiGet(address, "/api/v4/users/" + alice.UserId + "/projects", api))
+        Check((await Json(projects)).EnumerateArray().Any(project => project.GetProperty("id").GetInt64() == projectId), "a person's own projects are listed");
+
+    // Issues: the iids filter, scope, a milestone's issues, reactions on a comment, and deleting one.
+    long milestoneId;
+    using (HttpResponseMessage milestone = await ApiPost(address, prefix + "/milestones", api, new { title = "First" }))
+        milestoneId = (await Json(milestone)).GetProperty("id").GetInt64();
+    using (HttpResponseMessage first = await ApiPost(address, prefix + "/issues", api, new { title = "First issue", milestone_id = milestoneId })) { }
+    using (HttpResponseMessage second = await ApiPost(address, prefix + "/issues", api, new { title = "Second issue" })) { }
+    using (HttpResponseMessage picked = await ApiGet(address, prefix + "/issues?iids[]=2", api))
+    {
+        JsonElement json = await Json(picked);
+        Check(json.GetArrayLength() == 1 && json[0].GetProperty("iid").GetInt64() == 2, "iids picks issues by number");
+    }
+    using (HttpResponseMessage assigned = await ApiGet(address, prefix + "/issues?scope=assigned_to_me", api))
+        Check((await Json(assigned)).GetArrayLength() == 0, "scope=assigned_to_me finds nothing assigned");
+    using (HttpResponseMessage mine = await ApiGet(address, prefix + "/issues?scope=created_by_me", api))
+        Check((await Json(mine)).GetArrayLength() == 2, "scope=created_by_me finds what the caller opened");
+    using (HttpResponseMessage inMilestone = await ApiGet(address, prefix + "/milestones/" + milestoneId + "/issues", api))
+    {
+        JsonElement json = await Json(inMilestone);
+        Check(json.GetArrayLength() == 1 && json[0].GetProperty("title").GetString() == "First issue", "a milestone's issues are listed");
+    }
+    long noteId;
+    using (HttpResponseMessage note = await ApiPost(address, prefix + "/issues/1/notes", api, new { body = "A comment to react to" }))
+        noteId = (await Json(note)).GetProperty("id").GetInt64();
+    long awardId;
+    using (HttpResponseMessage awarded = await ApiSend(address, HttpMethod.Post, prefix + "/issues/1/notes/" + noteId + "/award_emoji", api,
+        new FormUrlEncodedContent([new("name", "thumbsup")])))
+    {
+        JsonElement json = await Json(awarded);
+        awardId = awarded.IsSuccessStatusCode ? json.GetProperty("id").GetInt64() : 0;
+        Check(awarded.StatusCode == HttpStatusCode.Created && json.GetProperty("awardable_id").GetInt64() == noteId &&
+            json.GetProperty("user").GetProperty("username").GetString() == alice.Username, "a reaction is added to a comment");
+    }
+    using (HttpResponseMessage twice = await ApiPost(address, prefix + "/issues/1/notes/" + noteId + "/award_emoji", api, new { name = "thumbsup" }))
+        Check(twice.StatusCode == HttpStatusCode.NotFound, "the same reaction twice is refused, as GitLab refuses it");
+    using (HttpResponseMessage awards = await ApiGet(address, prefix + "/issues/1/notes/" + noteId + "/award_emoji", api))
+        Check((await Json(awards)).GetArrayLength() == 1, "and the reactions are listed");
+    using (HttpResponseMessage elsewhere = await ApiGet(address, prefix + "/issues/2/notes/" + noteId + "/award_emoji", api))
+        Check(elsewhere.StatusCode == HttpStatusCode.NotFound, "a comment addressed beneath another issue is not found");
+    using (HttpResponseMessage removed = await ApiDelete(address, prefix + "/issues/1/notes/" + noteId + "/award_emoji/" + awardId, api))
+        Check(removed.StatusCode == HttpStatusCode.NoContent, "and a reaction is taken back");
+
+    // Merge requests: discussions, a line comment from flat position fields, resolving, approvals, commits, changes.
+    using (HttpResponseMessage proposal = await ApiPost(address, prefix + "/merge_requests", api, new { source_branch = "feature", target_branch = "main", title = "Add a line" }))
+        Check(proposal.StatusCode == HttpStatusCode.Created, "a merge request to discuss is opened");
+    string discussionId;
+    using (HttpResponseMessage started = await ApiSend(address, HttpMethod.Post, prefix + "/merge_requests/1/discussions", api,
+        new FormUrlEncodedContent([new("body", "Why this line?")])))
+    {
+        JsonElement json = await Json(started);
+        discussionId = started.IsSuccessStatusCode ? json.GetProperty("id").GetString()! : "0";
+        Check(started.StatusCode == HttpStatusCode.Created && json.GetProperty("notes").GetArrayLength() == 1, "a discussion is started from a form");
+    }
+    using (HttpResponseMessage replied = await ApiPost(address, prefix + "/merge_requests/1/discussions/" + discussionId + "/notes", api, new { body = "Because." }))
+        Check(replied.StatusCode == HttpStatusCode.Created, "and replied to");
+    using (HttpResponseMessage onLine = await ApiSend(address, HttpMethod.Post, prefix + "/merge_requests/1/discussions", api,
+        new FormUrlEncodedContent([new("body", "On the new line"), new("position[position_type]", "text"), new("position[new_path]", "README.md"), new("position[new_line]", "3")])))
+    {
+        JsonElement note = (await Json(onLine)).GetProperty("notes")[0];
+        Check(onLine.StatusCode == HttpStatusCode.Created && note.GetProperty("type").GetString() == "DiffNote" &&
+            note.GetProperty("position").GetProperty("new_line").GetInt32() == 3 && note.GetProperty("position").GetProperty("head_sha").GetString() == featureSha,
+            "a line comment comes from the flat position fields, anchored to the source tip");
+    }
+    using (HttpResponseMessage resolved = await ApiSend(address, HttpMethod.Put, prefix + "/merge_requests/1/discussions/" + discussionId + "?resolved=true", api, null))
+    {
+        JsonElement note = (await Json(resolved)).GetProperty("notes")[0];
+        Check(resolved.IsSuccessStatusCode && note.GetProperty("resolved").GetBoolean() &&
+            note.GetProperty("resolved_by").GetProperty("username").GetString() == alice.Username, "a discussion is resolved, and says by whom");
+    }
+    using (HttpResponseMessage discussions = await ApiGet(address, prefix + "/merge_requests/1/discussions", api))
+    {
+        JsonElement json = await Json(discussions);
+        Check(json.GetArrayLength() == 2 && json[0].GetProperty("notes").GetArrayLength() == 2 && !json[0].GetProperty("individual_note").GetBoolean(),
+            "the discussions list each thread with its replies");
+    }
+    using (HttpResponseMessage approvals = await ApiGet(address, prefix + "/merge_requests/1/approvals", api))
+    {
+        JsonElement json = await Json(approvals);
+        Check(approvals.IsSuccessStatusCode && json.GetProperty("approved_by").ValueKind == JsonValueKind.Array && json.GetProperty("approvals_left").GetInt32() == 0,
+            "the approval state is GitLab's, with approved_by an array");
+    }
+    using (HttpResponseMessage commits = await ApiGet(address, prefix + "/merge_requests/1/commits", api))
+    {
+        JsonElement json = await Json(commits);
+        Check(json.GetArrayLength() == 1 && json[0].GetProperty("id").GetString() == featureSha, "a merge request's commits are the ones it brings");
+    }
+    using (HttpResponseMessage changes = await ApiGet(address, prefix + "/merge_requests/1/changes", api))
+    {
+        JsonElement json = await Json(changes);
+        Check(json.GetProperty("iid").GetInt64() == 1 && json.GetProperty("changes")[0].GetProperty("new_path").GetString() == "README.md" &&
+            json.GetProperty("changes")[0].GetProperty("diff").GetString()!.Contains("+A second line.", StringComparison.Ordinal) &&
+            json.GetProperty("merge_request").GetProperty("iid").GetInt64() == 1,
+            "changes answer GitLab's shape, the merge request with its unified diffs, and keep Graft's");
+    }
+    using (HttpResponseMessage cancelAuto = await ApiPost(address, prefix + "/merge_requests/1/cancel_merge_when_pipeline_succeeds", api, new { }))
+        Check(cancelAuto.IsSuccessStatusCode && (await Json(cancelAuto)).GetProperty("iid").GetInt64() == 1, "canceling an automatic merge answers the merge request");
+
+    // Commits and contributors.
+    using (HttpResponseMessage single = await ApiGet(address, prefix + "/repository/commits/feature", api))
+        Check(single.IsSuccessStatusCode && (await Json(single)).GetProperty("id").GetString() == featureSha, "a single commit is read by a name that resolves to it");
+    using (HttpResponseMessage diff = await ApiGet(address, prefix + "/repository/commits/" + featureSha + "/diff", api))
+    {
+        JsonElement json = await Json(diff);
+        Check(json.ValueKind == JsonValueKind.Array && json[0].GetProperty("a_mode").GetString() == "100644" && !json[0].GetProperty("new_file").GetBoolean() &&
+            diff.Headers.TryGetValues("X-Graft-Truncated", out _), "a commit's diff is GitLab's array, with Graft's truncation in a header");
+    }
+    using (HttpResponseMessage contributors = await ApiGet(address, prefix + "/repository/contributors", api))
+    {
+        JsonElement json = await Json(contributors);
+        Check(json.GetArrayLength() == 1 && json[0].GetProperty("commits").GetInt32() == 1, "contributors are counted on the default branch");
+    }
+
+    // Snippet comments.
+    long snippetId;
+    using (HttpResponseMessage snippet = await ApiPost(address, prefix + "/snippets", api, new { title = "Note", file_name = "note.txt", content = "hello" }))
+        snippetId = (await Json(snippet)).GetProperty("id").GetInt64();
+    using (HttpResponseMessage commented = await ApiPost(address, prefix + "/snippets/" + snippetId + "/notes", api, new { body = "Nice snippet" }))
+        Check(commented.StatusCode == HttpStatusCode.Created, "a snippet is commented on");
+    using (HttpResponseMessage notes = await ApiGet(address, prefix + "/snippets/" + snippetId + "/notes", api))
+        Check((await Json(notes)).GetArrayLength() == 1, "and its comments are listed");
+
+    // Activity: pushes, issues and comments, for the project and for the person.
+    using (HttpResponseMessage events = await ApiGet(address, prefix + "/events", api))
+    {
+        JsonElement json = await Json(events);
+        string[] actions = [.. json.EnumerateArray().Select(item => item.GetProperty("action_name").GetString()!)];
+        JsonElement push = json.EnumerateArray().FirstOrDefault(item => item.GetProperty("action_name").GetString() == "pushed new");
+        Check(actions.Contains("opened") && actions.Contains("commented on") && push.ValueKind == JsonValueKind.Object &&
+            push.GetProperty("push_data").GetProperty("commit_count").GetInt32() >= 1, "a project's activity has its pushes, issues and comments");
+    }
+    using (HttpResponseMessage events = await ApiGet(address, "/api/v4/events", api))
+        Check((await Json(events)).EnumerateArray().Any(item => item.GetProperty("project_id").GetInt64() == projectId), "and the caller's own activity includes it");
+    using (HttpResponseMessage events = await ApiGet(address, "/api/v4/users/" + alice.UserId + "/events", bobApi))
+        Check(events.StatusCode == HttpStatusCode.NotFound, "somebody else's activity is not shown to another member");
+
+    // Across projects.
+    using (HttpResponseMessage issues = await ApiGet(address, "/api/v4/issues?scope=created_by_me&state=opened", api))
+        Check((await Json(issues)).EnumerateArray().Count(issue => issue.GetProperty("project_id").GetInt64() == projectId) == 2, "the caller's issues across projects are listed");
+    using (HttpResponseMessage proposals = await ApiGet(address, "/api/v4/merge_requests?scope=all&state=opened&wip=no", api))
+        Check((await Json(proposals)).EnumerateArray().Any(proposal => proposal.GetProperty("project_id").GetInt64() == projectId), "and merge requests across projects");
+
+    // Uploads: a file attached for Markdown, served to whoever may read the project and to nobody else.
+    byte[] picture = Convert.FromBase64String("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==");
+    MultipartFormDataContent form = new();
+    ByteArrayContent part = new(picture);
+    part.Headers.ContentType = new("image/png");
+    form.Add(part, "file", "screen shot.png");
+    string fullPath;
+    using (HttpResponseMessage uploaded = await ApiSend(address, HttpMethod.Post, prefix + "/uploads", api, form))
+    {
+        JsonElement json = await Json(uploaded);
+        fullPath = uploaded.IsSuccessStatusCode ? json.GetProperty("full_path").GetString()! : "/";
+        Check(uploaded.StatusCode == HttpStatusCode.Created && json.GetProperty("markdown").GetString()!.StartsWith("![screen_shot](/uploads/", StringComparison.Ordinal),
+            "a file is uploaded and answered with the Markdown that shows it");
+    }
+    using (HttpResponseMessage served = await ApiGet(address, fullPath, api))
+        Check(served.IsSuccessStatusCode && (await served.Content.ReadAsByteArrayAsync()).AsSpan().SequenceEqual(picture) &&
+            served.Content.Headers.ContentType?.MediaType == "image/png", "and served back to a reader of the project");
+    using (HttpResponseMessage refused = await ApiGet(address, fullPath, bobApi))
+        Check(refused.StatusCode == HttpStatusCode.NotFound, "but not to somebody who may not read it");
+
+    // Deleting an issue is the owner's.
+    using (HttpResponseMessage deleted = await ApiDelete(address, prefix + "/issues/2", api))
+        Check(deleted.StatusCode == HttpStatusCode.NoContent, "the project's owner deletes an issue");
+    using (HttpResponseMessage gone = await ApiGet(address, prefix + "/issues/2", api))
+        Check(gone.StatusCode == HttpStatusCode.NotFound, "and it is gone");
+}
+
 /// <summary>
 /// What GitLab clients such as LabCoat send and expect: writes as forms or query strings as well as JSON, a bare POST,
 /// lists as bare arrays with X-Total and Link, an ordering hint accepted, and members by user id and access level.

@@ -164,6 +164,7 @@ public sealed partial class GraftStore
             filter.Search is { Length: > 0 } ? "%" + filter.Search.Trim().ToLowerInvariant().Replace("%", "", StringComparison.Ordinal) + "%" : null,
             filter.Confidential is null ? -1 : filter.Confidential.Value ? 1 : 0,
             reader.Grant == AccessGrant.Member ? 1 : 0, identity?.UserId ?? 0,
+            filter.Author is { Length: > 0 } author ? Normalize(author) : "", IidList(filter.Iids),
             take, skip);
     }
 
@@ -197,6 +198,8 @@ public sealed partial class GraftStore
           AND (@Search IS NULL OR lower(i.Title) LIKE @Search OR lower(i.Description) LIKE @Search)
           AND (@ConfidentialFilter = -1 OR i.Confidential = @ConfidentialFilter)
           AND (@SeesConfidential = 1 OR i.Confidential = 0 OR i.AuthorUserId = @ViewerId)
+          AND (@Author = '' OR i.AuthorUserId = (SELECT au.Id FROM Users au WHERE au.NormalizedUsername = @Author))
+          AND (@Iids = ',' OR instr(@Iids, ',' || i.Iid || ',') > 0)
 
         """;
 
@@ -445,6 +448,7 @@ public sealed partial class GraftStore
         MergeQueryParameters parameters = new(projectId, StateName(filter.State), filter.State is null ? 1 : 0,
             "," + labels + ",", labelCount, milestoneMode, milestoneIid ?? 0, personMode, person, personKind,
             filter.Search is { Length: > 0 } ? "%" + filter.Search.Trim().ToLowerInvariant().Replace("%", "", StringComparison.Ordinal) + "%" : null,
+            filter.Author is { Length: > 0 } author ? Normalize(author) : "", IidList(filter.Iids), filter.Draft is null ? -1 : filter.Draft.Value ? 1 : 0,
             take, skip);
         // No approvals here, for the same reason a listing does not decide mergeability: it would be a
         // second query per row to answer a question the list does not ask.
@@ -455,6 +459,10 @@ public sealed partial class GraftStore
         long total = await db.QuerySingleAsync<long>("SELECT COUNT(*) FROM MergeRequests m " + MergeWhere, parameters);
         return new(await HydrateProposalsAsync(db, projectId, rows), total);
     }
+
+    // Issue numbers as one comma-bounded string, matched the way label names are, so the statement stays static.
+    private static string IidList(IReadOnlyList<long>? iids) => iids is not { Count: > 0 } ? ","
+        : "," + string.Join(",", iids.Select(iid => iid.ToString(CultureInfo.InvariantCulture))) + ",";
 
     private static (int Mode, string Name) PersonFilter(string value) =>
         string.Equals(value, IssueFilter.None, StringComparison.OrdinalIgnoreCase) ? (1, "") : (2, Normalize(value));
@@ -489,6 +497,9 @@ public sealed partial class GraftStore
                OR (@PersonMode = 2 AND EXISTS (SELECT 1 FROM SubjectPeople sp JOIN Users pu ON pu.Id = sp.UserId
                    WHERE sp.SubjectType = 'merge_request' AND sp.SubjectId = m.Id AND sp.Kind = @PersonKind AND pu.NormalizedUsername = @Person)))
           AND (@Search IS NULL OR lower(m.Title) LIKE @Search OR lower(m.Description) LIKE @Search)
+          AND (@Author = '' OR m.AuthorUserId = (SELECT au.Id FROM Users au WHERE au.NormalizedUsername = @Author))
+          AND (@Iids = ',' OR instr(@Iids, ',' || m.Iid || ',') > 0)
+          AND (@DraftMode = -1 OR m.Draft = @DraftMode)
 
         """;
 
@@ -1377,9 +1388,9 @@ internal sealed record IssueUpdateParameters(long Id, string? Title, string? Des
 internal sealed record MergeUpdateParameters(long Id, string? Title, string? Description, string State, string Now, int? Draft);
 internal sealed record IssueQueryParameters(long ProjectId, string? State, int AnyState, string Labels, int LabelCount,
     string Without, int HasWithout, int MilestoneMode, long MilestoneIid, int AssigneeMode, string Assignee, string? Search,
-    int ConfidentialFilter, int SeesConfidential, long ViewerId, int Take, int Skip);
+    int ConfidentialFilter, int SeesConfidential, long ViewerId, string Author, string Iids, int Take, int Skip);
 internal sealed record MergeQueryParameters(long ProjectId, string? State, int AnyState, string Labels, int LabelCount,
-    int MilestoneMode, long MilestoneIid, int PersonMode, string Person, string PersonKind, string? Search, int Take, int Skip);
+    int MilestoneMode, long MilestoneIid, int PersonMode, string Person, string PersonKind, string? Search, string Author, string Iids, int DraftMode, int Take, int Skip);
 internal sealed record MergeRecordParameters(long ProjectId, long Iid, string Sha, long UserId, string Now);
 internal sealed record MergeBranchParameters(long ProjectId, string Source, string Target, long SourceProjectId);
 internal sealed class ForkRow { public long Id { get; set; } public long? ForkedFromProjectId { get; set; } }

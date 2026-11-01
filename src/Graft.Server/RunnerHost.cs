@@ -305,7 +305,11 @@ internal sealed class RunnerHost : IAsyncDisposable
         {
             GraftStore.TraceAppend.Accepted or GraftStore.TraceAppend.Duplicate => new OracleResponse { Status = 202 },
             GraftStore.TraceAppend.Conflict => Error(409, "the log does not end at that offset"),
-            _ => Error(401, "the job token is not valid for a running job")
+            // A job canceled from the forge has lost its token. Saying so, rather than refusing the token, is how its
+            // runner learns to stop: it checks in with an empty piece of log every few seconds.
+            _ => await store.JobStatusAsync(jobId, cancellationToken) == CiStatus.Canceled
+                ? Error(410, "the job was canceled")
+                : Error(401, "the job token is not valid for a running job")
         };
     }
 

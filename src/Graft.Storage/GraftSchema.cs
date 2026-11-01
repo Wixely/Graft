@@ -4,7 +4,7 @@ namespace Graft.Storage;
 
 public static class GraftSchema
 {
-    public static DnaXMigrationManifest Manifest { get; } = new(24,
+    public static DnaXMigrationManifest Manifest { get; } = new(25,
     [
         DnaXMigration.Sql(1, "initial-identity-project-schema", "Create identity and private project schema", """
             CREATE TABLE Users (
@@ -806,6 +806,63 @@ public static class GraftSchema
             ALTER TABLE Jobs ADD COLUMN ArtifactPaths TEXT NOT NULL DEFAULT '[]';
             ALTER TABLE Jobs ADD COLUMN ArtifactsBytes INTEGER NULL;
             ALTER TABLE Jobs ADD COLUMN ArtifactsSha256 TEXT NULL;
+            """),
+        // What GitLab's clients read that Graft had nowhere to keep: stars, reactions on comments, comments on snippets,
+        // a record of pushes for the activity feed, files attached to Markdown, and which job attempts were retried.
+        DnaXMigration.Sql(25, "gitlab-client-surfaces", "Stars, reactions, snippet comments, pushes, uploads and retried jobs", """
+            CREATE TABLE ProjectStars (
+                UserId INTEGER NOT NULL REFERENCES Users(Id) ON DELETE CASCADE,
+                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                CreatedAtUtc TEXT NOT NULL,
+                PRIMARY KEY (UserId, ProjectId)
+            );
+            CREATE INDEX IX_ProjectStars_Project ON ProjectStars(ProjectId);
+
+            CREATE TABLE AwardEmoji (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                CommentId INTEGER NOT NULL REFERENCES Comments(Id) ON DELETE CASCADE,
+                UserId INTEGER NOT NULL REFERENCES Users(Id) ON DELETE CASCADE,
+                Name TEXT NOT NULL,
+                CreatedAtUtc TEXT NOT NULL,
+                UNIQUE (CommentId, UserId, Name)
+            );
+
+            CREATE TABLE SnippetNotes (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                SnippetId INTEGER NOT NULL REFERENCES Snippets(Id) ON DELETE CASCADE,
+                AuthorUserId INTEGER NOT NULL REFERENCES Users(Id),
+                Body TEXT NOT NULL,
+                CreatedAtUtc TEXT NOT NULL
+            );
+            CREATE INDEX IX_SnippetNotes_Snippet ON SnippetNotes(SnippetId, Id);
+
+            CREATE TABLE PushEvents (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                UserId INTEGER NULL REFERENCES Users(Id) ON DELETE SET NULL,
+                Ref TEXT NOT NULL,
+                BeforeSha TEXT NULL,
+                AfterSha TEXT NULL,
+                CommitCount INTEGER NOT NULL DEFAULT 0,
+                CommitTitle TEXT NULL,
+                CreatedAtUtc TEXT NOT NULL
+            );
+            CREATE INDEX IX_PushEvents_Project ON PushEvents(ProjectId, Id);
+            CREATE INDEX IX_PushEvents_User ON PushEvents(UserId, Id);
+
+            CREATE TABLE ProjectUploads (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                Secret TEXT NOT NULL,
+                FileName TEXT NOT NULL,
+                ContentType TEXT NOT NULL,
+                Bytes INTEGER NOT NULL,
+                UploadedByUserId INTEGER NULL REFERENCES Users(Id) ON DELETE SET NULL,
+                CreatedAtUtc TEXT NOT NULL,
+                UNIQUE (ProjectId, Secret)
+            );
+
+            ALTER TABLE Jobs ADD COLUMN Retried INTEGER NOT NULL DEFAULT 0 CHECK (Retried IN (0, 1));
             """)
     ]);
 }

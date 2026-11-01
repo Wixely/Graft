@@ -60,7 +60,22 @@ else
     @if (selected is not null)
     {
         <div class="panel">
-            <div class="panel-header"><h2>Pipeline #@selected.Iid</h2><span class="spacer"></span><span class="label @StatusClass(selected.Status)">@selected.Status</span></div>
+            <div class="panel-header">
+                <h2>Pipeline #@selected.Iid</h2><span class="spacer"></span>
+                @if (selected.Status is "pending" or "running")
+                {
+                    <button type="button" class="button secondary" disabled="@busy" @onclick='() => Act($"api/projects/{projectId}/pipelines/{selected.Id}/cancel", "Pipeline canceled.")'>Cancel</button>
+                }
+                else if (selected.Status is "failed" or "canceled")
+                {
+                    <button type="button" class="button secondary" disabled="@busy" @onclick='() => Act($"api/projects/{projectId}/pipelines/{selected.Id}/retry", "Pipeline retried.")'>Retry</button>
+                }
+                <span class="label @StatusClass(selected.Status)">@selected.Status</span>
+            </div>
+            @if (actionMessage.Length > 0)
+            {
+                <div class="panel-body"><div class="banner @(actionOk ? "success" : "error")" role="status"><span>@actionMessage</span></div></div>
+            }
             @if (selected.Error is not null)
             {
                 <div class="panel-body">
@@ -97,6 +112,18 @@ else
         <div class="panel">
             <div class="panel-header">
                 <Icon Name="file" /><h2>Log of @(jobs.FirstOrDefault(job => job.Id == jobId)?.Name ?? "job " + jobId)</h2>
+                @if (jobs.FirstOrDefault(job => job.Id == jobId) is JobResponse current)
+                {
+                    <span class="spacer"></span>
+                    @if (current.Status is "pending" or "running")
+                    {
+                        <button type="button" class="button secondary" disabled="@busy" @onclick='() => Act($"api/projects/{projectId}/jobs/{jobId}/cancel", "Job canceled.")'>Cancel</button>
+                    }
+                    else if (current.Status is "success" or "failed" or "canceled")
+                    {
+                        <button type="button" class="button secondary" disabled="@busy" @onclick='() => Act($"api/projects/{projectId}/jobs/{jobId}/retry", "Job retried.")'>Retry</button>
+                    }
+                }
                 @if (jobs.FirstOrDefault(job => job.Id == jobId)?.ArtifactsFile is JobArtifactsFileResponse artifacts)
                 {
                     <a class="button secondary" href="@($"/api/projects/{projectId}/jobs/{jobId}/artifacts")" download="@artifacts.Filename">
@@ -127,6 +154,9 @@ else
     private string message = "";
     private bool loading = true;
     private Timer? refresh;
+    private bool busy;
+    private string actionMessage = "";
+    private bool actionOk;
 
     private bool ViaSlug => Namespace.Length == 0;
     private string ProjectUrl => ViaSlug
@@ -190,10 +220,26 @@ else
         StateHasChanged();
     }
 
+    // Retrying and canceling, for whoever may push; the server decides and says why when it refuses.
+    private async Task Act(string path, string done)
+    {
+        busy = true;
+        try
+        {
+            ApiResult result = await Api.PostAsync(path, done);
+            actionMessage = result.Message;
+            actionOk = result.Ok;
+            if (result.Ok && path.Contains("/jobs/", StringComparison.Ordinal) && path.EndsWith("/retry", StringComparison.Ordinal)) shownJob = null;
+            await Load();
+        }
+        finally { busy = false; }
+    }
+
     private static string StatusClass(string status) => status switch
     {
         "success" => "success",
         "failed" => "danger",
+        "canceled" => "warning",
         _ => ""
     };
 

@@ -2,6 +2,30 @@
 
 Updated: 2026-11-01. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the project owner.
 
+## Added on 2026-11-01, second entry: every LabCoat call, retry and cancel, the directory
+
+All of the LabCoat gaps were taken on: the user list returns nothing for ordinary accounts and everyone for an
+administrator, and pipeline retry and cancel are implemented. [ADR 0041](decisions/0041-labcoat-routes-retry-cancel-directory.md) has the design.
+
+- **Where.** Routes are in one block in `Program.cs` headed "What GitLab's clients ask for", plus the CI control block
+  after the pipeline routes and an uploads middleware. Store: `GraftStoreClients.cs` (stars, reactions, snippet
+  notes, activity, uploads, directory, issue deletion) and `GraftStoreCiControl.cs` (retry, cancel, erase, job
+  listing). Migration 25.
+- **Retry and cancel.** Retried attempts are flagged and excluded everywhere a pipeline is read. A canceled running
+  job loses its token; `RunnerHost.TraceAsync` answers its log upload 410; `RunnerAgent.TraceWriter` checks in
+  every five seconds and cancels the job scope on 410.
+- **Shapes.** Projects carry `permissions` from the identity token auth leaves in `HttpContext.Items`. The v4 commit
+  diff is GitLab's array; `/changes` and `/merge` flatten the merge request into the top level through
+  `WriteWithMergeRequest`. LabCoat crashes on explicit nulls in fields it holds as non-null: keep numbers, flags and
+  lists non-null in new responses.
+- **Trap.** The SSH host calls its push callback while holding the repository; anything that takes the gate there
+  deadlocks, which is why pushes are recorded with `Task.Run` on SSH.
+
+Verified: all 95 LabCoat calls reach a route on a fresh forge; Git suite 1207 to **1272** managed and native (forge
+and runner, zero warnings); MCP suite 104. Not done: LabCoat itself against a forge; Comeet.
+
+Next action, owner user: provide Comeet's APK, or try LabCoat against a forge and report what fails.
+
 ## Added on 2026-11-01: GitLab clients, starting from LabCoat
 
 GraphQL came up, with LabCoat and Comeet as the clients in use. LabCoat is open source and uses only REST; its 95

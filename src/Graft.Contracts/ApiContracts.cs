@@ -44,7 +44,21 @@ public sealed record ProjectResponse(
     [property: JsonPropertyName("global_web_url")] string GlobalWebUrl = "",
     /// <summary>The project this one was forked from, when it was. GitLab's field name.</summary>
     [property: JsonPropertyName("forked_from_project")] ForkedFromResponse? ForkedFromProject = null,
-    [property: JsonPropertyName("forks_count")] long ForksCount = 0);
+    [property: JsonPropertyName("forks_count")] long ForksCount = 0,
+    /// <summary>How many people starred it.</summary>
+    [property: JsonPropertyName("star_count")] long StarCount = 0,
+    /// <summary>GitLab's view of what the caller may do here, as an access level; null for a caller with no role.</summary>
+    ProjectPermissionsResponse? Permissions = null,
+    /// <summary>The account that owns a project in a personal namespace; null when a group owns it.</summary>
+    UserResponse? Owner = null);
+
+/// <summary>GitLab's `permissions`: the caller's access level on the project, and through its group, which Graft folds into one.</summary>
+public sealed record ProjectPermissionsResponse(
+    [property: JsonPropertyName("project_access")] ProjectAccessResponse? ProjectAccess,
+    [property: JsonPropertyName("group_access")] ProjectAccessResponse? GroupAccess);
+public sealed record ProjectAccessResponse(
+    [property: JsonPropertyName("access_level")] int AccessLevel,
+    [property: JsonPropertyName("notification_level")] int NotificationLevel);
 
 /// <summary>What a repack did; GitLab answers housekeeping with an empty 201 and this says a little more.</summary>
 public sealed record HousekeepingResponse(
@@ -382,6 +396,25 @@ public sealed record DiffFileResponse(
     IReadOnlyList<DiffHunkResponse> Hunks);
 
 /// <summary>A commit and what it changed, for the page a commit link opens.</summary>
+/// <summary>
+/// One file's change in GitLab's diff shape: paths, modes as GitLab writes them (strings, "0" for a side that does not exist),
+/// flags, and the unified diff text. `status`, `added`, `removed` and `binary` are Graft's additions.
+/// </summary>
+public sealed record GitLabDiffResponse(
+    [property: JsonPropertyName("old_path")] string OldPath,
+    [property: JsonPropertyName("new_path")] string NewPath,
+    [property: JsonPropertyName("a_mode")] string AMode,
+    [property: JsonPropertyName("b_mode")] string BMode,
+    string Diff,
+    [property: JsonPropertyName("new_file")] bool NewFile,
+    [property: JsonPropertyName("renamed_file")] bool RenamedFile,
+    [property: JsonPropertyName("deleted_file")] bool DeletedFile,
+    [property: JsonPropertyName("too_large")] bool TooLarge,
+    string Status,
+    int Added,
+    int Removed,
+    bool Binary);
+
 public sealed record CommitDiffResponse(
     ProjectResponse Project,
     CommitResponse Commit,
@@ -1142,6 +1175,101 @@ public sealed record MergeRequestChangesResponse(
     int Added,
     int Removed);
 
+/// <summary>An activity entry in GitLab's event shape. Numbers and flags are never null, because clients read them as non-null.</summary>
+public sealed record EventResponse(
+    long Id,
+    [property: JsonPropertyName("project_id")] long ProjectId,
+    [property: JsonPropertyName("action_name")] string ActionName,
+    [property: JsonPropertyName("target_id")] long? TargetId,
+    [property: JsonPropertyName("target_iid")] long? TargetIid,
+    [property: JsonPropertyName("target_type")] string? TargetType,
+    [property: JsonPropertyName("target_title")] string? TargetTitle,
+    [property: JsonPropertyName("author_id")] long? AuthorId,
+    UserResponse? Author,
+    [property: JsonPropertyName("author_username")] string? AuthorUsername,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt,
+    [property: JsonPropertyName("push_data")] PushDataResponse? PushData,
+    NoteResponse? Note);
+
+public sealed record PushDataResponse(
+    [property: JsonPropertyName("commit_count")] int CommitCount,
+    string Action,
+    [property: JsonPropertyName("ref_type")] string RefType,
+    [property: JsonPropertyName("commit_from")] string? CommitFrom,
+    [property: JsonPropertyName("commit_to")] string? CommitTo,
+    string Ref,
+    [property: JsonPropertyName("commit_title")] string? CommitTitle);
+
+/// <summary>A reaction on a comment, in GitLab's shape; `awardable_type` is `Note`.</summary>
+public sealed record AwardEmojiResponse(
+    long Id,
+    string Name,
+    UserResponse User,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt,
+    [property: JsonPropertyName("updated_at")] DateTimeOffset UpdatedAt,
+    [property: JsonPropertyName("awardable_id")] long AwardableId,
+    [property: JsonPropertyName("awardable_type")] string AwardableType);
+
+public sealed record AwardEmojiRequest(string? Name);
+
+/// <summary>A thread on a merge request in GitLab's discussion shape. Its id is the first comment's, as a string.</summary>
+public sealed record DiscussionResponse(
+    string Id,
+    [property: JsonPropertyName("individual_note")] bool IndividualNote,
+    IReadOnlyList<DiscussionNoteResponse> Notes);
+
+public sealed record DiscussionNoteResponse(
+    long Id,
+    string? Type,
+    string Body,
+    UserResponse Author,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt,
+    [property: JsonPropertyName("updated_at")] DateTimeOffset UpdatedAt,
+    bool System,
+    [property: JsonPropertyName("noteable_id")] long NoteableId,
+    [property: JsonPropertyName("noteable_type")] string NoteableType,
+    [property: JsonPropertyName("noteable_iid")] long NoteableIid,
+    bool Resolvable,
+    bool Resolved,
+    [property: JsonPropertyName("resolved_by")] UserResponse? ResolvedBy,
+    [property: JsonPropertyName("resolved_at")] DateTimeOffset? ResolvedAt,
+    NotePositionResponse? Position);
+
+/// <summary>Where a comment on a diff sits, in GitLab's shape. Graft anchors to the source tip, which is `head_sha`.</summary>
+public sealed record NotePositionResponse(
+    [property: JsonPropertyName("base_sha")] string? BaseSha,
+    [property: JsonPropertyName("head_sha")] string? HeadSha,
+    [property: JsonPropertyName("start_sha")] string? StartSha,
+    [property: JsonPropertyName("old_path")] string? OldPath,
+    [property: JsonPropertyName("new_path")] string? NewPath,
+    [property: JsonPropertyName("position_type")] string PositionType,
+    [property: JsonPropertyName("old_line")] int? OldLine,
+    [property: JsonPropertyName("new_line")] int? NewLine);
+
+/// <summary>GitLab's merge request approval state. `approved_by` lists current approvals only, each as `{user}`.</summary>
+public sealed record MergeRequestApprovalsResponse(
+    long Id,
+    long Iid,
+    [property: JsonPropertyName("project_id")] long ProjectId,
+    string Title,
+    string State,
+    bool Approved,
+    [property: JsonPropertyName("approvals_required")] int ApprovalsRequired,
+    [property: JsonPropertyName("approvals_left")] int ApprovalsLeft,
+    [property: JsonPropertyName("approved_by")] IReadOnlyList<ApprovalUserResponse> ApprovedBy);
+
+public sealed record ApprovalUserResponse(UserResponse User);
+
+public sealed record ContributorResponse(string Name, string Email, int Commits, int Additions, int Deletions);
+
+/// <summary>GitLab's answer to an upload: where the file is and the Markdown that shows it.</summary>
+public sealed record ProjectUploadResponse(
+    long Id,
+    string Alt,
+    string Url,
+    [property: JsonPropertyName("full_path")] string FullPath,
+    string Markdown);
+
 // Numbers and booleans are also read from strings, because GitLab's API takes a write as a form or a query string as
 // readily as JSON, its clients send all three, and a form carries only strings. Writing is unchanged.
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower,
@@ -1316,6 +1444,19 @@ public sealed record MergeRequestChangesResponse(
 [JsonSerializable(typeof(ApprovalResponse))]
 [JsonSerializable(typeof(MergeAcceptRequest))]
 [JsonSerializable(typeof(BranchResponse))]
+[JsonSerializable(typeof(GitLabDiffResponse[]))]
+[JsonSerializable(typeof(EventResponse[]))]
+[JsonSerializable(typeof(AwardEmojiResponse))]
+[JsonSerializable(typeof(AwardEmojiResponse[]))]
+[JsonSerializable(typeof(AwardEmojiRequest))]
+[JsonSerializable(typeof(DiscussionResponse))]
+[JsonSerializable(typeof(DiscussionResponse[]))]
+[JsonSerializable(typeof(DiscussionNoteResponse))]
+[JsonSerializable(typeof(MergeRequestApprovalsResponse))]
+[JsonSerializable(typeof(ContributorResponse[]))]
+[JsonSerializable(typeof(ProjectUploadResponse))]
+[JsonSerializable(typeof(UserResponse[]))]
+[JsonSerializable(typeof(System.Text.Json.Nodes.JsonObject))]
 public partial class ApiJson : JsonSerializerContext;
 
 /// <summary>

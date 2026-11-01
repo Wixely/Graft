@@ -18,7 +18,11 @@ public sealed record IssueFilter(
     string? Assignee = null,
     /// <summary>A substring of the title or description, matched without regard to case.</summary>
     string? Search = null,
-    bool? Confidential = null)
+    bool? Confidential = null,
+    /// <summary>A username: issues this person opened.</summary>
+    string? Author = null,
+    /// <summary>Only these issue numbers.</summary>
+    IReadOnlyList<long>? Iids = null)
 {
     public const string None = "None";
 }
@@ -868,5 +872,9 @@ public sealed record MergeFilter(
     string? Milestone = null,
     string? Assignee = null,
     string? Reviewer = null,
-    string? Search = null);
+    string? Search = null,
+    string? Author = null,
+    IReadOnlyList<long>? Iids = null,
+    /// <summary>True for drafts only, false for ready proposals only.</summary>
+    bool? Draft = null);
 internal sealed record MilestoneKeyParameters(long ProjectId, long Id);

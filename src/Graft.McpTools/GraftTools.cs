@@ -371,31 +371,35 @@ public sealed class GraftTools
         CancellationToken cancellationToken)
     {
         if (parent is < 0 or > 15) return Failure("parent must be between 0 and 15.");
-        string path = "api/v4/projects/" + Encode(project) + "/repository/commits/" +
-            Uri.EscapeDataString((commit ?? "").Trim()) + "/diff" + (parent == 0 ? "" : "?parent=" + parent.ToString(CultureInfo.InvariantCulture));
-        (CommitDiffResponse? diff, string? error) = await graft.GetAsync(path, ApiJson.Default.CommitDiffResponse, cancellationToken);
+        string commitPath = "api/v4/projects/" + Encode(project) + "/repository/commits/" + Uri.EscapeDataString((commit ?? "").Trim());
+        (CommitResponse? found, string? missing) = await graft.GetAsync(commitPath, ApiJson.Default.CommitResponse, cancellationToken);
+        if (missing is not null) return Failure(missing);
+        // The diff is GitLab's array of files; whether it was cut short comes in a header.
+        (GitLabDiffResponse[]? files, _, bool truncated, string? error) = await graft.GetListAsync(
+            commitPath + "/diff" + (parent == 0 ? "" : "?parent=" + parent.ToString(CultureInfo.InvariantCulture)), ApiJson.Default.GitLabDiffResponseArray, cancellationToken);
         if (error is not null) return Failure(error);
+        var diff = new { Truncated = truncated, Files = files! };
 
         return new JsonObject
         {
-            ["commit"] = diff!.Commit.Id,
-            ["title"] = diff.Commit.Title,
-            ["author"] = diff.Commit.AuthorName,
-            ["compared_against"] = diff.ParentId,
-            ["added"] = diff.Added,
-            ["removed"] = diff.Removed,
+            ["commit"] = found!.Id,
+            ["title"] = found.Title,
+            ["author"] = found.AuthorName,
+            ["compared_against"] = found.ParentIds.Count > parent ? found.ParentIds[parent] : null,
+            ["added"] = files!.Sum(file => file.Added),
+            ["removed"] = files!.Sum(file => file.Removed),
             // Said out loud: a truncated diff that looked complete would have an agent conclude a file was
             // untouched when the server simply stopped listing.
             ["truncated"] = diff.Truncated,
             ["files"] = Array(diff.Files, file => new JsonObject
             {
-                ["path"] = file.Path,
+                ["path"] = file.NewPath,
                 ["status"] = file.Status,
                 ["added"] = file.Added,
                 ["removed"] = file.Removed,
-                ["binary"] = file.IsBinary,
+                ["binary"] = file.Binary,
                 ["too_large"] = file.TooLarge,
-                ["diff"] = file.IsBinary || file.TooLarge ? null : Unified(file)
+                ["diff"] = file.Binary || file.TooLarge ? null : file.Diff
             })
         }.ToJsonString();
     }
