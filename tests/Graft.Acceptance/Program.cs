@@ -327,8 +327,10 @@ try
 
         // Unknown fields and unknown features are errors, not warnings.
         Check(!PageConfiguration.Read(Encoding.UTF8.GetBytes("""{"page":{"flies":["*.md"]}}""")).Ok, "an unknown field is an error");
-        Check(!PageConfiguration.Read(Encoding.UTF8.GetBytes("""{"page":{"features":["issues"]}}""")).Ok,
+        Check(!PageConfiguration.Read(Encoding.UTF8.GetBytes("""{"page":{"features":["teleporter"]}}""")).Ok,
             "naming a feature Graft does not have is an error");
+        PageConfigurationResult known = PageConfiguration.Read(Encoding.UTF8.GetBytes("""{"page":{"features":["issues"]}}"""));
+        Check(known.Ok && known.Settings!.Features.Contains("issues"), "naming a feature Graft has is accepted");
         Check(!PageConfiguration.Read(Encoding.UTF8.GetBytes("not json at all")).Ok, "an unparseable config is an error");
         Check(!PageConfiguration.Read(Encoding.UTF8.GetBytes("""{"version":2,"page":{}}""")).Ok, "an unknown version is an error");
 

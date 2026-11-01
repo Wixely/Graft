@@ -85,6 +85,10 @@ described.
 documented behaviour rather than an oversight: a config claiming to expose issues must fail loudly while
 there are no issues.
 
+*Superseded on 2026-10-30:* `KnownFeatures` now names the seven surfaces that exist (see
+[project-pages.md](../project-pages.md#features)). On 2026-11-01 the MVP-04 acceptance suite's rejection case
+was changed to a name Graft does not have, with a positive check that `issues` is accepted.
+
 **A single-hostname fallback.** ADR 0006 records a sandboxed frame as the documented alternative and says
 it is a worse product because links inside the site break. Without a pages origin there is no site, and the
 page half still works.
