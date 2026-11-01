@@ -312,6 +312,70 @@ app.Use(async (context, next) =>
     }
 });
 
+// GitLab's API takes a write's parameters as JSON, as a form, or in the query string, and its clients use all three:
+// LabCoat posts forms and puts an issue's edit in the query string. Graft's handlers read JSON, so a GitLab write
+// that is not JSON is turned into the JSON it means before it reaches them: each field a string, or an array when
+// it repeats or is named `key[]`, numbers and booleans being read from strings by the contract's options. A write
+// with no body at all gets `{}`, so a bare POST such as an approval is not refused for its missing content type.
+//
+// Only under /api/v4, where the credential is a header a cross-site form cannot send, so accepting a form there
+// opens no forgery; the browser's own routes stay JSON with their CSRF token. Package and upload paths are left
+// alone, because there the body is the file.
+app.Use(async (context, next) =>
+{
+    HttpRequest request = context.Request;
+    if (!request.Path.StartsWithSegments("/api/v4") || HttpMethods.IsGet(request.Method) || HttpMethods.IsHead(request.Method) ||
+        request.Path.Value!.Contains("/packages/", StringComparison.Ordinal) || request.Path.Value.EndsWith("/uploads", StringComparison.Ordinal))
+    { await next(context); return; }
+    bool empty = request.ContentLength is 0 or null && !request.Headers.ContainsKey("Transfer-Encoding") && string.IsNullOrEmpty(request.ContentType);
+    bool form = request.HasFormContentType;
+    if (!empty && !form) { await next(context); return; }
+    if (empty && HttpMethods.IsDelete(request.Method) && request.Query.Count == 0) { await next(context); return; }
+
+    List<KeyValuePair<string, Microsoft.Extensions.Primitives.StringValues>> fields = [];
+    if (form)
+    {
+        if (request.ContentLength > 1024 * 1024) { await ApiError(context, 413, "413 Request Entity Too Large: a form is at most 1 MiB"); return; }
+        request.EnableBuffering();
+        IFormCollection collected;
+        try { collected = await request.ReadFormAsync(context.RequestAborted); }
+        catch (InvalidDataException) { await ApiError(context, 400, "400 Bad Request: the form could not be read"); return; }
+        // A multipart body carrying a file is an upload, which this does not turn into JSON; the handler decides.
+        if (collected.Files.Count > 0) { request.Body.Position = 0; await next(context); return; }
+        fields.AddRange(collected);
+    }
+    // GitLab reads the query string as parameters too; a form field wins over a query parameter of the same name.
+    foreach (KeyValuePair<string, Microsoft.Extensions.Primitives.StringValues> pair in request.Query)
+        if (!fields.Any(field => field.Key == pair.Key)) fields.Add(pair);
+
+    using MemoryStream json = new();
+    using (Utf8JsonWriter writer = new(json))
+    {
+        writer.WriteStartObject();
+        foreach (IGrouping<string, string?> field in fields
+            .SelectMany(pair => pair.Value.Select(value => (Key: pair.Key, Value: value)))
+            .GroupBy(pair => pair.Key.EndsWith("[]", StringComparison.Ordinal) ? pair.Key[..^2] : pair.Key, pair => pair.Value, StringComparer.Ordinal))
+        {
+            bool array = field.Count() > 1 || fields.Any(pair => pair.Key == field.Key + "[]");
+            writer.WritePropertyName(field.Key);
+            if (array)
+            {
+                writer.WriteStartArray();
+                foreach (string? value in field) writer.WriteStringValue(value);
+                writer.WriteEndArray();
+            }
+            else writer.WriteStringValue(field.First());
+        }
+        writer.WriteEndObject();
+    }
+    byte[] body = json.ToArray();
+    request.Body = new MemoryStream(body, writable: false);
+    request.ContentType = "application/json";
+    request.ContentLength = body.Length;
+    request.Headers.Remove("Transfer-Encoding");
+    await next(context);
+});
+
 // Only the upload group opts into the authentication stack. UseAntiforgery validates automatically for
 // endpoints that bind a form; Graft binds no forms, so existing routes keep their own Origin + X-Graft-CSRF
 // checks untouched and DnaX validates its own X-DnaX-Antiforgery header inside its handlers.
@@ -1539,7 +1603,7 @@ app.MapPost("/api/projects/{projectId:long}/members", async context =>
     long projectId = Convert.ToInt64(context.Request.RouteValues["projectId"], System.Globalization.CultureInfo.InvariantCulture);
     try
     {
-        UserAccount? user = await store.FindActiveUserAsync(request.Username, context.RequestAborted);
+        UserAccount? user = await store.FindActiveUserAsync(request.Username ?? "", context.RequestAborted);
         if (user is null) { await ApiError(context, 400, "user is unavailable"); return; }
         await store.SetMembershipAsync(browser.Value.Identity, projectId, user.Id, role, context.RequestAborted);
         context.Response.StatusCode = StatusCodes.Status204NoContent;
@@ -1564,7 +1628,7 @@ app.MapPost("/api/projects/{projectId:long}/owner", async context =>
     long projectId = Convert.ToInt64(context.Request.RouteValues["projectId"], System.Globalization.CultureInfo.InvariantCulture);
     try
     {
-        UserAccount? target = await store.FindActiveUserAsync(request.Username, context.RequestAborted);
+        UserAccount? target = await store.FindActiveUserAsync(request.Username ?? "", context.RequestAborted);
         if (target is null) { await ApiError(context, 400, "user is unavailable"); return; }
         await store.TransferProjectOwnershipAsync(browser.Value.Identity, projectId, target.Id, context.RequestAborted);
         context.Response.StatusCode = StatusCodes.Status204NoContent;
@@ -3055,21 +3119,61 @@ app.MapGet("/api/v4/projects/{projectId}/members", async context =>
     {
         IReadOnlyList<ProjectMember> members = await store.ListProjectMembersAsync(
             project.Identity!, project.Details.Project.Id, context.RequestAborted);
-        await context.Response.WriteAsJsonAsync(
-            members.Select(member => new ProjectMemberResponse(member.UserId, member.Username, member.Role.ToString().ToLowerInvariant())).ToArray(),
+        await context.Response.WriteAsJsonAsync(members.Select(GitLabMemberResponseFor).ToArray(),
             ApiJson.Default.ProjectMemberResponseArray, null, context.RequestAborted);
     }
     catch (UnauthorizedAccessException) { await ApiError(context, 404, "404 Project Not Found"); }
 });
 
-app.MapMethods("/api/v4/projects/{projectId}/members", ["POST", "PUT"], async context =>
+// Granting takes Graft's form, a username and a role name, or GitLab's, a user_id and an access_level. GitLab's
+// update is PUT on the member's own path; Graft's earlier PUT on the collection is kept.
+app.MapMethods("/api/v4/projects/{projectId}/members", ["POST", "PUT"], async context => await SetProjectMember(context, null));
+app.MapPut("/api/v4/projects/{projectId}/members/{member}", async context =>
+    await SetProjectMember(context, context.Request.RouteValues["member"]?.ToString() ?? ""));
+
+// A member is named in the path by username, as Graft always has, or by user id, as GitLab does. A username is
+// looked for first, so an account whose name is digits is still found by it.
+app.MapDelete("/api/v4/projects/{projectId}/members/{member}", async context =>
+{
+    AuthenticatedIdentity? caller = await RequireApiWriter(context);
+    if (caller is null) return;
+    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.ManageProject);
+    if (project is null) return;
+    try
+    {
+        long? userId = await ProjectMemberId(caller, project, context.Request.RouteValues["member"]?.ToString() ?? "", context.RequestAborted);
+        if (userId is null) { await ApiError(context, 404, "404 Member Not Found"); return; }
+        await store.RevokeMembershipAsync(caller, project.Details.Project.Id, userId.Value, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (ArgumentException) { await ApiError(context, 400, "username"); }
+    catch (InvalidOperationException error) { await ApiError(context, 400, error.Message); }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "404 Project Not Found"); }
+});
+
+async Task<AuthenticatedIdentity?> RequireApiWriter(HttpContext context)
 {
     (bool unresolved, AuthenticatedIdentity? caller) = await AuthenticateApiOptional(context);
-    if (unresolved) return;
-    if (caller is null) { await ApiError(context, 401, "401 Unauthorized"); return; }
-    if (!caller.TokenScopes.HasFlag(TokenScope.Api))
-    { await ApiError(context, 403, "403 Forbidden: insufficient_scope"); return; }
+    if (unresolved) return null;
+    if (caller is null) { await ApiError(context, 401, "401 Unauthorized"); return null; }
+    if (!caller.TokenScopes.HasFlag(TokenScope.Api)) { await ApiError(context, 403, "403 Forbidden: insufficient_scope"); return null; }
+    return caller;
+}
 
+async Task<long?> ProjectMemberId(AuthenticatedIdentity caller, ApiProject project, string member, CancellationToken cancellationToken)
+{
+    // The store refuses a string that cannot be a username, such as a bare number, rather than finding nothing.
+    try { if (await store.FindActiveUserAsync(member, cancellationToken) is { } named) return named.Id; }
+    catch (ArgumentException) { }
+    if (!long.TryParse(member, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out long id)) return null;
+    IReadOnlyList<ProjectMember> members = await store.ListProjectMembersAsync(caller, project.Details.Project.Id, cancellationToken);
+    return members.Any(m => m.UserId == id) ? id : null;
+}
+
+async Task SetProjectMember(HttpContext context, string? routeMember)
+{
+    AuthenticatedIdentity? caller = await RequireApiWriter(context);
+    if (caller is null) return;
     ApiProject? project = await AuthorizeApiProject(context, ProjectAction.ManageProject);
     if (project is null) return;
     if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
@@ -3077,47 +3181,52 @@ app.MapMethods("/api/v4/projects/{projectId}/members", ["POST", "PUT"], async co
     MembershipSetRequest? request;
     try { request = await context.Request.ReadFromJsonAsync(ApiJson.Default.MembershipSetRequest, context.RequestAborted); }
     catch (JsonException) { await ApiError(context, 400, "invalid JSON"); return; }
-    if (request is null || !Enum.TryParse(request.Role, ignoreCase: true, out ProjectRole role) || !Enum.IsDefined(role))
-    { await ApiError(context, 400, "role must be reporter, developer or maintainer"); return; }
+    if (request is null) { await ApiError(context, 400, "invalid JSON"); return; }
+    ProjectRole role;
+    if (request.AccessLevel is int level)
+    {
+        // GitLab's levels for the three roles Graft has. Guest, 10, has no equivalent, and a project's owner is
+        // whoever created it, so 50 is not something a grant can give.
+        switch (level)
+        {
+            case 20: role = ProjectRole.Reporter; break;
+            case 30: role = ProjectRole.Developer; break;
+            case 40: role = ProjectRole.Maintainer; break;
+            default: await ApiError(context, 400, "access_level must be 20 (Reporter), 30 (Developer) or 40 (Maintainer)"); return;
+        }
+    }
+    else if (!Enum.TryParse(request.Role, ignoreCase: true, out role) || !Enum.IsDefined(role))
+    { await ApiError(context, 400, "role must be reporter, developer or maintainer, or access_level 20, 30 or 40"); return; }
 
     try
     {
-        UserAccount? user = await store.FindActiveUserAsync(request.Username, context.RequestAborted);
-        // A username that is not there is a bad request, not a 404: the project was found, and refusing
-        // with the project's own "not found" would say something untrue about the project.
-        if (user is null) { await ApiError(context, 400, "no such account"); return; }
-        await store.SetMembershipAsync(caller, project.Details.Project.Id, user.Id, role, context.RequestAborted);
-        await context.Response.WriteAsJsonAsync(new ProjectMemberResponse(user.Id, user.Username, role.ToString().ToLowerInvariant()),
-            ApiJson.Default.ProjectMemberResponse, null, context.RequestAborted);
+        long? userId;
+        if (routeMember is not null) userId = await ProjectMemberId(caller, project, routeMember, context.RequestAborted);
+        else if (request.UserId is long given) userId = given;
+        else userId = (await store.FindActiveUserAsync(request.Username ?? "", context.RequestAborted))?.Id;
+        // An account that is not there is a bad request, not a 404: the project was found, and refusing with the
+        // project's own "not found" would say something untrue about the project.
+        if (userId is null)
+        {
+            if (routeMember is null) await ApiError(context, 400, "no such account");
+            else await ApiError(context, 404, "404 Member Not Found");
+            return;
+        }
+        await store.SetMembershipAsync(caller, project.Details.Project.Id, userId.Value, role, context.RequestAborted);
+        ProjectMember? member = (await store.ListProjectMembersAsync(caller, project.Details.Project.Id, context.RequestAborted))
+            .FirstOrDefault(m => m.UserId == userId.Value);
+        if (member is null) { await ApiError(context, 400, "no such account"); return; }
+        if (routeMember is null && HttpMethods.IsPost(context.Request.Method)) context.Response.StatusCode = StatusCodes.Status201Created;
+        await context.Response.WriteAsJsonAsync(GitLabMemberResponseFor(member), ApiJson.Default.ProjectMemberResponse, null, context.RequestAborted);
     }
-    catch (ArgumentException) { await ApiError(context, 400, "username"); }
+    catch (ArgumentException) { await ApiError(context, 400, "no such account"); }
     catch (InvalidOperationException error) { await ApiError(context, 400, error.Message); }
     catch (UnauthorizedAccessException) { await ApiError(context, 404, "404 Project Not Found"); }
-});
+}
 
-app.MapDelete("/api/v4/projects/{projectId}/members/{username}", async context =>
-{
-    (bool unresolved, AuthenticatedIdentity? caller) = await AuthenticateApiOptional(context);
-    if (unresolved) return;
-    if (caller is null) { await ApiError(context, 401, "401 Unauthorized"); return; }
-    if (!caller.TokenScopes.HasFlag(TokenScope.Api))
-    { await ApiError(context, 403, "403 Forbidden: insufficient_scope"); return; }
-
-    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.ManageProject);
-    if (project is null) return;
-
-    string username = context.Request.RouteValues["username"]?.ToString() ?? "";
-    try
-    {
-        UserAccount? user = await store.FindActiveUserAsync(username, context.RequestAborted);
-        if (user is null) { await ApiError(context, 400, "no such account"); return; }
-        await store.RevokeMembershipAsync(caller, project.Details.Project.Id, user.Id, context.RequestAborted);
-        context.Response.StatusCode = StatusCodes.Status204NoContent;
-    }
-    catch (ArgumentException) { await ApiError(context, 400, "username"); }
-    catch (InvalidOperationException error) { await ApiError(context, 400, error.Message); }
-    catch (UnauthorizedAccessException) { await ApiError(context, 404, "404 Project Not Found"); }
-});
+static ProjectMemberResponse GitLabMemberResponseFor(ProjectMember member) =>
+    new(member.UserId, member.Username, member.Role.ToString().ToLowerInvariant(), member.UserId, member.Username, "active",
+        member.Role switch { ProjectRole.Reporter => 20, ProjectRole.Developer => 30, _ => 40 });
 
 // What one commit changed, for a token. The browser has had this since commits became linkable; without it
 // an agent can see that a commit exists and never what it did, which is the one question worth asking
@@ -3684,7 +3793,8 @@ async Task<MergeAnalysis> AnalyseProposal(HttpContext context, ProjectDetails pr
     finally { endpoint.Gate.Release(); }
 }
 
-async Task ListIssues(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+// The browser reads a page object; GitLab's route answers a bare array, with the totals in X-Total and Link, as its clients expect.
+async Task ListIssues(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity, bool gitLab = false)
 {
     if (!await OnlyQuery(context, "state", "page", "per_page", "labels", "without_labels", "milestone_id", "assignee_username", "search", "confidential")) return;
     if (!TryReadState(context.Request.Query["state"].ToString(), out CollaborationState? state, merged: false))
@@ -3711,7 +3821,8 @@ async Task ListIssues(HttpContext context, ProjectDetails project, Authenticated
     List<IssueResponse> response = [];
     foreach (Issue issue in issues.Issues) response.Add(await IssueResponseFor(context, project, issue));
     SetPagination(context, page, perPage, issues.Total);
-    await context.Response.WriteAsJsonAsync(new IssuePageResponse(response, issues.Total, page, perPage),
+    if (gitLab) await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.IssueResponseArray, null, context.RequestAborted);
+    else await context.Response.WriteAsJsonAsync(new IssuePageResponse(response, issues.Total, page, perPage),
         ApiJson.Default.IssuePageResponse, null, context.RequestAborted);
 }
 
@@ -3867,7 +3978,7 @@ async Task CreateNote(HttpContext context, ProjectDetails project, Authenticated
     catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
 }
 
-async Task ListMergeRequests(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+async Task ListMergeRequests(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity, bool gitLab = false)
 {
     if (!await OnlyQuery(context, "state", "page", "per_page", "labels", "milestone_id", "assignee_username", "reviewer_username", "search")) return;
     if (!TryReadState(context.Request.Query["state"].ToString(), out CollaborationState? state, merged: true))
@@ -3885,7 +3996,8 @@ async Task ListMergeRequests(HttpContext context, ProjectDetails project, Authen
     foreach (MergeProposal proposal in proposals.Proposals)
         response.Add(await MergeResponseFor(context, project, proposal, null));
     SetPagination(context, page, perPage, proposals.Total);
-    await context.Response.WriteAsJsonAsync(new MergeRequestPageResponse(response, proposals.Total, page, perPage),
+    if (gitLab) await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.MergeRequestResponseArray, null, context.RequestAborted);
+    else await context.Response.WriteAsJsonAsync(new MergeRequestPageResponse(response, proposals.Total, page, perPage),
         ApiJson.Default.MergeRequestPageResponse, null, context.RequestAborted);
 }
 
@@ -5385,7 +5497,8 @@ static bool TryReadSearch(HttpContext context, string[] scopes, out string scope
     return true;
 }
 
-async Task ProjectSearch(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+// GitLab answers a search with a bare array of the scope asked for; the browser reads one object for every scope.
+async Task ProjectSearch(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity, bool gitLab = false)
 {
     if (!await OnlyQuery(context, "scope", "search", "ref")) return;
     if (!TryReadSearch(context, ["issues", "merge_requests", "blobs", "wiki_blobs", "commits"], out string scope, out string search, out string error))
@@ -5443,11 +5556,25 @@ async Task ProjectSearch(HttpContext context, ProjectDetails project, Authentica
     catch (UnauthorizedAccessException) { await ApiError(context, 404, "project"); return; }
     catch (GitInputException error2) { await ApiError(context, 400, "search refused: " + error2.Message); return; }
     int count = issues.Count + proposals.Count + blobs.Count + wiki.Count + commits.Count;
+    if (gitLab)
+    {
+        SetPagination(context, 1, Math.Max(count, 1), count);
+        context.Response.Headers["X-Graft-Truncated"] = count >= SearchLimit ? "true" : "false";
+        await (scope switch
+        {
+            "issues" => context.Response.WriteAsJsonAsync(issues.ToArray(), ApiJson.Default.IssueResponseArray, null, context.RequestAborted),
+            "merge_requests" => context.Response.WriteAsJsonAsync(proposals.ToArray(), ApiJson.Default.MergeRequestResponseArray, null, context.RequestAborted),
+            "blobs" => context.Response.WriteAsJsonAsync(blobs.ToArray(), ApiJson.Default.BlobSearchResponseArray, null, context.RequestAborted),
+            "wiki_blobs" => context.Response.WriteAsJsonAsync(wiki.ToArray(), ApiJson.Default.WikiPageResponseArray, null, context.RequestAborted),
+            _ => context.Response.WriteAsJsonAsync(commits.ToArray(), ApiJson.Default.CommitResponseArray, null, context.RequestAborted)
+        });
+        return;
+    }
     await context.Response.WriteAsJsonAsync(new SearchResponse(scope, search, count, count >= SearchLimit, [], issues, proposals, blobs, wiki, commits),
         ApiJson.Default.SearchResponse, null, context.RequestAborted);
 }
 
-async Task GlobalSearch(HttpContext context, AuthenticatedIdentity? identity)
+async Task GlobalSearch(HttpContext context, AuthenticatedIdentity? identity, bool gitLab = false)
 {
     if (!await OnlyQuery(context, "scope", "search")) return;
     if (!TryReadSearch(context, ["projects", "issues", "merge_requests"], out string scope, out string search, out string error))
@@ -5480,6 +5607,18 @@ async Task GlobalSearch(HttpContext context, AuthenticatedIdentity? identity)
             break;
     }
     int count = projects.Count + issues.Count + proposals.Count;
+    if (gitLab)
+    {
+        SetPagination(context, 1, Math.Max(count, 1), count);
+        context.Response.Headers["X-Graft-Truncated"] = count >= SearchLimit ? "true" : "false";
+        await (scope switch
+        {
+            "projects" => context.Response.WriteAsJsonAsync(projects.ToArray(), ApiJson.Default.ProjectResponseArray, null, context.RequestAborted),
+            "issues" => context.Response.WriteAsJsonAsync(issues.ToArray(), ApiJson.Default.IssueResponseArray, null, context.RequestAborted),
+            _ => context.Response.WriteAsJsonAsync(proposals.ToArray(), ApiJson.Default.MergeRequestResponseArray, null, context.RequestAborted)
+        });
+        return;
+    }
     await context.Response.WriteAsJsonAsync(new SearchResponse(scope, search, count, count >= SearchLimit, projects, issues, proposals, [], [], []),
         ApiJson.Default.SearchResponse, null, context.RequestAborted);
 }
@@ -5494,7 +5633,7 @@ app.MapGet("/api/v4/search", async context =>
 {
     (bool failed, AuthenticatedIdentity? identity) = await AuthenticateApiOptional(context);
     if (failed) return;
-    await GlobalSearch(context, identity);
+    await GlobalSearch(context, identity, gitLab: true);
 });
 
 app.MapGet("/api/projects/{projectId:long}/search", async context =>
@@ -5506,7 +5645,7 @@ app.MapGet("/api/projects/{projectId:long}/search", async context =>
 app.MapGet("/api/v4/projects/{projectId}/search", async context =>
 {
     var scope = await ApiCollaboration(context);
-    if (scope is not null) await ProjectSearch(context, scope.Value.Details, scope.Value.Identity);
+    if (scope is not null) await ProjectSearch(context, scope.Value.Details, scope.Value.Identity, gitLab: true);
 });
 
 // ---------------------------------------------------------------------------------------------------
@@ -6724,7 +6863,7 @@ app.MapGet("/api/v4/projects/{projectId}/issues", async context =>
 {
     var scope = await ApiCollaboration(context);
     if (scope is null) return;
-    await ListIssues(context, scope.Value.Details, scope.Value.Identity);
+    await ListIssues(context, scope.Value.Details, scope.Value.Identity, gitLab: true);
 });
 
 app.MapPost("/api/v4/projects/{projectId}/issues", async context =>
@@ -6766,7 +6905,7 @@ app.MapGet("/api/v4/projects/{projectId}/merge_requests", async context =>
 {
     var scope = await ApiCollaboration(context);
     if (scope is null) return;
-    await ListMergeRequests(context, scope.Value.Details, scope.Value.Identity);
+    await ListMergeRequests(context, scope.Value.Details, scope.Value.Identity, gitLab: true);
 });
 
 app.MapPost("/api/v4/projects/{projectId}/merge_requests", async context =>
@@ -7978,12 +8117,34 @@ static void SetPagination(HttpContext context, int page, int perPage, long total
     context.Response.Headers["X-Page"] = page.ToString(System.Globalization.CultureInfo.InvariantCulture);
     context.Response.Headers["X-Next-Page"] = page < pages ? (page + 1).ToString(System.Globalization.CultureInfo.InvariantCulture) : "";
     context.Response.Headers["X-Prev-Page"] = page > 1 ? (page - 1).ToString(System.Globalization.CultureInfo.InvariantCulture) : "";
+    // GitLab's Link header, which clients such as LabCoat follow instead of counting pages: the same request with the
+    // page changed, for next, prev, first and last.
+    string Page(long number)
+    {
+        Dictionary<string, Microsoft.Extensions.Primitives.StringValues> query = new(context.Request.Query, StringComparer.Ordinal)
+        {
+            ["page"] = number.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            ["per_page"] = perPage.ToString(System.Globalization.CultureInfo.InvariantCulture)
+        };
+        return "<" + Origin(context) + context.Request.PathBase + context.Request.Path + QueryString.Create(query) + ">";
+    }
+    List<string> links = [];
+    if (page < pages) links.Add(Page(page + 1) + "; rel=\"next\"");
+    if (page > 1) links.Add(Page(page - 1) + "; rel=\"prev\"");
+    links.Add(Page(1) + "; rel=\"first\"");
+    links.Add(Page(pages) + "; rel=\"last\"");
+    context.Response.Headers.Link = string.Join(", ", links);
 }
 
 static async Task<bool> OnlyQuery(HttpContext context, params string[] allowed)
 {
-    if (context.Request.Query.Keys.All(key => allowed.Contains(key, StringComparer.Ordinal))) return true;
-    await ApiError(context, 400, "unsupported query parameter");
+    // GitLab's clients send an ordering with every list. Under /api/v4 an ordering a route does not implement is accepted and
+    // the route's own order kept, because it changes the order of what comes back but never what comes back; a filter
+    // that is not implemented is still refused by name.
+    bool gitLab = context.Request.Path.StartsWithSegments("/api/v4");
+    if (context.Request.Query.Keys.All(key => allowed.Contains(key, StringComparer.Ordinal) || (gitLab && key is "order_by" or "sort"))) return true;
+    string unsupported = context.Request.Query.Keys.First(key => !allowed.Contains(key, StringComparer.Ordinal) && !(gitLab && key is "order_by" or "sort"));
+    await ApiError(context, 400, "unsupported query parameter: " + unsupported);
     return false;
 }
 

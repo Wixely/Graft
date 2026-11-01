@@ -238,6 +238,7 @@ try
     await CheckPackages(address, aliceIdentity, "carol");
     await CheckCompressedGitRequests(address, aliceIdentity);
     address = await CheckPushDeletion(address, aliceIdentity);
+    await CheckGitLabClientShapes(address, aliceIdentity, bob.Username);
     await CheckGitEngine(address, aliceIdentity);
     await CheckFetching(address, aliceIdentity, "carol");
     await CheckSsh(address, aliceIdentity, bob.Username);
@@ -410,6 +411,10 @@ async Task<string> Git(string directory, string[] arguments)
     if (exitCode != 0) throw new InvalidOperationException("Git " + arguments[0] + " failed: " + Redact(errors.Trim()));
     return output;
 }
+
+// GitLab's lists are bare arrays with the count in a header.
+static long HeaderTotal(HttpResponseMessage response) =>
+    response.Headers.TryGetValues("X-Total", out IEnumerable<string>? values) ? long.Parse(values.First(), System.Globalization.CultureInfo.InvariantCulture) : -1;
 
 async Task GitFails(string directory, string[] arguments, string name)
 {
@@ -3290,8 +3295,8 @@ async Task CheckCollaboration(string address, AuthenticatedIdentity alice, strin
     using (HttpResponseMessage listing = await ApiGet(address, prefix + "/issues", aliceReadApi))
     {
         using JsonDocument json = JsonDocument.Parse(await listing.Content.ReadAsStreamAsync());
-        Check(listing.IsSuccessStatusCode && json.RootElement.GetProperty("total").GetInt64() == 2 &&
-            json.RootElement.GetProperty("issues")[0].GetProperty("iid").GetInt64() == 2,
+        Check(listing.IsSuccessStatusCode && HeaderTotal(listing) == 2 &&
+            json.RootElement[0].GetProperty("iid").GetInt64() == 2,
             "a read_api token lists issues, newest first");
     }
     using (HttpResponseMessage refused = await ApiPost(address, prefix + "/issues", aliceReadApi, new { title = "Not with this token" }))
@@ -3376,7 +3381,7 @@ async Task CheckCollaboration(string address, AuthenticatedIdentity alice, strin
     {
         using JsonDocument json = JsonDocument.Parse(await listing.Content.ReadAsStreamAsync());
         Check(listing.IsSuccessStatusCode &&
-            json.RootElement.GetProperty("merge_requests")[0].GetProperty("merge_status").GetString() == "unchecked",
+            json.RootElement[0].GetProperty("merge_status").GetString() == "unchecked",
             "a listing does not decide whether each proposal merges");
     }
 
@@ -3469,7 +3474,7 @@ async Task CheckCollaboration(string address, AuthenticatedIdentity alice, strin
     using (HttpResponseMessage anonymous = await ApiGet(address, prefix + "/issues", null))
     {
         using JsonDocument json = JsonDocument.Parse(await anonymous.Content.ReadAsStreamAsync());
-        Check(anonymous.IsSuccessStatusCode && json.RootElement.GetProperty("total").GetInt64() == 2,
+        Check(anonymous.IsSuccessStatusCode && HeaderTotal(anonymous) == 2,
             "a public project's issues are readable with no credential");
     }
     using (HttpResponseMessage refused = await ApiPost(address, prefix + "/issues", null, new { title = "From nobody" }))
@@ -4164,27 +4169,27 @@ async Task CheckPlanning(string address, AuthenticatedIdentity alice, string bob
     using (HttpResponseMessage filtered = await ApiGet(address, prefix + "/issues?labels=urgent", readApi))
     {
         using JsonDocument json = JsonDocument.Parse(await filtered.Content.ReadAsStreamAsync());
-        Check(filtered.IsSuccessStatusCode && json.RootElement.GetProperty("total").GetInt64() == 1 &&
-            json.RootElement.GetProperty("issues")[0].GetProperty("iid").GetInt64() == reporters,
+        Check(filtered.IsSuccessStatusCode && HeaderTotal(filtered) == 1 &&
+            json.RootElement[0].GetProperty("iid").GetInt64() == reporters,
             "issues are filtered by label");
     }
     using (HttpResponseMessage filtered = await ApiGet(address, prefix + "/issues?milestone_id=" + milestoneId + "&assignee_username=" + bobUsername, readApi))
     {
         using JsonDocument json = JsonDocument.Parse(await filtered.Content.ReadAsStreamAsync());
-        Check(filtered.IsSuccessStatusCode && json.RootElement.GetProperty("total").GetInt64() == 1 &&
-            json.RootElement.GetProperty("issues")[0].GetProperty("iid").GetInt64() == planned,
+        Check(filtered.IsSuccessStatusCode && HeaderTotal(filtered) == 1 &&
+            json.RootElement[0].GetProperty("iid").GetInt64() == planned,
             "issues are filtered by milestone and assignee together");
     }
     using (HttpResponseMessage filtered = await ApiGet(address, prefix + "/issues?milestone_id=None&search=reporter", readApi))
     {
         using JsonDocument json = JsonDocument.Parse(await filtered.Content.ReadAsStreamAsync());
-        Check(filtered.IsSuccessStatusCode && json.RootElement.GetProperty("total").GetInt64() == 1,
+        Check(filtered.IsSuccessStatusCode && HeaderTotal(filtered) == 1,
             "issues with no milestone are filtered, and a search narrows by title");
     }
     using (HttpResponseMessage filtered = await ApiGet(address, prefix + "/issues?without_labels=defect,urgent", readApi))
     {
         using JsonDocument json = JsonDocument.Parse(await filtered.Content.ReadAsStreamAsync());
-        Check(filtered.IsSuccessStatusCode && json.RootElement.GetProperty("total").GetInt64() == 0,
+        Check(filtered.IsSuccessStatusCode && HeaderTotal(filtered) == 0,
             "a board's first column asks for issues carrying none of its labels");
     }
     using (HttpResponseMessage milestone = await ApiGet(address, prefix + "/milestones/" + milestoneId, readApi))
@@ -4220,8 +4225,8 @@ async Task CheckPlanning(string address, AuthenticatedIdentity alice, string bob
     using (HttpResponseMessage anonymous = await ApiGet(address, prefix + "/issues?state=all", null))
     {
         using JsonDocument json = JsonDocument.Parse(await anonymous.Content.ReadAsStreamAsync());
-        Check(anonymous.IsSuccessStatusCode && json.RootElement.GetProperty("total").GetInt64() == 2 &&
-            json.RootElement.GetProperty("issues").EnumerateArray().All(issue => !issue.GetProperty("confidential").GetBoolean()),
+        Check(anonymous.IsSuccessStatusCode && HeaderTotal(anonymous) == 2 &&
+            json.RootElement.EnumerateArray().All(issue => !issue.GetProperty("confidential").GetBoolean()),
             "a public project's listing conceals its confidential issues from a stranger");
     }
     using (HttpResponseMessage hidden = await ApiGet(address, prefix + "/issues/" + secret, null))
@@ -4324,7 +4329,7 @@ async Task CheckPlanning(string address, AuthenticatedIdentity alice, string bob
     using (HttpResponseMessage filtered = await ApiGet(address, prefix + "/merge_requests?reviewer_username=" + bobUsername, readApi))
     {
         using JsonDocument json = JsonDocument.Parse(await filtered.Content.ReadAsStreamAsync());
-        Check(filtered.IsSuccessStatusCode && json.RootElement.GetProperty("total").GetInt64() == 1, "proposals are filtered by reviewer");
+        Check(filtered.IsSuccessStatusCode && HeaderTotal(filtered) == 1, "proposals are filtered by reviewer");
     }
     using (HttpResponseMessage ready = await ApiPut(address, prefix + "/merge_requests/" + draft, aliceApi, new { draft = false }))
     {
@@ -4879,7 +4884,7 @@ async Task CheckSearch(string address, AuthenticatedIdentity alice, string stran
     using (HttpResponseMessage found = await ApiGet(address, prefix + "/search?scope=blobs&search=needle", aliceApi))
     {
         using JsonDocument json = JsonDocument.Parse(await found.Content.ReadAsStreamAsync());
-        JsonElement blobs = json.RootElement.GetProperty("blobs");
+        JsonElement blobs = json.RootElement;
         Check(found.IsSuccessStatusCode && blobs.GetArrayLength() == 1 && blobs[0].GetProperty("path").GetString() == "src/lamp.cs" &&
             blobs[0].GetProperty("startline").GetInt32() == 1 && blobs[0].GetProperty("data").GetString()!.Contains("Needle", StringComparison.Ordinal),
             "code search finds the line, without regard to case, and skips the binary file");
@@ -4887,18 +4892,18 @@ async Task CheckSearch(string address, AuthenticatedIdentity alice, string stran
     using (HttpResponseMessage found = await ApiGet(address, prefix + "/search?scope=commits&search=haystack", aliceApi))
     {
         using JsonDocument json = JsonDocument.Parse(await found.Content.ReadAsStreamAsync());
-        Check(found.IsSuccessStatusCode && json.RootElement.GetProperty("commits").GetArrayLength() == 1, "commit search finds the message");
+        Check(found.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 1, "commit search finds the message");
     }
     using (HttpResponseMessage found = await ApiGet(address, prefix + "/search?scope=issues&search=needle", aliceApi))
     {
         using JsonDocument json = JsonDocument.Parse(await found.Content.ReadAsStreamAsync());
-        Check(found.IsSuccessStatusCode && json.RootElement.GetProperty("issues").GetArrayLength() == 2, "issue search finds both for a member");
+        Check(found.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 2, "issue search finds both for a member");
     }
     using (HttpResponseMessage found = await ApiGet(address, prefix + "/search?scope=wiki_blobs&search=cushion", aliceApi))
     {
         using JsonDocument json = JsonDocument.Parse(await found.Content.ReadAsStreamAsync());
-        Check(found.IsSuccessStatusCode && json.RootElement.GetProperty("wiki_blobs").GetArrayLength() == 1 &&
-            json.RootElement.GetProperty("wiki_blobs")[0].GetProperty("slug").GetString() == "sewing", "wiki search finds the page by its content");
+        Check(found.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 1 &&
+            json.RootElement[0].GetProperty("slug").GetString() == "sewing", "wiki search finds the page by its content");
     }
     using (HttpResponseMessage bad = await ApiGet(address, prefix + "/search?scope=users&search=needle", aliceApi))
         Check(bad.StatusCode == HttpStatusCode.BadRequest, "an unknown scope is refused");
@@ -4909,18 +4914,18 @@ async Task CheckSearch(string address, AuthenticatedIdentity alice, string stran
     using (HttpResponseMessage found = await ApiGet(address, "/api/v4/search?scope=projects&search=haystack", aliceApi))
     {
         using JsonDocument json = JsonDocument.Parse(await found.Content.ReadAsStreamAsync());
-        Check(found.IsSuccessStatusCode && json.RootElement.GetProperty("projects").EnumerateArray()
+        Check(found.IsSuccessStatusCode && json.RootElement.EnumerateArray()
             .Any(project => project.GetProperty("path").GetString() == "haystack"), "a global search finds a project by name");
     }
     using (HttpResponseMessage found = await ApiGet(address, "/api/v4/search?scope=issues&search=needle", aliceApi))
     {
         using JsonDocument json = JsonDocument.Parse(await found.Content.ReadAsStreamAsync());
-        Check(found.IsSuccessStatusCode && json.RootElement.GetProperty("issues").GetArrayLength() == 2, "a global search finds an owner's issues, confidential included");
+        Check(found.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 2, "a global search finds an owner's issues, confidential included");
     }
     using (HttpResponseMessage found = await ApiGet(address, "/api/v4/search?scope=issues&search=needle", strangerApi))
     {
         using JsonDocument json = JsonDocument.Parse(await found.Content.ReadAsStreamAsync());
-        Check(found.IsSuccessStatusCode && json.RootElement.GetProperty("issues").GetArrayLength() == 0, "a stranger's global search finds nothing in a private project");
+        Check(found.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 0, "a stranger's global search finds nothing in a private project");
     }
     using (HttpResponseMessage anonymous = await ApiGet(address, "/api/v4/search?scope=issues&search=needle", null))
     {
@@ -4929,7 +4934,7 @@ async Task CheckSearch(string address, AuthenticatedIdentity alice, string stran
         if (publicBrowsing)
         {
             using JsonDocument json = JsonDocument.Parse(await anonymous.Content.ReadAsStreamAsync());
-            Check(anonymous.IsSuccessStatusCode && json.RootElement.GetProperty("issues").GetArrayLength() == 0,
+            Check(anonymous.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 0,
                 "an anonymous global search sees nothing of a private project");
         }
         else Check(anonymous.StatusCode == HttpStatusCode.Unauthorized, "an anonymous global search needs public browsing, which this server has off");
@@ -7509,6 +7514,94 @@ async Task CheckEmptyRepository(string address, AuthenticatedIdentity alice, str
 /// negotiation. That is what happens once two histories have diverged, which is why a clone of a new
 /// repository worked and a pull against a busy one did not.
 /// </summary>
+/// <summary>
+/// What GitLab clients such as LabCoat send and expect: writes as forms or query strings as well as JSON, a bare POST,
+/// lists as bare arrays with X-Total and Link, an ordering hint accepted, and members by user id and access level.
+/// </summary>
+async Task CheckGitLabClientShapes(string address, AuthenticatedIdentity alice, string bobUsername)
+{
+    string api;
+    long projectId;
+    long bobId;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        ProjectInfo created = await store.CreateProjectWithRepositoryAsync(alice, "client-shapes", "Client shapes",
+            (project, cancellation) => { cancellation.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, project.StorageId)); return Task.CompletedTask; });
+        projectId = created.Id;
+        api = (await store.CreateTokenAsync(alice, "client-shapes", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        bobId = (await store.FindActiveUserAsync(bobUsername))!.Id;
+    }
+    string prefix = "/api/v4/projects/" + projectId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    for (int n = 1; n <= 2; n++)
+    {
+        using HttpResponseMessage posted = await ApiSend(address, HttpMethod.Post, prefix + "/issues", api,
+            new FormUrlEncodedContent([new("title", "Form issue " + n), new("description", "from a form"), new("confidential", "false")]));
+        using JsonDocument json = JsonDocument.Parse(await posted.Content.ReadAsStringAsync());
+        Check(posted.IsSuccessStatusCode && json.RootElement.GetProperty("title").GetString() == "Form issue " + n,
+            "an issue is created from a form, as LabCoat sends it (" + n + ")");
+    }
+    using (HttpResponseMessage posted = await ApiSend(address, HttpMethod.Post, prefix + "/issues?title=Query+issue", api, null))
+    {
+        using JsonDocument json = JsonDocument.Parse(await posted.Content.ReadAsStringAsync());
+        Check(posted.IsSuccessStatusCode && json.RootElement.GetProperty("title").GetString() == "Query issue",
+            "a bodyless POST takes its parameters from the query string");
+    }
+    using (HttpResponseMessage edited = await ApiSend(address, HttpMethod.Put, prefix + "/issues/1?title=Renamed&confidential=true", api, null))
+    {
+        using JsonDocument json = JsonDocument.Parse(await edited.Content.ReadAsStringAsync());
+        Check(edited.IsSuccessStatusCode && json.RootElement.GetProperty("title").GetString() == "Renamed" &&
+            json.RootElement.GetProperty("confidential").GetBoolean(),
+            "an edit in the query string is applied, a boolean read from its string");
+    }
+
+    using (HttpResponseMessage listed = await ApiGet(address, prefix + "/issues?per_page=2&order_by=created_at&sort=desc", api))
+    {
+        using JsonDocument json = JsonDocument.Parse(await listed.Content.ReadAsStringAsync());
+        string link = listed.Headers.TryGetValues("Link", out IEnumerable<string>? links) ? string.Join(",", links) : "";
+        Check(listed.IsSuccessStatusCode && json.RootElement.ValueKind == JsonValueKind.Array && json.RootElement.GetArrayLength() == 2 &&
+            HeaderTotal(listed) == 3 && link.Contains("page=2", StringComparison.Ordinal) && link.Contains("rel=\"next\"", StringComparison.Ordinal) &&
+            link.Contains(address.TrimEnd('/') + prefix + "/issues?", StringComparison.Ordinal),
+            "a list is a bare array, with X-Total and an absolute Link to the next page, and an ordering hint is accepted");
+    }
+    using (HttpResponseMessage refused = await ApiGet(address, prefix + "/issues?not_a_filter=1", api))
+        Check(refused.StatusCode == HttpStatusCode.BadRequest && (await refused.Content.ReadAsStringAsync()).Contains("not_a_filter", StringComparison.Ordinal),
+            "a filter Graft does not have is refused, by name");
+
+    using (HttpResponseMessage granted = await ApiSend(address, HttpMethod.Post, prefix + "/members", api,
+        new FormUrlEncodedContent([new("user_id", bobId.ToString(System.Globalization.CultureInfo.InvariantCulture)), new("access_level", "30")])))
+    {
+        using JsonDocument json = JsonDocument.Parse(await granted.Content.ReadAsStringAsync());
+        Check(granted.StatusCode == HttpStatusCode.Created && json.RootElement.GetProperty("id").GetInt64() == bobId &&
+            json.RootElement.GetProperty("access_level").GetInt32() == 30 && json.RootElement.GetProperty("role").GetString() == "developer",
+            "a member is granted by user_id and access_level, and reported in GitLab's member shape");
+    }
+    using (HttpResponseMessage changed = await ApiPut(address, prefix + "/members/" + bobId, api, new { access_level = 40 }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await changed.Content.ReadAsStringAsync());
+        Check(changed.IsSuccessStatusCode && json.RootElement.GetProperty("access_level").GetInt32() == 40,
+            "GitLab's PUT on the member's own path changes the level (" + (int)changed.StatusCode + " " + json.RootElement.GetRawText() + ")");
+    }
+    using (HttpResponseMessage guest = await ApiPost(address, prefix + "/members", api, new { user_id = bobId, access_level = 10 }))
+        Check(guest.StatusCode == HttpStatusCode.BadRequest && (await guest.Content.ReadAsStringAsync()).Contains("access_level", StringComparison.Ordinal),
+            "Guest, which Graft does not have, is refused by name");
+    using (HttpResponseMessage removed = await ApiDelete(address, prefix + "/members/" + bobId, api))
+        Check(removed.StatusCode == HttpStatusCode.NoContent, "a member is removed by user id");
+    using (HttpResponseMessage members = await ApiGet(address, prefix + "/members", api))
+        Check((await members.Content.ReadAsStringAsync()) == "[]", "and is gone");
+}
+
+async Task<HttpResponseMessage> ApiSend(string address, HttpMethod method, string path, string? token, HttpContent? content)
+{
+    HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false };
+    using HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
+    using HttpRequestMessage request = new(method, path) { Content = content };
+    if (token is not null) request.Headers.Add("PRIVATE-TOKEN", token);
+    HttpResponseMessage response = await client.SendAsync(request);
+    await response.Content.LoadIntoBufferAsync();
+    return response;
+}
+
 /// <summary>
 /// Deleting a branch or tag by push (ADR 0039): on by default, with the forge's rules, a reason Git prints for
 /// every refused reference, and off when the operator says so.

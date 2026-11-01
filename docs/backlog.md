@@ -122,6 +122,12 @@ Then the first of the four large items, in the order given:
   exist, on the settings tab and at GitLab's `audit_events` route. The whole trail stays the administrator's.
   [ADR 0036](decisions/0036-project-audit.md).
 
+## Closed on 2026-11-01
+
+- **GitLab clients could not read Graft's lists or send it writes.** Found by reading LabCoat: `/api/v4` issue and
+  merge-request lists and search answered objects instead of bare arrays, writes needed JSON, members needed a
+  username, lists had no `Link` and refused `order_by`. All fixed. [ADR 0040](decisions/0040-gitlab-request-and-list-shapes.md).
+
 ## Closed on 2026-10-31
 
 - **Deleting a branch by push, and refusals that say why.** An agent cleaning up merged branches on the live
@@ -131,7 +137,19 @@ Then the first of the four large items, in the order given:
 
 ## Near, and small
 
-Taken top down. Added on 2026-10-31: making "the runner works on Windows, Linux and in Docker" true. Today only
+Taken top down.
+
+Added on 2026-11-01, first in line: the GitLab clients in use, LabCoat and Comeet.
+
+1. Read Comeet's traffic (Android, `com.monokaijs.comeet`, closed source): its APK from a phone, or a log
+   of the `/api/v4` requests Graft has no route for, with the client's user agent. GraphQL only if it sends some.
+2. The 39 LabCoat calls with no route, most-used first: `events`, the cross-project `issues` and `merge_requests`,
+   `users` and `users/:id`, merge-request `discussions`, `commits` and `approvals`, job and pipeline `retry` and
+   `cancel`, `star`, award emoji, `uploads`, `repository/contributors`, a single commit, deleting an issue. Then the
+   filters LabCoat sends that Graft refuses: `scope` and `iids` on issues and merge requests, `membership` and
+   `starred` on projects.
+
+Added on 2026-10-31: making "the runner works on Windows, Linux and in Docker" true. Today only
 the Windows runner is tested.
 
 1. Publish the linux-x64 runner, NativeAOT, static musl like the forge.

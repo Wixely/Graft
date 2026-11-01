@@ -268,7 +268,9 @@ public sealed record GroupMemberResponse(
 
 /// <summary>GitLab's member request: a user id and an access level; Graft also takes a username.</summary>
 public sealed record GroupMemberRequest([property: JsonPropertyName("user_id")] long? UserId, string? Username, [property: JsonPropertyName("access_level")] int? AccessLevel);
-public sealed record MembershipSetRequest(string Username, string Role);
+/// <summary>Graft's member request, a username and a role name, or GitLab's, a `user_id` and an `access_level`.</summary>
+public sealed record MembershipSetRequest(string? Username, string? Role,
+    [property: JsonPropertyName("user_id")] long? UserId = null, [property: JsonPropertyName("access_level")] int? AccessLevel = null);
 
 /// <summary>A project's human-facing text. A null field is left alone, so one can be changed without
 /// resending the other.</summary>
@@ -280,7 +282,12 @@ public sealed record OwnershipTransferRequest(string Username);
 /// <summary>Names the branch a project should open at. Null or empty clears the preference and lets the
 /// repository fall back to convention.</summary>
 public sealed record DefaultBranchRequest(string? Branch);
-public sealed record ProjectMemberResponse(long UserId, string Username, string Role);
+/// <summary>
+/// A project member. `user_id`, `username` and `role` are Graft's; `id`, `name`, `state` and `access_level` are GitLab's member
+/// shape, filled on the GitLab-compatible route so its clients can read it.
+/// </summary>
+public sealed record ProjectMemberResponse(long UserId, string Username, string Role, long? Id = null, string? Name = null,
+    string? State = null, [property: JsonPropertyName("access_level")] int? AccessLevel = null);
 /// <summary>
 /// Names a completed browser upload for an application operation to ingest. The upload id is a transport
 /// receipt, not an authorization: the server re-checks the caller's permission and that the caller owns it.
@@ -1135,7 +1142,10 @@ public sealed record MergeRequestChangesResponse(
     int Added,
     int Removed);
 
-[JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower)]
+// Numbers and booleans are also read from strings, because GitLab's API takes a write as a form or a query string as
+// readily as JSON, its clients send all three, and a form carries only strings. Writing is unchanged.
+[JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower,
+    NumberHandling = JsonNumberHandling.AllowReadingFromString, Converters = [typeof(LenientBooleanConverter)])]
 [JsonSerializable(typeof(UserResponse))]
 [JsonSerializable(typeof(ProjectResponse))]
 [JsonSerializable(typeof(ProjectResponse[]))]
@@ -1307,3 +1317,27 @@ public sealed record MergeRequestChangesResponse(
 [JsonSerializable(typeof(MergeAcceptRequest))]
 [JsonSerializable(typeof(BranchResponse))]
 public partial class ApiJson : JsonSerializerContext;
+
+/// <summary>
+/// Reads a boolean from JSON's true and false, or from the strings a form carries: "true", "false", "1" and "0", as
+/// GitLab accepts. Writes JSON's true and false.
+/// </summary>
+public sealed class LenientBooleanConverter : JsonConverter<bool>
+{
+    public override bool Read(ref System.Text.Json.Utf8JsonReader reader, Type typeToConvert, System.Text.Json.JsonSerializerOptions options) =>
+        reader.TokenType switch
+        {
+            System.Text.Json.JsonTokenType.True => true,
+            System.Text.Json.JsonTokenType.False => false,
+            System.Text.Json.JsonTokenType.String => reader.GetString() switch
+            {
+                "true" or "1" => true,
+                "false" or "0" => false,
+                _ => throw new System.Text.Json.JsonException("a boolean must be true or false")
+            },
+            _ => throw new System.Text.Json.JsonException("a boolean must be true or false")
+        };
+
+    public override void Write(System.Text.Json.Utf8JsonWriter writer, bool value, System.Text.Json.JsonSerializerOptions options) =>
+        writer.WriteBooleanValue(value);
+}

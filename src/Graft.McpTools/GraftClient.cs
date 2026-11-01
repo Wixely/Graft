@@ -235,6 +235,29 @@ public sealed class GraftClient
         catch (JsonException error) { return (default, "Graft returned something this client could not read: " + error.Message); }
     }
 
+    /// <summary>
+    /// Reads a GitLab list: the array, and what the server says about it in headers, `X-Total` and Graft's
+    /// `X-Graft-Truncated`, because GitLab's routes answer a bare array and put the rest there.
+    /// </summary>
+    public async Task<(T? Value, long Total, bool Truncated, string? Error)> GetListAsync<T>(string path, JsonTypeInfo<T> type,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            using HttpRequestMessage request = Build(HttpMethod.Get, path);
+            using HttpResponseMessage response = await connection.Http.SendAsync(request, cancellationToken);
+            if (!response.IsSuccessStatusCode)
+                return (default, 0, false, Describe((int)response.StatusCode, await response.Content.ReadAsStringAsync(cancellationToken)));
+            long total = response.Headers.TryGetValues("X-Total", out IEnumerable<string>? totals) &&
+                long.TryParse(totals.FirstOrDefault(), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out long parsed) ? parsed : 0;
+            bool truncated = response.Headers.TryGetValues("X-Graft-Truncated", out IEnumerable<string>? flags) && flags.FirstOrDefault() == "true";
+            return (await response.Content.ReadFromJsonAsync(type, cancellationToken), total, truncated, null);
+        }
+        catch (HttpRequestException error) { return (default, 0, false, "Graft could not be reached: " + error.Message); }
+        catch (TaskCanceledException) { return (default, 0, false, "Graft did not answer within the timeout."); }
+        catch (JsonException error) { return (default, 0, false, "Graft returned something this client could not read: " + error.Message); }
+    }
+
     /// <summary>Whether this caller presented a credential at all. False only where an operator has
     /// explicitly allowed anonymous access, in which case Graft answers as it would any stranger.</summary>
     public bool Anonymous => token.Length == 0;

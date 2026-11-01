@@ -1,6 +1,27 @@
 # Next-agent handoff
 
-Updated: 2026-10-31. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the project owner.
+Updated: 2026-11-01. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the project owner.
+
+## Added on 2026-11-01: GitLab clients, starting from LabCoat
+
+GraphQL came up, with LabCoat and Comeet as the clients in use. LabCoat is open source and uses only REST; its 95
+calls were probed against a disposable forge: 56 matched, 39 have no route, and four defects on existing routes would
+break any GitLab client. The fixes come first and investigation after. [ADR 0040](decisions/0040-gitlab-request-and-list-shapes.md).
+
+- **Lists and search.** `ListIssues`, `ListMergeRequests`, `ProjectSearch` and `GlobalSearch` take `gitLab: true` from
+  their `/api/v4` routes and write bare arrays; `SetPagination` adds an absolute `Link`.
+- **Writes.** A middleware after the error handler turns `/api/v4` forms and bodyless query strings into JSON.
+  `ApiJson` reads numbers from strings and booleans through `LenientBooleanConverter`.
+- **Members.** `SetProjectMember` and `ProjectMemberId` take `user_id`/`access_level` or username/role, and a user
+  id or username in the path; `GitLabMemberResponseFor` fills GitLab's fields.
+- **Queries.** `OnlyQuery` accepts `order_by` and `sort` under `/api/v4` and names a refused parameter.
+- **MCP tools** read the arrays through `GraftClient.GetListAsync`, which reads `X-Total` and `X-Graft-Truncated`.
+
+Verified: Git suite 1196 to **1207** managed and against the NativeAOT forge (zero warnings); MCP suite 104. Not run:
+the `glab` suite. LabCoat itself has not been pointed at a forge.
+
+Next action, owner user: provide Comeet's APK (`adb shell pm path com.monokaijs.comeet`, then `adb pull`) or say to
+add the unmatched-request log; owner implementation agent: the LabCoat routes in the backlog's Near list.
 
 ## Added on 2026-10-31, third entry: deletion by push, and refusals with reasons
 

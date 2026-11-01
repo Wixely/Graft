@@ -564,14 +564,14 @@ public sealed class GraftTools
         CancellationToken cancellationToken)
     {
         if (!TryState(state, merged: false, out string? query)) return Failure("state must be opened, closed or all.");
-        (IssuePageResponse? page, string? error) = await graft.GetAsync(
-            "api/v4/projects/" + Encode(project) + "/issues" + query, ApiJson.Default.IssuePageResponse, cancellationToken);
+        (IssueResponse[]? issues, long total, _, string? error) = await graft.GetListAsync(
+            "api/v4/projects/" + Encode(project) + "/issues" + query, ApiJson.Default.IssueResponseArray, cancellationToken);
         if (error is not null) return Failure(error);
 
         return new JsonObject
         {
-            ["total"] = page!.Total,
-            ["issues"] = Array(page.Issues, issue => new JsonObject
+            ["total"] = total,
+            ["issues"] = Array(issues!, issue => new JsonObject
             {
                 ["number"] = issue.Iid,
                 ["title"] = issue.Title,
@@ -763,15 +763,15 @@ public sealed class GraftTools
     {
         if (!TryState(state, merged: true, out string? query))
             return Failure("state must be opened, closed, merged or all.");
-        (MergeRequestPageResponse? page, string? error) = await graft.GetAsync(
+        (MergeRequestResponse[]? proposals, long total, _, string? error) = await graft.GetListAsync(
             "api/v4/projects/" + Encode(project) + "/merge_requests" + query,
-            ApiJson.Default.MergeRequestPageResponse, cancellationToken);
+            ApiJson.Default.MergeRequestResponseArray, cancellationToken);
         if (error is not null) return Failure(error);
 
         return new JsonObject
         {
-            ["total"] = page!.Total,
-            ["merge_requests"] = Array(page.MergeRequests, request => new JsonObject
+            ["total"] = total,
+            ["merge_requests"] = Array(proposals!, request => new JsonObject
             {
                 ["number"] = request.Iid,
                 ["title"] = request.Title,
@@ -1088,19 +1088,32 @@ public sealed class GraftTools
         if (string.IsNullOrWhiteSpace(query)) return Failure("query is required.");
         string path = (string.IsNullOrWhiteSpace(project) ? "api/v4/search" : "api/v4/projects/" + Encode(project) + "/search") +
             "?scope=" + Uri.EscapeDataString((scope ?? "").Trim()) + "&search=" + Uri.EscapeDataString(query.Trim());
-        (SearchResponse? found, string? error) = await graft.GetAsync(path, ApiJson.Default.SearchResponse, cancellationToken);
+        // GitLab's search answers a bare array of the scope asked for, so the scope decides what to read.
+        string wanted = (scope ?? "").Trim();
+        ProjectResponse[] projects = []; IssueResponse[] issues = []; MergeRequestResponse[] proposals = [];
+        BlobSearchResponse[] blobs = []; WikiPageResponse[] wiki = []; CommitResponse[] commits = [];
+        long count; bool truncated; string? error;
+        switch (wanted)
+        {
+            case "projects": (ProjectResponse[]? p, count, truncated, error) = await graft.GetListAsync(path, ApiJson.Default.ProjectResponseArray, cancellationToken); projects = p ?? []; break;
+            case "issues": (IssueResponse[]? i, count, truncated, error) = await graft.GetListAsync(path, ApiJson.Default.IssueResponseArray, cancellationToken); issues = i ?? []; break;
+            case "merge_requests": (MergeRequestResponse[]? m, count, truncated, error) = await graft.GetListAsync(path, ApiJson.Default.MergeRequestResponseArray, cancellationToken); proposals = m ?? []; break;
+            case "blobs": (BlobSearchResponse[]? b, count, truncated, error) = await graft.GetListAsync(path, ApiJson.Default.BlobSearchResponseArray, cancellationToken); blobs = b ?? []; break;
+            case "wiki_blobs": (WikiPageResponse[]? w, count, truncated, error) = await graft.GetListAsync(path, ApiJson.Default.WikiPageResponseArray, cancellationToken); wiki = w ?? []; break;
+            default: (CommitResponse[]? c, count, truncated, error) = await graft.GetListAsync(path, ApiJson.Default.CommitResponseArray, cancellationToken); commits = c ?? []; break;
+        }
         if (error is not null) return Failure(error);
         return new JsonObject
         {
-            ["scope"] = found!.Scope,
-            ["count"] = found.Count,
-            ["truncated"] = found.Truncated,
-            ["projects"] = Array(found.Projects, Summarise),
-            ["issues"] = Array(found.Issues, issue => new JsonObject { ["number"] = issue.Iid, ["title"] = issue.Title, ["state"] = issue.State, ["web_url"] = issue.WebUrl }),
-            ["merge_requests"] = Array(found.MergeRequests, request => new JsonObject { ["number"] = request.Iid, ["title"] = request.Title, ["state"] = request.State, ["web_url"] = request.WebUrl }),
-            ["blobs"] = Array(found.Blobs, blob => new JsonObject { ["path"] = blob.Path, ["line"] = blob.Startline, ["text"] = blob.Data }),
-            ["wiki"] = Array(found.WikiBlobs, page => new JsonObject { ["slug"] = page.Slug, ["title"] = page.Title }),
-            ["commits"] = Array(found.Commits, commit => new JsonObject { ["id"] = commit.Id, ["title"] = commit.Title, ["author"] = commit.AuthorName })
+            ["scope"] = wanted,
+            ["count"] = count,
+            ["truncated"] = truncated,
+            ["projects"] = Array(projects, Summarise),
+            ["issues"] = Array(issues, issue => new JsonObject { ["number"] = issue.Iid, ["title"] = issue.Title, ["state"] = issue.State, ["web_url"] = issue.WebUrl }),
+            ["merge_requests"] = Array(proposals, request => new JsonObject { ["number"] = request.Iid, ["title"] = request.Title, ["state"] = request.State, ["web_url"] = request.WebUrl }),
+            ["blobs"] = Array(blobs, blob => new JsonObject { ["path"] = blob.Path, ["line"] = blob.Startline, ["text"] = blob.Data }),
+            ["wiki"] = Array(wiki, page => new JsonObject { ["slug"] = page.Slug, ["title"] = page.Title }),
+            ["commits"] = Array(commits, commit => new JsonObject { ["id"] = commit.Id, ["title"] = commit.Title, ["author"] = commit.AuthorName })
         }.ToJsonString();
     }
 
