@@ -32,6 +32,10 @@ else
         {
             <span class="label accent">forked from <a href="@("/" + repo.Project.ForkedFromProject.PathWithNamespace)">@repo.Project.ForkedFromProject.PathWithNamespace</a></span>
         }
+        @if (repo.Project.ImportUrl is not null)
+        {
+            <span class="label" title="@repo.Project.ImportUrl">@(repo.Project.Mirror ? "mirror of" : "imported from") <a href="@repo.Project.ImportUrl" rel="noopener noreferrer nofollow">@ImportHost(repo.Project.ImportUrl)</a></span>
+        }
         @if (Api.Authenticated && !repo.CanManage)
         {
             <div class="page-header-actions">
@@ -71,6 +75,22 @@ else
 
     @* A repository nobody has pushed to yet. Shown as a state of its own rather than as an error, and it
        carries the commands that end it, because "empty" is only useful alongside what to do about it. *@
+    @* An import, while it runs or after it failed, and a mirror's last update: shown above the code, where somebody
+       wondering why the repository is empty or stale will look. *@
+    @if (tab == "code" && mirror is not null && (repo.Branches.Count == 0 || mirror.UpdateStatus == "failed" || repo.Project.Mirror))
+    {
+        <div class="banner @(mirror.UpdateStatus == "failed" ? "warning" : "info")" role="status">
+            <Icon Name="@(mirror.UpdateStatus == "failed" ? "alert" : "download")" />
+            <span>
+                @MirrorSummary(mirror)
+                @if (repo.CanManage)
+                {
+                    <button type="button" class="secondary" @onclick="UpdateMirrorNow" disabled="@(busy || mirror.UpdateStatus == "started")">Update now</button>
+                }
+            </span>
+        </div>
+    }
+
     @if (tab == "code" && repo.Branches.Count == 0)
     {
         <div class="panel">
@@ -386,6 +406,35 @@ git push -u origin main</pre>
                         </div>
                     </form>
                 }
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="panel-header"><Icon Name="download" /><h2>Import and mirroring</h2></div>
+            <div class="panel-body">
+                <p class="secondary-text">
+                    Import this project's branches and tags from another server's address, and keep them up to date from
+                    there. Updates add and advance; they never remove. A branch or tag the original deletes stays here,
+                    and one it rewrites keeps its previous history under <code>refs/graft-preserved/</code>, so this copy
+                    outlives the original.
+                </p>
+                @if (mirror is not null)
+                {
+                    <p class="secondary-text">@MirrorSummary(mirror)</p>
+                }
+                <form class="form" @onsubmit="SaveMirror" @onsubmit:preventDefault>
+                    <label for="mirror-url">Address</label>
+                    <input id="mirror-url" type="url" @bind="mirrorUrlChoice" maxlength="2048" placeholder="https://example.com/owner/repository.git" />
+                    <p class="field-hint">A repository anybody may clone, over http or https, with no password in the address.</p>
+                    <label class="checkbox"><input type="checkbox" @bind="mirrorEnabledChoice" /> Keep it up to date</label>
+                    <div class="form-actions">
+                        <button type="submit" disabled="@(busy || string.IsNullOrWhiteSpace(mirrorUrlChoice))">Save</button>
+                        @if (mirror is not null)
+                        {
+                            <button type="button" class="secondary" @onclick="UpdateMirrorNow" disabled="@(busy || mirror.UpdateStatus == "started")">Update now</button>
+                        }
+                    </div>
+                </form>
             </div>
         </div>
 
@@ -888,11 +937,80 @@ git push -u origin main</pre>
         if (newTagFrom.Length == 0 || repo?.Branches.All(option => option.Name != newTagFrom) == true)
             newTagFrom = newBranchFrom;
         if (repo is not null) await LoadTags();
+        await LoadMirror();
         if (repo?.CanManage == true)
         {
             await LoadMembers(repo.Project.Id);
             await LoadHooks();
         }
+    }
+
+    private PullMirrorResponse? mirror;
+    private string mirrorUrlChoice = "";
+    private bool mirrorEnabledChoice = true;
+
+    private async Task LoadMirror()
+    {
+        mirror = repo?.Project.ImportUrl is null ? null
+            : (await Api.GetOptionalAsync($"api/projects/{repo.Project.Id}/mirror/pull", ApiJson.Default.PullMirrorResponse)).Item2;
+        mirrorUrlChoice = mirror?.Url ?? "";
+        mirrorEnabledChoice = mirror?.Enabled ?? true;
+    }
+
+    private static string ImportHost(string url) =>
+        Uri.TryCreate(url, UriKind.Absolute, out Uri? parsed) ? parsed.Host + parsed.AbsolutePath.TrimEnd('/') : url;
+
+    private static string When(DateTimeOffset? at) => at?.ToLocalTime().ToString("yyyy-MM-dd HH:mm") ?? "never";
+
+    private static string MirrorSummary(PullMirrorResponse mirror)
+    {
+        string source = ImportHost(mirror.Url);
+        if (mirror.LastSuccessfulUpdateAt is null)
+            return mirror.UpdateStatus switch
+            {
+                "failed" => "The import from " + source + " failed: " + mirror.LastError + "." + (mirror.Enabled ? " It is tried again at " + When(mirror.NextUpdateAt) + "." : ""),
+                "started" => "Importing from " + source + " now. Refresh in a moment to see it.",
+                _ => "The import from " + source + " is queued and starts shortly."
+            };
+        string last = "Last updated from " + source + " at " + When(mirror.LastSuccessfulUpdateAt) +
+            (mirror.LastChangedAt is null ? "." : "; last change seen " + When(mirror.LastChangedAt) + ".");
+        if (mirror.UpdateStatus == "failed")
+            return last + " The latest attempt failed: " + mirror.LastError + ". Everything already here is kept" +
+                (mirror.Enabled ? ", and it is tried again at " + When(mirror.NextUpdateAt) + "." : ".");
+        if (mirror.UpdateStatus == "started") return last + " Updating now.";
+        return last + (mirror.Enabled ? " Next update at " + When(mirror.NextUpdateAt) + "." : " Not kept up to date.");
+    }
+
+    private async Task SaveMirror()
+    {
+        if (busy || repo is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult<PullMirrorResponse> result = await Api.SendAsync<PullMirrorRequest, PullMirrorResponse>(HttpMethod.Post,
+                $"api/projects/{repo.Project.Id}/mirror", new PullMirrorRequest(mirrorEnabledChoice, mirrorUrlChoice.Trim()),
+                ApiJson.Default.PullMirrorRequest, ApiJson.Default.PullMirrorResponse, "Saved. The next update is queued.");
+            message = result.Message;
+            messageKind = result.Ok ? "success" : "error";
+            if (result.Ok) await Load();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task UpdateMirrorNow()
+    {
+        if (busy || repo is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/projects/{repo.Project.Id}/mirror/pull", "The update is queued and starts shortly.");
+            message = result.Message;
+            messageKind = result.Ok ? "success" : "error";
+            if (result.Ok) await LoadMirror();
+        }
+        finally { busy = false; }
     }
 
     /// <summary>Reloads just the repository view, after something that changed its branches.</summary>

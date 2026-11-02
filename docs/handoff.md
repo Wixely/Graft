@@ -1,6 +1,33 @@
 # Next-agent handoff
 
-Updated: 2026-11-01. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the project owner.
+Updated: 2026-11-02. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the project owner.
+
+## Added on 2026-11-02: import by address, and mirrors that outlive the original
+
+A repository can now be imported by URL and kept up to date, mainly so that a relatively recent copy survives if
+the upstream is ever taken down. [ADR 0042](decisions/0042-import-by-address-and-mirrors.md).
+
+- **Engine.** `GitRemote` (`src/Graft.Git/GitRemote.cs`) is the fetch half of smart HTTP: v2 when offered, v0
+  otherwise, anonymous, SHA-1 only. `RepositoryMirror.Apply` applies a fetched pack and the upstream's refs: add,
+  fast-forward, rewrite with the old tip kept under `refs/graft-preserved/<time>/`, never delete. `Limits.IsRef`
+  accepts that namespace; `IsClientRef` is now exactly heads and tags.
+- **Server.** `--url-import off|public|any` (off by default) and `--mirror-interval` (360 minutes). `ImportClient` in
+  `Program.cs` checks every resolved address on connect. `MirrorWorker.cs` runs one update at a time from the
+  schedule in `ProjectMirrors` (migration 26, `GraftStoreMirrors.cs`); `UpdateMirror` in `Program.cs` lists, fetches
+  without the gate, then applies under it.
+- **Surfaces.** `import_url`/`mirror` on project creation, `import_*` and `mirror` on projects, GitLab's
+  `mirror/pull` GET/PUT/POST, the new-project form, the project banner and settings panel, three MCP tools.
+- **Not done.** Credentials, LFS, SSH addresses, pipelines or webhooks on updates, push mirrors, the GitLab data
+  import. Each is in the backlog's larger section and needs a decision.
+
+Verified: engine self-checks 44 to **58**; MVP-04 suite 169 to **215**; Git suite 1272 to **1300** managed and against
+the NativeAOT forge (zero warnings); MCP suite 104 to **106**. Against GitHub: Hello-World and libgit2 imported, refs
+identical to GitHub's, `git fsck --strict` clean. The engine's delta limit went from 32 to 250 because GitHub's
+libgit2 pack has 50-deep chains. **Slow:** libgit2's first import took 63 minutes, all in the existing pack reader's
+per-object temporary files; a no-change update takes under a second.
+
+Next action, owner operator: redeploy with `GRAFT_URL_IMPORT=public` and import the repositories worth keeping; owner
+implementation agent, if wanted: make the pack reader stream instead of spilling every object.
 
 ## Added on 2026-11-01, second entry: every LabCoat call, retry and cancel, the directory
 

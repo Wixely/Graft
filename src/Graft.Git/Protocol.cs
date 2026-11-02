@@ -13,7 +13,13 @@ public static class Limits
     public const long PackExpandedBytes = 2 * ExpandedBytes;
     public const int ObjectCount = 1_000_000;
     public const int RefCount = 4096;
-    public const int DeltaDepth = 32;
+    /// <summary>
+    /// The longest delta chain read. Git writes chains up to 50 by default (<c>pack.depth</c>), and its <c>gc --aggressive</c>
+    /// wrote up to 250 before 2.18, so packs from long-lived repositories still carry them; GitHub served a
+    /// 50-deep chain for libgit2 when an import was first tried against it (ADR 0042). Work stays bounded by the
+    /// expansion budget, not by this.
+    /// </summary>
+    public const int DeltaDepth = 250;
     public const string Zero = "0000000000000000000000000000000000000000";
     public static void Require(bool value, string code)
     {
@@ -23,15 +29,17 @@ public static class Limits
     /// <summary>
     /// A reference this engine will store. Branches and tags come from clients; <c>refs/merge-requests/</c>
     /// is written by the server alone, to hold the tip of a proposal from a fork where the target
-    /// repository can read it. A client may fetch one and may not push one; <see cref="IsClientRef"/>
-    /// is the narrower check the receive path applies.
+    /// repository can read it. <c>refs/graft-preserved/</c> is written by the server alone too, to keep a mirror's
+    /// branch or tag that its upstream rewrote. A client may fetch either and may push neither;
+    /// <see cref="IsClientRef"/> is the narrower check the receive path applies.
     /// </summary>
     public static bool IsRef(string text) => text.Length <= 240 &&
         (text.StartsWith("refs/heads/", StringComparison.Ordinal) || text.StartsWith("refs/tags/", StringComparison.Ordinal) ||
-         text.StartsWith("refs/merge-requests/", StringComparison.Ordinal)) &&
+         text.StartsWith("refs/merge-requests/", StringComparison.Ordinal) || text.StartsWith("refs/graft-preserved/", StringComparison.Ordinal)) &&
         IsRefShape(text);
 
-    public static bool IsClientRef(string text) => IsRef(text) && !text.StartsWith("refs/merge-requests/", StringComparison.Ordinal);
+    public static bool IsClientRef(string text) => IsRef(text) &&
+        (text.StartsWith("refs/heads/", StringComparison.Ordinal) || text.StartsWith("refs/tags/", StringComparison.Ordinal));
 
     private static bool IsRefShape(string text) =>
         !text.Contains("..", StringComparison.Ordinal) && !text.Contains("@{", StringComparison.Ordinal) &&

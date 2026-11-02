@@ -33,7 +33,7 @@ if (args.Length == 1 && args[0] == "--licences")
 
 if (!Arguments.TryParse(args, out Arguments? parsedSettings))
 {
-    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>] [--mcp true|false] [--pages-origin <https origin>] [--recoverable-tokens true|false] [--webhooks true|false] [--ssh-port <0-65535>] [--ssh-host <name>] [--mail-smtp <smtp|smtp+starttls|smtps URL>] [--mail-from <address>] [--mail-password-file <UTF-8 path>] [--runner-port <0-65535>] [--runner-host <name>] [--runner-downloads <directory>] [--runner-chunk-threshold <MiB|off>] [--runner-chunk-size <1-64 MiB>] [--push-delete true|false].");
+    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>] [--mcp true|false] [--pages-origin <https origin>] [--recoverable-tokens true|false] [--webhooks true|false] [--ssh-port <0-65535>] [--ssh-host <name>] [--mail-smtp <smtp|smtp+starttls|smtps URL>] [--mail-from <address>] [--mail-password-file <UTF-8 path>] [--runner-port <0-65535>] [--runner-host <name>] [--runner-downloads <directory>] [--runner-chunk-threshold <MiB|off>] [--runner-chunk-size <1-64 MiB>] [--push-delete true|false] [--url-import off|public|any] [--mirror-interval <15-10080 minutes>].");
     Console.Error.WriteLine("       Graft.Server --licences  prints the third-party notices this build redistributes.");
     return 2;
 }
@@ -214,6 +214,11 @@ IDataProtector? tokenProtector = settings.RecoverableTokens
 // Outbound notification, when the operator has allowed it. Null is not "off for now": with no sender,
 // nothing anywhere queues a delivery, and the routes that manage hooks are absent rather than refusing.
 await using WebhookSender? webhooks = settings.Webhooks ? new WebhookSender(store) : null;
+// Import by address, when the operator has allowed it: one client for every fetch, whose connections are checked against
+// the policy after the name is resolved, so neither a redirect nor a name that resolves somewhere else gets around it.
+using HttpClient? importClient = settings.UrlImport == UrlImportPolicy.Off ? null : ImportClient(settings.UrlImport);
+// Started once the server is listening; null when import is off, and then nothing schedules an update.
+MirrorWorker? mirrors = null;
 // Mail, when the operator named a server. Off, the forge sends nothing and says so where it matters.
 await using MailSender? mail = settings.Mail is null ? null : new MailSender(settings.Mail, (text, exception) => Console.Error.WriteLine("MAIL: " + text + (exception is null ? "" : " " + exception.Message)));
 // A notification is an inbox row first. A message is a copy of it, and only for a person who asked and has
@@ -3939,6 +3944,138 @@ async Task EnsureSource(HttpContext context, ProjectDetails project, MergePropos
     finally { target.Gate.Release(); }
 }
 
+static PullMirrorResponse PullMirrorResponseFor(ProjectMirror mirror) => new(
+    mirror.ProjectId,
+    mirror.Status switch { MirrorStatus.Started => "started", MirrorStatus.Finished => "finished", MirrorStatus.Failed => "failed", _ => "scheduled" },
+    mirror.Url, mirror.LastError, mirror.LastSuccessAtUtc, mirror.LastAttemptAtUtc, mirror.LastAttemptAtUtc, mirror.Enabled,
+    false, false, true, null, mirror.NextAttemptAtUtc, mirror.ConsecutiveFailures, mirror.LastChangeAtUtc);
+
+async Task ReadPullMirror(HttpContext context, ProjectDetails project)
+{
+    if (!await OnlyQuery(context)) return;
+    ProjectMirror? mirror = await store.GetMirrorAsync(project.Project.Id, context.RequestAborted);
+    if (mirror is null) { await ApiError(context, 404, "404 Pull Mirror Not Found"); return; }
+    await context.Response.WriteAsJsonAsync(PullMirrorResponseFor(mirror), ApiJson.Default.PullMirrorResponse, null, context.RequestAborted);
+}
+
+// GitLab's switches are accepted when they ask for what Graft's mirror does anyway, and refused by name otherwise, so a
+// client is never told a branch filter or a protected-branch rule is in force when it is not.
+async Task ConfigurePullMirror(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    if (settings.UrlImport == UrlImportPolicy.Off) { await ApiError(context, 400, "this server does not import repositories from an address"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    bool? enabled = null;
+    string? url = null;
+    try
+    {
+        using JsonDocument document = await JsonDocument.ParseAsync(context.Request.Body, cancellationToken: context.RequestAborted);
+        if (document.RootElement.ValueKind != JsonValueKind.Object) { await ApiError(context, 400, "the mirror must be a JSON object"); return; }
+        foreach (JsonProperty property in document.RootElement.EnumerateObject())
+        {
+            JsonValueKind kind = property.Value.ValueKind;
+            bool flag = kind == JsonValueKind.True || (kind == JsonValueKind.String && property.Value.GetString() is "true" or "1");
+            bool isFlag = kind is JsonValueKind.True or JsonValueKind.False || (kind == JsonValueKind.String && property.Value.GetString() is "true" or "false" or "1" or "0");
+            switch (property.Name)
+            {
+                case "enabled" when isFlag: enabled = flag; break;
+                case "url" when kind == JsonValueKind.String: url = property.Value.GetString(); break;
+                case "mirror_trigger_builds" or "only_mirror_protected_branches" when isFlag && !flag: break;
+                case "mirror_overwrites_diverged_branches" when isFlag && flag: break;
+                case "mirror_branch_regex" when kind == JsonValueKind.Null || (kind == JsonValueKind.String && property.Value.GetString()!.Length == 0): break;
+                default:
+                    await ApiError(context, 400, "unsupported mirror property or value: " + property.Name +
+                        "; Graft mirrors every branch and tag, runs no pipelines for them, and keeps what a rewrite replaced");
+                    return;
+            }
+        }
+    }
+    catch (JsonException) { await ApiError(context, 400, "invalid JSON"); return; }
+    Uri? address = null;
+    if (url is not null && !ImportAddresses.TryParse(url, out address, out string? invalid)) { await ApiError(context, 400, invalid!); return; }
+    try
+    {
+        ProjectMirror mirror = await store.ConfigureMirrorAsync(identity, project.Project.Id, address?.ToString(), enabled, context.RequestAborted);
+        mirrors?.Poke();
+        await context.Response.WriteAsJsonAsync(PullMirrorResponseFor(mirror), ApiJson.Default.PullMirrorResponse, null, context.RequestAborted);
+    }
+    catch (KeyNotFoundException) { await ApiError(context, 400, "url is required to set up a pull mirror"); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, "403 Forbidden: " + error.Message); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+}
+
+async Task RequestPullMirrorUpdate(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
+{
+    if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
+    if (settings.UrlImport == UrlImportPolicy.Off) { await ApiError(context, 400, "this server does not import repositories from an address"); return; }
+    try
+    {
+        ProjectMirror mirror = await store.RequestMirrorUpdateAsync(identity, project.Project.Id, context.RequestAborted);
+        mirrors?.Poke();
+        await context.Response.WriteAsJsonAsync(PullMirrorResponseFor(mirror), ApiJson.Default.PullMirrorResponse, null, context.RequestAborted);
+    }
+    catch (KeyNotFoundException) { await ApiError(context, 400, "this project is not imported from an address"); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, "403 Forbidden: " + error.Message); }
+}
+
+// One update of a mirror, run by the worker: list what the upstream has, fetch the objects this repository lacks without
+// holding the repository, then take the repository and apply the result under RepositoryMirror's rules.
+async Task<MirrorOutcome> UpdateMirror(MirrorJob job, CancellationToken cancellationToken)
+{
+    ProjectDetails details = await store.GetReadyProjectAsync(job.ProjectId, cancellationToken)
+        ?? throw new InvalidOperationException("the project is no longer available");
+    if (!ImportAddresses.TryParse(job.Url, out Uri? address, out string? addressError)) throw new InvalidOperationException(addressError);
+    GitRemote remote = new(importClient!);
+    RemoteAdvertisement listed = await remote.ListAsync(address!, cancellationToken);
+    if (listed.Refs.Count > Limits.RefCount)
+        throw new InvalidOperationException("the upstream has " + listed.Refs.Count.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+            " branches and tags, more than the " + Limits.RefCount.ToString(System.Globalization.CultureInfo.InvariantCulture) + " a Graft repository holds");
+    RepositoryEndpoint endpoint = EndpointFor(details.Project);
+    List<string> wants;
+    List<string> haves;
+    await endpoint.Gate.WaitAsync(cancellationToken);
+    try
+    {
+        Repository current = endpoint.Repository;
+        wants = [.. listed.Refs.Values.Distinct(StringComparer.Ordinal).Where(id => !current.Objects.ContainsKey(id))];
+        haves = [.. current.Refs.Values.Distinct(StringComparer.Ordinal).Where(id => current.Objects.TryGetValue(id, out GitObject? value) && value.Type == 1)];
+    }
+    finally { endpoint.Gate.Release(); }
+
+    MirrorResult result;
+    using (TemporaryStorage? spool = wants.Count > 0 ? new() : null)
+    {
+        FileStream? pack = null;
+        try
+        {
+            if (spool is not null)
+            {
+                pack = spool.CreateFile();
+                await remote.FetchAsync(listed, wants, haves, pack, cancellationToken);
+                pack.Position = 0;
+            }
+            await endpoint.Gate.WaitAsync(cancellationToken);
+            try { result = RepositoryMirror.Apply(endpoint.Repository, pack, listed.Refs, DateTimeOffset.UtcNow, cancellationToken); }
+            catch (GitInputException error) { throw new InvalidOperationException("the upstream's repository was refused (" + error.Message + ")", error); }
+            finally { endpoint.Gate.Release(); }
+        }
+        finally { pack?.Dispose(); }
+    }
+    if (job.FirstImport && listed.HeadBranch is not null) await store.SetImportedDefaultBranchAsync(details.Project.Id, listed.HeadBranch, cancellationToken);
+
+    int Count(MirrorRefChange change) => result.References.Count(reference => reference.Change == change);
+    string summary = result.Changed || result.ObjectsReceived > 0
+        ? string.Join(", ", new[]
+        {
+            (Count(MirrorRefChange.Created), "added"), (Count(MirrorRefChange.Updated), "advanced"), (Count(MirrorRefChange.Rewritten), "rewritten upstream and preserved"),
+            (Count(MirrorRefChange.Kept), "kept after the upstream removed them"), (Count(MirrorRefChange.Skipped), "skipped")
+        }.Where(part => part.Item1 > 0).Select(part => part.Item1.ToString(System.Globalization.CultureInfo.InvariantCulture) + " " + part.Item2)) +
+          "; " + result.ObjectsReceived.ToString(System.Globalization.CultureInfo.InvariantCulture) + " objects over protocol v" +
+          listed.ProtocolVersion.ToString(System.Globalization.CultureInfo.InvariantCulture)
+        : "already up to date";
+    return new(result.Changed, summary);
+}
+
 async Task ForkProject(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
 {
     if (identity is null) { await ApiError(context, 401, "authentication is required to fork"); return; }
@@ -7020,6 +7157,12 @@ foreach ((string root, bool browserFamily) in new[] { ("/api/projects/{projectId
 
     app.MapGet(root + "/users", async context => { var scope = await Scope(context, false); if (scope is not null) await ListAssignable(context, scope.Value.Details, scope.Value.Identity); });
 
+    // A pull mirror: read by whoever may read the project, configured and updated by a Maintainer. GitLab's family
+    // configures with PUT; the browser's, which writes with POST throughout, configures at /mirror.
+    app.MapGet(root + "/mirror/pull", async context => { var scope = await Scope(context, false); if (scope is not null) await ReadPullMirror(context, scope.Value.Details); });
+    app.MapMethods(root + (browserFamily ? "/mirror" : "/mirror/pull"), [browserFamily ? "POST" : "PUT"], async context => { var scope = await Scope(context, true); if (scope is not null) await ConfigurePullMirror(context, scope.Value.Details, scope.Value.Identity); });
+    app.MapPost(root + "/mirror/pull", async context => { var scope = await Scope(context, true); if (scope is not null) await RequestPullMirrorUpdate(context, scope.Value.Details, scope.Value.Identity); });
+
     app.MapPost(root + "/fork", async context => { var scope = await Scope(context, true); if (scope is not null) await ForkProject(context, scope.Value.Details, scope.Value.Identity); });
     app.MapGet(root + "/forks", async context => { var scope = await Scope(context, false); if (scope is not null) await ListForks(context, scope.Value.Details, scope.Value.Identity); });
 
@@ -8527,6 +8670,18 @@ if (settings.SshPort >= 0)
     Console.WriteLine("SSH: " + SshBase(new Uri(serverOrigin!).Host) + "/<owner>/<project>.git; host key " + sshHostKey.Fingerprint);
 }
 else Console.WriteLine("SSH: off");
+if (importClient is not null)
+{
+    mirrors = await MirrorWorker.StartAsync(store, TimeSpan.FromMinutes(settings.MirrorIntervalMinutes), UpdateMirror,
+        text => Console.WriteLine("MIRROR: " + text));
+    app.Lifetime.ApplicationStopping.Register(() => mirrors.DisposeAsync().AsTask().GetAwaiter().GetResult());
+}
+Console.WriteLine("URL IMPORT: " + settings.UrlImport switch
+{
+    UrlImportPolicy.Public => "public addresses only; mirrors updated every " + settings.MirrorIntervalMinutes.ToString(System.Globalization.CultureInfo.InvariantCulture) + " minutes",
+    UrlImportPolicy.Any => "any address, including this server's own network; mirrors updated every " + settings.MirrorIntervalMinutes.ToString(System.Globalization.CultureInfo.InvariantCulture) + " minutes",
+    _ => "off"
+});
 Console.WriteLine("READY: " + address);
 await app.WaitForShutdownAsync();
 return 0;
@@ -8691,7 +8846,7 @@ async Task<ProjectCreateRequest?> ReadProjectCreateRequest(HttpContext context)
         using JsonDocument document = await JsonDocument.ParseAsync(context.Request.Body, cancellationToken: context.RequestAborted);
         if (document.RootElement.ValueKind != JsonValueKind.Object)
         { await ApiError(context, 400, "project must be a JSON object"); return null; }
-        string[] allowed = ["name", "path", "description", "visibility", "namespace_id"];
+        string[] allowed = ["name", "path", "description", "visibility", "namespace_id", "import_url", "mirror"];
         string? unsupported = document.RootElement.EnumerateObject()
             .Select(property => property.Name)
             .FirstOrDefault(name => !allowed.Contains(name, StringComparer.Ordinal));
@@ -8714,6 +8869,15 @@ async Task CreateProject(HttpContext context, AuthenticatedIdentity identity, Pr
     string requestedPath = request.Path?.Trim() ?? "";
     string description = request.Description ?? "";
     string visibility = request.Visibility ?? "private";
+    // An import names where the repository comes from, and its last segment is the path when none is given.
+    Uri? importAddress = null;
+    if (request.ImportUrl is not null)
+    {
+        if (settings.UrlImport == UrlImportPolicy.Off) { await ApiError(context, 400, "this server does not import repositories from an address"); return; }
+        if (!ImportAddresses.TryParse(request.ImportUrl, out importAddress, out string? importError)) { await ApiError(context, 400, importError!); return; }
+        if (name.Length == 0 && requestedPath.Length == 0) requestedPath = ImportAddresses.SuggestedPath(importAddress!);
+    }
+    else if (request.Mirror == true) { await ApiError(context, 400, "mirror needs import_url"); return; }
     if (name.Length == 0 && requestedPath.Length == 0) { await ApiError(context, 400, "name or path is required"); return; }
     if (name.Length == 0) name = requestedPath;
     if (name.Length > 200) { await ApiError(context, 400, "name must be at most 200 characters"); return; }
@@ -8749,6 +8913,13 @@ async Task CreateProject(HttpContext context, AuthenticatedIdentity identity, Pr
         // while its repository is still being initialised. Creation publishes nothing on its own.
         if (requested != ProjectVisibility.Private)
             await store.SetProjectVisibilityAsync(identity, project.Id, requested, context.RequestAborted);
+        // The project exists empty and the import runs on the mirror worker, as GitLab's does: a large repository
+        // takes minutes, and import_status says where it is.
+        if (importAddress is not null)
+        {
+            await store.ConfigureMirrorAsync(identity, project.Id, importAddress.ToString(), request.Mirror ?? false, context.RequestAborted);
+            mirrors?.Poke();
+        }
         ProjectDetails details = (await store.GetReadyProjectAsync(project.Id, context.RequestAborted))!;
         context.Response.StatusCode = StatusCodes.Status201Created;
         await context.Response.WriteAsJsonAsync(await ProjectResponseFor(context, details), ApiJson.Default.ProjectResponse, null, context.RequestAborted);
@@ -8775,6 +8946,44 @@ static string ProjectPathFromName(string name)
         else return "";
     }
     return path.ToString().TrimEnd('-');
+}
+
+// Every connection an import makes goes through here. The host is resolved, every address it resolves to is checked
+// against the policy, and the connection is made to those checked addresses, so a name that resolves differently a
+// second later, or a redirect to an internal host, is refused the same way. No proxy: the check is on the destination.
+static HttpClient ImportClient(UrlImportPolicy policy)
+{
+    SocketsHttpHandler handler = new()
+    {
+        UseProxy = false,
+        AllowAutoRedirect = true,
+        MaxAutomaticRedirections = 5,
+        ConnectTimeout = TimeSpan.FromSeconds(30),
+        PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+        ConnectCallback = async (connection, cancellationToken) =>
+        {
+            string host = connection.DnsEndPoint.Host;
+            IPAddress[] addresses = IPAddress.TryParse(host, out IPAddress? literal)
+                ? [literal]
+                : await Dns.GetHostAddressesAsync(host, cancellationToken);
+            if (addresses.Length == 0) throw new HttpRequestException(host + " does not resolve");
+            if (policy != UrlImportPolicy.Any && addresses.Any(candidate => !OutboundAddresses.IsPublic(candidate)))
+                throw new HttpRequestException("refused: " + host + " is not on the public internet, and this server imports from public addresses only");
+            Socket socket = new(SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+            try
+            {
+                await socket.ConnectAsync(addresses, connection.DnsEndPoint.Port, cancellationToken);
+                return new NetworkStream(socket, ownsSocket: true);
+            }
+            catch
+            {
+                socket.Dispose();
+                throw;
+            }
+        }
+    };
+    HttpClient client = new(handler) { Timeout = Timeout.InfiniteTimeSpan };
+    return client;
 }
 
 static bool ValidProjectPath(string path)
@@ -8976,6 +9185,7 @@ async Task<ProjectResponse> ProjectResponseForLocked(HttpContext context, Projec
     long stars = await store.CountStarsAsync(details.Project.Id, context.RequestAborted);
     ProjectPermissionsResponse? permissions = await PermissionsFor(context, details);
     UserResponse? owner = details.Project.GroupId is null ? await AuthorFor(context, details.Project.OwnerUserId, details.Project.Namespace) : null;
+    ProjectMirror? mirror = await store.GetMirrorAsync(details.Project.Id, context.RequestAborted);
     return new(details.Project.Id, details.Description, details.Project.Name,
         details.Project.Namespace + " / " + details.Project.Name, details.Project.Slug, path, details.CreatedAtUtc,
         defaultBranch, VisibilityName(details.Project.Visibility),
@@ -8988,7 +9198,9 @@ async Task<ProjectResponse> ProjectResponseForLocked(HttpContext context, Projec
         details.Project.GlobalSlug,
         details.Project.GlobalSlug.Length == 0 ? "" : origin + GlobalPrefix + "/" + Uri.EscapeDataString(details.Project.GlobalSlug),
         forks.UpstreamId is long upstreamId ? new ForkedFromResponse(upstreamId, forks.UpstreamPath!, origin + "/" + forks.UpstreamPath) : null,
-        forks.ForksCount, stars, permissions, owner);
+        forks.ForksCount, stars, permissions, owner,
+        mirror?.Url, mirror?.ImportStatus ?? "none", mirror is { LastSuccessAtUtc: null, Status: MirrorStatus.Failed } ? mirror.LastError : null,
+        mirror?.Enabled ?? false);
 }
 
 // The projects among these ids that the caller may read, in the order given.
@@ -9442,12 +9654,13 @@ sealed record PendingSecret(long UserId, string Secret, DateTimeOffset ExpiresAt
 sealed record Arguments(string Database, string Repositories, IPAddress ListenAddress, int ListenPort, string? Origin,
     string? Certificate, string? CertificatePasswordFile, bool PublicBrowsing, bool PushToCreate, int SessionMinutes, bool Mcp,
     string? PagesOrigin, bool RecoverableTokens, bool Webhooks, int SshPort, string? SshHost, MailSettings? Mail,
-    int RunnerPort, string? RunnerHost, string? RunnerDownloads, long RunnerChunkThreshold, long RunnerChunkBytes, bool PushDelete)
+    int RunnerPort, string? RunnerHost, string? RunnerDownloads, long RunnerChunkThreshold, long RunnerChunkBytes, bool PushDelete,
+    UrlImportPolicy UrlImport, int MirrorIntervalMinutes)
 {
     public static bool TryParse(string[] values, out Arguments? result)
     {
         result = null;
-        if (values.Length is < 4 or > 48 || values.Length % 2 != 0) return false;
+        if (values.Length is < 4 or > 52 || values.Length % 2 != 0) return false;
         string? database = null;
         string? repositories = null;
         string? listen = null;
@@ -9472,6 +9685,8 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         string? runnerChunkThreshold = null;
         string? runnerChunkSize = null;
         string? pushDelete = null;
+        string? urlImport = null;
+        string? mirrorInterval = null;
         HashSet<string> seen = new(StringComparer.Ordinal);
         for (int index = 0; index < values.Length; index += 2)
         {
@@ -9500,6 +9715,8 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             else if (values[index] == "--runner-chunk-threshold") runnerChunkThreshold = values[index + 1];
             else if (values[index] == "--runner-chunk-size") runnerChunkSize = values[index + 1];
             else if (values[index] == "--push-delete") pushDelete = values[index + 1];
+            else if (values[index] == "--url-import") urlImport = values[index + 1];
+            else if (values[index] == "--mirror-interval") mirrorInterval = values[index + 1];
             else return false;
         }
         if (string.IsNullOrWhiteSpace(database) || string.IsNullOrWhiteSpace(repositories)) return false;
@@ -9612,6 +9829,24 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         // it through the forge; off makes the forge the only way. Empty means unset, as above.
         if (string.IsNullOrWhiteSpace(pushDelete)) pushDelete = null;
         if (pushDelete is not null and not "true" and not "false") return false;
+        // Whether a project may be imported from another server's address and kept up to date from it (ADR 0042). Off by
+        // default, as webhooks are, because the server then makes requests on a person's behalf: "public" reaches only hosts
+        // on the public internet, "any" also the server's own network, for importing from a forge beside it.
+        if (string.IsNullOrWhiteSpace(urlImport)) urlImport = null;
+        UrlImportPolicy importPolicy = urlImport switch
+        {
+            null or "off" => UrlImportPolicy.Off,
+            "public" => UrlImportPolicy.Public,
+            "any" => UrlImportPolicy.Any,
+            _ => (UrlImportPolicy)(-1)
+        };
+        if (importPolicy < 0) return false;
+        // How often a mirror is brought up to date, in minutes: six hours unless the operator says otherwise.
+        if (string.IsNullOrWhiteSpace(mirrorInterval)) mirrorInterval = null;
+        int intervalMinutes = 360;
+        if (mirrorInterval is not null && (!int.TryParse(mirrorInterval, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out intervalMinutes) ||
+            intervalMinutes is < 15 or > 10080))
+            return false;
         if (certificatePasswordFile is not null && certificate is null) return false;
         if (!IPAddress.IsLoopback(address) && certificate is null) return false;
         if (!IPAddress.IsLoopback(address) && origin is null) return false;
@@ -9623,7 +9858,8 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             certificatePasswordFile is null ? null : Path.GetFullPath(certificatePasswordFile),
             publicBrowsing == "true", pushToCreate == "true", window, mcp == "true",
             pagesOrigin, recoverableTokens == "true", webhooks == "true", sshPortNumber, sshHost, mail,
-            runnerPortNumber, runnerHost, runnerDownloads is null ? null : Path.GetFullPath(runnerDownloads), chunkThreshold, chunkBytes, pushDelete != "false");
+            runnerPortNumber, runnerHost, runnerDownloads is null ? null : Path.GetFullPath(runnerDownloads), chunkThreshold, chunkBytes, pushDelete != "false",
+            importPolicy, intervalMinutes);
         return true;
     }
 }

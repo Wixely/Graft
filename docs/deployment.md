@@ -111,6 +111,17 @@ the permission to push, and never the default branch. It is on unless the operat
 forge prints which on startup as `PUSH DELETE: on` or `off`. A refused reference, for this or any other reason, is
 reported by Git beside the reference with the reason. See [ADR 0039](decisions/0039-deletion-by-push.md).
 
+### Importing repositories by address
+
+A project can be created from another server's repository address and kept up to date from it, so a copy survives
+the original being taken down. This makes the server send requests on a person's behalf, so it is off unless the
+operator says `--url-import public` (`GRAFT_URL_IMPORT=public`), which reaches only hosts on the public internet, or
+`--url-import any`, which also reaches the server's own network, for importing from a forge beside it. Mirrors are
+updated every 360 minutes unless `--mirror-interval <15-10080>` (`GRAFT_MIRROR_INTERVAL`) says otherwise. The
+forge prints which on startup as `URL IMPORT:`. Outbound requests go directly, never through a proxy, because the
+address check is made on the connection itself. Only repositories anybody may clone can be imported. See
+[ADR 0042](decisions/0042-import-by-address-and-mirrors.md).
+
 ### Optional MCP endpoint
 
 The forge hosts its own Model Context Protocol endpoint, at `/mcp` on the same port and certificate as everything else. It is off unless the operator asks for it: `--mcp true` on the command line, or in the container deployment

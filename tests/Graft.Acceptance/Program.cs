@@ -356,6 +356,29 @@ try
         Check(SiteContentTypes.For("payload.exe") is null, "and an extension that is not on the list has no type at all");
     }
 
+    // Import by address (ADR 0042): what an address may be, and which hosts a public-only server may reach.
+    {
+        Check(ImportAddresses.TryParse("https://example.com/owner/repository.git", out Uri? parsed, out _) &&
+            ImportAddresses.SuggestedPath(parsed!) == "repository", "an https repository address is accepted, and suggests its last segment");
+        Check(ImportAddresses.TryParse("http://git.example.com/a/b/", out Uri? trailing, out _) && ImportAddresses.SuggestedPath(trailing!) == "b",
+            "plain http is accepted, and a trailing slash does not empty the suggestion");
+        foreach (string refused in new[] { "", "ftp://example.com/a.git", "git@example.com:a/b.git", "ssh://example.com/a.git", "file:///srv/a.git",
+                     "https://user:secret@example.com/a.git", "https://token@example.com/a.git", "https://example.com/a.git?x=1",
+                     "https://example.com/a.git#main", "https://example.com/", "/relative/path.git" })
+            Check(!ImportAddresses.TryParse(refused, out _, out string? reason) && reason is { Length: > 0 }, "an import address is refused with a reason: " + refused);
+        Check(!ImportAddresses.TryParse("https://example.com/" + new string('a', 2048), out _, out _), "an import address over 2048 characters is refused");
+
+        foreach (string open in new[] { "8.8.8.8", "1.1.1.1", "140.82.112.3", "2606:4700:4700::1111", "2a00:1450:4001::1" })
+            Check(OutboundAddresses.IsPublic(System.Net.IPAddress.Parse(open)), "a public address is public: " + open);
+        foreach (string closed in new[] { "127.0.0.1", "127.8.9.10", "10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.1.1", "169.254.169.254",
+                     "100.64.0.1", "0.0.0.0", "224.0.0.1", "255.255.255.255", "192.0.2.1", "198.51.100.7", "203.0.113.9", "198.18.0.1",
+                     "::1", "::", "fe80::1", "fc00::1", "fd12:3456::1", "ff02::1", "::ffff:127.0.0.1", "::ffff:10.0.0.1", "64:ff9b::a00:1",
+                     "2001:db8::1", "2002:a00:1::1" })
+            Check(!OutboundAddresses.IsPublic(System.Net.IPAddress.Parse(closed)), "an address only the server can reach is not public: " + closed);
+        Check(OutboundAddresses.IsPublic(System.Net.IPAddress.Parse("172.32.0.1")) && OutboundAddresses.IsPublic(System.Net.IPAddress.Parse("100.128.0.1")),
+            "the private ranges end where they end");
+    }
+
     Console.WriteLine($"RESULT: PASS; assertions: {assertions}");
     Console.WriteLine("BOUNDARY: shared authorization decisions are exercised for REST, browse, fetch and push capabilities; actual HTTP/Git transport is MVP-05.");
     return 0;

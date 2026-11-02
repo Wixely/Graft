@@ -37,6 +37,9 @@ public sealed class Repository
     public int OffsetDeltas { get; private set; }
     public int ReferenceDeltas { get; private set; }
 
+    /// <summary>Whether objects and references are kept on disk, rather than only in memory.</summary>
+    internal bool IsDurable => persistence is not null;
+
     /// <summary>The number of loose objects in storage, or zero for a repository held only in memory.</summary>
     public int LooseObjectCount => persistence?.LooseObjectCount ?? 0;
 

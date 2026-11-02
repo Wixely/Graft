@@ -54,6 +54,12 @@ services:
       # Whether a push may delete a branch or tag, with the forge's rules. Empty means on. See docs/decisions/0039-deletion-by-push.md.
       - --push-delete
       - ${GRAFT_PUSH_DELETE:-}
+      # Import by address and mirrors: off, public or any, and the update interval in minutes. Empty means off and 360.
+      # See docs/decisions/0042-import-by-address-and-mirrors.md.
+      - --url-import
+      - ${GRAFT_URL_IMPORT:-}
+      - --mirror-interval
+      - ${GRAFT_MIRROR_INTERVAL:-}
       - --session-minutes
       - ${GRAFT_SESSION_MINUTES:-720}
       # The Model Context Protocol endpoint, served by the forge itself at /mcp on the same port and

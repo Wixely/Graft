@@ -4,7 +4,7 @@ namespace Graft.Storage;
 
 public static class GraftSchema
 {
-    public static DnaXMigrationManifest Manifest { get; } = new(25,
+    public static DnaXMigrationManifest Manifest { get; } = new(26,
     [
         DnaXMigration.Sql(1, "initial-identity-project-schema", "Create identity and private project schema", """
             CREATE TABLE Users (
@@ -863,6 +863,24 @@ public static class GraftSchema
             );
 
             ALTER TABLE Jobs ADD COLUMN Retried INTEGER NOT NULL DEFAULT 0 CHECK (Retried IN (0, 1));
+            """),
+        // A project imported from another server's address, and whether it is kept up to date from there (ADR 0042).
+        DnaXMigration.Sql(26, "url-import-mirrors", "Import a repository by address and keep it up to date", """
+            CREATE TABLE ProjectMirrors (
+                ProjectId INTEGER NOT NULL PRIMARY KEY REFERENCES Projects(Id) ON DELETE CASCADE,
+                Url TEXT NOT NULL,
+                Enabled INTEGER NOT NULL DEFAULT 1 CHECK (Enabled IN (0, 1)),
+                Status TEXT NOT NULL DEFAULT 'scheduled' CHECK (Status IN ('scheduled', 'started', 'finished', 'failed')),
+                CreatedByUserId INTEGER NULL REFERENCES Users(Id) ON DELETE SET NULL,
+                CreatedAtUtc TEXT NOT NULL,
+                LastAttemptAtUtc TEXT NULL,
+                LastSuccessAtUtc TEXT NULL,
+                LastChangeAtUtc TEXT NULL,
+                LastError TEXT NULL,
+                ConsecutiveFailures INTEGER NOT NULL DEFAULT 0,
+                NextAttemptAtUtc TEXT NOT NULL
+            );
+            CREATE INDEX IX_ProjectMirrors_Due ON ProjectMirrors(NextAttemptAtUtc);
             """)
     ]);
 }

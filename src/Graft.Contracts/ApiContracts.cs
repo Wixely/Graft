@@ -50,7 +50,15 @@ public sealed record ProjectResponse(
     /// <summary>GitLab's view of what the caller may do here, as an access level; null for a caller with no role.</summary>
     ProjectPermissionsResponse? Permissions = null,
     /// <summary>The account that owns a project in a personal namespace; null when a group owns it.</summary>
-    UserResponse? Owner = null);
+    UserResponse? Owner = null,
+    /// <summary>The address the project was imported from, or null. GitLab's field; Graft never stores a credential in it.</summary>
+    [property: JsonPropertyName("import_url")] string? ImportUrl = null,
+    /// <summary>GitLab's import state: <c>none</c>, <c>scheduled</c>, <c>started</c>, <c>finished</c> or <c>failed</c>.</summary>
+    [property: JsonPropertyName("import_status")] string ImportStatus = "none",
+    /// <summary>Why the first import failed, while it has not yet succeeded.</summary>
+    [property: JsonPropertyName("import_error")] string? ImportError = null,
+    /// <summary>Whether the project is kept up to date from <see cref="ImportUrl"/>: GitLab's pull mirror.</summary>
+    bool Mirror = false);
 
 /// <summary>GitLab's `permissions`: the caller's access level on the project, and through its group, which Graft folds into one.</summary>
 public sealed record ProjectPermissionsResponse(
@@ -249,7 +257,40 @@ public sealed record PersonalAccessTokenResponse(
     string ExpiresAt,
     string Token);
 public sealed record ProjectCreateRequest(string? Name, string? Path, string? Description, string? Visibility,
-    [property: JsonPropertyName("namespace_id")] long? NamespaceId = null);
+    [property: JsonPropertyName("namespace_id")] long? NamespaceId = null,
+    /// <summary>An http or https address to import the repository from, with no credential in it.</summary>
+    [property: JsonPropertyName("import_url")] string? ImportUrl = null,
+    /// <summary>Whether to keep the project up to date from <see cref="ImportUrl"/> afterwards.</summary>
+    bool? Mirror = null);
+
+/// <summary>
+/// A project's pull mirror in GitLab's shape (<c>GET /projects/:id/mirror/pull</c>), with Graft's own additions after it.
+/// Graft's mirror never deletes and keeps rewritten tips, so the GitLab switches it does not have report what it does.
+/// </summary>
+public sealed record PullMirrorResponse(
+    long Id,
+    [property: JsonPropertyName("update_status")] string UpdateStatus,
+    string Url,
+    [property: JsonPropertyName("last_error")] string? LastError,
+    [property: JsonPropertyName("last_successful_update_at")] DateTimeOffset? LastSuccessfulUpdateAt,
+    [property: JsonPropertyName("last_update_at")] DateTimeOffset? LastUpdateAt,
+    [property: JsonPropertyName("last_update_started_at")] DateTimeOffset? LastUpdateStartedAt,
+    bool Enabled,
+    [property: JsonPropertyName("mirror_trigger_builds")] bool MirrorTriggerBuilds,
+    [property: JsonPropertyName("only_mirror_protected_branches")] bool OnlyMirrorProtectedBranches,
+    [property: JsonPropertyName("mirror_overwrites_diverged_branches")] bool MirrorOverwritesDivergedBranches,
+    [property: JsonPropertyName("mirror_branch_regex")] string? MirrorBranchRegex,
+    /// <summary>When the worker will next update it.</summary>
+    [property: JsonPropertyName("next_update_at")] DateTimeOffset NextUpdateAt,
+    /// <summary>Failed updates in a row; zero after a success.</summary>
+    [property: JsonPropertyName("consecutive_failures")] int ConsecutiveFailures,
+    /// <summary>The last time an update changed anything.</summary>
+    [property: JsonPropertyName("last_changed_at")] DateTimeOffset? LastChangedAt);
+
+/// <summary>GitLab's <c>PUT /projects/:id/mirror/pull</c>: the address and whether the mirror is on.</summary>
+public sealed record PullMirrorRequest(
+    bool? Enabled = null,
+    string? Url = null);
 
 /// <summary>A group in GitLab's shape, as far as Graft has it.</summary>
 public sealed record GroupResponse(
@@ -1298,6 +1339,8 @@ public sealed record ProjectUploadResponse(
 [JsonSerializable(typeof(TokenRevealResponse))]
 [JsonSerializable(typeof(TokenResponse[]))]
 [JsonSerializable(typeof(ProjectCreateRequest))]
+[JsonSerializable(typeof(PullMirrorResponse))]
+[JsonSerializable(typeof(PullMirrorRequest))]
 [JsonSerializable(typeof(MembershipSetRequest))]
 [JsonSerializable(typeof(ProjectDetailsRequest))]
 [JsonSerializable(typeof(OwnershipTransferRequest))]

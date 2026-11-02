@@ -40,6 +40,8 @@ string? runnerChunkThreshold = null;
 string? runnerChunkSize = null;
 // Whether a push may delete a reference. Left unsaid unless false, so the default is what the suite exercises.
 bool pushDelete = true;
+// Which addresses a restart lets the forge import from (--url-import), or null for a forge that imports from nowhere.
+string? urlImport = null;
 Process? server = null;
 Task? outputReader = null;
 Task<string>? errorReader = null;
@@ -246,6 +248,7 @@ try
     await CheckEmptyRepository(address, aliceIdentity, alicePassword);
     address = await CheckWebhooks(address, aliceIdentity);
     address = await CheckRunners(address, aliceIdentity, bob.Username);
+    address = await CheckUrlImport(address, aliceIdentity, bob.Username);
     await CheckProjectAudit(address, aliceIdentity, bob.Username, "carol", alicePassword);
     await CheckGroups(address, aliceIdentity, bob.Username, "carol", adminPassword);
     await CheckSecondFactor(address, bob.Username, bobPassword, adminPassword);
@@ -367,6 +370,11 @@ ProcessStartInfo ServerStart()
     {
         start.ArgumentList.Add("--push-delete");
         start.ArgumentList.Add("false");
+    }
+    if (urlImport is not null)
+    {
+        start.ArgumentList.Add("--url-import");
+        start.ArgumentList.Add(urlImport);
     }
     if (mailSmtpUrl is not null)
     {
@@ -5828,6 +5836,272 @@ async Task<string> CheckWebhooks(string address, AuthenticatedIdentity alice)
     // moves the port.
     await StopServer();
     webhooksEnabled = false;
+    return await StartServer();
+}
+
+// Import by address and mirroring (ADR 0042), against an upstream this check serves itself over plain HTTP from a Graft
+// repository in memory, so it controls what the upstream does: advance, delete, rewrite, vanish, and speak either protocol.
+async Task<string> CheckUrlImport(string address, AuthenticatedIdentity alice, string bobUsername)
+{
+    string api, bobApi;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        api = (await store.CreateTokenAsync(alice, "import", TokenScope.Api | TokenScope.ReadRepository, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        UserAccount bob = Required(await store.FindActiveUserAsync(bobUsername), "bob account");
+        bobApi = (await store.CreateTokenAsync(new(bob.Id, bob.Username, false, IdentityKind.BrowserSession), "import-bob", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+    }
+
+    // With the operator's switch off, as everywhere else in this suite, nothing is fetched from anywhere.
+    using (HttpResponseMessage refused = await ApiPost(address, "/api/v4/projects", api, new { path = "not-imported", import_url = "https://example.com/a.git" }))
+        Check(refused.StatusCode == HttpStatusCode.BadRequest && (await refused.Content.ReadAsStringAsync()).Contains("does not import", StringComparison.Ordinal),
+            "a server started without the switch refuses an import");
+
+    await StopServer();
+    urlImport = "any";
+    address = await StartServer();
+    Check(serverLines.Any(line => line.StartsWith("URL IMPORT: any address", StringComparison.Ordinal)), "a server that imports by address says so at startup");
+
+    // The upstream: two branches and an annotated tag, opening at "trunk", which convention alone would not choose.
+    Repository upstream = new() { AcceptsDeletion = true, PreferredDefaultBranch = "trunk" };
+    GitObject readme = new(3, Encoding.UTF8.GetBytes("# Upstream\n"));
+    GitObject tree = new(2, [.. Encoding.ASCII.GetBytes("100644 README.md\0"), .. Convert.FromHexString(readme.Id)]);
+    GitObject initial = new(1, Encoding.UTF8.GetBytes("tree " + tree.Id +
+        "\nauthor Fixture <fixture@example.invalid> 1700000000 +0000\ncommitter Fixture <fixture@example.invalid> 1700000000 +0000\n\nroot\n"));
+    GitObject second = Commit(tree.Id, initial.Id, "second");
+    GitObject feature = Commit(tree.Id, initial.Id, "feature");
+    GitObject tag = new(4, Encoding.UTF8.GetBytes("object " + initial.Id + "\ntype commit\ntag v1.0\ntagger Fixture <fixture@example.invalid> 1700000000 +0000\n\nv1.0\n"));
+    object upstreamGate = new();
+    void Upstream((string Old, string New, string Name) command, IEnumerable<GitObject> objects)
+    {
+        lock (upstreamGate)
+        {
+            string report = Encoding.ASCII.GetString(upstream.Receive(Push(command, Pack.Write(objects))));
+            if (!report.Contains("ok " + command.Name, StringComparison.Ordinal)) throw new InvalidOperationException("the fixture upstream refused " + command.Name + ": " + report);
+        }
+    }
+    Upstream((Limits.Zero, second.Id, "refs/heads/trunk"), [readme, tree, initial, second]);
+    Upstream((Limits.Zero, feature.Id, "refs/heads/feature"), [feature]);
+    Upstream((Limits.Zero, tag.Id, "refs/tags/v1.0"), [tag]);
+
+    bool gone = false;
+    bool serveVersion2 = true;
+    int versionTwoRequests = 0;
+    int versionZeroRequests = 0;
+    using HttpListener listener = new();
+    int port = FreeLoopbackPort();
+    listener.Prefixes.Add("http://127.0.0.1:" + port.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/");
+    listener.Start();
+    Task serving = Task.Run(async () =>
+    {
+        while (listener.IsListening)
+        {
+            HttpListenerContext context;
+            try { context = await listener.GetContextAsync(); }
+            catch (Exception) { return; }
+            try
+            {
+                string path = context.Request.Url!.AbsolutePath;
+                bool v2 = serveVersion2 && (context.Request.Headers["Git-Protocol"] ?? "").Contains("version=2", StringComparison.Ordinal);
+                byte[]? body = null;
+                string type = "";
+                if (!gone && context.Request.HttpMethod == "GET" && path == "/owner/rescued.git/info/refs" &&
+                    context.Request.QueryString["service"] == "git-upload-pack")
+                {
+                    lock (upstreamGate) body = v2 ? upstream.AdvertiseV2("git-upload-pack") : upstream.Advertise("git-upload-pack");
+                    type = "application/x-git-upload-pack-advertisement";
+                    if (v2) Interlocked.Increment(ref versionTwoRequests); else Interlocked.Increment(ref versionZeroRequests);
+                }
+                else if (!gone && context.Request.HttpMethod == "POST" && path == "/owner/rescued.git/git-upload-pack")
+                {
+                    using MemoryStream input = new();
+                    await context.Request.InputStream.CopyToAsync(input);
+                    input.Position = 0;
+                    using MemoryStream output = new();
+                    lock (upstreamGate) { if (v2) upstream.ServeV2(input, output); else upstream.Upload(input, output); }
+                    body = output.ToArray();
+                    type = "application/x-git-upload-pack-result";
+                }
+                if (body is null) context.Response.StatusCode = 404;
+                else
+                {
+                    context.Response.ContentType = type;
+                    context.Response.ContentLength64 = body.Length;
+                    await context.Response.OutputStream.WriteAsync(body);
+                }
+                context.Response.Close();
+            }
+            catch (Exception)
+            {
+                try { context.Response.StatusCode = 500; context.Response.Close(); } catch (Exception) { }
+            }
+        }
+    });
+    string upstreamUrl = "http://127.0.0.1:" + port.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/owner/rescued.git";
+
+    // What an address may be is checked before a project exists.
+    using (HttpResponseMessage credential = await ApiPost(address, "/api/v4/projects", api,
+        new { path = "with-password", import_url = "http://user:secret@127.0.0.1:" + port.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/owner/rescued.git" }))
+        Check(credential.StatusCode == HttpStatusCode.BadRequest && (await credential.Content.ReadAsStringAsync()).Contains("password", StringComparison.Ordinal),
+            "an import address carrying a password is refused, so no credential is ever stored");
+    using (HttpResponseMessage scheme = await ApiPost(address, "/api/v4/projects", api, new { path = "over-ssh", import_url = "ssh://example.com/a.git" }))
+        Check(scheme.StatusCode == HttpStatusCode.BadRequest, "an import address that is not http or https is refused");
+    using (HttpResponseMessage lonely = await ApiPost(address, "/api/v4/projects", api, new { path = "no-source", mirror = true }))
+        Check(lonely.StatusCode == HttpStatusCode.BadRequest, "mirror without an address is refused");
+
+    // The import: the project exists at once, empty, and fills in on the worker. The path comes from the address.
+    long projectId;
+    using (HttpResponseMessage created = await ApiPost(address, "/api/v4/projects", api, new { import_url = upstreamUrl, mirror = true }))
+    {
+        string text = await created.Content.ReadAsStringAsync();
+        using JsonDocument json = JsonDocument.Parse(text);
+        projectId = created.StatusCode == HttpStatusCode.Created ? json.RootElement.GetProperty("id").GetInt64() : 0;
+        Check(created.StatusCode == HttpStatusCode.Created && json.RootElement.GetProperty("path").GetString() == "rescued" &&
+            json.RootElement.GetProperty("import_url").GetString() == upstreamUrl && json.RootElement.GetProperty("mirror").GetBoolean() &&
+            json.RootElement.GetProperty("import_status").GetString() is "scheduled" or "started" or "finished",
+            "an import creates the project named from its address, says where it comes from, and that it is a mirror (" + text + ")");
+    }
+    string prefix = "/api/v4/projects/" + projectId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    async Task<JsonElement> Mirror()
+    {
+        using HttpResponseMessage response = await ApiGet(address, prefix + "/mirror/pull", api);
+        using JsonDocument json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        return json.RootElement.Clone();
+    }
+    async Task<JsonElement> Settled(Func<JsonElement, bool> done, string what)
+    {
+        for (int attempt = 0; attempt < 240; attempt++)
+        {
+            JsonElement mirror = await Mirror();
+            if (done(mirror)) return mirror;
+            await Task.Delay(250);
+        }
+        throw new InvalidOperationException("the mirror did not settle: " + what + " (" + (await Mirror()).ToString() + ")");
+    }
+    JsonElement imported = await Settled(m => m.GetProperty("update_status").GetString() is "finished" or "failed", "first import");
+    Check(imported.GetProperty("update_status").GetString() == "finished" && imported.GetProperty("enabled").GetBoolean() &&
+        imported.GetProperty("last_successful_update_at").ValueKind == JsonValueKind.String && imported.GetProperty("url").GetString() == upstreamUrl,
+        "the import finishes, and the mirror reports it in GitLab's shape (" + imported + ")");
+    using (HttpResponseMessage project = await ApiGet(address, prefix, api))
+    {
+        using JsonDocument json = JsonDocument.Parse(await project.Content.ReadAsStringAsync());
+        Check(json.RootElement.GetProperty("import_status").GetString() == "finished" && json.RootElement.GetProperty("default_branch").GetString() == "trunk",
+            "the project's import is finished and it opens at the branch the upstream opens at");
+    }
+    string mirrorUrl = AuthenticatedUrl(address, "alice", api, "alice/rescued.git");
+    async Task<Dictionary<string, string>> Remote()
+    {
+        string listing = await Git(root, ["ls-remote", mirrorUrl]);
+        return listing.Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(line => line.Split('\t'))
+            .ToDictionary(parts => parts[1].Trim(), parts => parts[0].Trim(), StringComparer.Ordinal);
+    }
+    Dictionary<string, string> refs = await Remote();
+    Check(refs.GetValueOrDefault("refs/heads/trunk") == second.Id && refs.GetValueOrDefault("refs/heads/feature") == feature.Id &&
+        refs.GetValueOrDefault("refs/tags/v1.0") == tag.Id && refs.GetValueOrDefault("refs/tags/v1.0^{}") == initial.Id,
+        "a clone of the import has every branch and tag, the annotated tag intact");
+    string cloned = Path.Combine(root, "imported-clone");
+    await Git(root, ["clone", "--quiet", mirrorUrl, cloned]);
+    Check(File.ReadAllText(Path.Combine(cloned, "README.md")) == "# Upstream\n" && (await Git(cloned, ["fsck", "--strict"])).Length >= 0,
+        "and the import checks out and passes git fsck");
+    Check(versionTwoRequests > 0, "the import spoke protocol version 2 to an upstream that offers it");
+
+    // The upstream moves on: the trunk advances, the feature branch is deleted and recreated with unrelated history,
+    // and the tag is deleted. Graft follows the trunk, keeps the feature's old tip, and keeps the tag.
+    GitObject third = Commit(tree.Id, second.Id, "third");
+    GitObject rewritten = new(1, Encoding.UTF8.GetBytes("tree " + tree.Id +
+        "\nauthor Fixture <fixture@example.invalid> 1700000001 +0000\ncommitter Fixture <fixture@example.invalid> 1700000001 +0000\n\nrewritten\n"));
+    Upstream((second.Id, third.Id, "refs/heads/trunk"), [third]);
+    Upstream((feature.Id, Limits.Zero, "refs/heads/feature"), []);
+    Upstream((Limits.Zero, rewritten.Id, "refs/heads/feature"), [rewritten]);
+    Upstream((tag.Id, Limits.Zero, "refs/tags/v1.0"), []);
+    string before = imported.GetProperty("last_successful_update_at").GetString()!;
+    using (HttpResponseMessage requested = await ApiPost(address, prefix + "/mirror/pull", api, new { }))
+        Check(requested.IsSuccessStatusCode, "a Maintainer asks for an update now");
+    JsonElement updated = await Settled(m => m.GetProperty("update_status").GetString() is "finished" or "failed" &&
+        m.GetProperty("last_update_started_at").GetString() != before, "update");
+    refs = await Remote();
+    string? preserved = refs.Keys.SingleOrDefault(name => name.StartsWith("refs/graft-preserved/", StringComparison.Ordinal) && name.EndsWith("/heads/feature", StringComparison.Ordinal));
+    Check(updated.GetProperty("update_status").GetString() == "finished" && refs.GetValueOrDefault("refs/heads/trunk") == third.Id &&
+        refs.GetValueOrDefault("refs/heads/feature") == rewritten.Id && preserved is not null && refs[preserved] == feature.Id &&
+        refs.GetValueOrDefault("refs/tags/v1.0") == tag.Id && updated.GetProperty("last_changed_at").ValueKind == JsonValueKind.String,
+        "an update follows the trunk, preserves the rewritten branch's old tip, and keeps the deleted tag (" + string.Join(", ", refs.Keys) + ")");
+    using (HttpResponseMessage stranger = await ApiPost(address, prefix + "/mirror/pull", bobApi, new { }))
+        Check(stranger.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.Forbidden, "somebody who is not a Maintainer cannot ask for an update");
+
+    // The upstream is taken down. The update fails, says why, and everything already here stays.
+    gone = true;
+    string beforeOutage = updated.GetProperty("last_update_started_at").GetString()!;
+    using (HttpResponseMessage requested = await ApiPost(address, prefix + "/mirror/pull", api, new { }))
+        Check(requested.IsSuccessStatusCode, "an update is asked for after the upstream disappeared");
+    JsonElement outage = await Settled(m => m.GetProperty("update_status").GetString() is "finished" or "failed" &&
+        m.GetProperty("last_update_started_at").GetString() != beforeOutage, "outage");
+    Check(outage.GetProperty("update_status").GetString() == "failed" && outage.GetProperty("last_error").GetString()!.Contains("404", StringComparison.Ordinal) &&
+        outage.GetProperty("consecutive_failures").GetInt32() == 1 && outage.GetProperty("last_successful_update_at").GetString() == updated.GetProperty("last_successful_update_at").GetString(),
+        "an upstream that has gone fails the update with the server's answer, and the last success is kept (" + outage + ")");
+    Dictionary<string, string> afterOutage = await Remote();
+    Check(afterOutage.Count == refs.Count && afterOutage.All(pair => refs.GetValueOrDefault(pair.Key) == pair.Value), "and every branch, tag and preserved tip is still here");
+    using (HttpResponseMessage project = await ApiGet(address, prefix, api))
+    {
+        using JsonDocument json = JsonDocument.Parse(await project.Content.ReadAsStringAsync());
+        Check(json.RootElement.GetProperty("import_status").GetString() == "finished" && json.RootElement.GetProperty("import_error").ValueKind == JsonValueKind.Null,
+            "a failed update after a finished import does not make the import a failure");
+    }
+
+    // It comes back, speaking only protocol version 0, and moves again.
+    gone = false;
+    serveVersion2 = false;
+    GitObject fourth = Commit(tree.Id, third.Id, "fourth");
+    Upstream((third.Id, fourth.Id, "refs/heads/trunk"), [fourth]);
+    string beforeReturn = outage.GetProperty("last_update_started_at").GetString()!;
+    using (HttpResponseMessage requested = await ApiPost(address, prefix + "/mirror/pull", api, new { }))
+        Check(requested.IsSuccessStatusCode, "an update is asked for when the upstream is back");
+    JsonElement back = await Settled(m => m.GetProperty("update_status").GetString() is "finished" or "failed" &&
+        m.GetProperty("last_update_started_at").GetString() != beforeReturn, "return");
+    Check(back.GetProperty("update_status").GetString() == "finished" && back.GetProperty("consecutive_failures").GetInt32() == 0 &&
+        (await Remote()).GetValueOrDefault("refs/heads/trunk") == fourth.Id && versionZeroRequests > 0,
+        "an upstream that speaks only protocol version 0 is followed too, and the failure count resets");
+
+    // Settings: GitLab's switches are accepted only when they ask for what Graft does.
+    using (HttpResponseMessage off = await ApiSend(address, HttpMethod.Put, prefix + "/mirror/pull", api, JsonContent.Create(new { enabled = false })))
+    {
+        using JsonDocument json = JsonDocument.Parse(await off.Content.ReadAsStringAsync());
+        Check(off.IsSuccessStatusCode && !json.RootElement.GetProperty("enabled").GetBoolean(), "a Maintainer stops keeping the mirror up to date");
+    }
+    using (HttpResponseMessage project = await ApiGet(address, prefix, api))
+        Check((await project.Content.ReadAsStringAsync()).Contains("\"mirror\":false", StringComparison.Ordinal), "and the project says it is no longer a mirror");
+    using (HttpResponseMessage filtered = await ApiSend(address, HttpMethod.Put, prefix + "/mirror/pull", api, JsonContent.Create(new { only_mirror_protected_branches = true })))
+        Check(filtered.StatusCode == HttpStatusCode.BadRequest && (await filtered.Content.ReadAsStringAsync()).Contains("only_mirror_protected_branches", StringComparison.Ordinal),
+            "a GitLab mirror switch Graft does not have is refused by name");
+    using (HttpResponseMessage plain = await ApiSend(address, HttpMethod.Put, prefix + "/mirror/pull", api,
+        JsonContent.Create(new { enabled = true, mirror_overwrites_diverged_branches = true, mirror_trigger_builds = false })))
+        Check(plain.IsSuccessStatusCode, "while the ones that describe what it does are accepted");
+    using (HttpResponseMessage strangerRead = await ApiGet(address, prefix + "/mirror/pull", bobApi))
+        Check(strangerRead.StatusCode == HttpStatusCode.NotFound, "a private project's mirror is hidden from somebody who cannot read the project");
+
+    // A server that imports from public addresses only refuses this loopback upstream when it connects, not just by name.
+    await StopServer();
+    urlImport = "public";
+    address = await StartServer();
+    long guarded;
+    using (HttpResponseMessage created = await ApiPost(address, "/api/v4/projects", api, new { path = "loopback-import", import_url = upstreamUrl }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStringAsync());
+        guarded = json.RootElement.GetProperty("id").GetInt64();
+    }
+    prefix = "/api/v4/projects/" + guarded.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    JsonElement blocked = await Settled(m => m.GetProperty("update_status").GetString() is "finished" or "failed", "guarded import");
+    Check(blocked.GetProperty("update_status").GetString() == "failed" && blocked.GetProperty("last_error").GetString()!.Contains("public", StringComparison.Ordinal),
+        "a server limited to public addresses refuses to fetch from its own network (" + blocked.GetProperty("last_error").GetString() + ")");
+    using (HttpResponseMessage project = await ApiGet(address, prefix, api))
+    {
+        using JsonDocument json = JsonDocument.Parse(await project.Content.ReadAsStringAsync());
+        Check(json.RootElement.GetProperty("import_status").GetString() == "failed" && json.RootElement.GetProperty("import_error").GetString() is { Length: > 0 },
+            "and the project's import says it failed, and why");
+    }
+
+    listener.Stop();
+    await serving;
+    await StopServer();
+    urlImport = null;
     return await StartServer();
 }
 

@@ -122,6 +122,13 @@ Then the first of the four large items, in the order given:
   exist, on the settings tab and at GitLab's `audit_events` route. The whole trail stays the administrator's.
   [ADR 0036](decisions/0036-project-audit.md).
 
+## Closed on 2026-11-02
+
+- **Import a repository by its address, and keep it up to date.** A project can be created from an http or https
+  address, fetched by Graft's own client, and kept up to date on a schedule so that a copy survives the original being
+  taken down: updates never remove anything, and a rewritten branch keeps its old tip. Behind `--url-import`, off by
+  default. [ADR 0042](decisions/0042-import-by-address-and-mirrors.md).
+
 ## Closed on 2026-11-01
 
 - **Every LabCoat call answered, retry and cancel, and the directory.** The 39 missing routes, the crashing commit diff,
@@ -168,6 +175,12 @@ Graft's own runner over CupriNet, install scripts, a strict subset of `.gitlab-c
 chunked, resumable transfers ([ADR 0038](decisions/0038-chunked-runner-transfers-and-artifacts.md)). Still absent:
 containers, artifact expiry and passing artifacts between stages, caches, `rules` and the rest of the format, group and project runners (retry and cancel exist since ADR 0041),
 detecting a runner that dropped mid-job, and GitLab's runner API for the official `gitlab-runner`.
+
+**More from an import.** [ADR 0042](decisions/0042-import-by-address-and-mirrors.md) imports and mirrors public
+repositories' branches and tags. Each of these needs a decision before it is built: credentials for a private
+upstream (stored how, shown to whom), Git LFS objects (bandwidth and storage on somebody else's behalf), SSH
+addresses, pipelines or webhooks on a mirror update, push mirrors, and the GitLab data import of the requirements
+(issues, merge requests, wiki), which is a different and much larger thing.
 
 **GraphQL.** GitLab's newer clients increasingly prefer it. Not implemented, and implementing a useful
 subset is a large piece of work with its own schema to keep honest.

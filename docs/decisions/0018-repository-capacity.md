@@ -19,7 +19,7 @@ The feasibility budgets in `Graft.Git.Limits` are superseded:
 | Pack expansion work, including delta instructions and results | 8 GiB |
 | Objects per repository / incoming pack | 1,000,000 |
 | Branches and tags combined | 4,096 |
-| Delta chain depth | 32, unchanged |
+| Delta chain depth | 32, unchanged; 250 since 2026-11-02, see below |
 | Git transfer / archive request deadline | 2 hours |
 
 The transport allowance accounts for incompressible data and framing. The larger delta
@@ -57,3 +57,11 @@ tests do not establish large-repository performance on the legacy host. See
 Remaining work: validate the deployment's disk, concurrency and reverse-proxy envelope.
 Next action — Operator + implementation agent: rebuild the server, exercise a representative
 repository in the intended acceptance environment, and deploy through the established process.
+
+## Superseded in part on 2026-11-02: delta chain depth 250
+
+The first import of a real repository from GitHub ([ADR 0042](0042-import-by-address-and-mirrors.md)), libgit2,
+was refused for a 50-deep delta chain. Git writes chains up to 50 by default (`pack.depth`), and wrote up to 250
+under `gc --aggressive` before 2.18, so a push of any long-lived repository could have met the same refusal. The
+limit is now 250. The work a pack can cause is still bounded by the 8 GiB expansion budget, which was always the
+real bound; the depth only caps how many passes reference-delta resolution may take.

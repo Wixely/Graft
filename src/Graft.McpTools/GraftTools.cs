@@ -229,6 +229,75 @@ public sealed class GraftTools
             : Failure(GraftClient.Describe(status, response));
     }
 
+    [McpServerTool(Name = "graft_import_project")]
+    [Description("Creates a project owned by the token's account from another server's repository address, and optionally keeps it up to date from there. The import runs in the background; graft_mirror_status reports how it went. Updates never remove anything: a branch deleted upstream is kept, and one rewritten upstream keeps its old history under refs/graft-preserved/. Refused unless writes are allowed here and the server's operator turned on import by address.")]
+    public static async Task<string> ImportProject(
+        GraftClient graft,
+        [Description("The repository's http or https address, such as https://example.com/owner/repository.git, with no password in it.")] string url,
+        [Description("Path for the new project. Empty uses the address's last segment without .git.")] string path,
+        [Description("Human readable name. Empty uses the path.")] string name,
+        [Description("True to keep checking the address for changes after the import.")] bool keepUpToDate,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowWrites) return Refused(graft, "importing a project");
+
+        JsonObject body = new() { ["import_url"] = url, ["mirror"] = keepUpToDate };
+        if (!string.IsNullOrWhiteSpace(path)) body["path"] = path;
+        if (!string.IsNullOrWhiteSpace(name)) body["name"] = name;
+
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Post, "api/v4/projects", body, cancellationToken);
+        if (!ok) return Failure(GraftClient.Describe(status, response));
+        ProjectResponse? created = JsonSerializer.Deserialize(response, ApiJson.Default.ProjectResponse);
+        JsonObject result = created is null ? new() : Summarise(created);
+        result["import_status"] = created?.ImportStatus;
+        result["mirror"] = created?.Mirror;
+        return result.ToJsonString();
+    }
+
+    [McpServerTool(Name = "graft_mirror_status")]
+    [Description("Reports a project's import from another server's address: where from, whether it is kept up to date, how the latest update went and when the next is due.")]
+    public static async Task<string> MirrorStatus(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, or its numeric id.")] string project,
+        CancellationToken cancellationToken)
+    {
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Get,
+            "api/v4/projects/" + Encode(project) + "/mirror/pull", null, cancellationToken);
+        // A project that exists but was never imported answers 404 too; say which, rather than "no such project".
+        if (status == 404 && response.Contains("Pull Mirror Not Found", StringComparison.Ordinal))
+            return Failure("This project was not imported from an address, so it has no mirror (Pull Mirror Not Found).");
+        if (!ok) return Failure(GraftClient.Describe(status, response));
+        PullMirrorResponse? mirror = JsonSerializer.Deserialize(response, ApiJson.Default.PullMirrorResponse);
+        return mirror is null ? Failure("Graft answered with an empty mirror.") : Mirror(mirror).ToJsonString();
+    }
+
+    [McpServerTool(Name = "graft_update_mirror")]
+    [Description("Asks for an imported project to be brought up to date from its address now, or a failed import to be tried again. Needs the Maintainer role. Refused unless writes are allowed on this server.")]
+    public static async Task<string> UpdateMirror(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, or its numeric id.")] string project,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowWrites) return Refused(graft, "updating a mirror");
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Post,
+            "api/v4/projects/" + Encode(project) + "/mirror/pull", new JsonObject(), cancellationToken);
+        if (!ok) return Failure(GraftClient.Describe(status, response));
+        PullMirrorResponse? mirror = JsonSerializer.Deserialize(response, ApiJson.Default.PullMirrorResponse);
+        return mirror is null ? new JsonObject { ["requested"] = true }.ToJsonString() : Mirror(mirror).ToJsonString();
+    }
+
+    private static JsonObject Mirror(PullMirrorResponse mirror) => new()
+    {
+        ["url"] = mirror.Url,
+        ["kept_up_to_date"] = mirror.Enabled,
+        ["status"] = mirror.UpdateStatus,
+        ["last_successful_update_at"] = mirror.LastSuccessfulUpdateAt?.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+        ["last_changed_at"] = mirror.LastChangedAt?.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+        ["last_error"] = mirror.LastError,
+        ["consecutive_failures"] = mirror.ConsecutiveFailures,
+        ["next_update_at"] = mirror.NextUpdateAt.ToString("O", System.Globalization.CultureInfo.InvariantCulture)
+    };
+
     [McpServerTool(Name = "graft_set_visibility")]
     [Description("Sets who can read a whole project: private, unlisted, or public. Public and unlisted expose every file and the history, and allow cloning without an account. Refused unless writes are allowed on this server.")]
     public static async Task<string> SetVisibility(

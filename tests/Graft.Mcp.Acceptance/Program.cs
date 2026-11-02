@@ -150,7 +150,7 @@ async Task CheckForge(string address, string token, string password)
     using (HttpResponseMessage listing = await Post(client, token, Request(3, "tools/list", "{}")))
     {
         using JsonDocument body = Parse(await listing.Content.ReadAsStringAsync());
-        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 38,
+        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 41,
             "the forge's endpoint advertises every tool");
     }
 
@@ -287,6 +287,19 @@ async Task CheckForge(string address, string token, string password)
         using JsonDocument body = Parse(await edited.Content.ReadAsStringAsync());
         Check(Text(body).Contains("Edited by an agent", StringComparison.Ordinal),
             "an agent edits a project's description once writes are allowed");
+    }
+
+    // Importing by address is the operator's switch, off on this server; the tool passes on the forge's reason (ADR 0042).
+    using (HttpResponseMessage import = await Post(client, token, Call(16, "graft_import_project",
+        """{"url":"https://example.com/owner/repository.git","path":"","name":"","keepUpToDate":true}""")))
+    {
+        using JsonDocument body = Parse(await import.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("does not import", StringComparison.Ordinal), "an agent's import is refused with the forge's reason when the operator has not allowed it");
+    }
+    using (HttpResponseMessage status = await Post(client, token, Call(17, "graft_mirror_status", """{"project":"shared"}""")))
+    {
+        using JsonDocument body = Parse(await status.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("Pull Mirror Not Found", StringComparison.Ordinal), "a project that was not imported has no mirror to report");
     }
     using (HttpResponseMessage reread = await Post(client, token, Call(16, "graft_get_project", """{"project":"admin/shared"}""")))
     {
@@ -518,7 +531,7 @@ async Task CheckStdio(string address, bool readOnly)
 
         using JsonDocument tools = await Exchange(client, Request(2, "tools/list", "{}"));
         int count = tools.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength();
-        Check(count == 38, label + " advertises every tool");
+        Check(count == 41, label + " advertises every tool");
 
         using JsonDocument read = await Exchange(client, Call(3, "graft_browse", """{"search":""}"""));
         Check(Text(read).Contains("admin/shared", StringComparison.Ordinal), label + " reads the public listing");
@@ -571,7 +584,7 @@ async Task CheckHttp(string address, string token)
     using (HttpResponseMessage listing = await Post(client, token, Request(3, "tools/list", "{}")))
     {
         using JsonDocument body = Parse(await listing.Content.ReadAsStringAsync());
-        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 38,
+        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 41,
             "the launcher's HTTP endpoint advertises every tool");
     }
 

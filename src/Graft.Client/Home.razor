@@ -41,13 +41,28 @@ else
                         </select>
                     }
                     <label for="project-name">Name</label>
-                    <input id="project-name" @bind="name" required maxlength="200" />
+                    <input id="project-name" @bind="name" required="@(string.IsNullOrWhiteSpace(importUrl))" maxlength="200" />
                     <label for="project-path">Path</label>
                     <input id="project-path" @bind="path" minlength="2" maxlength="39"
                            pattern="[A-Za-z0-9](?:[A-Za-z0-9]|[._\-][A-Za-z0-9])+" />
                     <p class="field-hint">Optional. Derived from the name when left empty.</p>
                     <label for="project-description">Description</label>
                     <input id="project-description" @bind="description" maxlength="2000" />
+                    <label for="project-import">Import from an address</label>
+                    <input id="project-import" type="url" @bind="importUrl" @bind:event="oninput" maxlength="2048"
+                           placeholder="https://example.com/owner/repository.git" />
+                    <p class="field-hint">
+                        Optional. A repository anybody may clone, over http or https. The project starts empty and fills
+                        in while the import runs; the name and path come from the address when left empty.
+                    </p>
+                    @if (!string.IsNullOrWhiteSpace(importUrl))
+                    {
+                        <label class="checkbox"><input type="checkbox" @bind="keepUpdated" /> Keep it up to date</label>
+                        <p class="field-hint">
+                            Checked for changes regularly. Nothing is ever removed here: a branch the original deletes is
+                            kept, and one it rewrites keeps its old history under a preserved reference.
+                        </p>
+                    }
                     <div class="form-actions">
                         <button type="submit" disabled="@busy">@(busy ? "Creating…" : "Create project")</button>
                         <button type="button" class="secondary" @onclick="() => creating = false" disabled="@busy">Cancel</button>
@@ -87,6 +102,8 @@ else
     private string name = "";
     private string path = "";
     private string description = "";
+    private string importUrl = "";
+    private bool keepUpdated = true;
     private string message = "";
     private string messageKind = "info";
     private bool creating;
@@ -127,13 +144,16 @@ else
         message = "";
         try
         {
-            ProjectCreateRequest request = new(name, string.IsNullOrWhiteSpace(path) ? null : path, description, "private",
-                long.TryParse(namespaceId, out long inGroup) ? inGroup : null);
-            ApiResult result = await Api.PostAsync("api/projects", request, ApiJson.Default.ProjectCreateRequest, "Project created.");
+            bool importing = !string.IsNullOrWhiteSpace(importUrl);
+            ProjectCreateRequest request = new(string.IsNullOrWhiteSpace(name) ? null : name, string.IsNullOrWhiteSpace(path) ? null : path, description, "private",
+                long.TryParse(namespaceId, out long inGroup) ? inGroup : null,
+                importing ? importUrl.Trim() : null, importing ? keepUpdated : null);
+            ApiResult result = await Api.PostAsync("api/projects", request, ApiJson.Default.ProjectCreateRequest,
+                importing ? "Project created. The import is running; open the project to follow it." : "Project created.");
             message = result.Message;
             messageKind = result.Ok ? "success" : "error";
             if (!result.Ok) return;
-            name = ""; path = ""; description = ""; creating = false;
+            name = ""; path = ""; description = ""; importUrl = ""; keepUpdated = true; creating = false;
             await LoadProjects();
         }
         finally { busy = false; }

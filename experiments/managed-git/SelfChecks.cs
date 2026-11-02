@@ -99,6 +99,12 @@ public static class SelfChecks
                     .Select(_ => (3, new byte[1024 * 1024], (string?)null)).ToArray()));
                 Pack.Read(input, empty, expandedBudget: 8 * 1024 * 1024);
             });
+            Check("a delta chain as deep as Git writes by default is read", () =>
+            {
+                var entries = new List<(int, byte[], string?)> { (3, [1], null) };
+                for (var i = 0; i < 50; i++) entries.Add((6, [1, 1, 1, (byte)(i + 2)], null));
+                Require(Pack.Read(FixturePack(entries.ToArray()), empty).Objects.Count == 51);
+            });
             Reject("delta depth limit", () =>
             {
                 var entries = new List<(int, byte[], string?)> { (3, [1], null) };
@@ -170,6 +176,74 @@ public static class SelfChecks
                 using var data = new MemoryStream(); data.Write("120000 link\0"u8); data.Write(Convert.FromHexString(blob.Id));
                 Require(Graph.Links(new GitObject(2, data.ToArray())).Single() == (blob.Id, 3));
             });
+            // Import by address (ADR 0042): the fetch client against this engine's own server half, over both protocol versions,
+            // and the mirror rules: follow additions and fast-forwards, keep what the upstream deletes, preserve what it rewrites.
+            foreach (bool version2 in new[] { true, false })
+            {
+                string label = version2 ? " (protocol v2)" : " (protocol v0)";
+                var upstream = new Repository { AcceptsDeletion = true };
+                var second = Commit(tree.Id, commit.Id, "second");
+                var tag = new GitObject(4, Encoding.UTF8.GetBytes("object " + commit.Id + "\ntype commit\ntag v1\ntagger Fixture <fixture@example.invalid> 1700000000 +0000\n\nv1\n"));
+                upstream.Receive(Push([(Limits.Zero, second.Id, "refs/heads/main"), (Limits.Zero, commit.Id, "refs/heads/old"), (Limits.Zero, tag.Id, "refs/tags/v1")],
+                    Pack.Write([tree, commit, second, tag])));
+                using var client = new HttpClient(new ServedRepository(upstream, version2));
+                var remote = new GitRemote(client);
+                var mirror = new Repository();
+                MirrorResult Sync(DateTimeOffset at)
+                {
+                    RemoteAdvertisement listed = remote.ListAsync(new Uri("https://upstream.invalid/owner/repo.git"), CancellationToken.None).GetAwaiter().GetResult();
+                    Require(listed.ProtocolVersion == (version2 ? 2 : 0) && listed.HeadBranch == "main");
+                    var wants = listed.Refs.Values.Distinct().Where(id => !mirror.Objects.ContainsKey(id)).ToList();
+                    var haves = mirror.Refs.Values.Distinct().Where(id => mirror.Objects.TryGetValue(id, out var value) && value.Type == 1).ToList();
+                    if (wants.Count == 0) return RepositoryMirror.Apply(mirror, null, listed.Refs, at);
+                    using var pack = new MemoryStream();
+                    remote.FetchAsync(listed, wants, haves, pack, CancellationToken.None).GetAwaiter().GetResult();
+                    pack.Position = 0;
+                    return RepositoryMirror.Apply(mirror, pack, listed.Refs, at);
+                }
+                Check("an import copies every branch and tag" + label, () =>
+                {
+                    MirrorResult first = Sync(DateTimeOffset.UnixEpoch);
+                    Require(first.Changed && mirror.Refs.Count == 3 && mirror.Refs["refs/heads/main"] == second.Id && mirror.Refs["refs/tags/v1"] == tag.Id &&
+                        mirror.Objects.ContainsKey(tree.Id) && first.References.All(reference => reference.Change == MirrorRefChange.Created));
+                });
+                Check("an update with nothing new changes nothing" + label, () => Require(!Sync(DateTimeOffset.UnixEpoch.AddHours(1)).Changed));
+                var third = Commit(tree.Id, second.Id, "third");
+                var rewrite = Commit(tree.Id, null, "rewritten old");
+                upstream.Receive(Push([(second.Id, third.Id, "refs/heads/main"), (commit.Id, Limits.Zero, "refs/heads/old")], Pack.Write([third])));
+                upstream.Receive(Push([(Limits.Zero, rewrite.Id, "refs/heads/old"), (tag.Id, Limits.Zero, "refs/tags/v1")], Pack.Write([rewrite])));
+                Check("an update follows a fast-forward, preserves a rewrite, and keeps a deleted tag" + label, () =>
+                {
+                    MirrorResult update = Sync(DateTimeOffset.UnixEpoch.AddHours(2));
+                    string preserved = RepositoryMirror.PreservedPrefix + "19700101T020000Z/heads/old";
+                    Require(mirror.Refs["refs/heads/main"] == third.Id && mirror.Refs["refs/heads/old"] == rewrite.Id && mirror.Refs[preserved] == commit.Id &&
+                        mirror.Refs["refs/tags/v1"] == tag.Id &&
+                        update.References.Single(reference => reference.Name == "refs/heads/main").Change == MirrorRefChange.Updated &&
+                        update.References.Single(reference => reference.Name == "refs/heads/old").Preserved == preserved &&
+                        update.References.Single(reference => reference.Name == "refs/tags/v1").Change == MirrorRefChange.Kept);
+                });
+                Check("a preserved reference is fetchable and not pushable" + label, () =>
+                {
+                    string preserved = RepositoryMirror.PreservedPrefix + "19700101T020000Z/heads/old";
+                    Require(Limits.IsRef(preserved) && !Limits.IsClientRef(preserved) && Encoding.ASCII.GetString(mirror.Advertise("git-upload-pack")).Contains(preserved));
+                });
+                Reject("a client cannot push into the preserved namespace" + label,
+                    () => mirror.Receive(Push([(Limits.Zero, commit.Id, RepositoryMirror.PreservedPrefix + "x/heads/main")], [])));
+                Check("an upstream that is gone answers as unavailable" + label, () =>
+                {
+                    using var gone = new HttpClient(new ServedRepository(upstream, version2) { Gone = true });
+                    try { new GitRemote(gone).ListAsync(new Uri("https://upstream.invalid/owner/repo.git"), CancellationToken.None).GetAwaiter().GetResult(); }
+                    catch (GitRemoteException error) when (error.Failure == RemoteFailure.Unavailable) { return; }
+                    throw new InvalidOperationException("a missing upstream was not reported as unavailable");
+                });
+            }
+            Check("an address that is not a Git server is refused as such", () =>
+            {
+                using var html = new HttpClient(new StaticAnswer());
+                try { new GitRemote(html).ListAsync(new Uri("https://example.invalid/page"), CancellationToken.None).GetAwaiter().GetResult(); }
+                catch (GitRemoteException error) when (error.Failure == RemoteFailure.Protocol) { return; }
+                throw new InvalidOperationException("an HTML page was taken for a repository");
+            });
             Console.WriteLine($"SELF-CHECKS: PASS ({passed})");
             return 0;
         }
@@ -218,6 +292,48 @@ public static class SelfChecks
         }
         output.Write(SHA1.HashData(output.GetBuffer().AsSpan(0, (int)output.Length)));
         return output.ToArray();
+    }
+
+    /// <summary>Smart HTTP served from an in-memory repository, as the forge serves it, for the fetch client to talk to.</summary>
+    private sealed class ServedRepository(Repository repository, bool version2) : HttpMessageHandler
+    {
+        public bool Gone { get; init; }
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            if (Gone) return new HttpResponseMessage(System.Net.HttpStatusCode.NotFound) { RequestMessage = request };
+            bool asksV2 = version2 && request.Headers.TryGetValues("Git-Protocol", out var values) && values.Contains("version=2");
+            string path = request.RequestUri!.AbsolutePath;
+            byte[] body;
+            string type;
+            if (request.Method == HttpMethod.Get && path.EndsWith("/info/refs", StringComparison.Ordinal))
+            {
+                body = asksV2 ? repository.AdvertiseV2("git-upload-pack") : repository.Advertise("git-upload-pack");
+                type = "application/x-git-upload-pack-advertisement";
+            }
+            else if (request.Method == HttpMethod.Post && path.EndsWith("/git-upload-pack", StringComparison.Ordinal))
+            {
+                using var input = new MemoryStream(await request.Content!.ReadAsByteArrayAsync(cancellationToken));
+                using var output = new MemoryStream();
+                if (asksV2) repository.ServeV2(input, output, cancellationToken); else repository.Upload(input, output, cancellationToken);
+                body = output.ToArray();
+                type = "application/x-git-upload-pack-result";
+            }
+            else return new HttpResponseMessage(System.Net.HttpStatusCode.NotFound) { RequestMessage = request };
+            var response = new HttpResponseMessage(System.Net.HttpStatusCode.OK) { RequestMessage = request, Content = new ByteArrayContent(body) };
+            response.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue(type);
+            return response;
+        }
+    }
+
+    private sealed class StaticAnswer : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var response = new HttpResponseMessage(System.Net.HttpStatusCode.OK) { RequestMessage = request, Content = new StringContent("<html></html>") };
+            response.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("text/html");
+            return Task.FromResult(response);
+        }
     }
 
     private static void Rehash(byte[] bytes) => SHA1.HashData(bytes.AsSpan(0, bytes.Length - 20)).CopyTo(bytes.AsSpan(bytes.Length - 20));
