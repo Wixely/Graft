@@ -773,6 +773,31 @@ app.MapPost("/api/password-reset", async context =>
 
 string ResetUrl(string secret) => serverOrigin + "/-/reset/" + secret;
 
+// The profile's activity calendar: a year of contributions per day, for the person themselves or an administrator, as
+// the activity feed is. `utc_offset` is the reader's zone in minutes east of UTC, so a day is the reader's day.
+app.MapGet("/api/users/{userId:long}/calendar", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!await OnlyQuery(context, "utc_offset")) return;
+    string offsetText = context.Request.Query["utc_offset"].ToString();
+    int offset = 0;
+    if (offsetText.Length > 0 && !(int.TryParse(offsetText, System.Globalization.NumberStyles.AllowLeadingSign, System.Globalization.CultureInfo.InvariantCulture, out offset) && offset is >= -840 and <= 840))
+    { await ApiError(context, 400, "utc_offset must be minutes from UTC, between -840 and 840"); return; }
+    DateOnly to = DateOnly.FromDateTime(DateTimeOffset.UtcNow.ToOffset(TimeSpan.FromMinutes(offset)).DateTime);
+    // A year back to the Sunday that starts its week, so the calendar's first column is whole.
+    DateOnly from = to.AddDays(-364);
+    from = from.AddDays(-(int)from.DayOfWeek);
+    DateTimeOffset since = new DateTimeOffset(from.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero).AddMinutes(-offset);
+    IReadOnlyDictionary<DateOnly, int>? days = await store.ActivityCalendarAsync(browser.Value.Identity, RouteId(context, "userId"), since, offset,
+        context.RequestAborted);
+    if (days is null) { await ApiError(context, 404, "No such user."); return; }
+    ActivityDayResponse[] response = [.. days.Where(day => day.Key >= from && day.Key <= to).OrderBy(day => day.Key)
+        .Select(day => new ActivityDayResponse(day.Key, day.Value))];
+    await context.Response.WriteAsJsonAsync(new ActivityCalendarResponse(from, to, response.Sum(day => day.Count), response),
+        ApiJson.Default.ActivityCalendarResponse, null, context.RequestAborted);
+});
+
 app.MapGet("/api/users", async context =>
 {
     (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);

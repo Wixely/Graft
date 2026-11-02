@@ -1,0 +1,86 @@
+@inject GraftApi Api
+
+@* A year of one person's contributions, a column a week and a row a weekday, shaded by how much was done that
+   day. Drawn as SVG because the page's content security policy forbids style attributes, and SVG places each
+   cell with plain attributes. Each cell names its day and count for a pointer; the picture as a whole is
+   summarised for a screen reader. *@
+
+@if (calendar is not null)
+{
+    <div class="panel">
+        <div class="panel-header"><Icon Name="commit" /><h2>@Plural(calendar.Total) in the last year</h2></div>
+        <div class="panel-body">
+            <div class="activity-calendar">
+                <svg width="@Width" height="@Height" viewBox="0 0 @Width @Height" role="img"
+                     aria-label="@($"{Plural(calendar.Total)} between {calendar.From:d MMMM yyyy} and {calendar.To:d MMMM yyyy}; the busiest day had {busiest}.")">
+                    @foreach ((int column, string name) in months)
+                    {
+                        <g><text x="@(Left + column * Step)" y="10">@name</text></g>
+                    }
+                    <text x="0" y="@(Top + 1 * Step + Cell - 1)">Mon</text>
+                    <text x="0" y="@(Top + 3 * Step + Cell - 1)">Wed</text>
+                    <text x="0" y="@(Top + 5 * Step + Cell - 1)">Fri</text>
+                    @for (DateOnly day = calendar.From; day <= calendar.To; day = day.AddDays(1))
+                    {
+                        int count = counts.GetValueOrDefault(day);
+                        int offset = day.DayNumber - calendar.From.DayNumber;
+                        <rect x="@(Left + offset / 7 * Step)" y="@(Top + offset % 7 * Step)" width="@Cell" height="@Cell" rx="2" class="level-@Level(count)">
+                            <title>@($"{(count == 0 ? "No contributions" : Plural(count))} on {day:dddd d MMMM yyyy}")</title>
+                        </rect>
+                    }
+                </svg>
+            </div>
+            <div class="activity-legend" aria-hidden="true">
+                <span>Less</span>
+                @for (int level = 0; level <= 4; level++)
+                {
+                    <svg width="@Cell" height="@Cell"><rect width="@Cell" height="@Cell" rx="2" class="level-@level" /></svg>
+                }
+                <span>More</span>
+            </div>
+            <p class="field-hint">One for each push, issue or merge request opened, merge and comment, in projects you can read.</p>
+        </div>
+    </div>
+}
+
+@code {
+    [Parameter] public long UserId { get; set; }
+
+    private const int Cell = 11;
+    private const int Step = 14;
+    private const int Left = 30;
+    private const int Top = 16;
+
+    private ActivityCalendarResponse? calendar;
+    private Dictionary<DateOnly, int> counts = [];
+    private List<(int Column, string Name)> months = [];
+    private int busiest;
+
+    private int Width => calendar is null ? 0 : Left + ((calendar.To.DayNumber - calendar.From.DayNumber) / 7 + 1) * Step;
+    private static int Height => Top + 7 * Step;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        int offset = (int)DateTimeOffset.Now.Offset.TotalMinutes;
+        calendar = await Api.GetAsync($"api/users/{UserId}/calendar?utc_offset={offset}", ApiJson.Default.ActivityCalendarResponse);
+        if (calendar is null) return;
+        counts = calendar.Days.ToDictionary(day => day.Date, day => day.Count);
+        busiest = counts.Count == 0 ? 0 : counts.Values.Max();
+        // A month is named over the first week that starts in it, unless that would crowd the name before it.
+        months = [];
+        int weeks = (calendar.To.DayNumber - calendar.From.DayNumber) / 7 + 1;
+        for (int column = 0; column < weeks; column++)
+        {
+            DateOnly start = calendar.From.AddDays(column * 7);
+            if (column > 0 && start.Month == start.AddDays(-7).Month) continue;
+            if (months.Count > 0 && column - months[^1].Column < 3) months.RemoveAt(months.Count - 1);
+            if (column > weeks - 3) continue;
+            months.Add((column, start.ToString("MMM", System.Globalization.CultureInfo.InvariantCulture)));
+        }
+    }
+
+    /// <summary>Shading in quarters of the busiest day, so one heavy day does not wash out the rest; any activity shows.</summary>
+    private int Level(int count) => count == 0 || busiest == 0 ? 0 : Math.Clamp((int)Math.Ceiling(4.0 * count / busiest), 1, 4);
+
+    private static string Plural(int count) => count == 1 ? "1 contribution" : $"{count:N0} contributions";
+}

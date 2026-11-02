@@ -241,7 +241,7 @@ try
     await CheckCompressedGitRequests(address, aliceIdentity);
     address = await CheckPushDeletion(address, aliceIdentity);
     await CheckGitLabClientShapes(address, aliceIdentity, bob.Username);
-    await CheckClientSurfaces(address, aliceIdentity, bob.Username);
+    await CheckClientSurfaces(address, aliceIdentity, bob.Username, alicePassword, bobPassword, adminPassword);
     await CheckGitEngine(address, aliceIdentity);
     await CheckFetching(address, aliceIdentity, "carol");
     await CheckSsh(address, aliceIdentity, bob.Username);
@@ -7894,7 +7894,7 @@ async Task CheckEmptyRepository(string address, AuthenticatedIdentity alice, str
 /// directory, activity, reactions, discussions, approvals, commits, contributors, snippet comments, milestone issues,
 /// the cross-project lists, deleting an issue, and uploads.
 /// </summary>
-async Task CheckClientSurfaces(string address, AuthenticatedIdentity alice, string bobUsername)
+async Task CheckClientSurfaces(string address, AuthenticatedIdentity alice, string bobUsername, string alicePassword, string bobPassword, string adminPassword)
 {
     string api, adminApi, bobApi;
     long projectId, bobId;
@@ -8098,6 +8098,48 @@ async Task CheckClientSurfaces(string address, AuthenticatedIdentity alice, stri
         Check((await Json(events)).EnumerateArray().Any(item => item.GetProperty("project_id").GetInt64() == projectId), "and the caller's own activity includes it");
     using (HttpResponseMessage events = await ApiGet(address, "/api/v4/users/" + alice.UserId + "/events", bobApi))
         Check(events.StatusCode == HttpStatusCode.NotFound, "somebody else's activity is not shown to another member");
+
+    // The profile's activity calendar counts the same things a day at a time, for the person and an administrator only.
+    long feedTotal;
+    using (HttpResponseMessage events = await ApiGet(address, "/api/v4/events", api))
+        feedTotal = long.Parse(events.Headers.GetValues("X-Total").Single(), System.Globalization.CultureInfo.InvariantCulture);
+    (HttpClient aliceBrowser, _) = await BrowserSession(address, "alice", alicePassword);
+    (HttpClient adminBrowser, _) = await BrowserSession(address, "admin", adminPassword);
+    (HttpClient bobBrowser, _) = await BrowserSession(address, bobUsername, bobPassword);
+    using (aliceBrowser)
+    using (adminBrowser)
+    using (bobBrowser)
+    {
+        string calendar = "/api/users/" + alice.UserId + "/calendar";
+        DateOnly today = DateOnly.FromDateTime(DateTime.UtcNow);
+        using (HttpResponseMessage own = await aliceBrowser.GetAsync(calendar + "?utc_offset=0"))
+        {
+            JsonElement json = await Json(own);
+            DateOnly from = DateOnly.Parse(json.GetProperty("from").GetString()!, System.Globalization.CultureInfo.InvariantCulture);
+            DateOnly to = DateOnly.Parse(json.GetProperty("to").GetString()!, System.Globalization.CultureInfo.InvariantCulture);
+            JsonElement[] days = [.. json.GetProperty("days").EnumerateArray()];
+            Check(own.IsSuccessStatusCode && to == today && from.DayOfWeek == DayOfWeek.Sunday && today.DayNumber - from.DayNumber is >= 364 and < 371,
+                "the activity calendar covers a year to today, from the Sunday that starts its first week");
+            // The suite runs today, so its whole feed is in the last day or two (a run may cross midnight).
+            Check(json.GetProperty("total").GetInt64() == feedTotal && days.Sum(day => day.GetProperty("count").GetInt64()) == feedTotal &&
+                days.Length is 1 or 2 && days[^1].GetProperty("date").GetString() == today.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
+                "and counts by day everything the person's activity feed holds");
+        }
+        using (HttpResponseMessage ahead = await aliceBrowser.GetAsync(calendar + "?utc_offset=720"))
+        using (HttpResponseMessage behind = await aliceBrowser.GetAsync(calendar + "?utc_offset=-720"))
+        {
+            JsonElement aheadJson = await Json(ahead), behindJson = await Json(behind);
+            Check(aheadJson.GetProperty("total").GetInt64() == feedTotal && behindJson.GetProperty("total").GetInt64() == feedTotal &&
+                aheadJson.GetProperty("to").GetString() != behindJson.GetProperty("to").GetString(), "days are the reader's, by the offset the reader gives");
+        }
+        using (HttpResponseMessage far = await aliceBrowser.GetAsync(calendar + "?utc_offset=900"))
+        using (HttpResponseMessage wrong = await aliceBrowser.GetAsync(calendar + "?utc_offset=east"))
+            Check(wrong.StatusCode == HttpStatusCode.BadRequest && far.StatusCode == HttpStatusCode.BadRequest, "an offset that is not minutes, or further than any zone, is refused");
+        using (HttpResponseMessage administrator = await adminBrowser.GetAsync(calendar))
+            Check(administrator.IsSuccessStatusCode && (await Json(administrator)).GetProperty("total").GetInt64() == feedTotal, "an administrator reads anybody's calendar");
+        using (HttpResponseMessage other = await bobBrowser.GetAsync(calendar))
+            Check(other.StatusCode == HttpStatusCode.NotFound, "and another member is told there is no such person");
+    }
 
     // Across projects.
     using (HttpResponseMessage issues = await ApiGet(address, "/api/v4/issues?scope=created_by_me&state=opened", api))

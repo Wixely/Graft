@@ -216,6 +216,37 @@ public sealed partial class GraftStore
         return ([.. visible.Skip(skip).Take(take)], visible.Count);
     }
 
+    /// <summary>
+    /// How much one person did on each day since <paramref name="sinceUtc"/>, for the profile's activity calendar: one for
+    /// each push, issue or merge request opened, merge and comment, as GitLab's calendar counts, in projects the viewer may
+    /// read the conversation of. Days are dated <paramref name="utcOffsetMinutes"/> from UTC, the viewer's own zone. The
+    /// same people may ask as for <see cref="ListUserActivityAsync"/>; anybody else gets null.
+    /// </summary>
+    public async Task<IReadOnlyDictionary<DateOnly, int>?> ActivityCalendarAsync(AuthenticatedIdentity viewer, long userId, DateTimeOffset sinceUtc,
+        int utcOffsetMinutes, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(viewer);
+        if (utcOffsetMinutes is < -14 * 60 or > 14 * 60) throw new ArgumentOutOfRangeException(nameof(utcOffsetMinutes));
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        AuthenticatedIdentity live = await RequireLiveIdentityAsync(db, null, viewer, cancellationToken);
+        if (live.UserId != userId && !live.IsAdministrator) return null;
+        IEnumerable<ActivityDayRow> rows = await db.QueryAsync<ActivityDayRow>("SELECT e.ProjectId, date(e.At, @Shift) AS Day, COUNT(*) AS Count FROM ("
+            + ActivityUnion + ") e WHERE e.UserId = @Id AND e.At >= @SinceUtc GROUP BY e.ProjectId, Day;",
+            new ActivityCalendarParameters(userId, sinceUtc.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture),
+                utcOffsetMinutes.ToString("+0;-0", CultureInfo.InvariantCulture) + " minutes"));
+        Dictionary<long, bool> readable = [];
+        Dictionary<DateOnly, int> days = [];
+        foreach (ActivityDayRow row in rows)
+        {
+            if (!readable.TryGetValue(row.ProjectId, out bool allowed))
+                readable[row.ProjectId] = allowed = (await DecideAsync(db, null, live, row.ProjectId, ProjectAction.ReadCollaboration, cancellationToken)).Allowed;
+            if (!allowed) continue;
+            DateOnly day = DateOnly.ParseExact(row.Day, "yyyy-MM-dd", CultureInfo.InvariantCulture);
+            days[day] = days.GetValueOrDefault(day) + (int)row.Count;
+        }
+        return days;
+    }
+
     // ---------------------------------------------------------------------------------------------------
     // Uploads
     // ---------------------------------------------------------------------------------------------------
@@ -389,6 +420,8 @@ internal sealed record AwardRow(long Id, long CommentId, string Name, long UserI
 internal sealed record SnippetNoteInsertParameters(long SnippetId, long AuthorUserId, string Body, string NowUtc);
 internal sealed record SnippetNoteRow(long Id, long SnippetId, long AuthorUserId, string AuthorUsername, string Body, string CreatedAtUtc);
 internal sealed record PushInsertParameters(long ProjectId, long? UserId, string Ref, string? BeforeSha, string? AfterSha, int CommitCount, string? CommitTitle, string NowUtc);
+internal sealed record ActivityDayRow(long ProjectId, string Day, long Count);
+internal sealed record ActivityCalendarParameters(long Id, string SinceUtc, string Shift);
 internal sealed record ActivityRow(long Kind, long SourceId, long ProjectId, long? UserId, string? Username, string At, long? TargetId, long? TargetIid,
     string? TargetTitle, string? SubjectType, string? Body, string? Ref, string? BeforeSha, string? AfterSha, long CommitCount, string? CommitTitle);
 internal sealed record UploadInsertParameters(long ProjectId, string Secret, string FileName, string ContentType, long Bytes, long UserId, string NowUtc);

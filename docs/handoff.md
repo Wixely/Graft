@@ -2,6 +2,14 @@
 
 Updated: 2026-11-02. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the project owner.
 
+## Added on 2026-11-02: an activity calendar on the profile
+
+A GitHub-style activity graph was wanted on the developer page; Graft has no public page per person (users
+cannot look each other up), so it is on `/-/profile`. `ActivityCalendar.razor` draws it as SVG (the CSP forbids
+style attributes); colours are `--activity-0..4` tokens in Graft's blue, not GitHub's green.
+`GraftStore.ActivityCalendarAsync` groups the activity union by project and day, shifted by the reader's offset, and
+drops projects the reader may not read. The Git suite checks it in `CheckClientSurfaces`.
+
 ## Added on 2026-11-02: import by address, and mirrors that outlive the original
 
 A repository can now be imported by URL and kept up to date, mainly so that a relatively recent copy survives if

@@ -23,6 +23,8 @@ else if (Api.Authenticated)
 
     <Banner Message="@message" Kind="@messageKind" />
 
+    <ActivityCalendar UserId="@Api.Session!.UserId" />
+
     <div class="tabs">
         <button type="button" class="@(tab == "tokens" ? "active" : "")" @onclick='() => tab = "tokens"'>Access tokens</button>
         <button type="button" class="@(tab == "keys" ? "active" : "")" @onclick='() => tab = "keys"'>SSH keys</button>

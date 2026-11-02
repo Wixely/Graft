@@ -124,6 +124,11 @@ Then the first of the four large items, in the order given:
 
 ## Closed on 2026-11-02
 
+- **An activity calendar on the profile.** A year of the person's contributions a day at a time, shaded like
+  GitHub's, at the top of `/-/profile`. It counts what the activity feed counts (one per push, issue or merge request
+  opened, merge and comment, as GitLab's calendar does, not commits), in projects the reader may read, by the
+  reader's own day. Browser route `GET /api/users/:id/calendar?utc_offset=`, for the person and administrators only,
+  as the feed is. GitLab's `/users/:username/calendar.json` is not served.
 - **Import a repository by its address, and keep it up to date.** A project can be created from an http or https
   address, fetched by Graft's own client, and kept up to date on a schedule so that a copy survives the original being
   taken down: updates never remove anything, and a rewritten branch keeps its old tip. Behind `--url-import`, off by

@@ -40,6 +40,13 @@
     --shadow-card: 0 1px 2px #1f23280d;
     --shadow-overlay: 0 8px 24px #1f232826;
 
+    /* The activity calendar, from no contributions to the most. */
+    --activity-0: #e4e7eb;
+    --activity-1: #b6d3fb;
+    --activity-2: #6ea6f4;
+    --activity-3: #2f7ded;
+    --activity-4: #144fa8;
+
     --radius: 6px;
     --radius-large: 8px;
     --topbar-height: 44px;
@@ -96,6 +103,12 @@
 
     --shadow-card: 0 1px 2px #00000052;
     --shadow-overlay: 0 8px 24px #00000080;
+
+    --activity-0: #23272f;
+    --activity-1: #0e3a55;
+    --activity-2: #1673a6;
+    --activity-3: #2fa4e0;
+    --activity-4: #74d2ff;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -133,6 +146,12 @@
 
         --shadow-card: 0 1px 2px #00000052;
         --shadow-overlay: 0 8px 24px #00000080;
+
+        --activity-0: #23272f;
+        --activity-1: #0e3a55;
+        --activity-2: #1673a6;
+        --activity-3: #2fa4e0;
+        --activity-4: #74d2ff;
     }
 }
 
@@ -808,3 +827,17 @@ progress.progress::-moz-progress-bar { background: var(--success); }
 /* Wide forms for prose: the wiki editor and a snippet's content. */
 form.form.wide { max-width: none; }
 form.form.wide textarea.mono { font-family: var(--font-mono); font-size: 12px; }
+
+/* Activity calendar: a year of contributions, a column a week, drawn as SVG so no cell needs a style attribute. */
+.activity-calendar { overflow-x: auto; }
+.activity-calendar svg { display: block; width: 100%; min-width: 640px; max-width: 980px; height: auto; font-family: var(--font-sans); }
+.activity-calendar text { fill: var(--text-secondary); font-size: 10px; }
+.activity-calendar rect, .activity-legend rect { stroke: var(--border-muted); stroke-width: 1px; }
+.activity-calendar .level-0, .activity-legend .level-0 { fill: var(--activity-0); }
+.activity-calendar .level-1, .activity-legend .level-1 { fill: var(--activity-1); }
+.activity-calendar .level-2, .activity-legend .level-2 { fill: var(--activity-2); }
+.activity-calendar .level-3, .activity-legend .level-3 { fill: var(--activity-3); }
+.activity-calendar .level-4, .activity-legend .level-4 { fill: var(--activity-4); }
+.activity-legend { display: flex; align-items: center; gap: 3px; justify-content: flex-end; margin-top: var(--space-2); color: var(--text-secondary); font-size: 12px; }
+.activity-legend svg { display: block; }
+.activity-legend span { margin: 0 var(--space-1); }
