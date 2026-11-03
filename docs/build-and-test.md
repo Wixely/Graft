@@ -34,6 +34,8 @@ Since 2026-11-03 DnaX, CupriNet and CupriMark restore from Wixely's GitHub Packa
 dotnet nuget add source https://nuget.pkg.github.com/Wixely/index.json --name GitHub-Wixely-Packages --username <github user> --password <token with read:packages>
 ```
 
+Or run `powershell -ExecutionPolicy Bypass -File eng\set-packages-token.ps1`, which prompts for the token without echoing it (Enter uses Git's GitHub credential), checks the feed accepts it and asks again if not, then stores it encrypted in `%APPDATA%\NuGet\NuGet.Config`. The feed takes only classic tokens; a fine-grained one (`github_pat_...`) is refused.
+
 A machine whose NuGet cache still holds DnaX 10.0.0-alpha.13 packed from the old local feed fails restore with NU1403 until the `10.0.0-alpha.13` folders under `%USERPROFILE%\.nuget\packages\dnax.data.migrations`, `dnax.data.migrations.sqlite` and `dnax.uploads` are removed. The experiments under `experiments/` keep their own `NuGet.config` and the old local feed.
 
 The release executables are built by `eng\build-windows.ps1` and `eng/build-linux.sh`, which `.github/workflows/release.yml` runs on a `v*` tag; both document how to run them locally.
