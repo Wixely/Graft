@@ -10,6 +10,7 @@
 # Alpine 3.21 because the forge embeds that release's ICU data (icudt74l.dat). Writes artifacts/release/*-linux-x64
 # and smoke-tests each one.
 set -eu
+echo "Building Graft $1 for linux-x64 in $(cat /etc/alpine-release 2>/dev/null || echo unknown)"
 version=${1:?usage: eng/build-linux.sh <version>}
 repository=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repository"
@@ -17,11 +18,11 @@ test -f artifacts/client/wwwroot/index.html || { echo "artifacts/client is missi
 
 apk add --no-cache bash curl unzip file binutils git ca-certificates libstdc++ libgcc icu-libs \
     clang build-base zlib-dev zlib-static openssl-dev openssl-libs-static icu-dev icu-static icu-data-full \
-    cmake linux-headers lttng-ust libunwind >/dev/null
+    cmake linux-headers lttng-ust libunwind
 
 if ! command -v dotnet >/dev/null 2>&1; then
     curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
-    bash /tmp/dotnet-install.sh --jsonfile global.json --install-dir /usr/share/dotnet >/dev/null
+    bash /tmp/dotnet-install.sh --jsonfile global.json --install-dir /usr/share/dotnet
     ln -sf /usr/share/dotnet/dotnet /usr/local/bin/dotnet
 fi
 export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 DOTNET_GENERATE_ASPNET_CERTIFICATE=false
@@ -32,7 +33,8 @@ mkdir -p "$out" artifacts/publish
 common="-c Release -r linux-musl-x64 --self-contained true -p:Version=$version"
 
 publish() { # project, property, published name, release name
-    dotnet publish "src/$1/$1.csproj" $common -p:"$2"=true $4 -o "artifacts/publish/$1-linux" >/dev/null
+    echo "Publishing $1"
+    dotnet publish "src/$1/$1.csproj" $common -p:"$2"=true $4 -o "artifacts/publish/$1-linux" -nologo -v q
     cp "artifacts/publish/$1-linux/$3" "$out/$5"
 }
 publish Graft.Server GraftServerStatic Graft.Server "-p:GraftSkipClientPublish=true -p:GraftSqliteLibrary=$repository/$sqlite" graft-server-linux-x64
