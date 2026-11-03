@@ -18,8 +18,11 @@ agent can follow. [ADR 0044](decisions/0044-releases.md).
   release; a manual run publishes nothing.
 - **Trap found.** The old static Linux build linked Alpine's libsqlite3, whose foreign keys default off; e_sqlite3's
   default on. The release builds compile SQLite with e_sqlite3's options on both platforms.
-- **Locally.** `link.exe` failed under a long `NUGET_PACKAGES` path (MAX_PATH); `artifacts
-uget` works.
+- **Locally.** `link.exe` failed under a long `NUGET_PACKAGES` path (MAX_PATH); `artifacts\nuget` works.
+- **Released.** v0.1.0 on 2026-11-03: https://github.com/Wixely/Graft/releases/tag/v0.1.0 and `ghcr.io/wixely/graft:0.1.0`.
+  Next action, owner user: remove the three cached DnaX alpha.13 folders on the development machine (NU1403 until
+  then) and try an install from the README; owner implementation agent: run the released Linux executables on the
+  3.10 host.
 
 ## Added on 2026-11-03: git-remote-graft, for a proxy that limits requests
 
