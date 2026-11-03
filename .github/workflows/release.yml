@@ -121,12 +121,15 @@ jobs:
         with:
           name: client
           path: artifacts/client
+      # Into the checkout's own NuGet.config, which the build container mounts; the runner's user configuration it
+      # cannot see. The checkout is thrown away with the job.
       - name: Authenticate to GitHub Packages
         run: |
           dotnet nuget update source GitHub-Wixely-Packages \
             --username "${{ github.actor }}" \
             --password "${{ secrets.GITHUB_TOKEN }}" \
-            --store-password-in-clear-text
+            --store-password-in-clear-text \
+            --configfile NuGet.config
       # Built in Alpine 3.21 exactly as eng/build-linux.sh documents for a local build.
       - name: Build and smoke-test
         run: docker run --rm -v "$PWD:/src" -w /src alpine:3.21 sh eng/build-linux.sh '${{ needs.version.outputs.version }}'
