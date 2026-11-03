@@ -1,7 +1,7 @@
 # 0044: Releases: single-file executables from a tag, packages from GitHub Packages
 
 - Date: 2026-11-03
-- Status: Accepted, implemented; the first tagged run is the remaining proof
+- Status: Accepted, implemented; v0.1.0 released 2026-11-03
 - Source: A request on 2026-11-03 for releases built by GitHub Actions on a version tag: the forge for Windows, Linux
   and Docker and the helper for Windows and Linux, preferably as single standalone executables; DnaX, CupriNet and
   CupriMark from the GitHub Packages feed; the image on GHCR; Graft.Admin and graft-runner as well, with install
@@ -73,5 +73,9 @@ log moved to [history](../history.md).
   DnaX, the release runner (`GRAFT_RUNNER`) and helper (`GRAFT_REMOTE_HELPER`); MVP-04, 215, on the feed's packages.
   The helper check now installs the helper under the name Git looks for, as the README tells people to.
 
-Not verified until the first tagged run: the Linux build and the image in GitHub Actions, the workflow's access to the
-feed with its own token, and the published release.
+- In GitHub Actions: four manual runs found and fixed what a local build could not (a credential the Linux build
+  container could not see, and ignore files that hid `artifacts/container` from the image build); the fourth passed
+  every job. Tag `v0.1.0` then published the release with eight executables and `SHA256SUMS`, and
+  `ghcr.io/wixely/graft:0.1.0` and `:latest`, which pull anonymously. The workflow's own token reads the feed.
+
+Not verified: the released Linux executables on the 3.10 host, and an install that follows the README end to end.
