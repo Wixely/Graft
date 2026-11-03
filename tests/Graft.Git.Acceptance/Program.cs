@@ -5954,8 +5954,14 @@ async Task<string> CheckRemoteHelper(string address, AuthenticatedIdentity alice
         await RunGit(root, ["lfs", "install"], environment);
         var lfsClone = await RunGit(root, [.. credential, "clone", repository, "relayed-lfs"], traced);
         string model = Path.Combine(root, "relayed-lfs", "model.dat");
-        Check(lfsClone.ExitCode == 0 && lfsClone.Errors.Contains("starting transfer adapter \"graft\"", StringComparison.Ordinal) &&
-            File.Exists(model) && File.ReadAllBytes(model).AsSpan().SequenceEqual(large), "and downloads through it, every byte, in a fresh clone");
+        bool transferred = lfsClone.Errors.Contains("starting transfer adapter \"graft\"", StringComparison.Ordinal);
+        bool downloaded = lfsClone.ExitCode == 0 && transferred && File.Exists(model) && File.ReadAllBytes(model).AsSpan().SequenceEqual(large);
+        // The clone runs traced, so a failure names which part failed and keeps what git and git-lfs said, without the trace.
+        Check(downloaded, "and downloads through it, every byte, in a fresh clone" + (downloaded ? "" :
+            " (exit " + lfsClone.ExitCode + ", graft transfer " + (transferred ? "started" : "not started") + ", model.dat " +
+            (File.Exists(model) ? new FileInfo(model).Length + " bytes" : "missing") + "): " +
+            Redact(string.Join(" | ", lfsClone.Errors.Split('\n').Select(line => line.Trim())
+                .Where(line => line.Length > 0 && !line.Contains("trace:", StringComparison.Ordinal) && !line.Contains("trace git-lfs", StringComparison.Ordinal)).TakeLast(8)))));
     }
     else Console.WriteLine("SKIP: git-lfs is not installed, so the graft transfer for large files is exercised over HTTP only.");
 
