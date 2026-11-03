@@ -278,7 +278,7 @@ dotnet nuget add source https://nuget.pkg.github.com/Wixely/index.json --name Gi
   --username <your-github-user> --password <token-with-read:packages>
 ```
 
-On Windows, `powershell -ExecutionPolicy Bypass -File engset-packages-token.ps1` does the same: it asks for the token
+On Windows, `powershell -ExecutionPolicy Bypass -File eng\set-packages-token.ps1` does the same: it asks for the token
 without showing it (Enter uses the GitHub sign-in Git already has), checks the feed accepts it, then stores it. The feed
 takes only classic tokens; a fine-grained one (`github_pat_...`) is refused.
 
