@@ -1,333 +1,307 @@
 # Graft
 
-Repository capacity as of **2026-10-24**: 4 GiB of uncompressed object history, with
-64 MiB individual objects. Git transfers and archives use temporary files, and stored
-objects load on demand. See [limits and operational requirements](docs/decisions/0018-repository-capacity.md)
-and [validation](docs/validation/2026-10-24-repository-capacity.md).
-
 <p align="center">
   <img src="docs/assets/graft-readme-blue.png" alt="Graft" width="600" />
 </p>
 
-Graft is a planned locally hosted GitLab alternative in C#/.NET 10. It targets GitLab APIs, URL conventions, applications and CI/CD, with simpler operations, permissions and runners, low resource use, and GitLab data import.
+Graft is a self-hosted Git forge written in C#/.NET 10. It speaks GitLab's REST API and URL conventions, so GitLab
+clients and tools work against it, and it aims to be simpler to run than GitLab: every part is one executable with
+nothing to install beside it, the data is one SQLite database and a directory of bare repositories, and nothing
+else needs running.
 
-Status as of **2026-09-20**: [MVP-08 packaging and resource validation](docs/validation/2026-09-19-mvp08-packaging-resources.md) conditionally passes. Windows NativeAOT interactive and Windows Service, Linux static-musl interactive/systemd, and rootless Podman paths are implemented and tested; the recorded Linux static binaries retain all 76 Git/API/project-creation and 36 recovery assertions. That Windows Git/API/browser workflow passed **135 assertions** under the runtime and NativeAOT at the time, including [administrator user creation and project membership](docs/validation/2026-09-19-user-membership.md), [personal access-token lifecycle](docs/validation/2026-09-19-personal-access-tokens.md), and [account credential lifecycle](docs/validation/2026-09-20-account-credentials.md). The GitLab 18.0.0 source fixture passes against Graft and a [live reference](docs/validation/2026-09-19-gitlab-18-live-reference.md), while pinned `glab` 1.58.0 passes against both. The rendered Blazor workflow and one-use [operator bootstrap](docs/validation/2026-09-19-operator-bootstrap.md) pass. The Linux 3.10.108 run is deferred. DnaX distribution and a real CA/DNS trust environment remain gates. Remote hosting and the project licence are undecided. The repository itself is public at github.com/Wixely/Graft.
+- **Download:** [Releases](https://github.com/Wixely/Graft/releases): Windows and Linux executables, and a container
+  image at `ghcr.io/wixely/graft`.
+- **Install:** [the forge](#installing-the-forge), [a runner](#installing-a-runner),
+  [git-remote-graft](#git-remote-graft-for-a-forge-behind-cloudflare-or-another-proxy), and
+  [step by step for an agent](#for-agents-installing-graft-unattended).
+- **Status:** working and used, not finished. What exists is below; what does not is in
+  [the backlog](docs/backlog.md), and GitLab compatibility is tracked per route in [compatibility](docs/compatibility.md).
+  The project's licence is still undecided.
 
-Status as of **2026-10-22**, last of the day: things can be got out of Graft without cloning it. A file
-downloads as its exact bytes, the whole tree downloads as a gzipped tar or a zip, and tags are listed,
-created and deleted, with an annotated tag pushed by a client described correctly beside one made here.
-Repository bytes are always served as an attachment of unknown type, never as the type the content looks
-like, because this origin holds the session cookie and the API and that is the same reason project sites
-have a hostname of their own. Two defects went with it: an empty repository used to report a permission
-problem, and a commit link into a public project used to fail for anyone who was not a member. See
-[ADR 0017](docs/decisions/0017-getting-things-out.md) and
-[the evidence](docs/validation/2026-10-22-fetching.md).
+## What it does
 
-Status as of **2026-10-22**, later the same day: the review journey works end to end. The merge request
-page renders the diff rather than only listing which files changed. A comment can sit on a line, and when
-the branch is pushed to afterwards it is reported as written against an earlier version rather than
-silently re-anchored to whatever now occupies that line number. A project can require approvals, which
-count only while the commit they were given against is still the one being merged, so a push supersedes
-them; an author cannot approve their own. Branches can be created and removed without a Git client, and a
-merge can take the source branch with it.
+- **Git** over HTTPS and SSH, protocol versions 0 and 2, with Git LFS, served by Graft's own managed Git engine:
+  no `git` executable on the server. Repositories up to 4 GiB of history, 64 MiB per object
+  ([ADR 0018](docs/decisions/0018-repository-capacity.md)).
+- **Projects and groups** with nested groups, roles that inherit, private, unlisted and public visibility, forks, an address with no owner in it (`/projects/<slug>`), and import from another server's address,
+  kept up to date as a mirror that never deletes ([ADR 0042](docs/decisions/0042-import-by-address-and-mirrors.md)).
+- **Collaboration:** issues, merge requests with diffs, line comments, approvals, code owners, squash and rebase
+  merges, boards, milestones, labels, time tracking, releases, wikis, snippets and an activity feed.
+- **Pipelines** from a subset of `.gitlab-ci.yml`, run by Graft's own runner, which reaches the forge over CupriNet
+  without needing a certificate or an HTTPS route ([ADR 0037](docs/decisions/0037-runners-over-cuprinet.md)).
+- **Packages and container images** stored beside the repository, webhooks, a notification inbox, optional email,
+  an authenticator-app second factor, personal access tokens and SSH keys.
+- **Agents:** a Model Context Protocol endpoint at `/mcp` and a guide at `/llms.txt`
+  ([ADR 0009](docs/decisions/0009-mcp-in-the-forge.md)).
+- **Behind a limiting proxy:** `git-remote-graft` sends pushes, fetches and LFS files in parts small enough for
+  Cloudflare's free plan ([ADR 0043](docs/decisions/0043-chunked-transfers-git-remote-graft.md)).
 
-A project can also ask to be told. `--webhooks true`, off by default, lets a Maintainer register a hook for
-pushes, issues, merge requests and comments; each delivery carries an HMAC over its exact body so a
-receiver can tell a real one from anything else that found its address. Turning the switch on lets a
-project Maintainer make the server call an address of their choosing, which is why it is the operator's.
-See [ADR 0015](docs/decisions/0015-review-journey.md), [ADR 0016](docs/decisions/0016-webhooks.md) and
-[the evidence](docs/validation/2026-10-22-review.md).
+## Downloads
 
-Email is optional. Graft sends nothing unless `--mail-smtp` names a server, and it works without one: a
-forgotten password is reset with a one-time link an administrator makes and hands over, so the administrator
-never knows the password the person chooses. With a mail server, the sign-in page lets people ask for that
-link themselves, sent to the address on their account. See [ADR 0032](docs/decisions/0032-email-is-optional.md).
+Every [release](https://github.com/Wixely/Graft/releases) carries these, each a single executable. The Linux ones are
+static and run on any x64 Linux, old kernels included. `SHA256SUMS` lists every file's hash.
 
-What needs you arrives in an inbox, with or without mail: being assigned, being asked to review, and whatever
-happens to an issue or proposal you are part of, written in the same transaction as the event and read from the
-bell in the header, `/-/notifications`, or GitLab's `/api/v4/todos`. A message per entry is a preference, off
-by default, and only ever a copy of the inbox. See [ADR 0033](docs/decisions/0033-notifications.md).
+| File | What it is |
+|---|---|
+| `graft-server-win-x64.exe`, `graft-server-linux-x64` | The forge. |
+| `graft-admin-win-x64.exe`, `graft-admin-linux-x64` | Creates the first administrator; backs up, verifies and restores. |
+| `graft-runner-win-x64.exe`, `graft-runner-linux-x64` | Runs pipelines. |
+| `git-remote-graft-win-x64.exe`, `git-remote-graft-linux-x64` | Git's helper for a forge behind a proxy that limits uploads. |
+| `ghcr.io/wixely/graft:<version>` | The forge in a container, with every runner and helper download inside. |
 
-An account can ask for a code from an authenticator app after its password. The factor is the app and nothing
-else: no email, no phone number, recovery codes for the day the app is gone, and an administrator to remove it
-for the person who lost both. Tokens and SSH keys are unaffected. See [ADR 0034](docs/decisions/0034-second-factor.md).
+The latest release's files are always at `https://github.com/Wixely/Graft/releases/latest/download/<file>`.
 
-Projects can belong to a group rather than a person, and a group can hold groups. A role in a group is held
-on every group and project beneath it, so a team is granted once. A project under `team/platform` is
-`team/platform/api` to the API, to Git over HTTPS and to Git over SSH; in the browser its namespace travels as
-one encoded segment, and the natural address redirects there. See [ADR 0035](docs/decisions/0035-groups.md).
+## Installing the forge
 
-Graft runs pipelines on runners of its own. An administrator creates a runner and copies an install script to
-the build machine; the script carries the forge's CupriNet Intonation and a one-time token, registers the runner
-and installs it as a service. The runner then reaches the forge over CupriNet, pinning the forge's key, with no
-certificate, DNS name or HTTPS route needed, fetches each job's source over the same connection, and streams the
-log back. A push carrying `.gitlab-ci.yml` makes a pipeline, run stage by stage; Graft reads a strict subset of
-the format and names anything else it is asked for. See [ADR 0037](docs/decisions/0037-runners-over-cuprinet.md).
-A job can keep artifacts, downloadable from its page and GitLab's job artifacts route. Sources and artifacts go
-whole up to 80 MiB and in verified, resumable chunks above it, a line the operator can move or turn off
-([ADR 0038](docs/decisions/0038-chunked-runner-transfers-and-artifacts.md)).
+Graft needs HTTPS. On loopback it makes itself a short-lived certificate, which is enough to try it; anywhere else it
+needs a PKCS#12 certificate whose subject alternative name matches the address people use, the certificate's password
+in a file of its own, and that address as `--origin`. The [deployment runbook](docs/deployment.md) covers certificates,
+proxies such as IIS and Cloudflare, temporary disk space and every option.
 
-Whoever may manage a project can read what has been done to it: the audit entries that name the project, its
-issues, proposals and comments, or its releases, packages, images and snippets, at the bottom of the settings
-tab and at GitLab's `audit_events` route. The whole trail stays the administrator's. See
-[ADR 0036](docs/decisions/0036-project-audit.md).
+### Try it
 
-Status as of **2026-10-22**: Graft hosts the conversation about the code, not just the code. A project now
-has issues, merge requests and comments on both, numbered from one within that project. Reading them
-follows the repository, so a public project's issues are readable by a stranger; writing on them needs
-membership, because a public project that accepted anonymous writing would be a spam target and there is no
-moderation to fall back on.
+```powershell
+# Windows; the same on Linux with graft-admin-linux-x64 and graft-server-linux-x64
+New-Item -ItemType Directory -Force graft-data | Out-Null
+Set-Content -NoNewline graft-data\admin-password.txt 'choose-a-long-password'
+.\graft-admin-win-x64.exe bootstrap --database graft-data\graft.db --repositories graft-data\repositories --username admin --password-file graft-data\admin-password.txt
+Remove-Item graft-data\admin-password.txt
+.\graft-server-win-x64.exe --database graft-data\graft.db --repositories graft-data\repositories --listen https://127.0.0.1:7443
+```
 
-Merging is narrower than other forges and says so rather than guessing. It fast-forwards where the target
-branch is an ancestor of the source, writes a two-parent merge commit where both branches moved but touched
-different files, and refuses where both changed the same file, naming those files so the author can merge
-locally. It does not merge file contents, because a forge that produced a silently wrong merge would be
-worse than one that admits the limit. Each proposal reports which of those three it is in before anything
-is merged. Real Git fetches the result, finds two parents and passes `git fsck --strict`.
+Open `https://127.0.0.1:7443`, accept the certificate warning, and sign in as `admin`. The server prints `READY:` with
+its address when it is listening.
 
-Two smaller absences closed with it. A project can be deleted, by its owner or an administrator, with the
-path typed back in the browser and irreversibly; and the audit trail, written on every sensitive act since
-the first migration, can finally be read by an administrator. Nine new agent tools bring the Model Context
-Protocol surface to 28; deleting a project is deliberately not one of them. See
-[ADR 0013](docs/decisions/0013-project-deletion-and-audit.md),
-[ADR 0014](docs/decisions/0014-collaboration.md) and
-[the evidence](docs/validation/2026-10-22-collaboration.md).
+### First administrator
 
-What Graft still does not do is now written down in one place rather than discovered: see
-[the backlog](docs/backlog.md).
+`graft-admin bootstrap` creates the first administrator, once, while the server is stopped. The password is read
+from a file so it never appears in a command line or a process list; delete the file once you have signed in.
+Everyone else is created by an administrator in the browser, under **Administration**, **Users**.
 
-Status as of **2026-10-21**: a personal access token's secret never enters the page. Creating one returns a
-single-use handle rather than the secret; pressing Copy claims it with one request and writes it straight
-to the clipboard. A token nobody copies therefore never reaches the browser, and a copied one is never in
-the document for a screenshot or an extension to find. The secret waits in server memory for five minutes
-and one read, never on disk, and is shown only if the clipboard refuses, because losing a token that cannot
-be produced again is worse. Separately, an operator can now switch on
-`--recoverable-tokens`, which keeps each new token's secret encrypted so its owner can copy it again with
-their account password. Off by default, because with it on the database and its key ring together are every
-token on the instance; see [ADR 0012](docs/decisions/0012-recoverable-tokens.md).
+### Windows service
 
-Status as of **2026-10-20**: the project page is now what it was always meant to be. A `.graft/project.json`
-in the repository says what the page offers, a file allowlist decides which files are reachable, and a
-folder in the repository can be served as a static website, GitHub Pages style, from a hostname of its own
-behind `--pages-origin`. Everything is deny by default: no allowlist means no files, and nothing outside the
-site folder is reachable at all. A page still cannot clone, show history or show a diff, because those walk
-the object graph and no filter makes a graph walk honour a path allowlist. See
-[project pages](docs/project-pages.md), a [worked sample](samples/project-page/SAMPLE.md) and
-[the evidence](docs/validation/2026-10-20-project-pages.md).
+```powershell
+# As an administrator. Paths are examples; the service account needs write access to the data directory.
+New-Item -ItemType Directory -Force 'C:\Program Files\Graft', 'C:\ProgramData\Graft\secrets' | Out-Null
+Copy-Item graft-server-win-x64.exe 'C:\Program Files\Graft\Graft.Server.exe'
+sc.exe create Graft start= auto binPath= '"C:\Program Files\Graft\Graft.Server.exe" --database "C:\ProgramData\Graft\graft.db" --repositories "C:\ProgramData\Graft\repositories" --listen https://0.0.0.0:7443 --origin https://graft.example.com:7443 --certificate "C:\ProgramData\Graft\secrets\tls.pfx" --certificate-password-file "C:\ProgramData\Graft\secrets\tls-password"'
+sc.exe start Graft
+```
 
-Graft also explains itself to agents, so one need not learn the forge by failing. The Model Context
-Protocol handshake carries a short overview, a `graft_help` tool serves topics on demand, and `/llms.txt`
-publishes the whole guide unauthenticated for anything that reads a URL rather than speaking the protocol.
-All three read the same text, because a guide that drifts between surfaces is worse than none.
+### Linux and systemd
 
-Status as of **2026-10-19**: agent access is at parity with what a credential can do. The gap was never
-missing tools: almost every mutating route accepted a browser session and nothing else, so no token could
-edit a description, write a file or grant a role. Six capabilities were opened to tokens as GitLab-shaped
-routes, taking the tool set to eighteen, and the browser gained the name and description editing the
-product itself never had. Four capabilities stay deliberately out of reach of any agent: account
-administration, password resets, token issue and revocation, and the agent switches themselves. See
-[ADR 0011](docs/decisions/0011-agent-parity.md) and
-[the evidence](docs/validation/2026-10-19-agent-parity.md).
+```sh
+sudo install -m 755 graft-server-linux-x64 /opt/graft/Graft.Server
+sudo useradd --system --home /var/lib/graft --create-home graft
+```
 
-Status as of **2026-10-19**: every project now has a second address with no account name in it,
-`/projects/<slug>`, so a link can be shared without naming its owner. Browsing, cloning and pushing all work
-through it and the owned `/<owner>/<slug>` path is unchanged. The slug is assigned automatically from the
-project's own path, gaining a short random suffix when that name is already taken instance-wide, and
-existing projects are given one on upgrade. It is an alias and nothing more: the same permission decision,
-the same refusals, and a concealed project answers identically through either address. See
-[ADR 0010](docs/decisions/0010-project-slugs.md) and
-[the evidence](docs/validation/2026-10-19-project-slugs.md).
+Then fill in the `@...@` placeholders of [deploy/systemd/graft.service](deploy/systemd/graft.service) (executable,
+data directory, listen address, origin and certificate files readable only by `graft`), install it as
+`/etc/systemd/system/graft.service`, and run `sudo systemctl daemon-reload && sudo systemctl enable --now graft`.
+`curl --insecure https://127.0.0.1:7443/healthz` answers once it is up.
 
-Status as of **2026-10-16**: the Model Context Protocol endpoint is part of the forge. `--mcp true`, or
-`GRAFT_MCP=true` in the container deployment, serves it at `/mcp` on the same port and certificate as
-everything else; nothing else about a deployment changes, and the compose profile, second port and
-plain-HTTP overlay are gone. Once on, an administrator decides in the browser, under Administration, Agent
-access, whether agents are served, whether they may change anything, and whether callers with no token are
-served at all, and each change applies to the next request with nothing restarted. The tools are the same
-ones and still reach Graft over the REST API with each caller's own token, so an agent can do exactly what
-that token could do with curl. What made this possible is that the MCP SDK turned out to publish NativeAOT
-cleanly, on its own and with no warning inside the forge, which [ADR 0008](docs/decisions/0008-mcp-layer.md)
-had named as the thing to wait for. The same first native publish of the forge in weeks found that the
-upload transport, not MCP, stops the native forge from starting, and that one MSBuild property in that
-package fixes it: rebuilt that way, the forge publishes native with no warnings and passes all 82 MCP and
-389 Git assertions as a native binary. Releasing that package is the next action. See [ADR 0009](docs/decisions/0009-mcp-in-the-forge.md) and
-[the evidence](docs/validation/2026-10-16-mcp-in-the-forge.md).
+### Container
 
-Status as of **2026-10-13**: the Model Context Protocol server ships in the standard container image and
-starts under a compose profile, so enabling agent access is a restart rather than a rebuild and an operator
-who wants none has nothing listening. It carries no credential of its own: every caller sends their own
-Graft token, and a caller presenting none is refused unless an operator explicitly allows that. A second
-overlay serves the endpoint over plain HTTP for an internal network, which also has to be asked for. The
-reference compose file is hardened by default and every posture was verified in a real container runtime;
-see [deployment evidence](docs/validation/2026-10-13-mcp-in-the-deployment.md).
+```sh
+docker pull ghcr.io/wixely/graft:latest
+```
 
-Graft also ships the same tools as a separate launcher, `src/Graft.Mcp`, speaking stdio for clients that
-start their MCP server locally, and Streamable HTTP on its own. It reaches Graft through the ordinary REST
-API with a personal access token, so an agent can do exactly what that token's owner can do and nothing
-more, and mutating tools are refused unless it is started with writes allowed. Two settings that were
-previously browser-only gained token equivalents to support it, one of which is a route GitLab already has.
-See [ADR 0008](docs/decisions/0008-mcp-layer.md), partly superseded by ADR 0009 above.
+[deploy/container/compose.yaml](deploy/container/compose.yaml) runs it as an unprivileged user on a read-only root
+filesystem with one data volume. Copy [deploy/container/.env.example](deploy/container/.env.example) to `.env`, set
+`GRAFT_IMAGE=ghcr.io/wixely/graft:<version>` and the certificate and origin it documents, then
+`docker compose --file deploy/container/compose.yaml up --detach`. Create the first administrator first, with the
+admin tool inside the image, before the forge's first start. The password file is mounted for that one command and
+must be readable by the image's user, UID 1654:
 
-Status as of **2026-10-13**: signing in now lasts. A session was expiring fifteen minutes after sign-in
-whatever you were doing, because the expiry was set once and never moved; it is now an idle window renewed
-by use, 12 hours by default via `--session-minutes`, with a 30 day ceiling from sign-in.
+```sh
+printf '%s' 'choose-a-long-password' > admin-password && chmod 644 admin-password
+docker compose --file deploy/container/compose.yaml run --rm -v "$PWD/admin-password:/run/admin-password:ro" \
+  --entrypoint /app/Graft.Admin graft \
+  bootstrap --database /data/graft.db --repositories /data/repositories --username admin --password-file /run/admin-password
+rm admin-password
+```
 
-Status as of **2026-10-13**: a fix worth calling out on its own. Every push larger than one mebibyte had
-been failing over HTTP, because Git settles authentication with an empty probe request before streaming a
-body it cannot replay, and Graft answered that probe with an error. Small pushes fit in the client's buffer
-and were never probed, which is why it went unnoticed. A lone flush packet is now answered with an empty
-result, as Git's own server does, and the suite pushes an incompressible two-mebibyte repository to keep
-that path exercised.
+The image carries the runner and `git-remote-graft` for every platform in `/app/downloads`, which the forge serves to
+its install scripts.
 
-A push to a path holding no project can also create one, behind `--push-to-create`, off by default. The
-project is created private, owned by the pusher, in the pusher's own namespace only. See
-[ADR 0007](docs/decisions/0007-push-to-create.md).
+### Options worth knowing
 
-Status as of **2026-10-13**: a project can now be read by someone with no account. Visibility is stored for
-the first time, as `private`, `unlisted` or `public`, and a public or unlisted repository browses and clones
-with no credentials. A public one is listed and searchable on an `/-/explore` page that anonymous visitors
-reach. The four executable suites pass **389**, **129**, **41** and **36** assertions. See
-[visibility evidence](docs/validation/2026-10-13-visibility-and-public-browsing.md) and
-[ADR 0006](docs/decisions/0006-project-pages-and-public-browsing.md).
+All are off or at their default unless given. The [deployment runbook](docs/deployment.md) has every one.
 
-Access resolves to exactly one grant, and the grant carries its own reach: membership, then the repository's
-visibility, then a published project page, then nothing. The first that applies wins, so "the repository's
-settings take precedence over the page's" is a property of the order rather than of a pile of flags. A
-published page can never offer clone, history or a diff, because all three walk the object graph and a pack
-is reachability-shaped rather than path-shaped. Publishing is also an operator switch, off by default, and
-with it off a stored `public` is inert rather than merely unlisted, so a database restored onto a host whose
-operator never allowed publishing does not start serving strangers.
+| Option | Effect |
+|---|---|
+| `--origin https://host` | The address people reach the forge at; required off loopback. |
+| `--ssh-port <port>` | Serve Git over SSH. |
+| `--runner-port <port>` | Accept runners ([ADR 0037](docs/decisions/0037-runners-over-cuprinet.md)). |
+| `--runner-downloads <directory>` | Serve the runner and `git-remote-graft` executables from this directory to the install scripts. Put the release's `graft-runner-*` and `git-remote-graft-*` files there under their release names. |
+| `--transfer-part-size <MiB>` | Largest part `git-remote-graft` sends; 16 by default, under Cloudflare's 100 MB. |
+| `--url-import public\|any` | Allow importing and mirroring repositories by address. |
+| `--public-browsing true` | Let public projects be read without signing in. |
+| `--mcp true` | Serve the Model Context Protocol endpoint at `/mcp`. |
+| `--webhooks true`, `--mail-smtp <url>` | Outbound webhooks; email. |
 
-The curated file surface that a project page is meant to carry, configured from a `.graft` folder in the
-repository, is designed in ADR 0006 and **not yet built**. A published page currently shows a project's name,
-description and avatar and no repository content.
+## Installing a runner
 
-Status as of **2026-10-09**: the work below is merged to `main`.
-The three executable suites pass **302**, **110** and **41** assertions.
+A runner is installed from a script the forge writes. An administrator opens **Administration**, **Runners**, creates
+a runner, and copies its install script, which carries a one-time registration token valid for a day. Run it on the
+machine that will run jobs:
 
-A [rebuilt browser UI](docs/validation/2026-10-04-ui-overhaul.md) with light and dark themes;
-[browser uploads](docs/validation/2026-10-04-browser-uploads.md) through DnaX
-([ADR 0005](docs/decisions/0005-browser-upload-transport.md)) for Git bundle inspection, repository file
-commits and avatars; [server-authored Git objects](docs/validation/2026-10-04-server-authored-commits.md)
-byte-identical to Git's own; [avatars](docs/validation/2026-10-04-avatars.md);
-[project ownership transfer](docs/validation/2026-10-04-project-ownership.md); and a default branch resolved
-from the repository rather than assumed to be `main`.
+- Windows, as an administrator: the PowerShell script installs `graft-runner` as the `GraftRunner` service.
+- Linux, as root: the shell script installs it under `/opt/graft-runner` as a systemd service.
 
-A project page now renders its [README](docs/validation/2026-10-04-readme-rendering.md). That is the first
-place repository content becomes markup, so it is held closed by three layers, each proved by removing it
-and watching the suite fail. Images resolve against the repository or do not load at all, which leaks less
-than stripping a referrer because no request to the third party is made. Diagrams draw inside a sandboxed
-frame with a policy of its own; the main document's policy is unchanged.
+The script downloads `graft-runner` from the forge when the forge has `--runner-downloads`, or takes one you already
+have with `-Binary` or `--binary`. `-NoService` and `--no-service` register without installing a service.
 
-A [commit page](docs/validation/2026-10-09-commit-diff.md) shows what changed, behind the
-`/-/commit/<sha>` links the API had been handing out with nothing behind them. The diff is computed on the object model rather than by invoking Git, and is measured
-against Git rather than assumed to match it: `tests/Graft.Diff.Fuzz` generates file pairs and compares every
-result, agreeing on about **99%** of cases with `git diff` at its default settings. Graft's placement of a
-change is a port of Git's own compaction step, indent heuristic included, since 2026-10-30; the residual is
-Git's search settling on a different script of the same length, which placement cannot reconcile.
+## git-remote-graft: for a forge behind Cloudflare or another proxy
 
-A clone menu offers the HTTPS URL, ready `git clone` commands including a single-branch one, and handoff to
-Visual Studio Code and Visual Studio. [Third-party notices](THIRD-PARTY-NOTICES.md) are embedded in the
-server and served at `/-/licences`, because several of those licences bind the binary rather than the source
-tree.
+A proxy can refuse a request over a size: Cloudflare's free plan stops at 100 MB. Git sends a whole push, and Git LFS a
+whole file, as one request, so past that size they fail with HTTP 413. `git-remote-graft` sends pushes, fetches and
+LFS files in parts the proxy accepts. Each person installs it once; after that their ordinary `https://` remotes,
+clones, editors and tools for that forge go through it with nothing else changed, and other hosts are untouched.
 
-Still untested: the Android case that motivated the upload work needs a physical device, and NativeAOT
-behaviour needs a machine with the C++ build tools.
+From the forge, which also sets it up for that forge:
 
-## Start here
+```powershell
+# Windows PowerShell, as yourself (not as an administrator)
+& ([scriptblock]::Create((Invoke-RestMethod https://graft.example.com/-/git-remote-graft/install.ps1)))
+```
 
-1. Read [AGENTS.md](AGENTS.md).
-2. Read [the next-agent handoff](docs/handoff.md), [requirements](docs/requirements.md), and [decisions](docs/decisions/README.md).
-3. Consult [architecture questions](docs/architecture.md), [compatibility scope](docs/compatibility.md), and [integration candidates](docs/integrations.md).
-4. Follow [the build and verification runbook](docs/build-and-test.md).
+```sh
+# Linux
+curl -fsSL https://graft.example.com/-/git-remote-graft/install.sh | sh
+```
 
-## What is already proven
+Or by hand: put the release's `git-remote-graft` executable on `PATH` under the name `git-remote-graft` (`.exe` on
+Windows) and run `git-remote-graft setup https://graft.example.com`. That adds one rule to your global Git
+configuration, `url."graft::https://graft.example.com/".insteadOf`, and registers the `graft` transfer with Git LFS.
+`--push-only` routes only pushes through it. `git-remote-graft remove https://graft.example.com` undoes the rule.
 
-A single Linux x64 NativeAOT executable, statically linked with musl, SQLite, OpenSSL and ICU, passed all six compatibility checks on the required **Linux 3.10.108 x86_64** host. Dapper.AOT query generation, full globalization and ASP.NET Core loopback HTTPS were exercised. No Docker, runtime installation, kernel upgrade or system-library replacement was required. [Acceptance evidence](docs/validation/2026-09-18-nativeaot.md) records the exact boundary.
+It uses the same credentials as Git: when Git asks, the password is a personal access token. Large transfers show
+their progress with `git push --progress`.
 
-The earlier self-contained CoreCLR build failed there because host libraries lacked `GLIBC_2.27`. Do not confuse single-file packaging, self-contained CoreCLR, Dapper.AOT generation and NativeAOT compilation.
+## For agents: installing Graft unattended
 
-## Cloning and pushing with Git
+Steps an agent can follow on someone's behalf, without prompts. Each ends with a check; stop and report if a check
+fails rather than continuing. Never put a password or token on a command line: write it to a file readable only by
+the account that needs it, and delete it when done.
 
-Graft serves Git over HTTPS. A public or unlisted project clones with no credentials. Anything else, and
-every push, authenticates with HTTP Basic where the **password is a personal access token**, never the
-account password. A password is refused before any lookup happens.
+**Choose the files.** Windows x64 uses the `*-win-x64.exe` files; any x64 Linux uses `*-linux-x64`. Other
+architectures are not built. Download from `https://github.com/Wixely/Graft/releases/latest/download/<file>` (or
+`/releases/download/v<version>/<file>` for a fixed version) and check each against `SHA256SUMS` from the same release:
 
-1. Sign in, open **Profile and tokens** and create a token. Pushing needs the `write_repository` or `api`
-   scope; cloning a private project needs `read_repository` or better.
-2. When Git prompts, give your username and paste the token as the password. The token is shown once; it
-   begins `graft_pat_`.
+```sh
+curl -fsSLO https://github.com/Wixely/Graft/releases/latest/download/SHA256SUMS
+curl -fsSLO https://github.com/Wixely/Graft/releases/latest/download/graft-server-linux-x64
+grep ' graft-server-linux-x64$' SHA256SUMS | sha256sum -c -
+chmod 755 graft-server-linux-x64 && ./graft-server-linux-x64 --version
+```
 
-If a push fails and keeps failing with no prompt, a credential helper has cached the refused password and is
-replaying it. Clear it and try again:
+```powershell
+$base = 'https://github.com/Wixely/Graft/releases/latest/download'
+Invoke-WebRequest -UseBasicParsing "$base/SHA256SUMS" -OutFile SHA256SUMS
+Invoke-WebRequest -UseBasicParsing "$base/graft-server-win-x64.exe" -OutFile graft-server-win-x64.exe
+$expected = ((Get-Content SHA256SUMS) -match ' graft-server-win-x64.exe$' -split ' ')[0]
+if ((Get-FileHash -Algorithm SHA256 graft-server-win-x64.exe).Hash.ToLower() -ne $expected) { throw 'checksum mismatch' }
+.\graft-server-win-x64.exe --version
+```
+
+**Install git-remote-graft for a person** (no administrator rights; run as that person):
+
+1. If the forge serves it (`https://<forge>/-/git-remote-graft/download/git-remote-graft-<platform>` answers), run the
+   forge's install script from the section above. Otherwise download `git-remote-graft-<platform>` from the release
+   and verify it.
+2. Install it on `PATH` as `git-remote-graft`: on Linux `install -m 755 git-remote-graft-linux-x64 ~/.local/bin/git-remote-graft`;
+   on Windows copy it to `%LOCALAPPDATA%\Programs\git-remote-graft\git-remote-graft.exe` and add that directory to the
+   user's `Path` (`[Environment]::SetEnvironmentVariable('Path', ..., 'User')`). Editors and terminals opened earlier
+   need restarting to see it.
+3. Run `git-remote-graft setup https://<forge>`.
+4. Check: `git-remote-graft --version` prints the version; `git config --global --get-regexp '^url\.graft::'` shows
+   the rule; and `git ls-remote https://<forge>/<namespace>/<project>.git` lists references, which shows Git found
+   the helper. A Git LFS repository's address is fixed up the first time the helper runs in it; any fetch, pull or
+   push does that.
+
+**Install the forge** on a machine you administer:
+
+1. Download and verify `graft-server-<platform>` and `graft-admin-<platform>`.
+2. Choose a data directory, and write the first administrator's password to a file there, readable only by you.
+3. `graft-admin bootstrap --database <data>/graft.db --repositories <data>/repositories --username <name> --password-file <file>`,
+   then delete the file.
+4. Off loopback, put the PKCS#12 certificate and a file holding its password in a directory only the service account
+   can read, and install the service as above: Windows `sc.exe create`, Linux the systemd unit. Pass `--origin` as the
+   address people will use.
+5. Check: `curl --insecure https://127.0.0.1:<port>/healthz` answers, and the log shows `READY:` and `VERSION:`.
+
+**Install a runner** with an administrator's personal access token with the `api` scope:
+
+1. Create the runner: `POST https://<forge>/api/v4/user/runners` with header `PRIVATE-TOKEN: <token>` and body
+   `{"description": "<machine name>"}`. The answer carries `install_powershell` and `install_shell`, the same scripts
+   the browser offers, with a one-time registration token valid for a day.
+2. Save the script for the machine's platform to a file readable only by you and run it: on Windows as an
+   administrator with `powershell -ExecutionPolicy Bypass -File <script>`, on Linux as root with `sh <script>`. If the
+   forge has no downloads directory, download and verify `graft-runner-<platform>` first and pass it with `-Binary` or
+   `--binary`. Delete the script afterwards.
+3. Check: the service runs (`Get-Service GraftRunner`, or `systemctl is-active graft-runner`), and
+   `GET https://<forge>/api/v4/runners/all` lists the runner with `"online": true`.
+
+## Using Git with Graft
+
+Graft serves Git over HTTPS. A public or unlisted project clones with no credentials. Anything else, and every push,
+authenticates with HTTP Basic where the **password is a personal access token**, never the account password.
+
+1. Sign in, open **Profile and tokens** and create a token. Pushing needs the `write_repository` or `api` scope;
+   cloning a private project needs `read_repository` or better.
+2. When Git prompts, give your username and paste the token as the password. The token is shown once; it begins
+   `graft_pat_`.
+
+If a push keeps failing with no prompt, a credential helper has cached a refused password and is replaying it. Clear it
+and try again:
 
 ```text
 printf "protocol=https\nhost=<your graft host>\n\n" | git credential reject
 ```
 
-The clone menu on every repository says the same thing, so this is not the only place to find out.
+**Or use SSH.** Where the forge runs with `--ssh-port`, the clone menu also offers `ssh://git@host:port/owner/project.git`.
+Register the public half of your key under **Profile and SSH keys** and Git authenticates with it. Check the host key
+fingerprint the server prints at startup the first time you connect. See
+[ADR 0031](docs/decisions/0031-git-over-ssh.md).
 
-**Or use SSH.** Where the operator has started the SSH listener with `--ssh-port`, the clone menu also
-offers `ssh://git@host:port/owner/project.git`. Register the public half of your key under **Profile and
-SSH keys**, or with `POST /api/v4/user/keys`, and Git authenticates with it: no token, no password. Graft is
-the SSH server, with no shell behind it; it accepts Ed25519, ECDSA and RSA keys and serves fetches in Git
-protocol version 2, which every Git since 2.26 uses by default. Check the host key fingerprint the server
-prints at startup the first time you connect. See [ADR 0031](docs/decisions/0031-git-over-ssh.md).
+**Behind a proxy that limits uploads**, install [git-remote-graft](#git-remote-graft-for-a-forge-behind-cloudflare-or-another-proxy).
 
-**Behind a proxy that limits uploads**, such as Cloudflare's free plan at 100 MB, a large push or Git LFS file fails
-with HTTP 413. Install `git-remote-graft` once and ordinary `https://` remotes for the forge send pushes, fetches and LFS
-files in parts the proxy accepts, with the same token:
+## Building Graft
 
-```text
-& ([scriptblock]::Create((Invoke-RestMethod https://<your graft host>/-/git-remote-graft/install.ps1)))   # Windows PowerShell
-curl -fsSL https://<your graft host>/-/git-remote-graft/install.sh | sh                                 # Linux
+Building needs the .NET 10 SDK, and the C++ build tools for the single-file NativeAOT executables. DnaX, CupriNet and
+CupriMark come from Wixely's GitHub Packages feed, which needs a GitHub token with `read:packages` even to read. Add it
+once per machine to your user-level NuGet configuration, under the source name the repository uses:
+
+```sh
+dotnet nuget add source https://nuget.pkg.github.com/Wixely/index.json --name GitHub-Wixely-Packages \
+  --username <your-github-user> --password <token-with-read:packages>
 ```
 
-`git-remote-graft remove https://<your graft host>` undoes it. See
-[ADR 0043](docs/decisions/0043-chunked-transfers-git-remote-graft.md).
+Then `dotnet build Graft.slnx`. The release executables are built by `eng/build-windows.ps1` and `eng/build-linux.sh`,
+which [the release workflow](.github/workflows/release.yml) runs on a `v*` tag. [Build and test](docs/build-and-test.md)
+covers the acceptance suites.
 
-## Run the existing experiment
-
-From this repository using .NET SDK 10.0.300 or a compatible newer .NET 10 feature band:
-
-```powershell
-dotnet build Graft.slnx
-dotnet run --project experiments/compatibility/Graft.Compatibility.csproj --no-build
-```
-
-This is a short-lived local probe, not a server startup command. It writes its own temporary database/files, opens a loopback-only HTTPS listener, reports PASS/FAIL and exits. VS Code's **Debug compatibility probe** launch configuration uses the same project.
-
-Linux static NativeAOT requires the separate toolchain/runbook; a Windows build is not evidence for the old Linux host. No Python, Node.js or frontend asset pipeline is needed.
+Working on Graft as an agent: read [AGENTS.md](AGENTS.md), then [the handoff](docs/handoff.md),
+[requirements](docs/requirements.md) and [decisions](docs/decisions/README.md). The README's former running status log
+is in [history](docs/history.md).
 
 ## Repository map
 
 | Path | Purpose |
 | --- | --- |
-| `docs/` | Requirements, decisions, architecture questions, work queue and evidence |
-| `src/Graft.Core/`, `src/Graft.Storage/` | MVP authorization policy and DnaX/SQLite persistence |
-| `src/Graft.Git/`, `src/Graft.Server/` | Managed Git engine (bare Git repository on disk, loose and packed objects with delta compression, smart HTTP protocol versions 0 and 2, server-side object authoring and unified diff), markdown rendering and authenticated HTTPS/API host |
-| `src/Graft.Ssh/` | Dependency-free SSH server for Git over SSH: ECDH P-256, an ECDSA host key, AES-GCM and AES-CTR, Ed25519, ECDSA and RSA client keys (ADR 0031) |
-| `src/Graft.Runner/`, `src/Graft.RunnerProtocol/` | The Graft runner (`graft-runner`, NativeAOT) and the protocol it shares with the forge: CupriNet transport, CupriMark version negotiation (ADR 0037) |
-| `src/Graft.Client/`, `src/Graft.Contracts/` | Blazor WebAssembly client (themed UI, routed pages, rendered READMEs, commit diffs, clone menu, vendored DnaX upload and diagram modules) and source-generated wire contracts |
-| `src/Graft.Operations/`, `src/Graft.Admin/` | Quiescence lease, backup/restore, import inventory and NativeAOT administration CLI |
-| `deploy/` | systemd, optional container and isolated static-musl build definitions |
-| `tests/Graft.Acceptance/` | Disposable MVP-04 persistence and authorization acceptance executable |
-| `tests/Graft.Browser.Fixture/` | Disposable production UI fixture with a seeded Git repository |
-| `tests/Graft.Git.Acceptance/` | Integrated MVP-06 real Git, repository API, browser-session, restart and revocation acceptance executable |
-| `tests/Graft.Diff.Fuzz/` | Generated file pairs compared against real `git diff`; a measuring instrument for the diff engine, not a gate |
-| `tests/Graft.Glab.Acceptance/` | Pinned existing-client API workflow against disposable Graft in WSL/Podman |
-| `tests/Graft.GitLab.Reference/` | C# live-reference harness for the versioned GitLab REST fixture |
-| `tests/Graft.Operations.Acceptance/` | MVP-07 synthetic import, backup, tamper, restore and rollback acceptance executable |
-| `tests/Graft.Packaging.Acceptance/` | MVP-08 lifecycle, container and resource acceptance executable |
-| `experiments/compatibility/` | Probe source, pinned NuGet dependencies and build scripts |
-| `experiments/managed-git/` | Bounded C# smart HTTP/pack experiment; [runbook](experiments/managed-git/README.md) |
-| `experiments/managed-git-client/` | C# acceptance harness using installed Git as an independent test client |
-| `experiments/storage/` | DnaX/SQLite migration and Dapper.AOT probe; [runbook](experiments/storage/README.md) |
-| `experiments/ui-server/` | NativeAOT API, embedded Blazor delivery and session probe; [runbook](experiments/ui-server/README.md) |
-| `experiments/ui-client/`, `ui-contracts/`, `ui-checks/` | Standalone C#/Razor client, JSON contracts, HTTP and browser checks |
-| `artifacts/reference/` | Ignored local copy of the accepted archive and checksum; not committed |
+| `docs/` | Requirements, decisions, architecture questions, backlog, history and evidence |
+| `eng/` | Release builds: the Windows and Linux scripts, the smoke test, and the SQLite they link in |
+| `src/Graft.Server/` | The forge: HTTPS host, API, Git transports, runner host, MCP endpoint |
+| `src/Graft.Git/` | Managed Git engine: bare repositories, packs and deltas, smart HTTP versions 0 and 2, diffs |
+| `src/Graft.Core/`, `src/Graft.Storage/` | Authorization policy and DnaX/SQLite persistence |
+| `src/Graft.Ssh/` | Dependency-free SSH server for Git over SSH ([ADR 0031](docs/decisions/0031-git-over-ssh.md)) |
+| `src/Graft.Runner/`, `src/Graft.RunnerProtocol/` | The runner and the protocol it shares with the forge |
+| `src/Graft.Remote/` | `git-remote-graft` ([ADR 0043](docs/decisions/0043-chunked-transfers-git-remote-graft.md)) |
+| `src/Graft.Client/`, `src/Graft.Contracts/` | Blazor WebAssembly client and source-generated wire contracts |
+| `src/Graft.Operations/`, `src/Graft.Admin/` | Backup, restore and import inventory, and the admin tool |
+| `src/Graft.Mcp/`, `src/Graft.McpTools/` | Agent tools, served by the forge and as a separate stdio launcher |
+| `deploy/` | systemd unit, container image and compose file |
+| `tests/` | Acceptance suites driving real Git, git-lfs, SSH and GitLab clients against a disposable forge |
+| `experiments/` | The early probes that settled the platform, kept with their runbooks |
 | `THIRD-PARTY-NOTICES.md` | Attribution for every redistributed component; embedded in the server and served at `/-/licences` |
-
-The original discovery notes remain in the sibling [PLAN idea](../PLAN/inbox/local-git-forge.md). This repository is now the canonical implementation/handoff context. Private infrastructure details stay in PLAN; project docs use a neutral target-host description.
-
-Recommended next action — Owner: Implementation agent: implement Git's indent heuristic in the diff, the one open item needing nothing but this repository. Owner: Operator + implementation agent: run the Android picker case on a device and publish NativeAOT where the C++ build tools exist. Owner: Operator + implementation agent: validate the intended certificate/DNS/client-trust environment. Owner: DnaX maintainer: provide an approved durable package feed. The Linux 3.10.108 run remains deferred.

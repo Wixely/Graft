@@ -356,7 +356,8 @@ internal static class Git
 
 internal static class HelperVersion
 {
-    public static readonly string Text = typeof(HelperVersion).Assembly.GetName().Version?.ToString(3) ?? "0.0.0";
+    public static readonly string Text = typeof(HelperVersion).Assembly.GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
+        is [System.Reflection.AssemblyInformationalVersionAttribute { InformationalVersion: { Length: > 0 } version }, ..] ? version : "unknown";
 }
 
 /// <summary>A failure to show the person as Git shows its own: one line, after <c>fatal:</c>.</summary>

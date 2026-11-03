@@ -15,6 +15,14 @@
     <RestorePackagesWithLockFile Condition="'$(RuntimeIdentifier)' == ''">true</RestorePackagesWithLockFile>
     <NuGetLockFilePath Condition="'$(RuntimeIdentifier)' != ''">$(BaseIntermediateOutputPath)packages.$(RuntimeIdentifier).lock.json</NuGetLockFilePath>
   </PropertyGroup>
+  <!-- One static executable for any x64 Linux, the old kernel included: published for linux-musl-x64 in Alpine, as the forge
+       is. Invariant globalization, so no ICU; OpenSSL linked in for TLS. -->
+  <PropertyGroup Condition="'$(GraftRemoteStatic)' == 'true'">
+    <PublishAot>true</PublishAot>
+    <StaticExecutable>true</StaticExecutable>
+    <StaticOpenSslLinking>true</StaticOpenSslLinking>
+    <IlcGenerateStackTraceData>false</IlcGenerateStackTraceData>
+  </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../Graft.Contracts/Graft.Contracts.csproj" />
     <ProjectReference Include="../Graft.Git/Graft.Git.csproj" />

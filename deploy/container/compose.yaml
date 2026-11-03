@@ -105,8 +105,9 @@ services:
       - ${GRAFT_RUNNER_PORT:-}
       - --runner-host
       - ${GRAFT_RUNNER_HOST:-}
+      # The runner and git-remote-graft executables the install scripts download; the released image carries them all.
       - --runner-downloads
-      - ${GRAFT_RUNNER_DOWNLOADS:-}
+      - ${GRAFT_RUNNER_DOWNLOADS:-/app/downloads}
       # Files between forge and runner go whole up to this many MiB and in resumable chunks above it; 0 chunks
       # everything, off chunks nothing. Empty means 80 MiB and 8 MiB chunks. See docs/decisions/0038-chunked-runner-transfers-and-artifacts.md.
       - --runner-chunk-threshold

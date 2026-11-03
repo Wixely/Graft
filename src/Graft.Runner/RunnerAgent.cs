@@ -72,7 +72,9 @@ internal sealed partial class RunnerJson : JsonSerializerContext;
 /// </summary>
 public sealed class RunnerAgent(RunnerConfig config, string home)
 {
-    public const string Version = "0.1.0";
+    /// <summary>The release this runner is, as the release build stamped it from its tag.</summary>
+    public static readonly string Version = typeof(RunnerAgent).Assembly.GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
+        is [System.Reflection.AssemblyInformationalVersionAttribute { InformationalVersion: { Length: > 0 } version }, ..] ? version : "unknown";
 
     /// <summary>A job runs at most this long before it is stopped and failed.</summary>
     private static readonly TimeSpan JobTimeout = TimeSpan.FromHours(1);

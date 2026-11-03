@@ -20,6 +20,15 @@ using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.AspNetCore.Http.Features;
 using ModelContextProtocol.Server;
 
+// The release this is, as the release build stamped it from its tag; a local build says 1.0.0 and its commit.
+string graftVersion = typeof(Arguments).Assembly.GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
+    is [System.Reflection.AssemblyInformationalVersionAttribute { InformationalVersion: { Length: > 0 } informational }, ..] ? informational : "unknown";
+if (args is ["--version"])
+{
+    Console.WriteLine("Graft.Server " + graftVersion);
+    return 0;
+}
+
 // Several bundled components require their attribution to accompany the binary, so the binary can print it
 // without the repository being present. The same text is served at /-/licences by a running server.
 if (args.Length == 1 && args[0] == "--licences")
@@ -35,6 +44,7 @@ if (!Arguments.TryParse(args, out Arguments? parsedSettings))
 {
     Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>] [--mcp true|false] [--pages-origin <https origin>] [--recoverable-tokens true|false] [--webhooks true|false] [--ssh-port <0-65535>] [--ssh-host <name>] [--mail-smtp <smtp|smtp+starttls|smtps URL>] [--mail-from <address>] [--mail-password-file <UTF-8 path>] [--runner-port <0-65535>] [--runner-host <name>] [--runner-downloads <directory>] [--runner-chunk-threshold <MiB|off>] [--runner-chunk-size <1-64 MiB>] [--push-delete true|false] [--url-import off|public|any] [--mirror-interval <15-10080 minutes>] [--transfer-part-size <1-95 MiB>].");
     Console.Error.WriteLine("       Graft.Server --licences  prints the third-party notices this build redistributes.");
+    Console.Error.WriteLine("       Graft.Server --version   prints the release this is.");
     return 2;
 }
 Arguments settings = parsedSettings!;
@@ -9015,6 +9025,7 @@ Console.WriteLine("URL IMPORT: " + settings.UrlImport switch
     _ => "off"
 });
 Console.WriteLine("TRANSFERS: in parts of " + (settings.TransferPartBytes / (1024 * 1024)).ToString(System.Globalization.CultureInfo.InvariantCulture) + " MiB, for git-remote-graft");
+Console.WriteLine("VERSION: " + graftVersion);
 Console.WriteLine("READY: " + address);
 await app.WaitForShutdownAsync();
 return 0;
@@ -10139,7 +10150,8 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         if (runnerHost is not null && (runnerHost.Length > 253 || Uri.CheckHostName(runnerHost) is UriHostNameType.Unknown or UriHostNameType.Basic)) return false;
         if (string.IsNullOrWhiteSpace(runnerDownloads)) runnerDownloads = null;
         if (runnerDownloads is not null && !Directory.Exists(runnerDownloads)) return false;
-        if (runnerPort is null && (runnerHost is not null || runnerDownloads is not null)) return false;
+        // The downloads directory serves git-remote-graft as well as the runner, so it stands without runners.
+        if (runnerPort is null && runnerHost is not null) return false;
         // Files between forge and runner go whole up to the threshold and in verified, resumable chunks above it
         // (ADR 0038): 80 MiB unless the operator says otherwise, 0 to chunk everything, off to chunk nothing.
         if (string.IsNullOrWhiteSpace(runnerChunkThreshold)) runnerChunkThreshold = null;

@@ -9,6 +9,12 @@ if (args.Length == 0)
     Usage();
     return 2;
 }
+if (args is ["version"] or ["--version"])
+{
+    object[] stamped = typeof(GraftStore).Assembly.GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false);
+    Console.WriteLine("Graft.Admin " + (stamped is [System.Reflection.AssemblyInformationalVersionAttribute { InformationalVersion: { Length: > 0 } version }, ..] ? version : "unknown"));
+    return 0;
+}
 
 try
 {
@@ -118,4 +124,5 @@ static void Usage() => Console.Error.WriteLine(
     "       Graft.Admin backup --database <path> --repositories <path> --output <directory>\n" +
     "       Graft.Admin verify --input <backup-directory>\n" +
     "       Graft.Admin restore --input <backup-directory> --database <path> --repositories <path>\n" +
-    "       Graft.Admin inspect-bundle --input <bundle> --output <report.json>");
+    "       Graft.Admin inspect-bundle --input <bundle> --output <report.json>\n" +
+    "       Graft.Admin version");

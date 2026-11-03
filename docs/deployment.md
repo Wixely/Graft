@@ -83,14 +83,22 @@ The unit uses `Type=notify`, restarts on failure, restricts filesystem writes to
 
 ## Optional container
 
-The container path uses the self-contained `linux-x64` publication at `artifacts/mvp08/server-linux-x64`. It goes into one image, which runs as UID/GID 1654 with a read-only root filesystem and a writable named data volume.
+Each release publishes the image as `ghcr.io/wixely/graft:<version>` ([ADR 0044](decisions/0044-releases.md)). It runs as UID/GID 1654 with a read-only root filesystem and a writable named data volume, and carries the static Linux forge and admin tool as `/app/Graft.Server` and `/app/Graft.Admin`, and every runner and `git-remote-graft` executable in `/app/downloads`, which the compose file passes as `--runner-downloads` unless `GRAFT_RUNNER_DOWNLOADS` says otherwise.
 
-Copy `deploy/container/.env.example` to `deploy/container/.env` and fill it in first. It documents every variable.
+Copy `deploy/container/.env.example` to `deploy/container/.env` and fill it in first. It documents every variable. Set `GRAFT_IMAGE=ghcr.io/wixely/graft:<version>` to run a release:
 
 ```powershell
-dotnet publish src/Graft.Server/Graft.Server.csproj -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -o artifacts/mvp08/server-linux-x64
-podman compose --file deploy/container/compose.yaml build
 podman compose --file deploy/container/compose.yaml up --detach
+```
+
+To build the image yourself, lay out `artifacts/container` from a release's files, or from `eng/build-linux.sh`'s output, as the release workflow does, then build:
+
+```sh
+mkdir -p artifacts/container/downloads
+cp graft-server-linux-x64 artifacts/container/Graft.Server
+cp graft-admin-linux-x64 artifacts/container/Graft.Admin
+cp graft-runner-* git-remote-graft-* artifacts/container/downloads/
+podman compose --file deploy/container/compose.yaml build
 ```
 
 The service names the image it runs, through `GRAFT_IMAGE`, defaulting to `graft:local`. That matters more than it looks. A compose service with only a `build:` section and no `image:` makes compose invent a name from the project directory and the service, so an image you built and tagged yourself is never referenced, and `up` runs whatever compose built first regardless of what changed underneath. Naming it means `podman build --tag graft:local .` and `compose build` produce the same thing, and either is what runs.
@@ -101,7 +109,7 @@ Set `GRAFT_IMAGE` to a registry path to push a built image and pull it elsewhere
 
 Compose mounts the certificate and password as read-only secrets. **Those files must be readable by UID 1654.** Compose secrets outside swarm are host bind mounts, so the file's own ownership and mode are what the container sees, and a root-only `0600` key produces a startup failure reading `Access to the path '/run/secrets/graft-tls.pfx' is denied`.
 
-The port is bound to host loopback. The image uses the .NET 10 Ubuntu runtime-deps base and is separate from the static-musl legacy-host artifact. Pinning the base by digest remains release work.
+The port is bound to host loopback. The image uses the .NET 10 Ubuntu runtime-deps base for its certificates and time zones; the executables in it are the same static Linux files a release ships. Pinning the base by digest remains release work.
 
 ### Deleting branches by push
 

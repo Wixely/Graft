@@ -18,9 +18,15 @@
     <EmbedIcuDataPath>/usr/share/icu/74.2/icudt74l.dat</EmbedIcuDataPath>
     <IlcGenerateStackTraceData>false</IlcGenerateStackTraceData>
   </PropertyGroup>
-  <ItemGroup Condition="'$(GraftAdminStatic)' == 'true'">
+  <!-- SQLite linked into the executable, so it is one file: GraftSqliteLibrary names the static library eng/build-sqlite.ps1
+       or eng/build-sqlite.sh built from eng/sqlite.txt, the same SQLite with the same options as the e_sqlite3 a managed
+       build loads. A static Linux build without one falls back to the system libsqlite3, whose defaults differ. -->
+  <PropertyGroup Condition="'$(GraftAdminStatic)' == 'true' and '$(GraftSqliteLibrary)' == ''">
+    <GraftSqliteLibrary>/usr/lib/libsqlite3.a</GraftSqliteLibrary>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(PublishAot)' == 'true' and '$(GraftSqliteLibrary)' != ''">
     <DirectPInvoke Include="e_sqlite3" />
-    <NativeLibrary Include="/usr/lib/libsqlite3.a" />
+    <NativeLibrary Include="$(GraftSqliteLibrary)" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../Graft.Operations/Graft.Operations.csproj" />

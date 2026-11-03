@@ -5859,6 +5859,11 @@ async Task<string> CheckRemoteHelper(string address, AuthenticatedIdentity alice
     string helper = RemoteHelperPath();
     Check(File.Exists(helper), "git-remote-graft is built where the suite looks for it");
     if (!File.Exists(helper)) return address;
+    // Installed as a person would: Git finds the helper on PATH by the name git-remote-graft, whatever a release calls the file.
+    string installed = Path.Combine(root, "helper-bin", OperatingSystem.IsWindows() ? "git-remote-graft.exe" : "git-remote-graft");
+    Directory.CreateDirectory(Path.GetDirectoryName(installed)!);
+    File.Copy(helper, installed, overwrite: true);
+    helper = installed;
 
     await StopServer();
     transferPartSize = "1";

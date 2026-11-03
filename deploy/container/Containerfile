@@ -1,7 +1,11 @@
 FROM mcr.microsoft.com/dotnet/runtime-deps:10.0-noble-chiseled-extra
 
+# artifacts/container holds the static Linux forge and admin tool as Graft.Server and Graft.Admin, and downloads/ the
+# runner and git-remote-graft executables for every platform, under the names the forge's install scripts ask for. The
+# release workflow lays it out from a release's files; docs/deployment.md shows how to do the same by hand.
 WORKDIR /app
-COPY --chown=1654:1654 --chmod=0755 artifacts/mvp08/server-linux-x64/ /app/
+COPY --chown=1654:1654 --chmod=0755 artifacts/container/Graft.Server artifacts/container/Graft.Admin /app/
+COPY --chown=1654:1654 --chmod=0755 artifacts/container/downloads/ /app/downloads/
 
 COPY --chown=1654:1654 deploy/container/data/ /data/
 COPY --chown=1654:1654 deploy/container/secrets/ /run/secrets/

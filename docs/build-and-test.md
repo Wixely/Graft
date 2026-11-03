@@ -26,12 +26,21 @@ For MVP-02, the [UI/auth runbook](../experiments/ui-server/README.md) covers aut
 
 The separate [managed Git runbook](../experiments/managed-git/README.md) covers MVP-01's C# self-checks, real Git client harness, VS Code configurations and Windows NativeAOT publish. Its [acceptance evidence](validation/2026-09-18-managed-git.md) does not extend the old-host result. The original compatibility-probe instructions below remain the accepted legacy-host baseline; the MVP-08 product build is a new artifact with its own pending host gate.
 
-The [storage migration runbook](../experiments/storage/README.md) covers MVP-03's JIT, Windows NativeAOT and static-musl commands. [Recorded storage evidence](validation/2026-09-19-storage-migrations.md) includes migration failure/recovery behavior and Dapper interception. Its static binary has not run on the required host, and clean external restore is blocked until the tagged DnaX packages have an approved durable source.
+The [storage migration runbook](../experiments/storage/README.md) covers MVP-03's JIT, Windows NativeAOT and static-musl commands. [Recorded storage evidence](validation/2026-09-19-storage-migrations.md) includes migration failure/recovery behavior and Dapper interception. Its static binary has not run on the required host.
 
-MVP-04 uses the reproducible ignored feed at `artifacts/storage/dnax-feed`, configured by the root `NuGet.config`. Prepare it from the pinned public DnaX tag when absent, then run the disposable acceptance executable:
+Since 2026-11-03 DnaX, CupriNet and CupriMark restore from Wixely's GitHub Packages feed, the source `GitHub-Wixely-Packages` in the root `NuGet.config` ([ADR 0044](decisions/0044-releases.md)). It needs a credential even to read; add it once per machine to your user-level NuGet configuration:
 
 ```powershell
-.\experiments\storage\prepare-dnax-packages.ps1
+dotnet nuget add source https://nuget.pkg.github.com/Wixely/index.json --name GitHub-Wixely-Packages --username <github user> --password <token with read:packages>
+```
+
+A machine whose NuGet cache still holds DnaX 10.0.0-alpha.13 packed from the old local feed fails restore with NU1403 until the `10.0.0-alpha.13` folders under `%USERPROFILE%\.nuget\packages\dnax.data.migrations`, `dnax.data.migrations.sqlite` and `dnax.uploads` are removed. The experiments under `experiments/` keep their own `NuGet.config` and the old local feed.
+
+The release executables are built by `eng\build-windows.ps1` and `eng/build-linux.sh`, which `.github/workflows/release.yml` runs on a `v*` tag; both document how to run them locally.
+
+MVP-04 is a disposable acceptance executable:
+
+```powershell
 dotnet build tests\Graft.Acceptance\Graft.Acceptance.csproj -c Debug
 dotnet tests\Graft.Acceptance\bin\Debug\net10.0\Graft.Acceptance.dll
 dotnet publish tests\Graft.Acceptance\Graft.Acceptance.csproj -c Release -r win-x64 --self-contained true -p:AcceptanceAot=true -o artifacts\mvp04\win-x64

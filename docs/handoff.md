@@ -2,6 +2,25 @@
 
 Updated: 2026-11-03. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the project owner.
 
+## Added on 2026-11-03, later: releases
+
+Releases are now built by GitHub Actions on a version tag: the forge for Windows, Linux and Docker, and the helper
+for Windows and Linux, as single executables; and also the admin tool and the runner, with install instructions an
+agent can follow. [ADR 0044](decisions/0044-releases.md).
+
+- **Packages.** `NuGet.config` restores DnaX, CupriNet and CupriMark from Wixely's GitHub Packages feed as
+  `GitHub-Wixely-Packages`, the name and pattern the sibling repositories use, rather than regenerating anything.
+  Only DnaX alpha.13's three lock hashes changed. A NuGet cache holding the old locally packed DnaX alpha.13 gives
+  NU1403 until those three version folders are removed.
+- **Builds.** `eng/build-windows.ps1` and `eng/build-linux.sh` (Alpine 3.21) publish all four executables, link SQLite in
+  from `eng/sqlite.txt` (3.53.3 with e_sqlite3's options), check the Linux ones are static, and smoke-test them
+  (`eng/smoke.sh`). `.github/workflows/release.yml` runs them, builds `ghcr.io/wixely/graft`, and publishes the
+  release; a manual run publishes nothing.
+- **Trap found.** The old static Linux build linked Alpine's libsqlite3, whose foreign keys default off; e_sqlite3's
+  default on. The release builds compile SQLite with e_sqlite3's options on both platforms.
+- **Locally.** `link.exe` failed under a long `NUGET_PACKAGES` path (MAX_PATH); `artifacts
+uget` works.
+
 ## Added on 2026-11-03: git-remote-graft, for a proxy that limits requests
 
 The live deployment is behind Cloudflare's free plan, which refuses a request over 100 MB. [ADR 0043](decisions/0043-chunked-transfers-git-remote-graft.md).

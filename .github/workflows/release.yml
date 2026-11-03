@@ -1,0 +1,235 @@
+# Cut a release on a v* tag: Graft's four single-file executables for Windows and Linux, a container image, and a
+# GitHub release carrying them.
+#
+#   graft-server     the forge
+#   graft-admin      creates the first administrator, backs up and restores
+#   graft-runner     runs pipelines for the forge
+#   git-remote-graft Git's helper for a forge behind a proxy that limits requests (ADR 0043)
+#
+# Each is NativeAOT: one file, nothing to install. Windows is built on Windows; Linux is built static in Alpine, so the
+# same file runs on any x64 Linux, the old kernel included. SQLite is compiled into both from eng/sqlite.txt. Every
+# executable is smoke-tested from where it was built before anything is published.
+#
+# A manual run builds and tests everything, image included, and publishes nothing.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build, without the v (e.g. 0.1.0). Builds and tests; publishes nothing.'
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  version:
+    name: Work out the version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.pick.outputs.version }}
+      tagged: ${{ steps.pick.outputs.tagged }}
+      prerelease: ${{ steps.pick.outputs.prerelease }}
+      image: ${{ steps.pick.outputs.image }}
+    steps:
+      - id: pick
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            version="${GITHUB_REF_NAME#v}"
+            echo "tagged=true" >> "$GITHUB_OUTPUT"
+          else
+            version="${{ inputs.version }}"
+            echo "tagged=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
+            || { echo "::error::'$version' is not a semantic version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # A hyphen marks a prerelease: GitHub flags it, and :latest does not move.
+          case "$version" in *-*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;; *) echo "prerelease=false" >> "$GITHUB_OUTPUT" ;; esac
+          # ghcr takes no capitals, and the owner is "Wixely".
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/$owner/graft" >> "$GITHUB_OUTPUT"
+
+  client:
+    name: Browser client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      # Published once and embedded in both forges, so Windows and Linux serve the same pages.
+      - name: Publish
+        run: dotnet publish src/Graft.Client/Graft.Client.csproj -c Release -o artifacts/client
+      - uses: actions/upload-artifact@v4
+        with:
+          name: client
+          path: artifacts/client
+          if-no-files-found: error
+
+  windows:
+    name: Windows x64
+    needs: [version, client]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - uses: actions/download-artifact@v4
+        with:
+          name: client
+          path: artifacts/client
+      # GitHub Packages will not serve even a public package anonymously; the workflow's own token reads Wixely's.
+      - name: Authenticate to GitHub Packages
+        shell: bash
+        run: |
+          dotnet nuget update source GitHub-Wixely-Packages \
+            --username "${{ github.actor }}" \
+            --password "${{ secrets.GITHUB_TOKEN }}" \
+            --store-password-in-clear-text
+      - name: Build and smoke-test
+        shell: powershell
+        run: .\eng\build-windows.ps1 -Version '${{ needs.version.outputs.version }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-win-x64
+          path: |
+            artifacts/release/*-win-x64.exe
+            artifacts/release/SHA256SUMS-win-x64
+          if-no-files-found: error
+
+  linux:
+    name: Linux x64 (static)
+    needs: [version, client]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - uses: actions/download-artifact@v4
+        with:
+          name: client
+          path: artifacts/client
+      - name: Authenticate to GitHub Packages
+        run: |
+          dotnet nuget update source GitHub-Wixely-Packages \
+            --username "${{ github.actor }}" \
+            --password "${{ secrets.GITHUB_TOKEN }}" \
+            --store-password-in-clear-text
+      # Built in Alpine 3.21 exactly as eng/build-linux.sh documents for a local build.
+      - name: Build and smoke-test
+        run: docker run --rm -v "$PWD:/src" -w /src alpine:3.21 sh eng/build-linux.sh '${{ needs.version.outputs.version }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-x64
+          path: |
+            artifacts/release/*-linux-x64
+            artifacts/release/SHA256SUMS-linux-x64
+          if-no-files-found: error
+
+  image:
+    name: Container image
+    needs: [version, windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: artifacts/release
+      # The image carries the Linux forge and admin tool, and every runner and helper download, so a forge started
+      # from it serves its own install scripts' binaries with GRAFT_RUNNER_DOWNLOADS=/app/downloads.
+      - name: Lay out the image's files
+        run: |
+          set -eu
+          mkdir -p artifacts/container/downloads
+          cp artifacts/release/graft-server-linux-x64 artifacts/container/Graft.Server
+          cp artifacts/release/graft-admin-linux-x64 artifacts/container/Graft.Admin
+          cp artifacts/release/graft-runner-* artifacts/release/git-remote-graft-* artifacts/container/downloads/
+          ls -la artifacts/container artifacts/container/downloads
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to ghcr
+        if: needs.version.outputs.tagged == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # The version always; :latest only for a stable release.
+      - name: Work out the image tags
+        id: tags
+        run: |
+          {
+            echo 'tags<<TAGS'
+            echo '${{ needs.version.outputs.image }}:${{ needs.version.outputs.version }}'
+            if [ '${{ needs.version.outputs.prerelease }}' != 'true' ]; then echo '${{ needs.version.outputs.image }}:latest'; fi
+            echo 'TAGS'
+          } >> "$GITHUB_OUTPUT"
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/container/Containerfile
+          platforms: linux/amd64
+          push: ${{ needs.version.outputs.tagged == 'true' }}
+          load: ${{ needs.version.outputs.tagged != 'true' }}
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+      # A manual run loaded the image locally; prove it starts.
+      - name: Smoke-test the image
+        if: needs.version.outputs.tagged != 'true'
+        run: |
+          docker run --rm --entrypoint /app/Graft.Server '${{ needs.version.outputs.image }}:${{ needs.version.outputs.version }}' --version
+
+  release:
+    name: Publish the release
+    needs: [version, windows, linux, image]
+    if: needs.version.outputs.tagged == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: artifacts/release
+      - name: One checksum file
+        run: |
+          cd artifacts/release
+          cat SHA256SUMS-win-x64 SHA256SUMS-linux-x64 > SHA256SUMS
+          rm SHA256SUMS-win-x64 SHA256SUMS-linux-x64
+          cat SHA256SUMS
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/release/*
+          generate_release_notes: true
+          prerelease: ${{ needs.version.outputs.prerelease == 'true' }}
+          body: |
+            ## Graft ${{ needs.version.outputs.version }}
+
+            A self-hosted forge with GitLab-compatible APIs. Every download is a single executable with nothing to install.
+
+            | Download | What it is |
+            |---|---|
+            | `graft-server-win-x64.exe`, `graft-server-linux-x64` | The forge. |
+            | `graft-admin-win-x64.exe`, `graft-admin-linux-x64` | Creates the first administrator; backs up, verifies and restores. |
+            | `graft-runner-win-x64.exe`, `graft-runner-linux-x64` | Runs pipelines; the forge's runner install scripts fetch it. |
+            | `git-remote-graft-win-x64.exe`, `git-remote-graft-linux-x64` | Git's helper for a forge behind a proxy that limits uploads, such as Cloudflare's free plan. |
+            | `${{ needs.version.outputs.image }}:${{ needs.version.outputs.version }}` | The forge in a container, with every runner and helper download inside. |
+
+            The Linux executables are static and run on any x64 Linux. `SHA256SUMS` lists every file's hash.
+            Installing: see the [README](https://github.com/${{ github.repository }}/blob/v${{ needs.version.outputs.version }}/README.md#installing).

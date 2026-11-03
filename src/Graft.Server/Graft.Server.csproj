@@ -20,9 +20,15 @@
     <EmbedIcuDataPath>/usr/share/icu/74.2/icudt74l.dat</EmbedIcuDataPath>
     <IlcGenerateStackTraceData>false</IlcGenerateStackTraceData>
   </PropertyGroup>
-  <ItemGroup Condition="'$(GraftServerStatic)' == 'true'">
+  <!-- SQLite linked into the executable, so it is one file: GraftSqliteLibrary names the static library eng/build-sqlite.ps1
+       or eng/build-sqlite.sh built from eng/sqlite.txt, the same SQLite with the same options as the e_sqlite3 a managed
+       build loads. A static Linux build without one falls back to the system libsqlite3, whose defaults differ. -->
+  <PropertyGroup Condition="'$(GraftServerStatic)' == 'true' and '$(GraftSqliteLibrary)' == ''">
+    <GraftSqliteLibrary>/usr/lib/libsqlite3.a</GraftSqliteLibrary>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(PublishAot)' == 'true' and '$(GraftSqliteLibrary)' != ''">
     <DirectPInvoke Include="e_sqlite3" />
-    <NativeLibrary Include="/usr/lib/libsqlite3.a" />
+    <NativeLibrary Include="$(GraftSqliteLibrary)" />
   </ItemGroup>
   <ItemGroup>
     <!-- The attribution has to ship inside the binary: a single-file executable is trivially separated from
@@ -37,8 +43,8 @@
     <ProjectReference Include="../Graft.Ssh/Graft.Ssh.csproj" />
     <ProjectReference Include="../Graft.RunnerProtocol/Graft.RunnerProtocol.csproj" />
     <PackageReference Include="DnaX.Uploads" Version="10.0.0-alpha.13" />
-    <!-- The runner transport: a Shrine runners reach from the Intonation in their install script. Restored from the
-         local feed until the authenticated GitHub Packages feed is approved; see ADR 0037. -->
+    <!-- The runner transport: a Shrine runners reach from the Intonation in their install script. Restored from
+         Wixely's GitHub Packages feed; see ADR 0044. -->
     <PackageReference Include="CupriNet.Hosting" Version="0.6.2" />
     <PackageReference Include="Markdig" Version="1.4.0" />
     <PackageReference Include="Microsoft.Extensions.Hosting.Systemd" Version="10.0.12" />
