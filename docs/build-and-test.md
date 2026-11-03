@@ -40,7 +40,14 @@ dotnet publish tests\Graft.Acceptance\Graft.Acceptance.csproj -c Release -r win-
 
 The package-preparation script verifies the exact public source tag and commit before packing. This local process does not replace the durable-feed release gate. See [MVP-04 evidence](validation/2026-09-19-mvp04-accounts-permissions.md).
 
-MVP-06 extends the ordinary Git client workflow with GitLab-style REST reads, browser-session APIs, embedded Blazor assets and repository browsing against the same disposable database/repository root. Git must be on `PATH`; the harness isolates Git configuration and disables certificate verification only for its ephemeral loopback certificate. Since 2026-10-30 the suite also drives Git over SSH, so `ssh`, `ssh-keygen` and `ssh-keyscan` must be on `PATH` too; Git for Windows and Windows OpenSSH both provide them. Since 2026-10-31 it also drives the runner: build `src/Graft.Runner` first, or point `GRAFT_RUNNER` at a runner binary, such as a NativeAOT one published with `-p:GraftRunnerAot=true`.
+MVP-06 extends the ordinary Git client workflow with GitLab-style REST reads, browser-session APIs, embedded Blazor assets and repository browsing against the same disposable database/repository root. Git must be on `PATH`; the harness isolates Git configuration and disables certificate verification only for its ephemeral loopback certificate. Since 2026-10-30 the suite also drives Git over SSH, so `ssh`, `ssh-keygen` and `ssh-keyscan` must be on `PATH` too; Git for Windows and Windows OpenSSH both provide them. Since 2026-10-31 it also drives the runner: build `src/Graft.Runner` first, or point `GRAFT_RUNNER` at a runner binary, such as a NativeAOT one published with `-p:GraftRunnerAot=true`. Since 2026-11-03 it also drives `git-remote-graft` (ADR 0043): building the suite builds `src/Graft.Remote` too, and `GRAFT_REMOTE_HELPER` points it at another build, such as a NativeAOT one. The helper's binaries for the forge's download directory are published per platform; on Windows under `vcvars64` with `Platform` cleared, as for the server:
+
+```powershell
+dotnet publish srcGraft.RemoteGraft.Remote.csproj -c Release -r win-x64 -p:GraftRemoteAot=true -p:IlcUseEnvironmentalTools=true -o artifactshelperwin-x64
+# then copy artifactshelperwin-x64git-remote-graft.exe to <runner downloads>git-remote-graft-win-x64.exe
+```
+
+The Linux binary, `git-remote-graft-linux-x64`, is published the same way with `-r linux-x64` on a Linux machine or in WSL.
 
 ```powershell
 dotnet build tests\Graft.Git.Acceptance\Graft.Git.Acceptance.csproj -c Debug

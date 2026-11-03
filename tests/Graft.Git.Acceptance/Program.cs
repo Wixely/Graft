@@ -42,6 +42,8 @@ string? runnerChunkSize = null;
 bool pushDelete = true;
 // Which addresses a restart lets the forge import from (--url-import), or null for a forge that imports from nowhere.
 string? urlImport = null;
+// The part size a restart gives chunked transfers (--transfer-part-size, in MiB), or null for the default.
+string? transferPartSize = null;
 Process? server = null;
 Task? outputReader = null;
 Task<string>? errorReader = null;
@@ -249,6 +251,7 @@ try
     address = await CheckWebhooks(address, aliceIdentity);
     address = await CheckRunners(address, aliceIdentity, bob.Username);
     address = await CheckUrlImport(address, aliceIdentity, bob.Username);
+    address = await CheckRemoteHelper(address, aliceIdentity, bob.Username);
     await CheckProjectAudit(address, aliceIdentity, bob.Username, "carol", alicePassword);
     await CheckGroups(address, aliceIdentity, bob.Username, "carol", adminPassword);
     await CheckSecondFactor(address, bob.Username, bobPassword, adminPassword);
@@ -375,6 +378,11 @@ ProcessStartInfo ServerStart()
     {
         start.ArgumentList.Add("--url-import");
         start.ArgumentList.Add(urlImport);
+    }
+    if (transferPartSize is not null)
+    {
+        start.ArgumentList.Add("--transfer-part-size");
+        start.ArgumentList.Add(transferPartSize);
     }
     if (mailSmtpUrl is not null)
     {
@@ -5841,6 +5849,233 @@ async Task<string> CheckWebhooks(string address, AuthenticatedIdentity alice)
 
 // Import by address and mirroring (ADR 0042), against an upstream this check serves itself over plain HTTP from a Graft
 // repository in memory, so it controls what the upstream does: advance, delete, rewrite, vanish, and speak either protocol.
+/// <summary>
+/// git-remote-graft (ADR 0043): pushes, fetches and Git LFS objects carried in parts no larger than the forge's part size,
+/// set up once so plain https remotes go through it. The server is restarted with one-MiB parts, so a few megabytes of
+/// random content is enough to need several; then the transfer API is held to its rules directly.
+/// </summary>
+async Task<string> CheckRemoteHelper(string address, AuthenticatedIdentity alice, string bobUsername)
+{
+    string helper = RemoteHelperPath();
+    Check(File.Exists(helper), "git-remote-graft is built where the suite looks for it");
+    if (!File.Exists(helper)) return address;
+
+    await StopServer();
+    transferPartSize = "1";
+    address = await StartServer();
+    Check(serverLines.Any(line => line.StartsWith("TRANSFERS: in parts of 1 MiB", StringComparison.Ordinal)), "a server given a part size says so at startup");
+
+    string token, bobToken;
+    long projectId;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        ProjectInfo created = await store.CreateProjectWithRepositoryAsync(alice, "relayed", "Relayed",
+            (project, cancellation) => { cancellation.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, project.StorageId)); return Task.CompletedTask; });
+        projectId = created.Id;
+        token = (await store.CreateTokenAsync(alice, "relay", TokenScope.Api | TokenScope.ReadRepository | TokenScope.WriteRepository, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        UserAccount bob = Required(await store.FindActiveUserAsync(bobUsername), "bob account");
+        bobToken = (await store.CreateTokenAsync(new(bob.Id, bob.Username, false, IdentityKind.BrowserSession), "relay-bob",
+            TokenScope.Api | TokenScope.ReadRepository | TokenScope.WriteRepository, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+    }
+    Uri origin = new(address);
+    string repository = address + "/alice/relayed.git";
+
+    // Set up as a person would: one command, into a global configuration of the suite's own.
+    string helperConfig = Path.Combine(root, "helper.gitconfig");
+    File.WriteAllText(helperConfig, "");
+    string credentials = Path.Combine(root, "helper.credentials");
+    File.WriteAllText(credentials, "https://alice:" + token + "@" + origin.Host + "%3a" + origin.Port.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\n");
+    Dictionary<string, string> environment = new()
+    {
+        ["GIT_CONFIG_GLOBAL"] = helperConfig,
+        ["PATH"] = Path.GetDirectoryName(helper) + Path.PathSeparator + Environment.GetEnvironmentVariable("PATH")
+    };
+    string[] credential = ["-c", "credential.helper=store --file=" + credentials.Replace('\\', '/')];
+    var setup = await RunTool(helper, root, ["setup", address], environment);
+    var rule = await RunGit(root, ["config", "--file", helperConfig, "--get", "url.graft::" + address + "/.insteadOf"]);
+    var agent = await RunGit(root, ["config", "--file", helperConfig, "--get", "lfs.customtransfer.graft.args"]);
+    Check(setup.ExitCode == 0 && rule.Output.Trim() == address + "/" && agent.Output.Trim() == "lfs-agent",
+        "setup routes the forge's addresses through the helper and names it as the graft transfer for Git LFS");
+
+    // A push of several parts, through a plain https remote.
+    string work = Path.Combine(root, "relayed");
+    Directory.CreateDirectory(work);
+    byte[] content = new byte[3 * 1024 * 1024 + 4321];
+    new Random(43).NextBytes(content);
+    File.WriteAllBytes(Path.Combine(work, "payload.bin"), content);
+    await Git(work, ["init", "--initial-branch=main"]);
+    await Git(work, ["add", "."]);
+    await Git(work, ["commit", "-m", "Payload"]);
+    await Git(work, ["remote", "add", "origin", repository]);
+    var pushed = await RunGit(work, [.. credential, "push", "--progress", "origin", "main"], environment);
+    string head = (await RunGit(work, ["rev-parse", "HEAD"])).Output.Trim();
+    var listed = await RunGit(root, ["ls-remote", AuthenticatedUrl(address, "alice", token, "alice/relayed.git"), "refs/heads/main"]);
+    Check(pushed.ExitCode == 0 && pushed.Errors.Contains("graft: sent", StringComparison.Ordinal) && listed.Output.StartsWith(head, StringComparison.Ordinal),
+        "a push larger than a part goes through the helper in parts and moves the branch: " + Redact(pushed.Errors.Trim().Split('\n')[^1]));
+    var pinned = await RunGit(work, ["config", "--get", "remote.origin.lfsurl"]);
+    Check(pinned.Output.Trim() == repository + "/info/lfs", "the helper pins the remote's Git LFS address to the plain https one");
+
+    // A clone and an incremental fetch through it.
+    var cloned = await RunGit(root, [.. credential, "clone", repository, "relayed-clone"], environment);
+    string clone = Path.Combine(root, "relayed-clone");
+    Check(cloned.ExitCode == 0 && File.Exists(Path.Combine(clone, "payload.bin")) && File.ReadAllBytes(Path.Combine(clone, "payload.bin")).AsSpan().SequenceEqual(content) &&
+        (await RunGit(clone, ["fsck", "--strict"])).ExitCode == 0, "a clone through the helper has every byte and passes fsck --strict");
+    File.WriteAllText(Path.Combine(work, "NEXT.md"), "next\n");
+    await Git(work, ["add", "."]);
+    await Git(work, ["commit", "-m", "Next"]);
+    var second = await RunGit(work, [.. credential, "push", "origin", "main"], environment);
+    var pulled = await RunGit(clone, [.. credential, "pull", "--ff-only", "origin", "main"], environment);
+    Check(second.ExitCode == 0 && pulled.ExitCode == 0 && File.Exists(Path.Combine(clone, "NEXT.md")), "a later push and an incremental fetch go through it too");
+    using (HttpResponseMessage events = await ApiGet(address, "/api/v4/projects/" + projectId + "/events", token))
+        Check((await events.Content.ReadAsStringAsync()).Contains("\"pushed new\"", StringComparison.Ordinal), "a push carried in parts is recorded in the activity feed like any other");
+
+    // Git LFS through the graft transfer, both ways.
+    if ((await RunGit(root, ["lfs", "version"])).ExitCode == 0)
+    {
+        await Git(work, ["lfs", "install", "--local"]);
+        await Git(work, ["lfs", "track", "*.dat"]);
+        byte[] large = new byte[2 * 1024 * 1024 + 99];
+        new Random(44).NextBytes(large);
+        File.WriteAllBytes(Path.Combine(work, "model.dat"), large);
+        await Git(work, ["add", "."]);
+        await Git(work, ["commit", "-m", "Model"]);
+        Dictionary<string, string> traced = new(environment) { ["GIT_TRACE"] = "1" };
+        var uploaded = await RunGit(work, [.. credential, "push", "origin", "main"], traced);
+        string oid = Convert.ToHexStringLower(SHA256.HashData(large));
+        Check(uploaded.ExitCode == 0 && uploaded.Errors.Contains("starting transfer adapter \"graft\"", StringComparison.Ordinal) &&
+            File.Exists(Path.Combine(repositoriesRoot, (await StorageIdOf(projectId))!, "lfs", oid[..2], oid[2..4], oid)),
+            "git-lfs uploads through the graft transfer, in parts, and the object is stored");
+        // A person who uses Git LFS has its filters in their global configuration; this one is the suite's own.
+        await RunGit(root, ["lfs", "install"], environment);
+        var lfsClone = await RunGit(root, [.. credential, "clone", repository, "relayed-lfs"], traced);
+        string model = Path.Combine(root, "relayed-lfs", "model.dat");
+        Check(lfsClone.ExitCode == 0 && lfsClone.Errors.Contains("starting transfer adapter \"graft\"", StringComparison.Ordinal) &&
+            File.Exists(model) && File.ReadAllBytes(model).AsSpan().SequenceEqual(large), "and downloads through it, every byte, in a fresh clone");
+    }
+    else Console.WriteLine("SKIP: git-lfs is not installed, so the graft transfer for large files is exercised over HTTP only.");
+
+    // The transfer API, held to its rules.
+    HttpClient Basic(string? username, string? secret)
+    {
+        HttpClient client = new(new HttpClientHandler { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false })
+        { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(30) };
+        if (username is not null) client.DefaultRequestHeaders.Authorization = new("Basic", Convert.ToBase64String(Encoding.UTF8.GetBytes(username + ":" + secret)));
+        return client;
+    }
+    static async Task<JsonElement> Status(HttpResponseMessage response) => JsonDocument.Parse(await response.Content.ReadAsStringAsync()).RootElement;
+    using HttpClient alicePlain = Basic("alice", token), bobPlain = Basic(bobUsername, bobToken), anonymous = Basic(null, null);
+    string transfers = "/alice/relayed.git/graft/transfers";
+    using (HttpResponseMessage refused = await anonymous.PostAsync(transfers + "?kind=git-receive-pack&size=4", new ByteArrayContent("0000"u8.ToArray())))
+        Check(refused.StatusCode == HttpStatusCode.Unauthorized, "a push transfer without a credential is challenged");
+    using (HttpResponseMessage stranger = await bobPlain.PostAsync(transfers + "?kind=git-receive-pack&size=4", new ByteArrayContent("0000"u8.ToArray())))
+        Check(stranger.StatusCode == HttpStatusCode.NotFound, "and one from somebody who may not push is told there is no such repository");
+    using (HttpResponseMessage wrong = await alicePlain.PostAsync(transfers + "?kind=archive&size=4", new ByteArrayContent("0000"u8.ToArray())))
+        Check(wrong.StatusCode == HttpStatusCode.BadRequest, "a transfer of a kind the forge does not know is refused");
+    // With Expect: 100-continue, as a careful client sends a large body, so the refusal arrives before the bytes would.
+    using HttpRequestMessage tooLarge = new(HttpMethod.Post, transfers + "?kind=git-receive-pack&size=4000000") { Content = new ByteArrayContent(new byte[1536 * 1024]) };
+    tooLarge.Headers.ExpectContinue = true;
+    using (HttpResponseMessage oversized = await alicePlain.SendAsync(tooLarge))
+        Check(oversized.StatusCode == HttpStatusCode.RequestEntityTooLarge, "a part larger than the part size is refused");
+
+    string session;
+    using (HttpResponseMessage started = await alicePlain.PostAsync(transfers + "?kind=git-receive-pack&size=10", new ByteArrayContent("0032"u8.ToArray())))
+    {
+        JsonElement status = await Status(started);
+        session = status.GetProperty("id").GetString()!;
+        Check(started.StatusCode == HttpStatusCode.Created && status.GetProperty("state").GetString() == "receiving" &&
+            status.GetProperty("received").GetInt64() == 4 && status.GetProperty("part_bytes").GetInt64() == 1024 * 1024,
+            "a transfer starts with its first part and says how large a part may be");
+    }
+    using (HttpResponseMessage ahead = await alicePlain.PutAsync(transfers + "/" + session + "?offset=8", new ByteArrayContent("xx"u8.ToArray())))
+        Check(ahead.StatusCode == HttpStatusCode.Conflict && (await Status(ahead)).GetProperty("received").GetInt64() == 4,
+            "a part beyond what has arrived is refused with where to resume");
+    using (HttpResponseMessage beyond = await alicePlain.PutAsync(transfers + "/" + session + "?offset=4", new ByteArrayContent("1234567"u8.ToArray())))
+        Check(beyond.StatusCode == HttpStatusCode.RequestEntityTooLarge, "parts that would pass the declared size are refused");
+    using (HttpResponseMessage others = await bobPlain.GetAsync(transfers + "/" + session))
+        Check(others.StatusCode == HttpStatusCode.NotFound, "somebody else's transfer is not found");
+    using (HttpResponseMessage last = await alicePlain.PutAsync(transfers + "/" + session + "?offset=4&wait=10", new ByteArrayContent("garbag"u8.ToArray())))
+    {
+        JsonElement status = await Status(last);
+        Check(last.IsSuccessStatusCode && status.GetProperty("state").GetString() == "failed" && status.GetProperty("error").GetString()!.Length > 0,
+            "a push that is not one fails with the engine's reason once its last part arrives");
+    }
+    using (HttpResponseMessage removed = await alicePlain.DeleteAsync(transfers + "/" + session))
+    using (HttpResponseMessage gone = await alicePlain.GetAsync(transfers + "/" + session))
+        Check(removed.StatusCode == HttpStatusCode.NoContent && gone.StatusCode == HttpStatusCode.NotFound, "a finished transfer is removed by whoever started it");
+
+    // A fetch request as a transfer, its answer read back in ranges.
+    MemoryStream listRefs = new();
+    Packet.Write(listRefs, "command=ls-refs\n");
+    Packet.Flush(listRefs);
+    using (HttpResponseMessage started = await alicePlain.PostAsync(transfers + "?kind=git-upload-pack&protocol=2&size=" + listRefs.Length + "&wait=10",
+        new ByteArrayContent(listRefs.ToArray())))
+    {
+        JsonElement status = await Status(started);
+        string id = status.GetProperty("id").GetString()!;
+        long length = status.GetProperty("result_bytes").GetInt64();
+        using HttpRequestMessage partial = new(HttpMethod.Get, transfers + "/" + id + "/result");
+        partial.Headers.Range = new(0, 9);
+        using HttpResponseMessage range = await alicePlain.SendAsync(partial);
+        byte[] whole = await alicePlain.GetByteArrayAsync(transfers + "/" + id + "/result");
+        Check(status.GetProperty("state").GetString() == "done" && range.StatusCode == HttpStatusCode.PartialContent &&
+            range.Content.Headers.ContentRange?.ToString() == "bytes 0-9/" + length && whole.Length == length &&
+            Encoding.ASCII.GetString(whole).Contains("refs/heads/main", StringComparison.Ordinal),
+            "a fetch request's answer is read back whole or a range at a time");
+    }
+
+    // Git LFS: the batch API offers the graft transfer to a client that asks for it, and objects are read in ranges.
+    using (HttpRequestMessage batch = new(HttpMethod.Post, "/alice/relayed.git/info/lfs/objects/batch")
+    {
+        Content = new StringContent("{\"operation\":\"upload\",\"transfers\":[\"graft\",\"basic\"],\"objects\":[{\"oid\":\"" + new string('a', 64) + "\",\"size\":5}]}",
+            Encoding.UTF8, "application/vnd.git-lfs+json")
+    })
+    using (HttpResponseMessage answered = await alicePlain.SendAsync(batch))
+    {
+        JsonElement json = await Status(answered);
+        Check(json.GetProperty("transfer").GetString() == "graft" &&
+            json.GetProperty("objects")[0].GetProperty("actions").GetProperty("upload").GetProperty("href").GetString()!.Contains("/graft/transfers?kind=lfs&oid=", StringComparison.Ordinal),
+            "the Git LFS batch answers with the graft transfer when the client offers it");
+    }
+    string stored = Convert.ToHexStringLower(SHA256.HashData("12345"u8));
+    using (HttpResponseMessage small = await alicePlain.PostAsync(transfers + "?kind=lfs&oid=" + stored + "&size=5&wait=10", new ByteArrayContent("12345"u8.ToArray())))
+    {
+        using HttpRequestMessage partial = new(HttpMethod.Get, "/alice/relayed.git/info/lfs/objects/" + stored);
+        partial.Headers.Range = new(1, 2);
+        using HttpResponseMessage range = await alicePlain.SendAsync(partial);
+        Check((await Status(small)).GetProperty("state").GetString() == "done" && range.StatusCode == HttpStatusCode.PartialContent &&
+            await range.Content.ReadAsStringAsync() == "23", "a large file sent as a transfer is stored, and read back a range at a time");
+    }
+    using (HttpResponseMessage lying = await alicePlain.PostAsync(transfers + "?kind=lfs&oid=" + new string('b', 64) + "&size=5&wait=10", new ByteArrayContent("12345"u8.ToArray())))
+        Check((await Status(lying)).GetProperty("error").GetString()!.Contains("do not hash", StringComparison.Ordinal), "a large file whose bytes do not hash to its oid is refused");
+
+    // Installing it from the forge.
+    using (HttpResponseMessage powershell = await anonymous.GetAsync("/-/git-remote-graft/install.ps1"))
+    using (HttpResponseMessage shell = await anonymous.GetAsync("/-/git-remote-graft/install.sh"))
+    using (HttpResponseMessage binary = await anonymous.GetAsync("/-/git-remote-graft/download/git-remote-graft-win-x64.exe"))
+    {
+        string ps1 = await powershell.Content.ReadAsStringAsync(), sh = await shell.Content.ReadAsStringAsync();
+        Check(powershell.IsSuccessStatusCode && ps1.Contains("setup $Origin", StringComparison.Ordinal) && ps1.Contains(address, StringComparison.Ordinal) &&
+            shell.IsSuccessStatusCode && sh.StartsWith("#!/bin/sh", StringComparison.Ordinal) && sh.Contains("setup \"$ORIGIN\"", StringComparison.Ordinal) &&
+            binary.StatusCode == HttpStatusCode.NotFound, "the forge serves the install scripts, and no binary when it has no downloads directory");
+    }
+
+    var removedRule = await RunTool(helper, root, ["remove", address], environment);
+    var afterRemove = await RunGit(root, ["config", "--file", helperConfig, "--get", "url.graft::" + address + "/.insteadOf"]);
+    Check(removedRule.ExitCode == 0 && afterRemove.ExitCode != 0, "remove takes the forge's addresses back out of the helper's hands");
+    return address;
+}
+
+/// <summary>The helper the suite drives: GRAFT_REMOTE_HELPER when set, otherwise the build beside the server's.</summary>
+string RemoteHelperPath()
+{
+    if (Environment.GetEnvironmentVariable("GRAFT_REMOTE_HELPER") is { Length: > 0 } named) return Path.GetFullPath(named);
+    string name = OperatingSystem.IsWindows() ? "git-remote-graft.exe" : "git-remote-graft";
+    for (DirectoryInfo? directory = new(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
+        if (File.Exists(Path.Combine(directory.FullName, "Graft.slnx")))
+            return Path.Combine(directory.FullName, "src", "Graft.Remote", "bin", "Debug", "net10.0", name);
+    return name;
+}
+
 async Task<string> CheckUrlImport(string address, AuthenticatedIdentity alice, string bobUsername)
 {
     string api, bobApi;
@@ -6686,7 +6921,14 @@ async Task<string> CheckRunners(string address, AuthenticatedIdentity alice, str
         else await Task.Delay(500);
     }
     Check(waitingJob != 0, "the waiting job starts on the runner");
-    await Task.Delay(1500);
+    // Canceled once its first line has reached the forge, so the log it keeps has something in it however slowly the job's
+    // shell starts: on a loaded Windows machine PowerShell can take longer than a fixed pause.
+    for (int poll = 0; poll < 60; poll++)
+    {
+        using HttpResponseMessage early = await ApiGet(address, prefix + "/jobs/" + waitingJob + "/trace", aliceApi);
+        if ((await early.Content.ReadAsStringAsync()).Contains("started", StringComparison.Ordinal)) break;
+        await Task.Delay(500);
+    }
     using (HttpResponseMessage canceled = await ApiPost(address, prefix + "/jobs/" + waitingJob + "/cancel", aliceApi, new { }))
         Check(canceled.StatusCode == HttpStatusCode.Created && (await canceled.Content.ReadAsStringAsync()).Contains("\"status\":\"canceled\"", StringComparison.Ordinal),
             "a running job is canceled from the forge");

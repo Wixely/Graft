@@ -60,6 +60,10 @@ services:
       - ${GRAFT_URL_IMPORT:-}
       - --mirror-interval
       - ${GRAFT_MIRROR_INTERVAL:-}
+      # The largest part git-remote-graft sends a push, fetch or large file in, in MiB; 16 when empty. See
+      # docs/decisions/0043-chunked-transfers-git-remote-graft.md.
+      - --transfer-part-size
+      - ${GRAFT_TRANSFER_PART_SIZE:-}
       - --session-minutes
       - ${GRAFT_SESSION_MINUTES:-720}
       # The Model Context Protocol endpoint, served by the forge itself at /mcp on the same port and

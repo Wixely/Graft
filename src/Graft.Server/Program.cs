@@ -33,7 +33,7 @@ if (args.Length == 1 && args[0] == "--licences")
 
 if (!Arguments.TryParse(args, out Arguments? parsedSettings))
 {
-    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>] [--mcp true|false] [--pages-origin <https origin>] [--recoverable-tokens true|false] [--webhooks true|false] [--ssh-port <0-65535>] [--ssh-host <name>] [--mail-smtp <smtp|smtp+starttls|smtps URL>] [--mail-from <address>] [--mail-password-file <UTF-8 path>] [--runner-port <0-65535>] [--runner-host <name>] [--runner-downloads <directory>] [--runner-chunk-threshold <MiB|off>] [--runner-chunk-size <1-64 MiB>] [--push-delete true|false] [--url-import off|public|any] [--mirror-interval <15-10080 minutes>].");
+    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>] [--mcp true|false] [--pages-origin <https origin>] [--recoverable-tokens true|false] [--webhooks true|false] [--ssh-port <0-65535>] [--ssh-host <name>] [--mail-smtp <smtp|smtp+starttls|smtps URL>] [--mail-from <address>] [--mail-password-file <UTF-8 path>] [--runner-port <0-65535>] [--runner-host <name>] [--runner-downloads <directory>] [--runner-chunk-threshold <MiB|off>] [--runner-chunk-size <1-64 MiB>] [--push-delete true|false] [--url-import off|public|any] [--mirror-interval <15-10080 minutes>] [--transfer-part-size <1-95 MiB>].");
     Console.Error.WriteLine("       Graft.Server --licences  prints the third-party notices this build redistributes.");
     return 2;
 }
@@ -219,6 +219,8 @@ await using WebhookSender? webhooks = settings.Webhooks ? new WebhookSender(stor
 using HttpClient? importClient = settings.UrlImport == UrlImportPolicy.Off ? null : ImportClient(settings.UrlImport);
 // Started once the server is listening; null when import is off, and then nothing schedules an update.
 MirrorWorker? mirrors = null;
+// Pushes, fetches and large files sent in parts by git-remote-graft, for a proxy that caps a request's size (ADR 0043).
+using TransferSessions transfers = new(settings.TransferPartBytes);
 // Mail, when the operator named a server. Off, the forge sends nothing and says so where it matters.
 await using MailSender? mail = settings.Mail is null ? null : new MailSender(settings.Mail, (text, exception) => Console.Error.WriteLine("MAIL: " + text + (exception is null ? "" : " " + exception.Message)));
 // A notification is an inbox row first. A message is a copy of it, and only for a person who asked and has
@@ -290,7 +292,14 @@ app.Use(async (context, next) =>
         IHttpMaxRequestBodySizeFeature? bodySize = context.Features.Get<IHttpMaxRequestBodySizeFeature>();
         if (bodySize is { IsReadOnly: false }) bodySize.MaxRequestBodySize = Limits.RequestBytes;
     }
-    gitTransfer |= largeFile;
+    // A part of a chunked transfer is at most the configured part size; the transfer as a whole may be a push's.
+    bool transferPart = context.Request.Path.Value?.Contains(".git/graft/transfers", StringComparison.Ordinal) == true;
+    if (transferPart)
+    {
+        IHttpMaxRequestBodySizeFeature? bodySize = context.Features.Get<IHttpMaxRequestBodySizeFeature>();
+        if (bodySize is { IsReadOnly: false }) bodySize.MaxRequestBodySize = settings.TransferPartBytes;
+    }
+    gitTransfer |= largeFile || transferPart;
     if (uploading)
     {
         IHttpMaxRequestBodySizeFeature? bodySize = context.Features.Get<IHttpMaxRequestBodySizeFeature>();
@@ -1076,6 +1085,33 @@ app.MapGet("/-/runner/download/{file}", async context =>
     if (!await OnlyQuery(context)) return;
     string file = context.Request.RouteValues["file"]?.ToString() ?? "";
     string? platform = Graft.Server.RunnerInstallScripts.Platforms.FirstOrDefault(p => Graft.Server.RunnerInstallScripts.BinaryName(p) == file);
+    string? path = settings.RunnerDownloads is null || platform is null ? null : Path.Combine(settings.RunnerDownloads, file);
+    if (path is null || !File.Exists(path)) { context.Response.StatusCode = StatusCodes.Status404NotFound; return; }
+    await using FileStream content = File.OpenRead(path);
+    await WriteDownloadStream(context, content, file, "application/octet-stream");
+});
+
+// git-remote-graft (ADR 0043): its install scripts, which carry no secret, and its binaries from the directory the runner's
+// come from. The scripts install it for the person running them and set it up for this forge.
+app.MapGet("/-/git-remote-graft/install.ps1", async context =>
+{
+    if (!await OnlyQuery(context)) return;
+    context.Response.ContentType = "text/plain; charset=utf-8";
+    await context.Response.WriteAsync(Graft.Server.HelperInstallScripts.PowerShell(serverOrigin!, settings.RunnerDownloads is not null), context.RequestAborted);
+});
+
+app.MapGet("/-/git-remote-graft/install.sh", async context =>
+{
+    if (!await OnlyQuery(context)) return;
+    context.Response.ContentType = "text/plain; charset=utf-8";
+    await context.Response.WriteAsync(Graft.Server.HelperInstallScripts.Shell(serverOrigin!, settings.RunnerDownloads is not null), context.RequestAborted);
+});
+
+app.MapGet("/-/git-remote-graft/download/{file}", async context =>
+{
+    if (!await OnlyQuery(context)) return;
+    string file = context.Request.RouteValues["file"]?.ToString() ?? "";
+    string? platform = Graft.Server.HelperInstallScripts.Platforms.FirstOrDefault(p => Graft.Server.HelperInstallScripts.BinaryName(p) == file);
     string? path = settings.RunnerDownloads is null || platform is null ? null : Path.Combine(settings.RunnerDownloads, file);
     if (path is null || !File.Exists(path)) { context.Response.StatusCode = StatusCodes.Status404NotFound; return; }
     await using FileStream content = File.OpenRead(path);
@@ -8240,13 +8276,17 @@ app.MapPost("/{projectNamespace}/{project}.git/info/lfs/objects/batch", async co
     try { request = await context.Request.ReadFromJsonAsync(ApiJson.Default.LfsBatchRequest, context.RequestAborted); }
     catch (JsonException) { await LfsError(context, 400, "the batch request is not valid JSON"); return; }
     if (request is null || request.Operation is not ("download" or "upload")) { await LfsError(context, 400, "operation must be download or upload"); return; }
-    if (request.Transfers is { Length: > 0 } && !request.Transfers.Contains("basic")) { await LfsError(context, 422, "only the basic transfer is supported"); return; }
+    // The basic transfer, or Graft's own when the client offers it: git-remote-graft as a custom transfer agent, which
+    // sends an object in parts no bigger than a proxy allows and reads one back in resumable ranges (ADR 0043).
+    bool graftTransfer = request.Transfers?.Contains("graft") == true;
+    if (request.Transfers is { Length: > 0 } && !graftTransfer && !request.Transfers.Contains("basic")) { await LfsError(context, 422, "only the basic and graft transfers are supported"); return; }
     if (request.Objects is not { Length: > 0 and <= 1000 }) { await LfsError(context, 422, "objects is required, at most a thousand at a time"); return; }
 
     AuthorizedRepository? authorized = await Authorize(context, request.Operation == "upload" ? ProjectAction.PushRepository : ProjectAction.FetchRepository);
     if (authorized is null) return;
     LargeFileStore store2 = new(Path.Combine(settings.Repositories, authorized.Project.StorageId));
     string origin = Origin(context) + "/" + Uri.EscapeDataString(authorized.Project.Namespace) + "/" + Uri.EscapeDataString(authorized.Project.Slug) + ".git/info/lfs/objects/";
+    string transferOrigin = Origin(context) + "/" + Uri.EscapeDataString(authorized.Project.Namespace) + "/" + Uri.EscapeDataString(authorized.Project.Slug) + ".git/graft/transfers";
     // The transfer requests carry the credential the batch arrived with, so a client that was told the
     // action is already authenticated does not go back to its credential helper for every object.
     string authorization = context.Request.Headers.Authorization.ToString();
@@ -8270,11 +8310,11 @@ app.MapPost("/{projectNamespace}/{project}.git/info/lfs/objects/batch", async co
             // Already here: nothing to upload, which the protocol says by omitting the action.
             objects.Add(stored is not null
                 ? new(wanted.Oid, wanted.Size, true, null, null)
-                : new(wanted.Oid, wanted.Size, true, new(null, new(origin + wanted.Oid, header, 3600)), null));
+                : new(wanted.Oid, wanted.Size, true, new(null, new(graftTransfer ? transferOrigin + "?kind=lfs&oid=" + wanted.Oid + "&size=" + wanted.Size.ToString(System.Globalization.CultureInfo.InvariantCulture) : origin + wanted.Oid, header, 3600)), null));
         }
     }
     context.Response.ContentType = LfsMediaType;
-    await context.Response.WriteAsJsonAsync(new LfsBatchResponse("basic", objects.ToArray()), ApiJson.Default.LfsBatchResponse, LfsMediaType, context.RequestAborted);
+    await context.Response.WriteAsJsonAsync(new LfsBatchResponse(graftTransfer ? "graft" : "basic", objects.ToArray()), ApiJson.Default.LfsBatchResponse, LfsMediaType, context.RequestAborted);
 });
 
 app.MapMethods("/{projectNamespace}/{project}.git/info/lfs/objects/{oid}", ["PUT"], async context =>
@@ -8312,11 +8352,10 @@ app.MapGet("/{projectNamespace}/{project}.git/info/lfs/objects/{oid}", async con
     LargeFileStore store2 = new(Path.Combine(settings.Repositories, authorized.Project.StorageId));
     long? size = store2.Size(oid);
     if (size is null) { await LfsError(context, 404, "no such object"); return; }
-    context.Response.ContentType = "application/octet-stream";
     context.Response.Headers.XContentTypeOptions = "nosniff";
-    context.Response.ContentLength = size;
-    using Stream content = store2.OpenRead(oid);
-    await content.CopyToAsync(context.Response.Body, context.RequestAborted);
+    // In ranges when asked, so git-remote-graft can resume a large object after a dropped connection.
+    await using Stream content = store2.OpenRead(oid);
+    await WriteRanged(context, content, "application/octet-stream");
 });
 
 static async Task LfsError(HttpContext context, int status, string message)
@@ -8437,6 +8476,274 @@ app.MapPost("/{projectNamespace}/{project}.git/{service}", async context =>
     await RecordPushes(authorized.Project, authorized.Identity, pushed);
     await CreatePushPipelines(authorized.Project, authorized.Identity, pushed);
 });
+
+// ---------------------------------------------------------------------------------------------------
+// Chunked transfers (ADR 0043): a push, a fetch request or a Git LFS object sent in parts, for the git-remote-graft
+// helper. A proxy in front of the forge may refuse a request over a size (Cloudflare's free plan: 100 MB) and give up on
+// a response that is slow to start, so the request arrives in parts no bigger than --transfer-part-size, the work runs
+// in the background while the client asks how it is going, and the answer is read back in ranges. The same credential
+// and the same permission as the route the transfer stands in for; every request after the first must come from the
+// person who started it.
+// ---------------------------------------------------------------------------------------------------
+
+app.MapPost("/{projectNamespace}/{project}.git/graft/transfers", async context =>
+{
+    string kindName = context.Request.Query["kind"].ToString();
+    TransferKind? kind = kindName switch
+    {
+        "git-receive-pack" => TransferKind.ReceivePack,
+        "git-upload-pack" => TransferKind.UploadPack,
+        "lfs" => TransferKind.LargeFile,
+        _ => null
+    };
+    if (kind is null) { await LfsError(context, 400, "kind must be git-receive-pack, git-upload-pack or lfs"); return; }
+    if (!long.TryParse(context.Request.Query["size"].ToString(), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out long size))
+    { await LfsError(context, 400, "size is the transfer's length in bytes"); return; }
+    string? oid = kind == TransferKind.LargeFile ? context.Request.Query["oid"].ToString() : null;
+    long ceiling = kind switch
+    {
+        TransferKind.ReceivePack => Limits.RequestBytes,
+        TransferKind.UploadPack => 16 * 1024 * 1024,
+        _ => LargeFileStore.MaximumBytes
+    };
+    if (size > ceiling) { await LfsError(context, 413, "the transfer exceeds the " + ceiling.ToString(System.Globalization.CultureInfo.InvariantCulture) + " bytes this kind may carry"); return; }
+    if (oid is not null && !LargeFileStore.IsOid(oid)) { await LfsError(context, 400, "oid is a lowercase SHA-256"); return; }
+    if (context.Request.ContentLength > transfers.PartBytes)
+    { await LfsError(context, 413, "a part is at most " + transfers.PartBytes.ToString(System.Globalization.CultureInfo.InvariantCulture) + " bytes"); return; }
+    AuthorizedRepository? authorized = await Authorize(context, kind == TransferKind.UploadPack ? ProjectAction.FetchRepository : ProjectAction.PushRepository);
+    if (authorized is null) return;
+
+    TransferSession session;
+    try
+    {
+        session = transfers.Create(kind.Value, authorized.Project.Id, authorized.Identity?.UserId, size,
+            context.Request.Query["protocol"].ToString() == "2", oid, Origin(context));
+    }
+    catch (TransferRefusedException refused) { await LfsError(context, refused.Status, refused.Message); return; }
+    context.Response.Headers.Location = context.Request.Path.Value + "/" + session.Id;
+    // A large file the forge already has needs nothing sent; the client is told it is done.
+    if (oid is not null && new LargeFileStore(Path.Combine(settings.Repositories, authorized.Project.StorageId)).Exists(oid))
+    {
+        session.Complete();
+        context.Response.StatusCode = StatusCodes.Status201Created;
+        await WriteTransferStatus(context, session);
+        return;
+    }
+    await ReceiveTransferPart(context, authorized, session, 0, StatusCodes.Status201Created);
+});
+
+app.MapPut("/{projectNamespace}/{project}.git/graft/transfers/{id}", async context =>
+{
+    var found = await FindTransfer(context);
+    if (found is null) return;
+    if (!long.TryParse(context.Request.Query["offset"].ToString(), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out long offset))
+    { await LfsError(context, 400, "offset is where the part starts, in bytes"); return; }
+    await ReceiveTransferPart(context, found.Value.Authorized, found.Value.Session, offset, StatusCodes.Status200OK);
+});
+
+app.MapGet("/{projectNamespace}/{project}.git/graft/transfers/{id}", async context =>
+{
+    var found = await FindTransfer(context);
+    if (found is null) return;
+    await found.Value.Session.WaitAsync(TransferWait(context), context.RequestAborted);
+    await WriteTransferStatus(context, found.Value.Session);
+});
+
+app.MapGet("/{projectNamespace}/{project}.git/graft/transfers/{id}/result", async context =>
+{
+    var found = await FindTransfer(context);
+    if (found is null) return;
+    TransferSession session = found.Value.Session;
+    if (session.State != TransferState.Done || !File.Exists(session.ResultPath)) { await LfsError(context, 409, "the transfer has no result yet"); return; }
+    await using FileStream result = new(session.ResultPath, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, FileOptions.Asynchronous);
+    await WriteRanged(context, result, "application/x-" + (session.Kind == TransferKind.ReceivePack ? "git-receive-pack" : "git-upload-pack") + "-result");
+});
+
+app.MapDelete("/{projectNamespace}/{project}.git/graft/transfers/{id}", async context =>
+{
+    var found = await FindTransfer(context);
+    if (found is null) return;
+    if (found.Value.Session.State == TransferState.Running) { await LfsError(context, 409, "the transfer is being acted on and is removed once it finishes"); return; }
+    transfers.Remove(found.Value.Session);
+    context.Response.StatusCode = StatusCodes.Status204NoContent;
+});
+
+// The transfer named in the route, for the person who started it, with the permission its kind needs; null, with the
+// answer written, otherwise. A transfer somebody else started is as absent as one that never existed.
+async Task<(AuthorizedRepository Authorized, TransferSession Session)?> FindTransfer(HttpContext context)
+{
+    string id = context.Request.RouteValues["id"]?.ToString() ?? "";
+    // The kind is not known until the transfer is found, so the narrowest permission comes first: a fetch is allowed to
+    // whoever may read, and a push or a large file is then held to the push permission below.
+    AuthorizedRepository? authorized = await Authorize(context, ProjectAction.FetchRepository);
+    if (authorized is null) return null;
+    TransferSession? session = transfers.Find(id, authorized.Project.Id, authorized.Identity?.UserId);
+    if (session is not null && session.Kind != TransferKind.UploadPack &&
+        !(await DecideFor(context, authorized.Identity, authorized.Project.Id, ProjectAction.PushRepository)).Allowed)
+        session = null;
+    if (session is null) { await LfsError(context, 404, "no such transfer"); return null; }
+    return (authorized, session);
+}
+
+// How long a request may wait for the transfer to finish before answering with where it is: under the minute and a
+// half a proxy allows a response to take.
+static TimeSpan TransferWait(HttpContext context) =>
+    int.TryParse(context.Request.Query["wait"].ToString(), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out int seconds)
+        ? TimeSpan.FromSeconds(Math.Min(seconds, 25)) : TimeSpan.Zero;
+
+async Task ReceiveTransferPart(HttpContext context, AuthorizedRepository authorized, TransferSession session, long offset, int status)
+{
+    await session.Writing.WaitAsync(context.RequestAborted);
+    try
+    {
+        if (session.State != TransferState.Receiving) { await LfsError(context, 409, "the transfer has every part it needs"); return; }
+        if (context.Request.ContentLength > transfers.PartBytes)
+        { await LfsError(context, 413, "a part is at most " + transfers.PartBytes.ToString(System.Globalization.CultureInfo.InvariantCulture) + " bytes"); return; }
+        if (!await session.WritePartAsync(offset, context.Request.Body, transfers.PartBytes, context.RequestAborted))
+        {
+            context.Response.StatusCode = StatusCodes.Status409Conflict;
+            await WriteTransferStatus(context, session);
+            return;
+        }
+        if (session.Received == session.Size) session.Start(work => RunTransfer(work, authorized.Project, authorized.Identity));
+    }
+    catch (TransferRefusedException refused) { await LfsError(context, refused.Status, refused.Message); return; }
+    finally { session.Writing.Release(); }
+    // Only the last part waits: until then there is nothing to finish.
+    if (session.State != TransferState.Receiving) await session.WaitAsync(TransferWait(context), context.RequestAborted);
+    context.Response.StatusCode = status;
+    await WriteTransferStatus(context, session);
+}
+
+async Task WriteTransferStatus(HttpContext context, TransferSession session)
+{
+    string state = session.State switch
+    {
+        TransferState.Receiving => "receiving",
+        TransferState.Running => "running",
+        TransferState.Done => "done",
+        _ => "failed"
+    };
+    await context.Response.WriteAsJsonAsync(new TransferStatusResponse(session.Id, state, session.Size, session.Received, transfers.PartBytes,
+        session.ResultBytes, session.Error), ApiJson.Default.TransferStatusResponse, null, context.RequestAborted);
+}
+
+// What a completed transfer does: exactly what the route it stands in for would have done with the same bytes.
+async Task RunTransfer(TransferSession session, ProjectInfo project, AuthenticatedIdentity? identity)
+{
+    if (session.Kind == TransferKind.LargeFile)
+    {
+        LargeFileStore files = new(Path.Combine(settings.Repositories, project.StorageId));
+        await using FileStream content = new(session.RequestPath, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, FileOptions.Asynchronous);
+        try { await files.StoreAsync(session.Oid!, session.Size, content, app.Lifetime.ApplicationStopping); }
+        catch (GitInputException error)
+        {
+            throw new TransferRefusedException(422, error.Message switch
+            {
+                "lfs-hash-mismatch" => "the bytes do not hash to the oid they were sent as",
+                "lfs-size-mismatch" or "lfs-size-exceeded" => "the bytes are not the size that was declared",
+                _ => "the object was refused: " + error.Message
+            });
+        }
+        return;
+    }
+
+    RepositoryEndpoint endpoint = EndpointFor(project);
+    List<(string Branch, string? From, string? To)> pushed = [];
+    // Waits for the repository rather than answering "busy": the client is already waiting, and a push that has
+    // crossed the network in parts should not be thrown away because a fetch was being served.
+    if (!await endpoint.Gate.WaitAsync(TimeSpan.FromMinutes(30), app.Lifetime.ApplicationStopping))
+        throw new TransferRefusedException(503, "the repository stayed busy for half an hour; try again");
+    try
+    {
+        await using FileStream input = new(session.RequestPath, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, FileOptions.SequentialScan);
+        await using FileStream output = new(session.ResultPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 64 * 1024);
+        if (session.Kind == TransferKind.ReceivePack)
+        {
+            Dictionary<string, string> before = new(endpoint.Repository.Refs, StringComparer.Ordinal);
+            byte[] report = endpoint.Repository.Receive(input, app.Lifetime.ApplicationStopping);
+            await output.WriteAsync(report, app.Lifetime.ApplicationStopping);
+            pushed = Moved(before, endpoint.Repository.Refs);
+        }
+        else if (session.ProtocolV2) endpoint.Repository.ServeV2(input, output, app.Lifetime.ApplicationStopping);
+        else endpoint.Repository.Upload(input, output, app.Lifetime.ApplicationStopping);
+    }
+    finally { endpoint.Gate.Release(); }
+    if (pushed.Count == 0) return;
+
+    // As a push over HTTP: after the repository is released, because a push is finished when it is durable.
+    foreach ((string branch, string? from, string? to) in pushed)
+    {
+        await NotifyAt(session.Origin, project, WebhookEvent.Push, payload =>
+        {
+            payload["branch"] = branch;
+            payload["before"] = from;
+            payload["commit"] = to;
+            payload["by"] = identity?.Username;
+            payload["via"] = "push";
+        }, CancellationToken.None);
+    }
+    await RecordPushes(project, identity, pushed);
+    await CreatePushPipelines(project, identity, pushed);
+}
+
+/// <summary>
+/// Writes a stream with a single byte range when the request asks for one, so a large result or object can be read back
+/// in pieces and resumed after a dropped connection.
+/// </summary>
+static async Task WriteRanged(HttpContext context, Stream content, string contentType)
+{
+    long length = content.Length;
+    context.Response.ContentType = contentType;
+    context.Response.Headers.AcceptRanges = "bytes";
+    long start = 0, end = length - 1;
+    string range = context.Request.Headers.Range.ToString();
+    if (range.Length > 0)
+    {
+        if (!TryByteRange(range, length, out start, out end))
+        {
+            context.Response.StatusCode = StatusCodes.Status416RangeNotSatisfiable;
+            context.Response.Headers.ContentRange = "bytes */" + length.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            return;
+        }
+        context.Response.StatusCode = StatusCodes.Status206PartialContent;
+        context.Response.Headers.ContentRange = "bytes " + start.ToString(System.Globalization.CultureInfo.InvariantCulture) + "-" +
+            end.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/" + length.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    }
+    long count = length == 0 ? 0 : end - start + 1;
+    context.Response.ContentLength = count;
+    content.Position = start;
+    byte[] buffer = new byte[64 * 1024];
+    while (count > 0)
+    {
+        int read = await content.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, count)), context.RequestAborted);
+        if (read == 0) break;
+        await context.Response.Body.WriteAsync(buffer.AsMemory(0, read), context.RequestAborted);
+        count -= read;
+    }
+}
+
+/// <summary>One range of the forms <c>bytes=a-b</c>, <c>bytes=a-</c> and <c>bytes=-n</c>, clipped to the length.</summary>
+static bool TryByteRange(string header, long length, out long start, out long end)
+{
+    start = 0;
+    end = length - 1;
+    if (!header.StartsWith("bytes=", StringComparison.Ordinal) || header.Contains(',', StringComparison.Ordinal) || length == 0) return false;
+    string[] bounds = header[6..].Split('-');
+    if (bounds.Length != 2) return false;
+    System.Globalization.CultureInfo invariant = System.Globalization.CultureInfo.InvariantCulture;
+    if (bounds[0].Length == 0)
+    {
+        if (!long.TryParse(bounds[1], System.Globalization.NumberStyles.None, invariant, out long suffix) || suffix == 0) return false;
+        start = Math.Max(0, length - suffix);
+        return true;
+    }
+    if (!long.TryParse(bounds[0], System.Globalization.NumberStyles.None, invariant, out start) || start >= length) return false;
+    if (bounds[1].Length == 0) return true;
+    if (!long.TryParse(bounds[1], System.Globalization.NumberStyles.None, invariant, out end) || end < start) return false;
+    end = Math.Min(end, length - 1);
+    return true;
+}
 
 // The pages origin: a project's static site, served from a different hostname and nothing else.
 //
@@ -8707,6 +9014,7 @@ Console.WriteLine("URL IMPORT: " + settings.UrlImport switch
     UrlImportPolicy.Any => "any address, including this server's own network; mirrors updated every " + settings.MirrorIntervalMinutes.ToString(System.Globalization.CultureInfo.InvariantCulture) + " minutes",
     _ => "off"
 });
+Console.WriteLine("TRANSFERS: in parts of " + (settings.TransferPartBytes / (1024 * 1024)).ToString(System.Globalization.CultureInfo.InvariantCulture) + " MiB, for git-remote-graft");
 Console.WriteLine("READY: " + address);
 await app.WaitForShutdownAsync();
 return 0;
@@ -9680,12 +9988,12 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
     string? Certificate, string? CertificatePasswordFile, bool PublicBrowsing, bool PushToCreate, int SessionMinutes, bool Mcp,
     string? PagesOrigin, bool RecoverableTokens, bool Webhooks, int SshPort, string? SshHost, MailSettings? Mail,
     int RunnerPort, string? RunnerHost, string? RunnerDownloads, long RunnerChunkThreshold, long RunnerChunkBytes, bool PushDelete,
-    UrlImportPolicy UrlImport, int MirrorIntervalMinutes)
+    UrlImportPolicy UrlImport, int MirrorIntervalMinutes, long TransferPartBytes)
 {
     public static bool TryParse(string[] values, out Arguments? result)
     {
         result = null;
-        if (values.Length is < 4 or > 52 || values.Length % 2 != 0) return false;
+        if (values.Length is < 4 or > 54 || values.Length % 2 != 0) return false;
         string? database = null;
         string? repositories = null;
         string? listen = null;
@@ -9712,6 +10020,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         string? pushDelete = null;
         string? urlImport = null;
         string? mirrorInterval = null;
+        string? transferPartSize = null;
         HashSet<string> seen = new(StringComparer.Ordinal);
         for (int index = 0; index < values.Length; index += 2)
         {
@@ -9742,6 +10051,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             else if (values[index] == "--push-delete") pushDelete = values[index + 1];
             else if (values[index] == "--url-import") urlImport = values[index + 1];
             else if (values[index] == "--mirror-interval") mirrorInterval = values[index + 1];
+            else if (values[index] == "--transfer-part-size") transferPartSize = values[index + 1];
             else return false;
         }
         if (string.IsNullOrWhiteSpace(database) || string.IsNullOrWhiteSpace(repositories)) return false;
@@ -9872,6 +10182,13 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         if (mirrorInterval is not null && (!int.TryParse(mirrorInterval, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out intervalMinutes) ||
             intervalMinutes is < 15 or > 10080))
             return false;
+        // The part a chunked transfer is cut into, in MiB: 16 unless the operator says otherwise, and never as large as
+        // the 100 MB a proxy such as Cloudflare's free plan allows one request to carry.
+        if (string.IsNullOrWhiteSpace(transferPartSize)) transferPartSize = null;
+        long partMebibytes = 16;
+        if (transferPartSize is not null && (!long.TryParse(transferPartSize, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out partMebibytes) ||
+            partMebibytes is < 1 or > 95))
+            return false;
         if (certificatePasswordFile is not null && certificate is null) return false;
         if (!IPAddress.IsLoopback(address) && certificate is null) return false;
         if (!IPAddress.IsLoopback(address) && origin is null) return false;
@@ -9884,7 +10201,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             publicBrowsing == "true", pushToCreate == "true", window, mcp == "true",
             pagesOrigin, recoverableTokens == "true", webhooks == "true", sshPortNumber, sshHost, mail,
             runnerPortNumber, runnerHost, runnerDownloads is null ? null : Path.GetFullPath(runnerDownloads), chunkThreshold, chunkBytes, pushDelete != "false",
-            importPolicy, intervalMinutes);
+            importPolicy, intervalMinutes, partMebibytes * 1024 * 1024);
         return true;
     }
 }

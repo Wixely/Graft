@@ -122,6 +122,28 @@ forge prints which on startup as `URL IMPORT:`. Outbound requests go directly, n
 address check is made on the connection itself. Only repositories anybody may clone can be imported. See
 [ADR 0042](decisions/0042-import-by-address-and-mirrors.md).
 
+### Large pushes behind a proxy that limits requests
+
+A proxy may refuse a request over a size: Cloudflare's free plan stops at 100 MB, and IIS at about 28.6 MiB unless
+`maxAllowedContentLength` is raised. Git sends a whole push, and Git LFS a whole file, as one request, so past that size
+they fail with 413. Fetches are not limited by size, but a large one can outlast a proxy's wait for the answer.
+
+`git-remote-graft` carries all three in parts. Each person installs it once, from the forge:
+
+```text
+# Windows PowerShell, as yourself
+& ([scriptblock]::Create((Invoke-RestMethod https://forge.example/-/git-remote-graft/install.ps1)))
+# Linux
+curl -fsSL https://forge.example/-/git-remote-graft/install.sh | sh
+```
+
+The scripts download the helper from the `--runner-downloads` directory, so put `git-remote-graft-win-x64.exe` and
+`git-remote-graft-linux-x64` there beside the runner binaries (see [build and test](build-and-test.md)); without them the
+scripts ask for `-Binary` or `--binary`. After that, ordinary `https://` remotes for the forge go through the helper with
+no other change. Parts are 16 MiB unless `--transfer-part-size <1-95>` (`GRAFT_TRANSFER_PART_SIZE`) says otherwise; the
+forge prints the size on startup as `TRANSFERS:`. Keep it under the smallest limit between clients and the forge. See
+[ADR 0043](decisions/0043-chunked-transfers-git-remote-graft.md).
+
 ### Optional MCP endpoint
 
 The forge hosts its own Model Context Protocol endpoint, at `/mcp` on the same port and certificate as everything else. It is off unless the operator asks for it: `--mcp true` on the command line, or in the container deployment

@@ -274,6 +274,18 @@ the SSH server, with no shell behind it; it accepts Ed25519, ECDSA and RSA keys 
 protocol version 2, which every Git since 2.26 uses by default. Check the host key fingerprint the server
 prints at startup the first time you connect. See [ADR 0031](docs/decisions/0031-git-over-ssh.md).
 
+**Behind a proxy that limits uploads**, such as Cloudflare's free plan at 100 MB, a large push or Git LFS file fails
+with HTTP 413. Install `git-remote-graft` once and ordinary `https://` remotes for the forge send pushes, fetches and LFS
+files in parts the proxy accepts, with the same token:
+
+```text
+& ([scriptblock]::Create((Invoke-RestMethod https://<your graft host>/-/git-remote-graft/install.ps1)))   # Windows PowerShell
+curl -fsSL https://<your graft host>/-/git-remote-graft/install.sh | sh                                 # Linux
+```
+
+`git-remote-graft remove https://<your graft host>` undoes it. See
+[ADR 0043](docs/decisions/0043-chunked-transfers-git-remote-graft.md).
+
 ## Run the existing experiment
 
 From this repository using .NET SDK 10.0.300 or a compatible newer .NET 10 feature band:

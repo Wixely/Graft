@@ -1,6 +1,20 @@
 # Next-agent handoff
 
-Updated: 2026-11-02. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the project owner.
+Updated: 2026-11-03. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the project owner.
+
+## Added on 2026-11-03: git-remote-graft, for a proxy that limits requests
+
+The live deployment is behind Cloudflare's free plan, which refuses a request over 100 MB. [ADR 0043](decisions/0043-chunked-transfers-git-remote-graft.md).
+
+- **Server.** `TransferSessions.cs` holds transfers in memory; the routes under `.git/graft/transfers` and `RunTransfer`
+  are in `Program.cs` beside the Git HTTP routes, with `WriteRanged` for byte ranges (also used by LFS downloads). The LFS
+  batch offers `graft` when asked. `--transfer-part-size` (MiB, default 16); the argument bound is now 54, which the
+  container exactly uses. `/-/git-remote-graft/install.ps1|install.sh|download/{file}`, binaries from `--runner-downloads`.
+- **Helper.** `src/Graft.Remote` (`git-remote-graft`): `GitBridge` (connect; v2 fetch, v0 push with `Pack.Capture` over a
+  buffered stdin), `ForgeClient` (credentials via `git credential`, TLS per `http.sslVerify`, transfers with retry),
+  `LfsAgent`, `Setup`. The trap: git-lfs applies `insteadOf` to its own address, including `lfsurl`; the helper pins
+  `lfsurl` plus a repository-local identity rule for that exact address.
+- **Not done.** The Linux binary is not built or run; nothing is verified behind the real Cloudflare and IIS.
 
 ## Added on 2026-11-02: an activity calendar on the profile
 

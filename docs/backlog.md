@@ -122,6 +122,13 @@ Then the first of the four large items, in the order given:
   exist, on the settings tab and at GitLab's `audit_events` route. The whole trail stays the administrator's.
   [ADR 0036](decisions/0036-project-audit.md).
 
+## Closed on 2026-11-03
+
+- **Large pushes, fetches and LFS files behind a proxy that limits requests.** `git-remote-graft`, a Git remote helper and
+  Git LFS transfer agent, sends each in parts under `--transfer-part-size` (16 MiB) through a transfer API on the forge,
+  so Cloudflare's 100 MB limit and its response timeout no longer stop them. One `setup` makes ordinary `https://`
+  remotes use it. [ADR 0043](decisions/0043-chunked-transfers-git-remote-graft.md).
+
 ## Closed on 2026-11-02
 
 - **An activity calendar on the profile.** A year of the person's contributions a day at a time, shaded like

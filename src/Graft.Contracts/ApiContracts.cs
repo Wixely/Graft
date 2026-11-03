@@ -975,6 +975,13 @@ public sealed record LfsObjectRequest(string? Oid, long Size);
 
 /// <summary>The Git LFS batch response: one entry per object asked about, each with its actions or its error.</summary>
 public sealed record LfsBatchResponse(string Transfer, IReadOnlyList<LfsObjectResponse> Objects);
+
+/// <summary>
+/// Where a chunked transfer is (ADR 0043): a push, a fetch request or a large file sent in parts no bigger than
+/// <c>part_bytes</c>, then acted on in the background. <c>state</c> is receiving, running, done or failed; a finished
+/// Git transfer has <c>result_bytes</c> to read back in ranges.
+/// </summary>
+public sealed record TransferStatusResponse(string Id, string State, long Size, long Received, long PartBytes, long? ResultBytes, string? Error);
 // Null members are omitted rather than written: git-lfs reads `actions` as a map of pointers and follows
 // each one without a nil check, so a written `"download": null` crashes the client outright.
 public sealed record LfsObjectResponse(
@@ -1462,6 +1469,7 @@ public sealed record ProjectUploadResponse(
 [JsonSerializable(typeof(RegistryErrors))]
 [JsonSerializable(typeof(LfsBatchRequest))]
 [JsonSerializable(typeof(LfsBatchResponse))]
+[JsonSerializable(typeof(TransferStatusResponse))]
 [JsonSerializable(typeof(ForkedFromResponse))]
 [JsonSerializable(typeof(HousekeepingResponse))]
 [JsonSerializable(typeof(BlobSearchResponse))]
