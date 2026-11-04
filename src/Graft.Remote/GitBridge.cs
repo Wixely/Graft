@@ -166,11 +166,9 @@ internal sealed class GitBridge(string remote, Uri address, Stream input, Stream
         if (remote.Contains("://", StringComparison.Ordinal) || remote.Contains("::", StringComparison.Ordinal)) return;
         try
         {
-            if (Git.Config("--get", "remote." + remote + ".url") is null)
-            {
-                Console.Error.WriteLine("graft: did not record the Git LFS address: this repository has no remote '" + remote + "' configured");
-                return;
-            }
+            // No check that the remote's URL is configured: some versions of Git start the helper for a clone before they
+            // write remote.origin.url, and a clone is where the pin matters most. Git named the remote, and the address is
+            // the one it asked for.
             string wanted = address.AbsoluteUri.TrimEnd('/');
             wanted += wanted.EndsWith(".git", StringComparison.Ordinal) ? "/info/lfs" : ".git/info/lfs";
             string? current = Git.Config("--get", "remote." + remote + ".lfsurl");

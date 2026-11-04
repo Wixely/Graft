@@ -77,6 +77,12 @@ repository-local rule mapping exactly that address to itself. No Git remote begi
 applies the rule. A repository the helper has never run in, used with `git lfs` commands alone before any fetch or push,
 still sees the rewritten address; any fetch, pull or push fixes it.
 
+Some versions of Git start the helper for a clone before they write `remote.origin.url` into the new repository. The
+helper first pinned only for a remote whose URL was configured, so on those versions a fresh clone was left unpinned and
+git-lfs failed with `missing protocol: "graft::https://.../info/lfs"`. Found on 2026-11-04 by the deployment's verify
+stage, which the local Git (2.55) did not reproduce. The helper now pins for whatever remote Git names, and says so
+with a `graft:` warning when Git refuses the write or the value does not read back.
+
 ## Distribution
 
 The forge serves `/-/git-remote-graft/install.ps1` and `/-/git-remote-graft/install.sh`, which carry no secret, and the
