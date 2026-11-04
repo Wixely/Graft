@@ -166,7 +166,11 @@ internal sealed class GitBridge(string remote, Uri address, Stream input, Stream
         if (remote.Contains("://", StringComparison.Ordinal) || remote.Contains("::", StringComparison.Ordinal)) return;
         try
         {
-            if (Git.Config("--get", "remote." + remote + ".url") is null) return;
+            if (Git.Config("--get", "remote." + remote + ".url") is null)
+            {
+                Console.Error.WriteLine("graft: did not record the Git LFS address: this repository has no remote '" + remote + "' configured");
+                return;
+            }
             string wanted = address.AbsoluteUri.TrimEnd('/');
             wanted += wanted.EndsWith(".git", StringComparison.Ordinal) ? "/info/lfs" : ".git/info/lfs";
             string? current = Git.Config("--get", "remote." + remote + ".lfsurl");
@@ -174,14 +178,17 @@ internal sealed class GitBridge(string remote, Uri address, Stream input, Stream
             if (current is not null && current != wanted && ours != "true") return;
             if (current != wanted)
             {
-                Git.Config("remote." + remote + ".lfsurl", wanted);
-                Git.Config("remote." + remote + ".graftlfsurl", "true");
+                Git.SetConfig("remote." + remote + ".lfsurl", wanted);
+                Git.SetConfig("remote." + remote + ".graftlfsurl", "true");
             }
-            if (Git.Config("--get", "url." + wanted + ".insteadOf") != wanted) Git.Config("url." + wanted + ".insteadOf", wanted);
+            if (Git.Config("--get", "url." + wanted + ".insteadOf") != wanted) Git.SetConfig("url." + wanted + ".insteadOf", wanted);
+            // Read back, so a write Git accepted but that did not land is reported rather than found by git-lfs later.
+            if (Git.Config("--get", "remote." + remote + ".lfsurl") != wanted || Git.Config("--get", "url." + wanted + ".insteadOf") != wanted)
+                throw new HelperException("the address did not read back as written");
         }
         catch (Exception error) when (error is not OperationCanceledException)
         {
-            Console.Error.WriteLine("graft: could not record the Git LFS address for '" + remote + "': " + error.Message);
+            Console.Error.WriteLine("graft: could not record the Git LFS address for '" + remote + "', so Git LFS may try a graft:: address: " + error.Message);
         }
     }
 

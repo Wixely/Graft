@@ -350,6 +350,13 @@ internal static class Git
         return exit == 0 && value.Length > 0 ? value : null;
     }
 
+    /// <summary>Sets a value in the repository's configuration, and says so when Git refuses.</summary>
+    public static void SetConfig(string key, string value)
+    {
+        (int exit, _) = RunAsync(["config", key, value], null, CancellationToken.None).GetAwaiter().GetResult();
+        if (exit != 0) throw new HelperException("git config " + key + " exited " + exit);
+    }
+
     public static string? ConfigUrlMatch(string key, Uri address, string type) =>
         Config("--type=" + type, "--get-urlmatch", key, address.AbsoluteUri);
 }

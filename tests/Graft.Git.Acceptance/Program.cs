@@ -5954,6 +5954,14 @@ async Task<string> CheckRemoteHelper(string address, AuthenticatedIdentity alice
         await RunGit(root, ["lfs", "install"], environment);
         var lfsClone = await RunGit(root, [.. credential, "clone", repository, "relayed-lfs"], traced);
         string model = Path.Combine(root, "relayed-lfs", "model.dat");
+        // git-lfs finds its batch address from the pin; without it, it tries graft::https://... and fails before the transfer.
+        string lfsAddress = repository + "/info/lfs";
+        string clonePinned = (await RunGit(Path.Combine(root, "relayed-lfs"), ["config", "--local", "--get", "remote.origin.lfsurl"])).Output.Trim();
+        string cloneRule = (await RunGit(Path.Combine(root, "relayed-lfs"), ["config", "--local", "--get", "url." + lfsAddress + ".insteadOf"])).Output.Trim();
+        Check(clonePinned == lfsAddress && cloneRule == lfsAddress,
+            "a fresh clone through the helper has its Git LFS address pinned to plain https (lfsurl " + (clonePinned.Length == 0 ? "unset" : clonePinned == lfsAddress ? "pinned" : "other") +
+            ", rule " + (cloneRule.Length == 0 ? "unset" : cloneRule == lfsAddress ? "present" : "other") + ")" +
+            (clonePinned == lfsAddress && cloneRule == lfsAddress ? "" : ": " + Redact(string.Join(" | ", lfsClone.Errors.Split('\n').Select(line => line.Trim()).Where(line => line.StartsWith("graft:", StringComparison.Ordinal))))));
         bool transferred = lfsClone.Errors.Contains("starting transfer adapter \"graft\"", StringComparison.Ordinal);
         bool downloaded = lfsClone.ExitCode == 0 && transferred && File.Exists(model) && File.ReadAllBytes(model).AsSpan().SequenceEqual(large);
         // The clone runs traced, so a failure names which part failed and keeps what git and git-lfs said, without the trace.
