@@ -162,26 +162,29 @@ internal sealed class GitBridge(string remote, Uri address, Stream input, Stream
     /// </summary>
     private void PinLargeFileAddress()
     {
-        if (Environment.GetEnvironmentVariable("GIT_DIR") is not { Length: > 0 }) return;
+        if (Environment.GetEnvironmentVariable("GIT_DIR") is not { Length: > 0 } gitDir) return;
         if (remote.Contains("://", StringComparison.Ordinal) || remote.Contains("::", StringComparison.Ordinal)) return;
         try
         {
-            // No check that the remote's URL is configured: some versions of Git start the helper for a clone before they
-            // write remote.origin.url, and a clone is where the pin matters most. Git named the remote, and the address is
-            // the one it asked for.
+            // The repository's own file, named rather than found: some versions of Git start the helper for a clone before
+            // the new repository has a HEAD or remote.origin.url, and plain git config then refuses it as no repository
+            // (exit 128). A clone is where the pin matters most; Git named the remote, and the address is the one it asked for.
+            string file = Path.Combine(Path.GetFullPath(gitDir), "config");
+            string? Get(string key) => Git.Config("--file", file, "--get", key);
+            void Set(string key, string value) => Git.SetConfig("--file", file, key, value);
             string wanted = address.AbsoluteUri.TrimEnd('/');
             wanted += wanted.EndsWith(".git", StringComparison.Ordinal) ? "/info/lfs" : ".git/info/lfs";
-            string? current = Git.Config("--get", "remote." + remote + ".lfsurl");
-            string? ours = Git.Config("--get", "remote." + remote + ".graftlfsurl");
+            string? current = Get("remote." + remote + ".lfsurl");
+            string? ours = Get("remote." + remote + ".graftlfsurl");
             if (current is not null && current != wanted && ours != "true") return;
             if (current != wanted)
             {
-                Git.SetConfig("remote." + remote + ".lfsurl", wanted);
-                Git.SetConfig("remote." + remote + ".graftlfsurl", "true");
+                Set("remote." + remote + ".lfsurl", wanted);
+                Set("remote." + remote + ".graftlfsurl", "true");
             }
-            if (Git.Config("--get", "url." + wanted + ".insteadOf") != wanted) Git.SetConfig("url." + wanted + ".insteadOf", wanted);
+            if (Get("url." + wanted + ".insteadOf") != wanted) Set("url." + wanted + ".insteadOf", wanted);
             // Read back, so a write Git accepted but that did not land is reported rather than found by git-lfs later.
-            if (Git.Config("--get", "remote." + remote + ".lfsurl") != wanted || Git.Config("--get", "url." + wanted + ".insteadOf") != wanted)
+            if (Get("remote." + remote + ".lfsurl") != wanted || Get("url." + wanted + ".insteadOf") != wanted)
                 throw new HelperException("the address did not read back as written");
         }
         catch (Exception error) when (error is not OperationCanceledException)

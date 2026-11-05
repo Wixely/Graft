@@ -81,7 +81,10 @@ Some versions of Git start the helper for a clone before they write `remote.orig
 helper first pinned only for a remote whose URL was configured, so on those versions a fresh clone was left unpinned and
 git-lfs failed with `missing protocol: "graft::https://.../info/lfs"`. Found on 2026-11-04 by the deployment's verify
 stage, which the local Git (2.55) did not reproduce. The helper now pins for whatever remote Git names, and says so
-with a `graft:` warning when Git refuses the write or the value does not read back.
+with a `graft:` warning when Git refuses the write or the value does not read back. That warning then showed the rest
+(2026-11-05): on that Git the new repository has no `HEAD` yet either, and `git config` with `GIT_DIR` set refuses a
+directory without one as no repository (exit 128). The helper reads and writes `$GIT_DIR/config` by name with
+`git config --file`, which needs no repository.
 
 ## Distribution
 
