@@ -7,6 +7,9 @@
 
 <PageTitle>@(Id is null ? "Milestones" : "Milestone") &middot; Graft</PageTitle>
 
+@* The project's header and tabs, first and outside the loading states so they hold their place. *@
+<ProjectHeader Repo="header" Loading="loading" Base="@ProjectUrl" Active="milestones" />
+
 @if (loading)
 {
     <p role="status" class="secondary-text">Loading…</p>
@@ -21,7 +24,6 @@ else if (Id is null)
     <div class="page-header">
         <div>
             <h1>Milestones</h1>
-            <p class="subtitle"><a href="@ProjectUrl">@project.Namespace.Name / @project.Name</a></p>
         </div>
         <div class="page-header-actions">
             <a class="button secondary" href="@(ProjectUrl + "/-/issues")"><Icon Name="issue" />Issues</a>
@@ -193,6 +195,7 @@ else
     private IssueResponse[] issues = [];
     private MergeRequestResponse[] proposals = [];
     private string state = "active";
+    private RepositoryPageResponse? header;
     private bool loading = true;
     private bool busy;
     private bool composing;
@@ -229,6 +232,7 @@ else
                 ? $"api/graft/slugs/{Uri.EscapeDataString(Slug)}"
                 : $"api/browser/projects/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
             (bool reached, RepositoryPageResponse? page) = await Api.GetOptionalAsync(path, ApiJson.Default.RepositoryPageResponse);
+            header = page;
             if (!reached) { message = "Graft could not be reached."; return; }
             if (page is null) { message = "That repository could not be found."; return; }
             project = page.Project;

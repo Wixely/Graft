@@ -10,6 +10,11 @@
 
 <PageTitle>@Slug &middot; Graft</PageTitle>
 
+@* The header and tabs come first and outside the loading states, as on every page under the project, so
+   they hold their place while the content beneath them changes. Issues, merge requests and the rest are
+   pages rather than tabs because each needs an address of its own. *@
+<ProjectHeader Repo="repo" Loading="loading" Base="@ProjectBase" Active="@tab" Primary="true" OnTab="SelectTab" />
+
 @if (loading)
 {
     <p role="status" class="secondary-text">Loading repository…</p>
@@ -21,57 +26,7 @@ else if (repo is null)
 }
 else
 {
-    <div class="repo-header">
-        <Avatar Url="@repo.Project.AvatarUrl" Name="@repo.Project.Name" Class="avatar-large" />
-        <div>
-            <h1><span class="namespace">@repo.Project.Namespace.Name /</span> @repo.Project.Name</h1>
-            <p class="subtitle">@(repo.Project.Description.Length > 0 ? repo.Project.Description : "No description")</p>
-        </div>
-        <VisibilityLabel Visibility="@repo.Project.Visibility" PagePublished="repo.PagePublished" />
-        @if (repo.Project.ForkedFromProject is not null)
-        {
-            <span class="label accent">forked from <a href="@("/" + repo.Project.ForkedFromProject.PathWithNamespace)">@repo.Project.ForkedFromProject.PathWithNamespace</a></span>
-        }
-        @if (repo.Project.ImportUrl is not null)
-        {
-            <span class="label" title="@repo.Project.ImportUrl">@(repo.Project.Mirror ? "mirror of" : "imported from") <a href="@repo.Project.ImportUrl" rel="noopener noreferrer nofollow">@ImportHost(repo.Project.ImportUrl)</a></span>
-        }
-        @if (Api.Authenticated && !repo.CanManage)
-        {
-            <div class="page-header-actions">
-                <button type="button" class="secondary" @onclick="Fork" disabled="@busy" title="Copy this project into your own namespace, to propose changes from">
-                    <Icon Name="branch" />Fork@(repo.Project.ForksCount > 0 ? $" ({repo.Project.ForksCount})" : "")
-                </button>
-            </div>
-        }
-    </div>
-
     <Banner Message="@message" Kind="@messageKind" />
-
-    @* Issues and merge requests are pages rather than tabs, because each one of them needs an address of
-       its own: a link to an issue is the commonest thing anybody shares about a project. *@
-    <div class="tabs">
-        <button type="button" class="@(tab == "code" ? "active" : "")" @onclick='() => tab = "code"'>Code</button>
-        <button type="button" class="@(tab == "commits" ? "active" : "")" @onclick='() => tab = "commits"'>Commits</button>
-        <a href="@(ProjectBase + "/-/issues")">Issues</a>
-        <a href="@(ProjectBase + "/-/merge-requests")">Merge requests</a>
-        <a href="@(ProjectBase + "/-/boards")">Boards</a>
-        <a href="@(ProjectBase + "/-/milestones")">Milestones</a>
-        <a href="@(ProjectBase + "/-/pipelines")">Pipelines</a>
-        <a href="@(ProjectBase + "/-/releases")">Releases</a>
-        <a href="@(ProjectBase + "/-/wiki")">Wiki</a>
-        <a href="@(ProjectBase + "/-/snippets")">Snippets</a>
-        <a href="@(ProjectBase + "/-/packages")">Packages</a>
-        <a href="@(ProjectBase + "/-/search")">Search</a>
-        @if (repo.CanPush)
-        {
-            <button type="button" class="@(tab == "upload" ? "active" : "")" @onclick='() => tab = "upload"'>Add files</button>
-        }
-        @if (repo.CanManage)
-        {
-            <button type="button" class="@(tab == "settings" ? "active" : "")" @onclick="OpenSettings">Settings</button>
-        }
-    </div>
 
     @* A repository nobody has pushed to yet. Shown as a state of its own rather than as an error, and it
        carries the commands that end it, because "empty" is only useful alongside what to do about it. *@
@@ -798,6 +753,36 @@ git push -u origin main</pre>
     private AuditEntryResponse[] audit = [];
     private long auditTotal;
 
+    /// <summary>The state another page linked to, as <c>?tab=</c>. Only the states that are not pages of their own.</summary>
+    [SupplyParameterFromQuery(Name = "tab")] public string? TabQuery { get; set; }
+    private string? appliedTabQuery;
+
+    /// <summary>A tab chosen in the header. Settings fetches what only it shows.</summary>
+    private async Task SelectTab(string chosen)
+    {
+        if (chosen == "settings") await OpenSettings();
+        else tab = chosen;
+    }
+
+    /// <summary>
+    /// Opens the state a link asked for, once per distinct query, and only one this reader may open; anything
+    /// else leaves the page on Code, which is what the address without a query means.
+    /// </summary>
+    private async Task ApplyTabQuery()
+    {
+        string wanted = TabQuery ?? "";
+        if (wanted == appliedTabQuery) return;
+        appliedTabQuery = wanted;
+        string chosen = wanted switch
+        {
+            "commits" => "commits",
+            "upload" when repo?.CanPush == true => "upload",
+            "settings" when repo?.CanManage == true => "settings",
+            _ => "code"
+        };
+        await SelectTab(chosen);
+    }
+
     /// <summary>Opens the settings tab and fetches the project's recent activity, which only that tab shows.</summary>
     private async Task OpenSettings()
     {
@@ -897,6 +882,7 @@ git push -u origin main</pre>
             await Api.EnsureSessionAsync();
             if (!Api.Reachable) { message = "Graft could not be reached."; return; }
             await Load();
+            await ApplyTabQuery();
             if (repo is null)
                 // Absent, private, and shared-with-someone-else all answer identically, so this cannot say
                 // which. Naming sign-in is the useful next step for a reader who has an account and is not
@@ -1290,22 +1276,6 @@ git push -u origin main</pre>
                 filePath = "";
                 await Load();
             }
-        }
-        finally { busy = false; }
-    }
-
-    private async Task Fork()
-    {
-        if (busy || repo is null) return;
-        busy = true;
-        message = "";
-        try
-        {
-            ApiResult<ProjectResponse> result = await Api.SendAsync<VisibilityRequest, ProjectResponse>(HttpMethod.Post,
-                $"api/projects/{repo.Project.Id}/fork", new VisibilityRequest(null), ApiJson.Default.VisibilityRequest,
-                ApiJson.Default.ProjectResponse, "Forked.");
-            if (!result.Ok || result.Value is null) { message = result.Message; messageKind = "error"; return; }
-            Navigation.NavigateTo("/" + result.Value.PathWithNamespace);
         }
         finally { busy = false; }
     }

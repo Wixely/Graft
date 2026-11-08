@@ -7,6 +7,9 @@
 
 <PageTitle>@(snippet?.Title ?? "Snippets") &middot; Graft</PageTitle>
 
+@* The project's header and tabs, first and outside the loading states so they hold their place. *@
+<ProjectHeader Repo="header" Loading="loading" Base="@ProjectUrl" Active="snippets" />
+
 @if (loading)
 {
     <p role="status" class="secondary-text">Loading…</p>
@@ -19,7 +22,7 @@ else if (project is null)
 else if (Id is null)
 {
     <div class="page-header">
-        <div><h1>Snippets</h1><p class="subtitle"><a href="@ProjectUrl">@project.Namespace.Name / @project.Name</a></p></div>
+        <div><h1>Snippets</h1></div>
         <div class="page-header-actions">
             @if (canParticipate)
             {
@@ -141,6 +144,7 @@ else
     private bool canManage;
     private SnippetResponse[] snippets = [];
     private SnippetResponse? snippet;
+    private RepositoryPageResponse? header;
     private bool loading = true;
     private bool busy;
     private bool composing;
@@ -173,6 +177,7 @@ else
                 ? $"api/graft/slugs/{Uri.EscapeDataString(Slug)}"
                 : $"api/browser/projects/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
             (bool reached, RepositoryPageResponse? repo) = await Api.GetOptionalAsync(path, ApiJson.Default.RepositoryPageResponse);
+            header = repo;
             if (!reached) { message = "Graft could not be reached."; return; }
             if (repo is null) { message = "That repository could not be found."; return; }
             project = repo.Project;

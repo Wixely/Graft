@@ -7,6 +7,9 @@
 
 <PageTitle>@(Sha.Length >= 8 ? Sha[..8] : Sha) &middot; Graft</PageTitle>
 
+@* The project's header and tabs, first and outside the loading states so they hold their place. *@
+<ProjectHeader Repo="header" Loading="loading" Base="@ProjectUrl" Active="commits" />
+
 @if (loading)
 {
     <p role="status" class="secondary-text">Loading commit…</p>
@@ -153,6 +156,7 @@ else
     [Parameter] public string Sha { get; set; } = "";
 
     private CommitDiffResponse? diff;
+    private RepositoryPageResponse? header;
     private bool loading = true;
     private string message = "";
 
@@ -197,6 +201,7 @@ else
                 : $"api/browser/projects/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
             (bool reached, RepositoryPageResponse? page) =
                 await Api.GetOptionalAsync(lookup, ApiJson.Default.RepositoryPageResponse);
+            header = page;
             if (!reached) { message = "Graft could not be reached."; return; }
             if (page is null) { message = "That repository could not be found."; return; }
             long projectId = page.Project.Id;

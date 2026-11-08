@@ -4,6 +4,9 @@
 
 <PageTitle>Packages &middot; Graft</PageTitle>
 
+@* The project's header and tabs, first and outside the loading states so they hold their place. *@
+<ProjectHeader Repo="header" Loading="loading" Base="@ProjectUrl" Active="packages" />
+
 @if (loading)
 {
     <p role="status" class="secondary-text">Loading…</p>
@@ -18,7 +21,6 @@ else
     <div class="page-header">
         <div>
             <h1>Packages and images</h1>
-            <p class="subtitle"><a href="@ProjectUrl">@project.Namespace.Name / @project.Name</a></p>
         </div>
     </div>
 
@@ -93,6 +95,7 @@ else
     private bool canPush;
     private PackageResponse[] packages = [];
     private ContainerRepositoryResponse[] images = [];
+    private RepositoryPageResponse? header;
     private bool loading = true;
     private bool busy;
     private string message = "";
@@ -115,6 +118,7 @@ else
                 ? $"api/graft/slugs/{Uri.EscapeDataString(Slug)}"
                 : $"api/browser/projects/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
             (bool reached, RepositoryPageResponse? page) = await Api.GetOptionalAsync(path, ApiJson.Default.RepositoryPageResponse);
+            header = page;
             if (!reached) { message = "Graft could not be reached."; return; }
             if (page is null) { message = "That repository could not be found."; return; }
             project = page.Project;

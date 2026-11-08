@@ -1,0 +1,128 @@
+@inject GraftApi Api
+@inject NavigationManager Navigation
+
+@* The project's title row and its tab bar, drawn first on the project page and on every page under it, so
+   the tabs sit in the same place whichever one is open. Each page passes the project response it already
+   fetched; while a page is loading the last header drawn for the same project stands in, so moving from
+   one tab to the next does not blank the bar and drop it back into place a moment later. *@
+
+@if (Shown is RepositoryPageResponse repo)
+{
+    <div class="repo-header">
+        <Avatar Url="@repo.Project.AvatarUrl" Name="@repo.Project.Name" Class="avatar-large" />
+        <div>
+            @* One h1 per page. On the project page the project is the subject; under it the page's own
+               heading is, so the project's name is the same size and weight but not a heading. *@
+            @if (Primary)
+            {
+                <h1><span class="namespace">@repo.Project.Namespace.Name /</span> @repo.Project.Name</h1>
+            }
+            else
+            {
+                <p class="repo-title"><a href="@Base"><span class="namespace">@repo.Project.Namespace.Name /</span> @repo.Project.Name</a></p>
+            }
+            <p class="subtitle">@(repo.Project.Description.Length > 0 ? repo.Project.Description : "No description")</p>
+        </div>
+        <VisibilityLabel Visibility="@repo.Project.Visibility" PagePublished="repo.PagePublished" />
+        @if (repo.Project.ForkedFromProject is not null)
+        {
+            <span class="label accent">forked from <a href="@("/" + repo.Project.ForkedFromProject.PathWithNamespace)">@repo.Project.ForkedFromProject.PathWithNamespace</a></span>
+        }
+        @if (repo.Project.ImportUrl is not null)
+        {
+            <span class="label" title="@repo.Project.ImportUrl">@(repo.Project.Mirror ? "mirror of" : "imported from") <a href="@repo.Project.ImportUrl" rel="noopener noreferrer nofollow">@ImportHost(repo.Project.ImportUrl)</a></span>
+        }
+        @if (Api.Authenticated && !repo.CanManage)
+        {
+            <div class="page-header-actions">
+                <button type="button" class="secondary" @onclick="Fork" disabled="@forking" title="Copy this project into your own namespace, to propose changes from">
+                    <Icon Name="branch" />Fork@(repo.Project.ForksCount > 0 ? $" ({repo.Project.ForksCount})" : "")
+                </button>
+            </div>
+        }
+    </div>
+
+    @* Code, Commits, Add files and Settings are states of the project page rather than pages of their own.
+       On that page they switch in place; everywhere else they are links that open it on the right one. *@
+    <nav class="tabs" aria-label="Project">
+        @Tab("code", "Code", "")
+        @Tab("commits", "Commits", "?tab=commits")
+        <a href="@(Base + "/-/issues")" class="@ActiveClass("issues")" aria-current="@Current("issues")">Issues</a>
+        <a href="@(Base + "/-/merge-requests")" class="@ActiveClass("merge-requests")" aria-current="@Current("merge-requests")">Merge requests</a>
+        <a href="@(Base + "/-/boards")" class="@ActiveClass("boards")" aria-current="@Current("boards")">Boards</a>
+        <a href="@(Base + "/-/milestones")" class="@ActiveClass("milestones")" aria-current="@Current("milestones")">Milestones</a>
+        <a href="@(Base + "/-/pipelines")" class="@ActiveClass("pipelines")" aria-current="@Current("pipelines")">Pipelines</a>
+        <a href="@(Base + "/-/releases")" class="@ActiveClass("releases")" aria-current="@Current("releases")">Releases</a>
+        <a href="@(Base + "/-/wiki")" class="@ActiveClass("wiki")" aria-current="@Current("wiki")">Wiki</a>
+        <a href="@(Base + "/-/snippets")" class="@ActiveClass("snippets")" aria-current="@Current("snippets")">Snippets</a>
+        <a href="@(Base + "/-/packages")" class="@ActiveClass("packages")" aria-current="@Current("packages")">Packages</a>
+        <a href="@(Base + "/-/search")" class="@ActiveClass("search")" aria-current="@Current("search")">Search</a>
+        @if (repo.CanPush) { @Tab("upload", "Add files", "?tab=upload") }
+        @if (repo.CanManage) { @Tab("settings", "Settings", "?tab=settings") }
+    </nav>
+
+    <Banner Message="@forkMessage" Kind="error" />
+}
+
+@code {
+    /// <summary>The project as the page fetched it, or null while it has not yet.</summary>
+    [Parameter] public RepositoryPageResponse? Repo { get; set; }
+
+    /// <summary>Whether the page is still fetching. Only then does the last header drawn stand in for a missing one;
+    /// a page that finished and found nothing shows no header, rather than one for a project it could not read.</summary>
+    [Parameter] public bool Loading { get; set; }
+
+    /// <summary>The project's address on whichever route the reader arrived by, which every tab is built from.</summary>
+    [Parameter, EditorRequired] public string Base { get; set; } = "";
+
+    /// <summary>The tab to mark as open.</summary>
+    [Parameter] public string Active { get; set; } = "";
+
+    /// <summary>Whether this is the project page itself, where the project's name is the page's heading.</summary>
+    [Parameter] public bool Primary { get; set; }
+
+    /// <summary>Set by the project page, which switches its own states in place instead of navigating.</summary>
+    [Parameter] public EventCallback<string> OnTab { get; set; }
+
+    // Per browser tab, since the client is WebAssembly: one reader, one cache entry, replaced on every draw.
+    private static string? lastBase;
+    private static RepositoryPageResponse? lastRepo;
+
+    private bool forking;
+    private string forkMessage = "";
+
+    private RepositoryPageResponse? Shown =>
+        Repo ?? (Loading && string.Equals(lastBase, Base, StringComparison.Ordinal) ? lastRepo : null);
+
+    protected override void OnParametersSet()
+    {
+        if (Repo is not null) { lastBase = Base; lastRepo = Repo; }
+    }
+
+    private string ActiveClass(string key) => Active == key ? "active" : "";
+    private string? Current(string key) => Active == key ? "page" : null;
+
+    /// <summary>One of the project page's own states: a button there, a link to it from anywhere else.</summary>
+    private RenderFragment Tab(string key, string label, string query) => OnTab.HasDelegate
+        ? @<button type="button" class="@ActiveClass(key)" aria-current="@Current(key)" @onclick="() => OnTab.InvokeAsync(key)">@label</button>
+        : @<a href="@(Base + query)" class="@ActiveClass(key)" aria-current="@Current(key)">@label</a>;
+
+    private static string ImportHost(string url) =>
+        Uri.TryCreate(url, UriKind.Absolute, out Uri? parsed) ? parsed.Host + parsed.AbsolutePath.TrimEnd('/') : url;
+
+    private async Task Fork()
+    {
+        if (forking || Shown is not RepositoryPageResponse repo) return;
+        forking = true;
+        forkMessage = "";
+        try
+        {
+            ApiResult<ProjectResponse> result = await Api.SendAsync<VisibilityRequest, ProjectResponse>(HttpMethod.Post,
+                $"api/projects/{repo.Project.Id}/fork", new VisibilityRequest(null), ApiJson.Default.VisibilityRequest,
+                ApiJson.Default.ProjectResponse, "Forked.");
+            if (!result.Ok || result.Value is null) { forkMessage = result.Message; return; }
+            Navigation.NavigateTo("/" + result.Value.PathWithNamespace);
+        }
+        finally { forking = false; }
+    }
+}

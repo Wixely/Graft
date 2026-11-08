@@ -57,7 +57,7 @@
                 }
             </aside>
         }
-        <main class="content @(Api.Authenticated ? "content-wide" : "content-centered")">@Body</main>
+        <main class="content @ContentClass">@Body</main>
     </div>
 
     @* Opens away from the application, so it carries the usual protections for a link that leaves. The
@@ -89,6 +89,23 @@
         busy = true;
         try { await Api.LogoutAsync(); Navigation.NavigateTo("/-/login?notice=signed-out"); }
         finally { busy = false; }
+    }
+
+    /// <summary>
+    /// The column the page sits in. The sign-in pages are a small form centred on the viewport; everything else,
+    /// signed in or not, is the wide column, so a public project reads the same to a stranger as to a member and
+    /// its header does not slide up and down with the height of what is under it.
+    /// </summary>
+    private string ContentClass
+    {
+        get
+        {
+            string current = Navigation.ToBaseRelativePath(Navigation.Uri);
+            int query = current.IndexOfAny(['?', '#']);
+            if (query >= 0) current = current[..query];
+            bool form = !Api.Authenticated && (current is "" or "projects" or "-/login" or "-/forgot" || current.StartsWith("-/reset/", StringComparison.Ordinal));
+            return form ? "content-centered" : "content-wide";
+        }
     }
 
     /// <summary>Marks the sidebar entry whose route the browser is on. Nested routes keep their section active.</summary>

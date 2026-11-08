@@ -6,6 +6,9 @@
 
 <PageTitle>Search &middot; Graft</PageTitle>
 
+@* The project's header and tabs, first and outside the loading states so they hold their place. *@
+@if (Slug.Length > 0) { <ProjectHeader Repo="header" Loading="loading" Base="@ProjectUrl" Active="search" /> }
+
 @if (loading)
 {
     <p role="status" class="secondary-text">Loading…</p>
@@ -119,6 +122,7 @@ else
     private SearchResponse? results;
     private string query = "";
     private string scope = "";
+    private RepositoryPageResponse? header;
     private bool loading = true;
     private bool busy;
     private string message = "";
@@ -158,6 +162,7 @@ else
                     ? $"api/graft/slugs/{Uri.EscapeDataString(Slug)}"
                     : $"api/browser/projects/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
                 (bool reached, RepositoryPageResponse? repo) = await Api.GetOptionalAsync(path, ApiJson.Default.RepositoryPageResponse);
+                header = repo;
                 if (!reached) { message = "Graft could not be reached."; return; }
                 if (repo is null) { message = "That repository could not be found."; return; }
                 project = repo.Project;

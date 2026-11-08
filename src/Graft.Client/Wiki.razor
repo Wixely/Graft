@@ -7,6 +7,9 @@
 
 <PageTitle>@(wikiPage?.Title ?? "Wiki") &middot; Graft</PageTitle>
 
+@* The project's header and tabs, first and outside the loading states so they hold their place. *@
+<ProjectHeader Repo="header" Loading="loading" Base="@ProjectUrl" Active="wiki" />
+
 @if (loading)
 {
     <p role="status" class="secondary-text">Loading…</p>
@@ -159,6 +162,7 @@ else
     private WikiPageResponse? wikiPage;
     private WikiVersionResponse[] versions = [];
     private WikiVersionResponse? viewing;
+    private RepositoryPageResponse? header;
     private bool loading = true;
     private bool busy;
     private bool composing;
@@ -189,6 +193,7 @@ else
                 ? $"api/graft/slugs/{Uri.EscapeDataString(Slug)}"
                 : $"api/browser/projects/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";
             (bool reached, RepositoryPageResponse? repo) = await Api.GetOptionalAsync(path, ApiJson.Default.RepositoryPageResponse);
+            header = repo;
             if (!reached) { message = "Graft could not be reached."; return; }
             if (repo is null) { message = "That repository could not be found."; return; }
             project = repo.Project;
