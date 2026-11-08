@@ -336,8 +336,10 @@ git push -u origin main</pre>
                     <h3>Project page</h3>
                     <p class="secondary-text">
                         A page is a curated surface that can stand over a private repository, so you can share a
-                        readme without sharing the code. It offers no clone, no history and no diff, because
-                        those read the whole repository rather than the files you chose.
+                        readme without sharing the code. What it shows is chosen in <code>.graft/project.json</code>:
+                        named files, the directory structure, recent commit messages with or without their
+                        authors, read-only issues, and releases. It never offers a clone or a diff, because
+                        those read the whole repository rather than what you chose.
                     </p>
                     @if (repo.Project.Visibility == "public")
                     {

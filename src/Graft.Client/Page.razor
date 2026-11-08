@@ -5,7 +5,9 @@
 
 @* A published project page: the curated surface an owner chose to show, which is not the repository and
    never becomes it. Everything on this page came from the project's own .graft/project.json; nothing is
-   offered by default, so an empty page means the config named nothing rather than that something failed. *@
+   offered by default, so an empty page means the config named nothing rather than that something failed.
+   The directory listing, the history, the issues and the releases each appear only when the config asked
+   for them, and each is served by a route of the page's own that the server decides separately. *@
 
 <PageTitle>@(view?.Title ?? "Project page") &middot; Graft</PageTitle>
 
@@ -48,26 +50,294 @@ else
         </div>
     }
 
-    <div class="panel">
-        <div class="panel-header"><Icon Name="folder" /><h2>Files</h2><span class="spacer"></span>
-            <span class="label">@view.Files.Count</span></div>
-        @if (view.Files.Count == 0)
+    @if (openPath is not null)
+    {
+        <div class="panel">
+            <div class="panel-header"><Icon Name="file" /><h2>@openPath</h2><span class="spacer"></span>
+                <button type="button" class="secondary" @onclick="() => openPath = null">Close</button></div>
+            <div class="panel-body">
+                <pre class="file-view"><code>@openText</code></pre>
+            </div>
+        </div>
+    }
+
+    @if (view.Tree is not null)
+    {
+        @* The structure without the content. Every path on the default branch is named here; only the ones
+           the allowlist admits can be opened, and the server said which, so a reader is never offered a
+           file the file route would refuse. *@
+        <div class="panel">
+            <div class="panel-header"><Icon Name="folder" /><h2>Structure</h2><span class="spacer"></span>
+                <span class="label">@view.Tree.Count(entry => entry.Type == "blob") files</span></div>
+            @if (view.Tree.Count == 0)
+            {
+                <div class="panel-empty">The default branch is empty.</div>
+            }
+            else
+            {
+                <div class="list">
+                    @foreach (PageTreeEntryResponse entry in view.Tree)
+                    {
+                        @if (entry.Readable)
+                        {
+                            <button type="button" class="list-item file-row" @onclick="() => Open(entry.Path)">
+                                <Icon Name="file" />
+                                <span class="list-item-main"><strong>@entry.Path</strong></span>
+                                <Icon Name="chevron-right" />
+                            </button>
+                        }
+                        else
+                        {
+                            <div class="list-item">
+                                <Icon Name="@(entry.Type == "tree" ? "folder" : "file")" Class="icon muted" />
+                                <span class="list-item-main">
+                                    <span class="secondary-text">@entry.Path@(entry.Type == "tree" ? "/" : "")</span>
+                                    @if (entry.Type == "blob") { <small>name only</small> }
+                                </span>
+                            </div>
+                        }
+                    }
+                </div>
+            }
+        </div>
+    }
+    else
+    {
+        <div class="panel">
+            <div class="panel-header"><Icon Name="folder" /><h2>Files</h2><span class="spacer"></span>
+                <span class="label">@view.Files.Count</span></div>
+            @if (view.Files.Count == 0)
+            {
+                <div class="panel-empty">This page offers no files.</div>
+            }
+            else
+            {
+                <div class="list">
+                    @foreach (string file in view.Files)
+                    {
+                        <button type="button" class="list-item file-row" @onclick="() => Open(file)">
+                            <Icon Name="file" />
+                            <span class="list-item-main"><strong>@file</strong></span>
+                        </button>
+                    }
+                </div>
+            }
+        </div>
+    }
+
+    @if (view.History is not null)
+    {
+        @* What was said and when. Not what changed: there is no diff behind these rows and no link to one. *@
+        <div class="panel">
+            <div class="panel-header"><Icon Name="commit" /><h2>History</h2><span class="spacer"></span>
+                <span class="label">@view.History.Commits.Count</span></div>
+            @if (view.History.Commits.Count == 0)
+            {
+                <div class="panel-empty">No commits yet.</div>
+            }
+            else
+            {
+                <div class="list">
+                    @foreach (PageCommitResponse commit in view.History.Commits)
+                    {
+                        <div class="list-item">
+                            <Icon Name="commit" />
+                            <span class="list-item-main">
+                                <strong>@commit.Title</strong>
+                                <small>
+                                    <code>@commit.ShortId</code> &middot; @commit.CommittedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")
+                                    @if (commit.AuthorName is { Length: > 0 }) { <span> &middot; @commit.AuthorName</span> }
+                                    @if (commit.AuthorEmail is { Length: > 0 }) { <span> &lt;@commit.AuthorEmail&gt;</span> }
+                                </small>
+                                @if (openCommit == commit.Id && HasBody(commit))
+                                {
+                                    <pre class="commit-message">@commit.Message.Trim()</pre>
+                                }
+                            </span>
+                            @if (HasBody(commit))
+                            {
+                                <button type="button" class="link" @onclick="() => openCommit = openCommit == commit.Id ? null : commit.Id">
+                                    @(openCommit == commit.Id ? "Less" : "More")
+                                </button>
+                            }
+                        </div>
+                    }
+                </div>
+            }
+            <div class="panel-body">
+                <p class="secondary-text">
+                    The @(view.History.Commits.Count == 1 ? "most recent commit" : view.History.Commits.Count + " most recent commits") on the default branch.
+                    @(view.History.Authors == "none" ? "Authors are not shown." : "")
+                </p>
+            </div>
+        </div>
+    }
+
+    @if (view.Releases)
+    {
+        <div class="panel">
+            <div class="panel-header"><Icon Name="archive" /><h2>Releases</h2><span class="spacer"></span>
+                @if (releases is not null) { <span class="label">@releases.Length</span> }</div>
+            @if (releases is null)
+            {
+                <div class="panel-empty">Loading…</div>
+            }
+            else if (releases.Length == 0)
+            {
+                <div class="panel-empty">Nothing has been released.</div>
+            }
+            else
+            {
+                @foreach (PageReleaseResponse release in releases)
+                {
+                    <div class="panel-body">
+                        <h3>@release.Name</h3>
+                        <p class="secondary-text"><code>@release.TagName</code> &middot; released @release.ReleasedAt.ToLocalTime().ToString("yyyy-MM-dd") by @release.Author</p>
+                        @if (release.Description.Length > 0) { <pre class="commit-message">@release.Description</pre> }
+                        @if (release.Files.Count > 0 || release.Links.Count > 0)
+                        {
+                            <div class="list">
+                                @foreach (ReleaseFileResponse file in release.Files)
+                                {
+                                    <div class="list-item">
+                                        <Icon Name="download" />
+                                        <span class="list-item-main">
+                                            <strong><a href="@file.Url" download>@file.FileName</a></strong>
+                                            <small>@file.Size bytes &middot; sha256 <code>@file.Sha256[..12]</code></small>
+                                        </span>
+                                    </div>
+                                }
+                                @foreach (ReleaseLinkResponse link in release.Links)
+                                {
+                                    <div class="list-item">
+                                        <Icon Name="chevron-right" />
+                                        <span class="list-item-main">
+                                            @* Leaves this origin: a release link is an address the project wrote. *@
+                                            <strong><a href="@link.Url" target="_blank" rel="noopener noreferrer">@link.Name</a></strong>
+                                            <small>@link.LinkType</small>
+                                        </span>
+                                    </div>
+                                }
+                            </div>
+                        }
+                    </div>
+                }
+            }
+        </div>
+    }
+
+    @if (view.Issues)
+    {
+        @if (openIssue is not null)
         {
-            <div class="panel-empty">This page offers no files.</div>
+            <div class="panel">
+                <div class="panel-header">
+                    <Icon Name="issue" Class="@(openIssue.Issue.State == "closed" ? "icon muted" : "icon")" />
+                    <h2>@openIssue.Issue.Title</h2>
+                    <span class="spacer"></span>
+                    <span class="label @(openIssue.Issue.State == "closed" ? "" : "accent")">@(openIssue.Issue.State == "closed" ? "closed" : "open")</span>
+                    <button type="button" class="secondary" @onclick="() => openIssue = null">Back to issues</button>
+                </div>
+                <div class="panel-body">
+                    <p class="secondary-text">
+                        #@openIssue.Issue.Iid opened by @openIssue.Issue.Author.Username on @openIssue.Issue.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd")
+                        @if (openIssue.Issue.ClosedAt is DateTimeOffset closed) { <span> &middot; closed @closed.ToLocalTime().ToString("yyyy-MM-dd")</span> }
+                        @if (openIssue.Issue.Milestone is not null) { <span> &middot; @openIssue.Issue.Milestone.Title</span> }
+                    </p>
+                    @if (openIssue.Issue.LabelDetails is { Count: > 0 })
+                    {
+                        <span class="list-labels">
+                            @foreach (LabelResponse label in openIssue.Issue.LabelDetails) { <LabelChip Label="label" /> }
+                        </span>
+                    }
+                    @if (openIssue.Issue.Description.Length > 0) { <pre class="commit-message">@openIssue.Issue.Description</pre> }
+                    else { <p class="secondary-text">No description.</p> }
+                </div>
+                <div class="panel-header"><h3>Comments</h3><span class="spacer"></span><span class="label">@openIssue.Notes.Count</span></div>
+                @if (openIssue.Notes.Count == 0)
+                {
+                    <div class="panel-empty">No comments.</div>
+                }
+                else
+                {
+                    <div class="list">
+                        @foreach (NoteResponse note in openIssue.Notes)
+                        {
+                            <div class="list-item">
+                                <Icon Name="user" />
+                                <span class="list-item-main">
+                                    <small>@note.Author.Username &middot; @note.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")@(note.EditedAt is null ? "" : " · edited")</small>
+                                    <pre class="commit-message">@note.Body</pre>
+                                </span>
+                            </div>
+                        }
+                    </div>
+                }
+                <div class="panel-body">
+                    <p class="secondary-text">Read only. Commenting needs an account on this project.</p>
+                </div>
+            </div>
         }
         else
         {
-            <div class="list">
-                @foreach (string file in view.Files)
+            <div class="panel">
+                <div class="panel-header"><Icon Name="issue" /><h2>Issues</h2><span class="spacer"></span>
+                    @if (issues is not null) { <span class="label">@issueTotal</span> }</div>
+                <div class="panel-body">
+                    <div class="tabs">
+                        <button type="button" class="@(issueState == "opened" ? "active" : "")" @onclick='() => FilterIssues("opened")'>Open</button>
+                        <button type="button" class="@(issueState == "closed" ? "active" : "")" @onclick='() => FilterIssues("closed")'>Closed</button>
+                        <button type="button" class="@(issueState == "all" ? "active" : "")" @onclick='() => FilterIssues("all")'>All</button>
+                    </div>
+                </div>
+                @if (issues is null)
                 {
-                    <button type="button" class="list-item file-row" @onclick="() => Open(file)">
-                        <Icon Name="file" />
-                        <span class="list-item-main"><strong>@file</strong></span>
-                    </button>
+                    <div class="panel-empty">Loading…</div>
+                }
+                else if (issues.Length == 0)
+                {
+                    <div class="panel-empty">
+                        @(issueState == "opened" ? "Nothing is open." : issueState == "closed" ? "Nothing has been closed." : "No issues yet.")
+                    </div>
+                }
+                else
+                {
+                    <div class="list">
+                        @foreach (IssueResponse issue in issues)
+                        {
+                            <button type="button" class="list-item file-row" @onclick="() => OpenIssue(issue.Iid)">
+                                <Icon Name="issue" Class="@(issue.State == "closed" ? "icon muted" : "icon")" />
+                                <span class="list-item-main">
+                                    <strong>@issue.Title</strong>
+                                    <small>
+                                        #@issue.Iid opened by @issue.Author.Username
+                                        @if (issue.UserNotesCount > 0)
+                                        {
+                                            <span> &middot; @issue.UserNotesCount @(issue.UserNotesCount == 1 ? "comment" : "comments")</span>
+                                        }
+                                        @if (issue.Milestone is not null) { <span> &middot; @issue.Milestone.Title</span> }
+                                    </small>
+                                    @if (issue.LabelDetails is { Count: > 0 })
+                                    {
+                                        <span class="list-labels">
+                                            @foreach (LabelResponse label in issue.LabelDetails) { <LabelChip Label="label" /> }
+                                        </span>
+                                    }
+                                </span>
+                                <Icon Name="chevron-right" />
+                            </button>
+                        }
+                    </div>
+                    @if (issueTotal > issues.Length)
+                    {
+                        <div class="panel-body">
+                            <p class="secondary-text">Showing the newest @issues.Length of @issueTotal.</p>
+                        </div>
+                    }
                 }
             </div>
         }
-    </div>
+    }
 
     @* Only what the config named and only what this reader may open: the server decided both. The
        destinations are the project's own pages, which apply their own rules again on arrival. *@
@@ -88,19 +358,9 @@ else
         </div>
     }
 
-    @if (openPath is not null)
-    {
-        <div class="panel">
-            <div class="panel-header"><Icon Name="file" /><h2>@openPath</h2><span class="spacer"></span>
-                <button type="button" class="secondary" @onclick="() => openPath = null">Close</button></div>
-            <div class="panel-body">
-                <pre class="file-view"><code>@openText</code></pre>
-            </div>
-        </div>
-    }
-
     <p class="secondary-text">
-        This is a published page. The project's repository is not readable from here.
+        This is a published page. The project's repository is not readable from here: what it shows is what
+        the project chose to show.
     </p>
 }
 
@@ -110,33 +370,76 @@ else
     private ProjectPageResponse? view;
     private string? openPath;
     private string openText = "";
+    private string? openCommit;
+    private PageReleaseResponse[]? releases;
+    private IssueResponse[]? issues;
+    private long issueTotal;
+    private string issueState = "opened";
+    private PageIssueResponse? openIssue;
     private string message = "";
     private string messageKind = "info";
     private bool loading = true;
+
+    private string PageApi => $"api/graft/pages/{Uri.EscapeDataString(Slug)}";
 
     protected override async Task OnParametersSetAsync()
     {
         loading = true;
         openPath = null;
+        openIssue = null;
+        issues = null;
+        releases = null;
         try
         {
             // Deliberately not requiring a session. A published page is for readers who have no account,
             // which is the entire reason the surface exists.
-            (bool reached, ProjectPageResponse? loaded) =
-                await Api.GetOptionalAsync($"api/graft/pages/{Uri.EscapeDataString(Slug)}", ApiJson.Default.ProjectPageResponse);
+            (bool reached, ProjectPageResponse? loaded) = await Api.GetOptionalAsync(PageApi, ApiJson.Default.ProjectPageResponse);
             if (!reached) { message = "Graft could not be reached."; messageKind = "error"; return; }
             view = loaded;
-            if (view is null) message = "No page is published at this address, or it was withdrawn.";
+            if (view is null) { message = "No page is published at this address, or it was withdrawn."; return; }
         }
         finally { loading = false; }
+
+        // The two surfaces with routes of their own are fetched after the page itself has rendered, so a
+        // page with many issues is not held up by them and a refused one simply stays empty.
+        if (view.Releases)
+        {
+            (bool reached, PageReleaseResponse[]? loaded) = await Api.GetOptionalAsync(PageApi + "/releases", ApiJson.Default.PageReleaseResponseArray);
+            releases = reached ? loaded ?? [] : [];
+        }
+        if (view.Issues) await LoadIssues();
+    }
+
+    private async Task LoadIssues()
+    {
+        (bool reached, IssuePageResponse? loaded) = await Api.GetOptionalAsync(
+            PageApi + "/issues?state=" + issueState + "&per_page=50", ApiJson.Default.IssuePageResponse);
+        issues = reached && loaded is not null ? [.. loaded.Issues] : [];
+        issueTotal = loaded?.Total ?? 0;
+    }
+
+    private async Task FilterIssues(string state)
+    {
+        issueState = state;
+        issues = null;
+        await LoadIssues();
+    }
+
+    private async Task OpenIssue(long iid)
+    {
+        message = "";
+        (bool reached, PageIssueResponse? loaded) = await Api.GetOptionalAsync(
+            PageApi + "/issues/" + iid.ToString(System.Globalization.CultureInfo.InvariantCulture), ApiJson.Default.PageIssueResponse);
+        if (!reached) { message = "Graft could not be reached."; messageKind = "error"; return; }
+        if (loaded is null) { message = $"Issue #{iid} could not be shown."; messageKind = "error"; return; }
+        openIssue = loaded;
     }
 
     private async Task Open(string file)
     {
         if (openPath == file) { openPath = null; return; }
         message = "";
-        (bool reached, string? text) = await Api.GetTextAsync(
-            $"api/graft/pages/{Uri.EscapeDataString(Slug)}/files/{Uri.EscapeDataString(file)}");
+        (bool reached, string? text) = await Api.GetTextAsync(PageApi + "/files/" + Uri.EscapeDataString(file));
         if (!reached) { message = "Graft could not be reached."; messageKind = "error"; return; }
         if (text is null)
         {
@@ -147,6 +450,9 @@ else
         openPath = file;
         openText = text;
     }
+
+    /// <summary>Whether a commit said more than its first line.</summary>
+    private static bool HasBody(PageCommitResponse commit) => commit.Message.Trim().Length > commit.Title.Trim().Length;
 
     /// <summary>The config names features by GitLab's snake-case names; a reader is shown words.</summary>
     private static string FeatureLabel(string name) => name switch

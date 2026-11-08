@@ -515,6 +515,7 @@ async Task CheckProjectPages(string address, AuthenticatedIdentity alice, string
     File.WriteAllText(Path.Combine(source, ".graft", "project.json"), """
         {"version":1,"page":{"title":"Sample","description":"Curated.","readme":"README.md",
          "files":["README.md","docs/**/*.md"],"features":["issues","wiki","issues"],
+         "tree":true,"history":{"commits":10,"authors":"names"},"issues":true,"releases":true,
          "site":{"root":"site","index":"index.html"}}}
         """);
     File.WriteAllText(Path.Combine(source, "README.md"), "# Sample\n\nCurated page.\n");
@@ -526,13 +527,34 @@ async Task CheckProjectPages(string address, AuthenticatedIdentity alice, string
     File.WriteAllText(Path.Combine(source, "site", "payload.exe"), "not a servable type\n");
     await Git(source, ["add", "."]);
     await Git(source, ["commit", "-m", "Page config, curated files and a site"]);
-    await Git(source, ["push", AuthenticatedUrl(address, "alice", grant.Secret, "alice/pagesample.git"), "main"]);
+    await Git(source, ["tag", "v0.1"]);
+    await Git(source, ["push", AuthenticatedUrl(address, "alice", grant.Secret, "alice/pagesample.git"), "main", "v0.1"]);
+
+    // The things a page may open beyond its files (ADR 0045), made as the owner: two issues, one of them
+    // confidential, a comment, and a release with a file attached.
+    string pagePrefix = "/api/v4/projects/" + pageProjectId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    using (HttpResponseMessage issue = await ApiPost(address, pagePrefix + "/issues", grant.Secret, new { title = "Lights flicker", description = "Seen by everyone." }))
+        Check(issue.StatusCode == System.Net.HttpStatusCode.Created, "the owner opens an issue (got " + (int)issue.StatusCode + ")");
+    using (HttpResponseMessage secret = await ApiPost(address, pagePrefix + "/issues", grant.Secret, new { title = "Customer data", confidential = true }))
+        Check(secret.StatusCode == System.Net.HttpStatusCode.Created, "and a confidential one");
+    using (HttpResponseMessage note = await ApiPost(address, pagePrefix + "/issues/1/notes", grant.Secret, new { body = "Looking into it." }))
+        Check(note.StatusCode == System.Net.HttpStatusCode.Created, "and comments on the first");
+    using (HttpResponseMessage release = await ApiPost(address, pagePrefix + "/releases", grant.Secret, new { tag_name = "v0.1", name = "First light", description = "It turns on." }))
+        Check(release.StatusCode == System.Net.HttpStatusCode.Created, "and publishes a release (got " + (int)release.StatusCode + ": " +
+            Redact(await release.Content.ReadAsStringAsync()) + ")");
+    byte[] pageBuild = Encoding.UTF8.GetBytes("a build anyone may download\n");
+    using (HttpResponseMessage attached = await ApiPutBytes(address, pagePrefix + "/releases/v0.1/assets/files/lanternry.bin", grant.Secret, pageBuild, "application/octet-stream"))
+        Check(attached.StatusCode == System.Net.HttpStatusCode.Created, "with a file attached");
 
     // Nothing is public until the page is published, which is a database act and never a config one: a
     // push must never be able to widen access.
     using (HttpResponseMessage beforePublish = await PagesGet(address, null, "/api/graft/pages/" + slug))
         Check(beforePublish.StatusCode == System.Net.HttpStatusCode.NotFound,
             "a page is not served until it is published, however complete its config");
+    foreach (string surface in new[] { "/issues", "/issues/1", "/releases" })
+        using (HttpResponseMessage beforePublish = await PagesGet(address, null, "/api/graft/pages/" + slug + surface))
+            Check(beforePublish.StatusCode == System.Net.HttpStatusCode.NotFound,
+                "and neither is anything the config opened: " + surface);
     using (HttpResponseMessage siteBefore = await PagesGet(address, PagesHost, "/" + slug + "/"))
         Check(siteBefore.StatusCode == System.Net.HttpStatusCode.NotFound, "and neither is its site");
 
@@ -556,6 +578,77 @@ async Task CheckProjectPages(string address, AuthenticatedIdentity alice, string
             "and the site is advertised on the pages origin, not this one");
         Check(json.RootElement.GetProperty("features").GetArrayLength() == 0,
             "the features the config named are not offered to a reader the project itself would refuse");
+
+        // The structure: every path, and per file whether the page will open it. Names are shown; content
+        // stays behind the allowlist, and the config's own directory is not even named.
+        var tree = json.RootElement.GetProperty("tree").EnumerateArray()
+            .Select(entry => (Path: entry.GetProperty("path").GetString()!, Type: entry.GetProperty("type").GetString()!, Readable: entry.GetProperty("readable").GetBoolean()))
+            .ToArray();
+        Check(tree.Any(entry => entry is { Path: "src/secret.cs", Type: "blob", Readable: false }),
+            "the structure names a file the allowlist does not admit, and says it is not readable");
+        Check(tree.Any(entry => entry is { Path: "docs/guide.md", Type: "blob", Readable: true }), "and marks an allowlisted one readable");
+        Check(tree.Any(entry => entry is { Path: "src", Type: "tree" }), "and lists directories");
+        Check(!tree.Any(entry => entry.Path.StartsWith(".graft", StringComparison.Ordinal)), "and never the config's own directory");
+
+        // The history: what was said and when, with names because the config asked for names and without
+        // addresses because it did not.
+        JsonElement history = json.RootElement.GetProperty("history");
+        Check(history.GetProperty("authors").GetString() == "names", "the history reports how much of the author it shows");
+        JsonElement commits = history.GetProperty("commits");
+        Check(commits.GetArrayLength() == 1 && commits[0].GetProperty("title").GetString() == "Page config, curated files and a site",
+            "and lists the default branch's commit messages");
+        Check(commits[0].GetProperty("author_name").ValueKind == JsonValueKind.String && commits[0].GetProperty("author_email").ValueKind == JsonValueKind.Null,
+            "with names and without addresses, as configured");
+        foreach (string absent in new[] { "diff", "files", "parent_ids", "web_url" })
+            Check(!commits[0].TryGetProperty(absent, out _), "a page's commit carries no " + absent);
+        Check(json.RootElement.GetProperty("issues").GetBoolean() && json.RootElement.GetProperty("releases").GetBoolean(),
+            "and the page says its issues and releases are open");
+    }
+
+    // Issues through the page, read only, to a reader with no account. The confidential one is not there.
+    using (HttpResponseMessage listing = await PagesGet(address, null, "/api/graft/pages/" + slug + "/issues?state=all"))
+    {
+        Check(listing.IsSuccessStatusCode, "a page whose config opened issues lists them without an account (got " + (int)listing.StatusCode + ")");
+        using JsonDocument json = JsonDocument.Parse(await listing.Content.ReadAsStreamAsync());
+        JsonElement issues = json.RootElement.GetProperty("issues");
+        Check(json.RootElement.GetProperty("total").GetInt64() == 1 && issues.GetArrayLength() == 1 &&
+            issues[0].GetProperty("title").GetString() == "Lights flicker", "exactly the issues a stranger may see");
+    }
+    using (HttpResponseMessage one = await PagesGet(address, null, "/api/graft/pages/" + slug + "/issues/1"))
+    {
+        Check(one.IsSuccessStatusCode, "and one issue with its conversation");
+        using JsonDocument json = JsonDocument.Parse(await one.Content.ReadAsStreamAsync());
+        Check(json.RootElement.GetProperty("issue").GetProperty("description").GetString() == "Seen by everyone." &&
+            json.RootElement.GetProperty("notes").GetArrayLength() == 1 &&
+            json.RootElement.GetProperty("notes")[0].GetProperty("body").GetString() == "Looking into it.", "description and comments included");
+    }
+    using (HttpResponseMessage hidden = await PagesGet(address, null, "/api/graft/pages/" + slug + "/issues/2"))
+        Check(hidden.StatusCode == System.Net.HttpStatusCode.NotFound, "a confidential issue does not exist for a page reader");
+    using (HttpResponseMessage api = await ApiGet(address, pagePrefix + "/issues", null))
+        Check(api.StatusCode == System.Net.HttpStatusCode.NotFound, "the page's reach does not open the project's own issues API to a stranger");
+    using (HttpResponseMessage api = await ApiGet(address, pagePrefix + "/releases", null))
+        Check(api.StatusCode == System.Net.HttpStatusCode.NotFound, "nor its releases API");
+
+    // Releases through the page: notes, links and files, and neither a commit nor a source archive.
+    string pageDownload;
+    using (HttpResponseMessage releases = await PagesGet(address, null, "/api/graft/pages/" + slug + "/releases"))
+    {
+        Check(releases.IsSuccessStatusCode, "a page whose config opened releases lists them without an account (got " + (int)releases.StatusCode + ")");
+        using JsonDocument json = JsonDocument.Parse(await releases.Content.ReadAsStreamAsync());
+        Check(json.RootElement.GetArrayLength() == 1 && json.RootElement[0].GetProperty("name").GetString() == "First light" &&
+            json.RootElement[0].GetProperty("description").GetString() == "It turns on.", "with their notes");
+        Check(!json.RootElement[0].TryGetProperty("commit", out _) && !json.RootElement[0].TryGetProperty("assets", out _),
+            "and no commit and no source archive, because an archive is the repository");
+        JsonElement files = json.RootElement[0].GetProperty("files");
+        Check(files.GetArrayLength() == 1 && files[0].GetProperty("file_name").GetString() == "lanternry.bin", "the attached file is listed");
+        pageDownload = files[0].GetProperty("url").GetString()!;
+        Check(pageDownload.StartsWith("/api/graft/pages/" + slug + "/releases/", StringComparison.Ordinal), "at an address under the page, not under the API");
+    }
+    using (HttpResponseMessage download = await PagesGet(address, null, pageDownload))
+    {
+        byte[] bytes = await download.Content.ReadAsByteArrayAsync();
+        Check(download.IsSuccessStatusCode && bytes.AsSpan().SequenceEqual(pageBuild) &&
+            download.Content.Headers.ContentDisposition?.DispositionType == "attachment", "and downloads byte for byte, as an attachment");
     }
 
     // The same page once the project is public: the features become links, each named once, at the
@@ -693,6 +786,27 @@ async Task CheckProjectPages(string address, AuthenticatedIdentity alice, string
             "an unparseable config unpublishes the page rather than serving it with defaults");
     using (HttpResponseMessage brokenSite = await PagesGet(address, PagesHost, "/" + slug + "/"))
         Check(brokenSite.StatusCode == System.Net.HttpStatusCode.NotFound, "and takes the site down with it");
+    foreach (string surface in new[] { "/issues", "/issues/1", "/releases", pageDownload.Substring(("/api/graft/pages/" + slug).Length) })
+        using (HttpResponseMessage brokenSurface = await PagesGet(address, null, "/api/graft/pages/" + slug + surface))
+            Check(brokenSurface.StatusCode == System.Net.HttpStatusCode.NotFound, "and everything the config had opened: " + surface);
+
+    // A config that is valid and silent about them closes them again. The published flag alone opens nothing
+    // but the page itself.
+    File.WriteAllText(Path.Combine(source, ".graft", "project.json"), """{"version":1,"page":{"files":["README.md"]}}""");
+    await Git(source, ["add", "."]);
+    await Git(source, ["commit", "-m", "Say nothing about issues or releases"]);
+    await Git(source, ["push", AuthenticatedUrl(address, "alice", grant.Secret, "alice/pagesample.git"), "main"]);
+    using (HttpResponseMessage quiet = await PagesGet(address, null, "/api/graft/pages/" + slug))
+    {
+        Check(quiet.IsSuccessStatusCode, "a config naming only files serves a page again");
+        using JsonDocument json = JsonDocument.Parse(await quiet.Content.ReadAsStreamAsync());
+        Check(json.RootElement.GetProperty("tree").ValueKind == JsonValueKind.Null && json.RootElement.GetProperty("history").ValueKind == JsonValueKind.Null &&
+            !json.RootElement.GetProperty("issues").GetBoolean() && !json.RootElement.GetProperty("releases").GetBoolean(),
+            "with no structure, no history, no issues and no releases");
+    }
+    foreach (string surface in new[] { "/issues", "/releases" })
+        using (HttpResponseMessage closed = await PagesGet(address, null, "/api/graft/pages/" + slug + surface))
+            Check(closed.StatusCode == System.Net.HttpStatusCode.NotFound, "and the route for each answers as if it did not exist: " + surface);
 }
 
 /// <summary>
@@ -5863,6 +5977,11 @@ async Task<string> CheckRemoteHelper(string address, AuthenticatedIdentity alice
     string installed = Path.Combine(root, "helper-bin", OperatingSystem.IsWindows() ? "git-remote-graft.exe" : "git-remote-graft");
     Directory.CreateDirectory(Path.GetDirectoryName(installed)!);
     File.Copy(helper, installed, overwrite: true);
+    // A framework-dependent build is an apphost beside its dll, runtimeconfig and deps; a NativeAOT build is one
+    // file and brings nothing. Whatever shares the helper's name comes along, so either kind runs from here.
+    foreach (string beside in Directory.EnumerateFiles(Path.GetDirectoryName(helper)!, Path.GetFileNameWithoutExtension(helper) + ".*"))
+        if (!string.Equals(beside, helper, StringComparison.OrdinalIgnoreCase))
+            File.Copy(beside, Path.Combine(Path.GetDirectoryName(installed)!, Path.GetFileName(beside)), overwrite: true);
     helper = installed;
 
     await StopServer();
@@ -5900,7 +6019,9 @@ async Task<string> CheckRemoteHelper(string address, AuthenticatedIdentity alice
     var rule = await RunGit(root, ["config", "--file", helperConfig, "--get", "url.graft::" + address + "/.insteadOf"]);
     var agent = await RunGit(root, ["config", "--file", helperConfig, "--get", "lfs.customtransfer.graft.args"]);
     Check(setup.ExitCode == 0 && rule.Output.Trim() == address + "/" && agent.Output.Trim() == "lfs-agent",
-        "setup routes the forge's addresses through the helper and names it as the graft transfer for Git LFS");
+        "setup routes the forge's addresses through the helper and names it as the graft transfer for Git LFS (setup exit " +
+        setup.ExitCode + ": " + Redact(setup.Errors.Trim()) + "; rule: " + Redact(rule.Output.Trim()) + " / " + Redact(rule.Errors.Trim()) +
+        "; agent: " + Redact(agent.Output.Trim()) + ")");
 
     // A push of several parts, through a plain https remote.
     string work = Path.Combine(root, "relayed");

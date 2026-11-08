@@ -24,7 +24,36 @@ public enum ProjectAction
     /// <summary>Open an issue or a merge request, comment on one, or change its state. Members only, and
     /// deliberately not granted by visibility: a public project that accepted anonymous writing would be a
     /// spam target, and Graft has no moderation for it to fall back on.</summary>
-    WriteCollaboration
+    WriteCollaboration,
+    /// <summary>Read the project's releases: their notes, links and attached files. Granted wherever the
+    /// repository can be read, and separately by a page whose config says <c>releases</c>, because a release's
+    /// files live beside the repository rather than in it and reading them walks no object graph.</summary>
+    ReadReleases
+}
+
+/// <summary>
+/// What a published page's config grants beyond the files it names. Resolved from <c>.graft/project.json</c>
+/// by the caller that read it and handed to the authorization decision, so a <see cref="AccessGrant.Page"/>
+/// grant can satisfy exactly the surfaces the config opened and nothing else.
+///
+/// <para>
+/// Absent means nothing: a store method that is not handed a reach decides as if the page granted only
+/// <see cref="ProjectAction.ReadPage"/>, which is how every other surface fails closed.
+/// </para>
+/// </summary>
+public sealed record PageReach(bool Issues, bool Releases)
+{
+    /// <summary>A page that grants nothing beyond its own surface.</summary>
+    public static PageReach None { get; } = new(false, false);
+
+    /// <summary>Whether this reach lets a page grant satisfy the action.</summary>
+    public bool Grants(ProjectAction action) => action switch
+    {
+        ProjectAction.ReadPage => true,
+        ProjectAction.ReadCollaboration => Issues,
+        ProjectAction.ReadReleases => Releases,
+        _ => false
+    };
 }
 
 /// <summary>
@@ -115,9 +144,11 @@ public static class ProjectAuthorization
     public static PermissionDecision Decide(
         AuthenticatedIdentity? identity,
         ProjectAccess project,
-        ProjectAction action)
+        ProjectAction action,
+        PageReach? page = null)
     {
         ArgumentNullException.ThrowIfNull(project);
+        page ??= PageReach.None;
 
         // A member grant is the broadest, so it is resolved first and never falls through on a role or scope
         // refusal: a member who may not do this has been answered, and the public grant below would be a
@@ -136,9 +167,14 @@ public static class ProjectAuthorization
             return new(true, ProjectRole.Reporter, "Visibility",
                 $"Project visibility {project.Visibility} grants anonymous {action}.", AccessGrant.Repository);
 
-        if (project.PagePublished && action == ProjectAction.ReadPage)
+        // A page grants its own surface, and whatever its config opened and the caller carried here. The
+        // reach is handed in by the one place that read the config, so a surface that was never told about
+        // the page cannot be reached through it: the default reach grants ReadPage alone.
+        if (project.PagePublished && page.Grants(action))
             return new(true, ProjectRole.Reporter, "Project page",
-                "A published project page grants its own curated surface and nothing else.", AccessGrant.Page);
+                action == ProjectAction.ReadPage
+                    ? "A published project page grants its own curated surface and nothing else."
+                    : $"The published project page's config grants anonymous {action}.", AccessGrant.Page);
 
         return identity is null
             ? Denied("Anonymous", "Authentication is required.")
@@ -204,13 +240,14 @@ public static class ProjectAuthorization
         or ProjectAction.BrowseRepository
         or ProjectAction.FetchRepository
         or ProjectAction.ReadPage
-        or ProjectAction.ReadCollaboration;
+        or ProjectAction.ReadCollaboration
+        or ProjectAction.ReadReleases;
 
     private static bool ScopeAllows(TokenScope scopes, ProjectAction action) => action switch
     {
         ProjectAction.ReadRest or ProjectAction.ReadPage =>
             scopes.HasFlag(TokenScope.Api) || scopes.HasFlag(TokenScope.ReadApi),
-        ProjectAction.BrowseRepository =>
+        ProjectAction.BrowseRepository or ProjectAction.ReadReleases =>
             scopes.HasFlag(TokenScope.Api) || scopes.HasFlag(TokenScope.ReadApi) || scopes.HasFlag(TokenScope.ReadRepository),
         ProjectAction.FetchRepository =>
             scopes.HasFlag(TokenScope.Api) || scopes.HasFlag(TokenScope.ReadRepository) || scopes.HasFlag(TokenScope.WriteRepository),

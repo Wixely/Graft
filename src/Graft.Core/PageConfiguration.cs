@@ -6,6 +6,25 @@ namespace Graft.Core;
 /// <summary>Where a project's static site lives in the repository, and which file answers for a directory.</summary>
 public sealed record PageSite(string Root, string Index);
 
+/// <summary>How much of a commit's author a page's history shows.</summary>
+public enum PageAuthors
+{
+    /// <summary>Messages and dates only. The default: who wrote a commit is not implied by showing that it
+    /// was written.</summary>
+    None = 0,
+    /// <summary>Author names, never addresses.</summary>
+    Names = 1,
+    /// <summary>Names and email addresses, as Git recorded them.</summary>
+    Emails = 2
+}
+
+/// <summary>
+/// The default branch's recent history, as a page shows it: the messages, the dates, and as much of the
+/// author as the config allowed. Never a diff, a changed-file list or a branch name; those print what the
+/// page did not name.
+/// </summary>
+public sealed record PageHistory(int Commits, PageAuthors Authors);
+
 /// <summary>
 /// What a published project page offers. Every field is optional and so is the whole file; what is absent
 /// is absent, never defaulted into something that exposes more.
@@ -17,7 +36,17 @@ public sealed record PageSettings(
     string? Readme,
     IReadOnlyList<string> Files,
     IReadOnlyList<string> Features,
-    PageSite? Site)
+    PageSite? Site,
+    /// <summary>Whether the page lists the default branch's directory structure: every path and its kind,
+    /// with content only for the files <see cref="Files"/> admits.</summary>
+    bool Tree = false,
+    /// <summary>The history the page shows, or null for none.</summary>
+    PageHistory? History = null,
+    /// <summary>Whether the page's readers may read the project's issues and their comments. Read only,
+    /// and never a confidential issue.</summary>
+    bool Issues = false,
+    /// <summary>Whether the page's readers may read the project's releases and download their files.</summary>
+    bool Releases = false)
 {
     /// <summary>
     /// What a project with no config in its repository offers: nothing but the fact that it exists. Deny by
@@ -26,7 +55,10 @@ public sealed record PageSettings(
     public static PageSettings Empty { get; } = new(null, null, null, null, [], [], null);
 
     /// <summary>Whether this page offers anything at all beyond its name and description.</summary>
-    public bool OffersContent => Files.Count > 0 || Site is not null;
+    public bool OffersContent => Files.Count > 0 || Site is not null || Tree || History is not null || Issues || Releases;
+
+    /// <summary>What this page grants beyond its own surface, in the shape the authorization decision takes.</summary>
+    public PageReach Reach => new(Issues, Releases);
 }
 
 /// <summary>The outcome of reading a config: settings, or the reason there are none.</summary>
@@ -63,6 +95,12 @@ public static class PageConfiguration
 
     /// <summary>Most patterns one config may carry, so matching stays bounded however the file was authored.</summary>
     public const int MaximumPatterns = 100;
+
+    /// <summary>Most commits a page's history may show. A page is a front door, not a log viewer.</summary>
+    public const int MaximumHistoryCommits = 500;
+
+    /// <summary>How many commits a history shows when the config asks for one without saying how many.</summary>
+    public const int DefaultHistoryCommits = 100;
 
     /// <summary>
     /// The product surfaces a page may point its readers at, by GitLab's names. Naming anything else is an
@@ -115,7 +153,8 @@ public static class PageConfiguration
     private static PageConfigurationResult ReadPage(JsonElement page)
     {
         foreach (JsonProperty property in page.EnumerateObject())
-            if (property.Name is not ("title" or "description" or "image" or "readme" or "files" or "features" or "site"))
+            if (property.Name is not ("title" or "description" or "image" or "readme" or "files" or "features" or "site"
+                or "tree" or "history" or "issues" or "releases"))
                 return new(null, "The page config has a field Graft does not understand: page." + property.Name);
 
         string? title = null;
@@ -125,6 +164,60 @@ public static class PageConfiguration
         List<string> files = [];
         List<string> features = [];
         PageSite? site = null;
+        bool tree = false;
+        PageHistory? history = null;
+        bool issues = false;
+        bool releases = false;
+
+        // The switches. Each is a boolean and nothing else: a string "true" or a 1 is refused, because a
+        // config that is lenient about what means "show this" will one day show it by accident.
+        if (page.TryGetProperty("tree", out JsonElement treeValue))
+        {
+            if (!IsBoolean(treeValue)) return new(null, "page.tree must be true or false.");
+            tree = treeValue.GetBoolean();
+        }
+        if (page.TryGetProperty("issues", out JsonElement issuesValue))
+        {
+            if (!IsBoolean(issuesValue)) return new(null, "page.issues must be true or false.");
+            issues = issuesValue.GetBoolean();
+        }
+        if (page.TryGetProperty("releases", out JsonElement releasesValue))
+        {
+            if (!IsBoolean(releasesValue)) return new(null, "page.releases must be true or false.");
+            releases = releasesValue.GetBoolean();
+        }
+
+        if (page.TryGetProperty("history", out JsonElement historyValue))
+        {
+            if (historyValue.ValueKind != JsonValueKind.Object) return new(null, "page.history must be an object.");
+            foreach (JsonProperty property in historyValue.EnumerateObject())
+                if (property.Name is not ("commits" or "authors"))
+                    return new(null, "The page config has a field Graft does not understand: page.history." + property.Name);
+
+            int commits = DefaultHistoryCommits;
+            if (historyValue.TryGetProperty("commits", out JsonElement commitsValue))
+            {
+                if (commitsValue.ValueKind != JsonValueKind.Number || !commitsValue.TryGetInt32(out commits) ||
+                    commits < 1 || commits > MaximumHistoryCommits)
+                    return new(null, "page.history.commits must be a whole number from 1 to " + MaximumHistoryCommits + ".");
+            }
+            // Authors are hidden unless the config says otherwise. Showing that a commit happened and
+            // showing who made it are different disclosures, and the second is the one with a person in it.
+            PageAuthors authors = PageAuthors.None;
+            if (historyValue.TryGetProperty("authors", out JsonElement authorsValue))
+            {
+                if (authorsValue.ValueKind != JsonValueKind.String) return new(null, "page.history.authors must be none, names or emails.");
+                authors = (authorsValue.GetString() ?? "").Trim().ToLowerInvariant() switch
+                {
+                    "none" => PageAuthors.None,
+                    "names" => PageAuthors.Names,
+                    "emails" => PageAuthors.Emails,
+                    _ => (PageAuthors)(-1)
+                };
+                if (authors < 0) return new(null, "page.history.authors must be none, names or emails.");
+            }
+            history = new(commits, authors);
+        }
 
         if (page.TryGetProperty("title", out JsonElement titleValue))
         {
@@ -214,8 +307,10 @@ public static class PageConfiguration
             site = new(root, index);
         }
 
-        return new(new PageSettings(title, description, image, readme, files, features, site), null);
+        return new(new PageSettings(title, description, image, readme, files, features, site, tree, history, issues, releases), null);
     }
+
+    private static bool IsBoolean(JsonElement value) => value.ValueKind is JsonValueKind.True or JsonValueKind.False;
 
     /// <summary>Whether a page may serve this path, which is the only question the serving code asks.</summary>
     public static bool AllowsFile(PageSettings settings, string path)

@@ -342,12 +342,53 @@ try
         PageConfigurationResult absent = PageConfiguration.Read(null);
         Check(absent.Ok && !absent.Settings!.OffersContent, "a repository with no config has a page that offers nothing");
 
+        // What a page may open beyond its files (ADR 0045): each is off unless the config says so, each is a
+        // boolean and nothing else, and the history's authors are hidden unless named.
+        PageConfigurationResult more = PageConfiguration.Read(Encoding.UTF8.GetBytes("""
+            {"page":{"tree":true,"history":{"commits":25,"authors":"names"},"issues":true,"releases":true}}
+            """));
+        Check(more.Ok && more.Settings!.Tree && more.Settings.Issues && more.Settings.Releases, "tree, issues and releases are switches a config turns on");
+        Check(more.Settings!.History is { Commits: 25, Authors: PageAuthors.Names }, "a history says how many commits and how much of the author");
+        Check(more.Settings.Reach is { Issues: true, Releases: true }, "and the reach handed to authorization is what the config granted");
+        Check(more.Settings.OffersContent, "a page with any of them offers content");
+        PageConfigurationResult quietHistory = PageConfiguration.Read(Encoding.UTF8.GetBytes("""{"page":{"history":{}}}"""));
+        Check(quietHistory.Ok && quietHistory.Settings!.History is { Commits: 100, Authors: PageAuthors.None },
+            "a history with no settings shows 100 commits and no authors");
+        foreach (string refused in new[]
+        {
+            """{"page":{"tree":"yes"}}""", """{"page":{"issues":1}}""", """{"page":{"releases":"true"}}""",
+            """{"page":{"history":true}}""", """{"page":{"history":{"commits":0}}}""", """{"page":{"history":{"commits":501}}}""",
+            """{"page":{"history":{"commits":"ten"}}}""", """{"page":{"history":{"authors":"everything"}}}""",
+            """{"page":{"history":{"authors":true}}}""", """{"page":{"history":{"diffs":true}}}"""
+        })
+            Check(!PageConfiguration.Read(Encoding.UTF8.GetBytes(refused)).Ok, "a loosely written switch is an error, not a guess: " + refused);
+
+        // The reach is what lets a page grant satisfy an action, and it satisfies only what it names.
+        ProjectAccess pageOnly = new(OwnerUserId: 1, ProjectVisibility.Private, PagePublished: true, Membership: null);
+        Check(ProjectAuthorization.Decide(null, pageOnly, ProjectAction.ReadPage).Grant == AccessGrant.Page, "a published page grants its own surface with no reach");
+        Check(!ProjectAuthorization.Decide(null, pageOnly, ProjectAction.ReadCollaboration).Allowed, "and without a reach it grants no issues");
+        Check(!ProjectAuthorization.Decide(null, pageOnly, ProjectAction.ReadReleases).Allowed, "and no releases");
+        Check(ProjectAuthorization.Decide(null, pageOnly, ProjectAction.ReadCollaboration, new PageReach(true, false)).Grant == AccessGrant.Page,
+            "a reach that opened issues grants reading them as a page grant");
+        Check(!ProjectAuthorization.Decide(null, pageOnly, ProjectAction.ReadReleases, new PageReach(true, false)).Allowed,
+            "and nothing it did not open");
+        Check(!ProjectAuthorization.Decide(null, pageOnly, ProjectAction.BrowseRepository, new PageReach(true, true)).Allowed,
+            "no reach opens the repository");
+        Check(!ProjectAuthorization.Decide(null, pageOnly, ProjectAction.WriteCollaboration, new PageReach(true, true)).Allowed,
+            "and no reach writes");
+        ProjectAccess unpublished = pageOnly with { PagePublished = false };
+        Check(!ProjectAuthorization.Decide(null, unpublished, ProjectAction.ReadCollaboration, new PageReach(true, true)).Allowed,
+            "a reach is nothing without the published flag, which lives in the database");
+
         // And the shape the decision record documents parses into what it says.
         PageConfigurationResult full = PageConfiguration.Read(Encoding.UTF8.GetBytes("""
             {"version":1,"page":{"title":"Graft","description":"A forge.","readme":"README.md",
              "files":["README.md","docs/**/*.md"],"site":{"root":"pages","index":"index.html"}}}
             """));
         Check(full.Ok, "the documented config shape parses");
+        Check(!full.Settings!.Tree && full.Settings.History is null && !full.Settings.Issues && !full.Settings.Releases,
+            "and a config that does not name the structure, history, issues or releases has none of them");
+        Check(full.Settings.Reach == PageReach.None, "so its reach grants nothing beyond the page");
         Check(PageConfiguration.AllowsFile(full.Settings!, "docs/guide.md"), "and admits a file its patterns name");
         Check(!PageConfiguration.AllowsFile(full.Settings!, "src/secret.cs"), "and refuses one they do not");
         Check(PageConfiguration.AllowsSiteFile(full.Settings!, "pages/index.html"), "a site file inside the root is servable");

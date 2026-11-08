@@ -525,10 +525,53 @@ public sealed record ProjectPageResponse(
     [property: JsonPropertyName("site_url")] string? SiteUrl,
     /// <summary>The product surfaces the config named that this reader may open. Empty for a reader the
     /// project itself would refuse, so a page never advertises a door that is locked to its visitor.</summary>
-    IReadOnlyList<PageFeatureResponse> Features);
+    IReadOnlyList<PageFeatureResponse> Features,
+    /// <summary>The default branch's directory structure when the config asked for it, or null. Names and
+    /// kinds only; content is reachable for the entries marked readable and for nothing else.</summary>
+    IReadOnlyList<PageTreeEntryResponse>? Tree = null,
+    /// <summary>The default branch's recent history when the config asked for it, or null.</summary>
+    PageHistoryResponse? History = null,
+    /// <summary>Whether this page's readers may read the project's issues, at the page's own issues route.</summary>
+    bool Issues = false,
+    /// <summary>Whether this page's readers may read the project's releases, at the page's own releases route.</summary>
+    bool Releases = false);
 
 /// <summary>One surface a page links onward to, by GitLab's name and at the project's shareable address.</summary>
 public sealed record PageFeatureResponse(string Name, string Url);
+
+/// <summary>One entry of a page's directory listing. <c>type</c> is <c>tree</c> or <c>blob</c>, Git's words.
+/// <c>readable</c> says whether the page's file route will serve it, which is decided by the allowlist and
+/// not by the listing.</summary>
+public sealed record PageTreeEntryResponse(string Path, string Type, bool Readable);
+
+/// <summary>A page's history: how much of each author it shows (<c>none</c>, <c>names</c> or <c>emails</c>)
+/// and the commits, newest first.</summary>
+public sealed record PageHistoryResponse(string Authors, IReadOnlyList<PageCommitResponse> Commits);
+
+/// <summary>One commit as a page shows it: what was said and when. Never what changed. The author fields are
+/// null when the config did not open them.</summary>
+public sealed record PageCommitResponse(
+    string Id,
+    [property: JsonPropertyName("short_id")] string ShortId,
+    string Title,
+    string Message,
+    [property: JsonPropertyName("committed_at")] DateTimeOffset CommittedAt,
+    [property: JsonPropertyName("author_name")] string? AuthorName,
+    [property: JsonPropertyName("author_email")] string? AuthorEmail);
+
+/// <summary>One issue with its conversation, as a page shows it: read only, so both arrive together.</summary>
+public sealed record PageIssueResponse(IssueResponse Issue, IReadOnlyList<NoteResponse> Notes);
+
+/// <summary>A release as a page shows it. No commit and no source archives: the first would print a commit
+/// the history may not have opened, and the second is the repository.</summary>
+public sealed record PageReleaseResponse(
+    [property: JsonPropertyName("tag_name")] string TagName,
+    string Name,
+    string Description,
+    [property: JsonPropertyName("released_at")] DateTimeOffset ReleasedAt,
+    string Author,
+    IReadOnlyList<ReleaseLinkResponse> Links,
+    IReadOnlyList<ReleaseFileResponse> Files);
 
 /// <summary>A registered SSH key, in GitLab's shape. <c>key</c> is the one-line public key as it was pasted;
 /// <c>fingerprint</c> is Graft's addition, the <c>SHA256:</c> form OpenSSH prints.</summary>
@@ -1418,6 +1461,12 @@ public sealed record ProjectUploadResponse(
 [JsonSerializable(typeof(PagePublishRequest))]
 [JsonSerializable(typeof(PageStateResponse))]
 [JsonSerializable(typeof(ProjectPageResponse))]
+[JsonSerializable(typeof(PageTreeEntryResponse))]
+[JsonSerializable(typeof(PageHistoryResponse))]
+[JsonSerializable(typeof(PageCommitResponse))]
+[JsonSerializable(typeof(PageIssueResponse))]
+[JsonSerializable(typeof(PageReleaseResponse))]
+[JsonSerializable(typeof(PageReleaseResponse[]))]
 [JsonSerializable(typeof(BrowseResponse))]
 [JsonSerializable(typeof(McpSettingsResponse))]
 [JsonSerializable(typeof(McpSettingsRequest))]

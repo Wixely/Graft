@@ -86,7 +86,8 @@ taken on in the order given: SSH, optional email, groups, the project-scoped aud
 
 - **`features` in `.graft/project.json`.** Every name was an error because there was nothing to name. The
   seven surfaces that exist are now names, and a name is a link offered only to a reader the project would
-  admit, never a grant. [Project pages](project-pages.md#features).
+  admit, never a grant. [Project pages](project-pages.md#features). Since 2026-11-08 the config may also open
+  the structure, the history, issues and releases; [ADR 0045](decisions/0045-semi-public-projects.md).
 - **Pushing needs a token and nothing said so.** The clone menu now says it where Git asks for the
   password, and the readme has a section on cloning and pushing, including how to clear a credential helper
   that cached the refused password.
@@ -121,6 +122,15 @@ Then the first of the four large items, in the order given:
   project, its issues, proposals and comments, or its releases, packages, images and snippets that still
   exist, on the settings tab and at GitLab's `audit_events` route. The whole trail stays the administrator's.
   [ADR 0036](decisions/0036-project-audit.md).
+
+## Closed on 2026-11-08
+
+- **A semi-public project.** Four fields in `.graft/project.json`, each off until named: `tree` lists the default
+  branch's structure with content only for allowlisted files; `history` shows commit messages and dates, with authors
+  hidden unless `names` or `emails` is asked for; `issues` opens the issues read only and never a confidential one;
+  `releases` opens releases with their files. The config's grants travel as one value to the authorization decision
+  and the store, so a store method never told about pages fails closed. Still no clone, diff, changed-file list or
+  branch list, and no page reading over `/api/v4`. [ADR 0045](decisions/0045-semi-public-projects.md).
 
 ## Closed on 2026-11-03
 

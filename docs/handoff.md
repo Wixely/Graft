@@ -147,6 +147,11 @@ entries and decision records as each lands.
   is a link to `/projects/<slug>/-/<feature>` offered only to a reader the project's own collaboration rule
   admits, decided per request. A name is never a grant. An unknown name is still an error and unpublishes
   the page. [project-pages.md](project-pages.md#features); the page view shows the links in a panel.
+- **A semi-public project** (2026-11-08). The same config may open `tree`, `history`, `issues` and `releases`,
+  each off until named, so a closed-source project can show its structure, its commit messages (authors only
+  when asked), read-only issues and releases with their files. The config's grants are one `PageReach` value
+  handed to the authorization decision and the store by the page routes alone. No clone, diff, changed-file
+  list or branch list, and nothing over `/api/v4`. [ADR 0045](decisions/0045-semi-public-projects.md).
 - **The token nobody was told about.** The clone menu says, under the clone command, that the password Git
   asks for is a personal access token and names the scope a push needs. The readme has a section on cloning
   and pushing with the `git credential reject` recipe for a helper that cached the refusal.

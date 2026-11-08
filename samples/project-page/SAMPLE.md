@@ -34,6 +34,19 @@ The config is the whole feature:
 Add a `src/secret.cs` to this repository and neither surface will serve it, because a page is deny by
 default: no `files` means no files, and there is no "everything except" form.
 
+To show more than files, add any of these to `page`, each off until named:
+
+```json
+"tree": true,
+"history": { "commits": 50, "authors": "names" },
+"issues": true,
+"releases": true
+```
+
+`tree` lists the structure without the content, `history` the commit messages (authors hidden unless
+`names` or `emails`), `issues` the issues read only, and `releases` the releases with their files. See
+[project-pages.md](../../docs/project-pages.md#beyond-files-a-semi-public-project).
+
 ## Running it
 
 The site needs a second hostname. Nothing is served until an operator configures one, because repository

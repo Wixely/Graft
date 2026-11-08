@@ -61,10 +61,11 @@ public sealed partial class GraftStore
     public async Task<IReadOnlyList<Release>> ListReleasesAsync(
         AuthenticatedIdentity? identity,
         long projectId,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        PageReach? page = null)
     {
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
-        await RequireRepositoryReaderAsync(db, identity, projectId, cancellationToken);
+        await RequireReleaseReaderAsync(db, identity, projectId, cancellationToken, page);
         IEnumerable<ReleaseRow> rows = await db.QueryAsync<ReleaseRow>(ReleaseSelect +
             "WHERE r.ProjectId = @Id ORDER BY r.ReleasedAtUtc DESC, r.Id DESC;", new IdParameters(projectId));
         List<Release> releases = [];
@@ -76,10 +77,11 @@ public sealed partial class GraftStore
         AuthenticatedIdentity? identity,
         long projectId,
         string tagName,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        PageReach? page = null)
     {
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
-        await RequireRepositoryReaderAsync(db, identity, projectId, cancellationToken);
+        await RequireReleaseReaderAsync(db, identity, projectId, cancellationToken, page);
         ReleaseRow? row = await db.QuerySingleOrDefaultAsync<ReleaseRow>(ReleaseSelect +
             "WHERE r.ProjectId = @ProjectId AND r.TagName = @Name;", new LabelLookupParameters(projectId, tagName.Trim()));
         return row is null ? null : await HydrateReleaseAsync(db, row);
@@ -241,10 +243,11 @@ public sealed partial class GraftStore
         long projectId,
         string tagName,
         string fileName,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        PageReach? page = null)
     {
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
-        await RequireRepositoryReaderAsync(db, identity, projectId, cancellationToken);
+        await RequireReleaseReaderAsync(db, identity, projectId, cancellationToken, page);
         ReleaseAssetBytesRow? row = await db.QuerySingleOrDefaultAsync<ReleaseAssetBytesRow>("""
             SELECT a.Id, a.FileName, a.Size, a.Sha256, a.Bytes, u.Username AS UploadedByUsername, a.CreatedAtUtc
             FROM ReleaseAssets a
@@ -312,6 +315,15 @@ public sealed partial class GraftStore
     private static async Task RequireRepositoryReaderAsync(SqliteConnection db, AuthenticatedIdentity? identity, long projectId, CancellationToken cancellationToken)
     {
         PermissionDecision permission = await DecideAsync(db, null, identity, projectId, ProjectAction.BrowseRepository, cancellationToken);
+        if (!permission.Allowed) throw new UnauthorizedAccessException(permission.Explanation);
+    }
+
+    /// <summary>Reading a release is its own action: granted wherever the repository can be read, and by a
+    /// page whose config opened releases. A release's files live beside the repository, not in it.</summary>
+    private static async Task RequireReleaseReaderAsync(SqliteConnection db, AuthenticatedIdentity? identity, long projectId,
+        CancellationToken cancellationToken, PageReach? page = null)
+    {
+        PermissionDecision permission = await DecideAsync(db, null, identity, projectId, ProjectAction.ReadReleases, cancellationToken, page);
         if (!permission.Allowed) throw new UnauthorizedAccessException(permission.Explanation);
     }
 

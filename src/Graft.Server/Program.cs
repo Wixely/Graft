@@ -2428,6 +2428,31 @@ app.MapGet("/api/graft/pages/{globalSlug}", async context =>
         CollectPagePaths(repository, page, "", files);
         files.Sort(StringComparer.Ordinal);
 
+        // The directory structure, when asked for: every path and its kind, and for each file whether the
+        // allowlist admits it. The listing is the same walk as the files above with the filter removed from
+        // the names and kept on the content, so a path can appear here that the file route will still refuse.
+        List<PageTreeEntryResponse>? tree = null;
+        if (page.Tree)
+        {
+            tree = [];
+            CollectPageTree(repository, page, "", tree);
+            tree.Sort((left, right) => string.CompareOrdinal(left.Path, right.Path));
+        }
+
+        // The history, when asked for: messages and dates, and as much of the author as the config opened.
+        // Nothing here names a file or a branch, and nothing links to a diff, because the page has no diff.
+        PageHistoryResponse? history = null;
+        if (page.History is PageHistory wanted)
+        {
+            IReadOnlyList<GitCommit> commits;
+            try { commits = RepositoryView.Commits(repository, "HEAD", 0, wanted.Commits); }
+            catch (GitInputException) { commits = []; }
+            history = new(wanted.Authors switch { PageAuthors.Names => "names", PageAuthors.Emails => "emails", _ => "none" },
+                [.. commits.Select(commit => new PageCommitResponse(commit.Id, commit.Id[..8], commit.Title, commit.Message, commit.Committer.When,
+                    wanted.Authors >= PageAuthors.Names ? commit.Author.Name : null,
+                    wanted.Authors >= PageAuthors.Emails ? commit.Author.Email : null))]);
+        }
+
         // The features the config named are links, not grants. They are offered only to a reader the
         // project's own collaboration surface would admit, which is decided here for this reader rather
         // than assumed from the page, so a visitor is never shown a door the project would then refuse.
@@ -2449,9 +2474,131 @@ app.MapGet("/api/graft/pages/{globalSlug}", async context =>
             page.Site is null || settings.PagesOrigin is null
                 ? null
                 : settings.PagesOrigin.TrimEnd('/') + "/" + Uri.EscapeDataString(details.Project.GlobalSlug) + "/",
-            features);
+            features,
+            tree,
+            history,
+            page.Issues,
+            page.Releases);
         await context.Response.WriteAsJsonAsync(response, ApiJson.Default.ProjectPageResponse, null, context.RequestAborted);
     });
+});
+
+// What a page's config may open beyond its files: the project's issues, read only, and its releases. Each
+// route resolves the page, reads the config under the repository's gate, and hands the config's reach to
+// the store, which decides again. The store is told about the page only here, so these are the only routes
+// through which a page grant reaches an issue or a release, and a store method that was never told fails
+// closed exactly as before.
+async Task<(ProjectInfo Project, ProjectDetails Details, AuthenticatedIdentity? Identity, PageSettings Page)?> OpenPage(HttpContext context)
+{
+    ProjectInfo? found = await store.FindReadyProjectByGlobalSlugAsync(
+        context.Request.RouteValues["globalSlug"]?.ToString() ?? "", context.RequestAborted);
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: false);
+    if (found is null || !(await DecideFor(context, browser?.Identity, found.Id, ProjectAction.ReadPage)).Allowed)
+    { await ApiError(context, 404, "page"); return null; }
+    ProjectDetails details = (await store.GetReadyProjectAsync(found.Id, context.RequestAborted))!;
+
+    RepositoryEndpoint endpoint = EndpointFor(found);
+    if (!await endpoint.Gate.WaitAsync(0, context.RequestAborted)) { await ApiError(context, 429, "429 Too Many Requests"); return null; }
+    PageConfigurationResult config;
+    try { config = PageConfiguration.Read(ReadRepositoryFile(endpoint.Repository, PageConfiguration.Path)); }
+    finally { endpoint.Gate.Release(); }
+    if (!config.Ok) { await ApiError(context, 404, "page"); return null; }
+    return (found, details, browser?.Identity, config.Settings!);
+}
+
+app.MapGet("/api/graft/pages/{globalSlug}/issues", async context =>
+{
+    if (!await OnlyQuery(context, "state", "page", "per_page")) return;
+    var opened = await OpenPage(context);
+    if (opened is null) return;
+    (ProjectInfo found, ProjectDetails details, AuthenticatedIdentity? identity, PageSettings page) = opened.Value;
+    if (!page.Issues || !(await DecideFor(context, identity, found.Id, ProjectAction.ReadCollaboration, page.Reach)).Allowed)
+    { await ApiError(context, 404, "page"); return; }
+    if (!TryReadState(context.Request.Query["state"].ToString(), out CollaborationState? state, merged: false))
+    { await ApiError(context, 400, "state must be opened, closed or all"); return; }
+    (int Page, int PerPage)? pagination = await Pagination(context);
+    if (pagination is null) return;
+    (int number, int perPage) = pagination.Value;
+    try
+    {
+        IssuePage issues = await store.ListIssuesAsync(identity, found.Id, new IssueFilter(state), (number - 1) * perPage, perPage,
+            context.RequestAborted, page: page.Reach);
+        List<IssueResponse> response = [];
+        foreach (Issue issue in issues.Issues) response.Add(await IssueResponseFor(context, details, issue));
+        SetPagination(context, number, perPage, issues.Total);
+        await context.Response.WriteAsJsonAsync(new IssuePageResponse(response, issues.Total, number, perPage),
+            ApiJson.Default.IssuePageResponse, null, context.RequestAborted);
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "page"); }
+});
+
+app.MapGet("/api/graft/pages/{globalSlug}/issues/{iid:long}", async context =>
+{
+    if (!await OnlyQuery(context)) return;
+    var opened = await OpenPage(context);
+    if (opened is null) return;
+    (ProjectInfo found, ProjectDetails details, AuthenticatedIdentity? identity, PageSettings page) = opened.Value;
+    if (!page.Issues || !(await DecideFor(context, identity, found.Id, ProjectAction.ReadCollaboration, page.Reach)).Allowed)
+    { await ApiError(context, 404, "page"); return; }
+    try
+    {
+        // A confidential issue is not here for a stranger: the store tells a page reader it does not exist,
+        // as it does any other non-member.
+        Issue? issue = await store.FindIssueAsync(identity, found.Id, Number(context), context.RequestAborted, page: page.Reach);
+        if (issue is null) { await ApiError(context, 404, "issue"); return; }
+        IReadOnlyList<Comment> comments = await store.ListCommentsAsync(identity, found.Id, CommentSubject.Issue, issue.Iid, 0, 100,
+            context.RequestAborted, page: page.Reach);
+        List<NoteResponse> notes = [];
+        foreach (Comment comment in comments) notes.Add(await NoteResponseFor(context, comment));
+        await context.Response.WriteAsJsonAsync(new PageIssueResponse(await IssueResponseFor(context, details, issue), notes),
+            ApiJson.Default.PageIssueResponse, null, context.RequestAborted);
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "page"); }
+    catch (CollaborationNotFoundException) { await ApiError(context, 404, "issue"); }
+});
+
+app.MapGet("/api/graft/pages/{globalSlug}/releases", async context =>
+{
+    if (!await OnlyQuery(context)) return;
+    var opened = await OpenPage(context);
+    if (opened is null) return;
+    (ProjectInfo found, ProjectDetails details, AuthenticatedIdentity? identity, PageSettings page) = opened.Value;
+    if (!page.Releases || !(await DecideFor(context, identity, found.Id, ProjectAction.ReadReleases, page.Reach)).Allowed)
+    { await ApiError(context, 404, "page"); return; }
+    try
+    {
+        IReadOnlyList<Release> releases = await store.ListReleasesAsync(identity, found.Id, context.RequestAborted, page: page.Reach);
+        // The page's own shape, not GitLab's: no commit, because that is history the config may not have
+        // opened, and no source archives, because an archive is the repository.
+        string downloads = "/api/graft/pages/" + Uri.EscapeDataString(details.Project.GlobalSlug) + "/releases/";
+        PageReleaseResponse[] response = [.. releases.Select(release => new PageReleaseResponse(
+            release.TagName, release.Name, release.Description, release.ReleasedAtUtc, release.AuthorUsername,
+            [.. release.Links.Select(link => new ReleaseLinkResponse(link.Id, link.Name, link.Url, link.LinkType))],
+            [.. release.Assets.Select(asset => new ReleaseFileResponse(asset.Id, asset.FileName, asset.Size, asset.Sha256,
+                downloads + Uri.EscapeDataString(release.TagName) + "/assets/files/" + Uri.EscapeDataString(asset.FileName),
+                asset.UploadedByUsername, asset.CreatedAtUtc))]))];
+        await context.Response.WriteAsJsonAsync(response, ApiJson.Default.PageReleaseResponseArray, null, context.RequestAborted);
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "page"); }
+});
+
+app.MapGet("/api/graft/pages/{globalSlug}/releases/{tag}/assets/files/{fileName}", async context =>
+{
+    if (!await OnlyQuery(context)) return;
+    var opened = await OpenPage(context);
+    if (opened is null) return;
+    (ProjectInfo found, _, AuthenticatedIdentity? identity, PageSettings page) = opened.Value;
+    if (!page.Releases || !(await DecideFor(context, identity, found.Id, ProjectAction.ReadReleases, page.Reach)).Allowed)
+    { await ApiError(context, 404, "page"); return; }
+    try
+    {
+        (ReleaseAsset Asset, byte[] Bytes)? asset = await store.ReadReleaseAssetAsync(identity, found.Id, TagOf(context), FileNameOf(context),
+            context.RequestAborted, page: page.Reach);
+        if (asset is null) { await ApiError(context, 404, "file"); return; }
+        context.Response.Headers.ETag = "\"" + asset.Value.Asset.Sha256 + "\"";
+        await WriteDownload(context, asset.Value.Bytes, asset.Value.Asset.FileName, "application/octet-stream");
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "page"); }
 });
 
 // One file a published page offers. Named paths only: the allowlist is asked before the object store is,
@@ -9040,9 +9187,11 @@ return 0;
 /// begin serving strangers when it is restored onto a host whose operator never did.
 /// </para>
 /// </summary>
-async Task<PermissionDecision> DecideFor(HttpContext context, AuthenticatedIdentity? identity, long projectId, ProjectAction action)
+// The page reach is only ever handed in by the page routes, after they read the config under the repository's
+// gate. Every other call site decides without one, so a page grant reaches nothing beyond the page itself.
+async Task<PermissionDecision> DecideFor(HttpContext context, AuthenticatedIdentity? identity, long projectId, ProjectAction action, PageReach? page = null)
 {
-    PermissionDecision decision = await store.GetPermissionAsync(identity, projectId, action, context.RequestAborted);
+    PermissionDecision decision = await store.GetPermissionAsync(identity, projectId, action, page, context.RequestAborted);
     if (settings.PublicBrowsing || decision.Grant is AccessGrant.Member or AccessGrant.None) return decision;
     return new(false, null, "Public browsing disabled", "This server does not serve projects to anonymous callers.");
 }
@@ -9787,6 +9936,35 @@ static void CollectPagePaths(Repository repository, PageSettings page, string di
         if (entry.Path.Equals(PageConfiguration.ReservedDirectory, StringComparison.OrdinalIgnoreCase)) continue;
         if (entry.Type == "tree") CollectPagePaths(repository, page, entry.Path, found, depth + 1);
         else if (PageConfiguration.AllowsFile(page, entry.Path)) found.Add(entry.Path);
+    }
+}
+
+/// <summary>
+/// Every path on the default branch and its kind, for a page whose config asked to show the structure. The
+/// allowlist decides nothing about what is listed and everything about what is readable, which is reported
+/// per entry so a reader is not offered a file the file route will then refuse. Bounded like the file
+/// listing, more generously, because a listing is cheap and a full one is the point.
+/// </summary>
+static void CollectPageTree(Repository repository, PageSettings page, string directory, List<PageTreeEntryResponse> found, int depth = 0)
+{
+    if (found.Count >= 2_000 || depth > 16) return;
+    IReadOnlyList<GitTreeEntry>? entries;
+    try { entries = RepositoryView.Tree(repository, "HEAD", directory); }
+    catch (GitInputException) { return; }
+    if (entries is null) return;
+
+    foreach (GitTreeEntry entry in entries)
+    {
+        if (found.Count >= 2_000) return;
+        // The config's own directory is not listed at any visibility: its name says there is a page config,
+        // and its content is the allowlist that describes what the page is hiding.
+        if (entry.Path.Equals(PageConfiguration.ReservedDirectory, StringComparison.OrdinalIgnoreCase)) continue;
+        if (entry.Type == "tree")
+        {
+            found.Add(new(entry.Path, "tree", false));
+            CollectPageTree(repository, page, entry.Path, found, depth + 1);
+        }
+        else found.Add(new(entry.Path, "blob", PageConfiguration.AllowsFile(page, entry.Path)));
     }
 }
 

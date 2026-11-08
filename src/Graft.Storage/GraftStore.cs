@@ -1344,6 +1344,20 @@ public sealed partial class GraftStore : IAsyncDisposable
         return await DecideAsync(db, null, identity, projectId, action, cancellationToken);
     }
 
+    /// <summary>The same decision for a caller who read a published page's config and carries what it grants.
+    /// Only the page routes hold a reach; everything else decides without one and a page grant then reaches
+    /// nothing beyond the page itself.</summary>
+    public async Task<PermissionDecision> GetPermissionAsync(
+        AuthenticatedIdentity? identity,
+        long projectId,
+        ProjectAction action,
+        PageReach? page,
+        CancellationToken cancellationToken = default)
+    {
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        return await DecideAsync(db, null, identity, projectId, action, cancellationToken, page);
+    }
+
     public async Task<bool> ContainsStoredSecretAsync(string rawSecret, CancellationToken cancellationToken = default)
     {
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
@@ -1421,7 +1435,8 @@ public sealed partial class GraftStore : IAsyncDisposable
         AuthenticatedIdentity? identity,
         long projectId,
         ProjectAction action,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        PageReach? page = null)
     {
         ProjectAccessRow? project = await db.QuerySingleOrDefaultAsync<ProjectAccessRow>("""
             SELECT p.OwnerUserId, p.Visibility, p.PagePublished, m.Role, p.GroupId
@@ -1448,7 +1463,7 @@ public sealed partial class GraftStore : IAsyncDisposable
             project.PagePublished != 0,
             project.Role is null ? null : (ProjectRole)project.Role.Value,
             groupRole);
-        return ProjectAuthorization.Decide(liveIdentity, access, action);
+        return ProjectAuthorization.Decide(liveIdentity, access, action, page);
     }
 
     private static async Task<AuthenticatedIdentity?> FindLiveIdentityAsync(

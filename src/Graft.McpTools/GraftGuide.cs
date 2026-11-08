@@ -156,8 +156,14 @@ public static class GraftGuide
             there is no "everything except" form. An invalid config unpublishes the page rather than falling
             back to defaults, so a config error takes the page down loudly.
 
-            A page can never clone, serve history or show a diff, whatever the config says. Those walk the
-            object graph, and no path allowlist can constrain a graph walk.
+            Four more fields make a project semi-public, each off until named: `"tree": true` lists the
+            default branch's structure with content only for allowlisted files; `"history": {"commits": 100,
+            "authors": "names"}` shows commit messages and dates, with `authors` as `none` (default), `names`
+            or `emails`; `"issues": true` opens the issues read only, never a confidential one; `"releases":
+            true` opens releases with their files. Each is a JSON boolean or object and nothing else.
+
+            A page can never clone, show a diff or a changed-file list, or list branches, whatever the
+            config says. Those walk the object graph, and no path allowlist can constrain a graph walk.
 
             A site is served only from a separate hostname an operator configures, because repository HTML
             cannot share an origin with the session cookie and the API. Within a site, a page can link back

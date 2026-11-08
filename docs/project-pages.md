@@ -66,10 +66,54 @@ Nothing else is a metacharacter, and there is no "everything except" form. Patte
 - **`readme` and `image` must themselves match `files`.** A path named in one field but absent from the
   allowlist is an error, not an implicit grant.
 
+## Beyond files: a semi-public project
+
+A closed-source project can still have public documentation, public bug reports and visible progress. Four
+more fields in `page` open those, and each is off until the config names it:
+
+```json
+{
+  "version": 1,
+  "page": {
+    "files": ["README.md", "docs/**/*.md"],
+    "tree": true,
+    "history": { "commits": 100, "authors": "names" },
+    "issues": true,
+    "releases": true
+  }
+}
+```
+
+| Field | What it shows |
+| --- | --- |
+| `tree` | The directory structure of the default branch: every path and whether it is a file or a directory. Names only. A file can be opened only if `files` admits it, and the listing says which. |
+| `history` | The default branch's recent commits: message and date. `commits` is how many, 1 to 500, 100 if omitted. `authors` is `none` (the default), `names`, or `emails`. Never a diff, a changed-file list or a branch. |
+| `issues` | The project's issues, read only: title, description, state, labels, milestone and comments. A confidential issue is not there. Nobody comments or opens one through a page. |
+| `releases` | The project's releases: notes, links and attached files, downloadable. No source archive, because an archive is the repository. |
+
+Each is a JSON boolean (or, for `history`, an object) and nothing else: `"true"`, `1` and `"yes"` are
+errors that unpublish the page, like any other misspelling here.
+
+So the levels of "semi-public" read, in config:
+
+- **Specific files**: `"files": ["README.md", "compose.yaml"]`
+- **Every Markdown file**: `"files": ["**/*.md"]`
+- **Specific folders**: `"files": ["docs/**"]`
+- **Structure without content**: `"tree": true`
+- **Commit messages, no names**: `"history": {}`; with names, `{ "authors": "names" }`; with addresses, `"emails"`
+- **Releases and binaries**: `"releases": true`
+- **Issues, read only**: `"issues": true`
+
+The issues and releases are served at the page's own routes, `/api/graft/pages/<slug>/issues` and
+`/api/graft/pages/<slug>/releases`, and rendered on the page. The project's own API at `/api/v4` still
+answers a stranger with a 404 for a page-only project, so a GitLab client does not see them; a reader who
+wants them reads the page. See [ADR 0045](decisions/0045-semi-public-projects.md) for why.
+
 ## What a page can never do
 
-A page is a separate read path, not a filter over the repository view. It will not clone, will not serve
-history, and will not show a diff, whatever the config says.
+A page is a separate read path, not a filter over the repository view. It will not clone, will not show a
+diff or a changed-file list, and will not list branches, whatever the config says. Its history, when the
+config opens one, is what was said and when, not what changed.
 
 That is a deliberate limit rather than an unfinished one. A Git pack is reachability-shaped rather than
 path-shaped, so no filter makes `git fetch` honour a file allowlist, and a diff prints the contents of

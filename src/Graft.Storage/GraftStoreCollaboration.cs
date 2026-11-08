@@ -102,12 +102,13 @@ public sealed partial class GraftStore
         IssueFilter filter,
         int skip,
         int take,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        PageReach? page = null)
     {
         ArgumentNullException.ThrowIfNull(filter);
         if (skip < 0 || take is < 1 or > 100) throw new ArgumentOutOfRangeException(nameof(take));
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
-        PermissionDecision reader = await RequireReaderAsync(db, null, identity, projectId, cancellationToken);
+        PermissionDecision reader = await RequireReaderAsync(db, null, identity, projectId, cancellationToken, page);
 
         IssueQueryParameters parameters = IssueQuery(projectId, filter, reader, identity, take, skip);
         IEnumerable<IssueRow> rows = await db.QueryAsync<IssueRow>(IssueSelect + IssueWhere + """
@@ -122,10 +123,11 @@ public sealed partial class GraftStore
         AuthenticatedIdentity? identity,
         long projectId,
         long iid,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        PageReach? page = null)
     {
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
-        PermissionDecision reader = await RequireReaderAsync(db, null, identity, projectId, cancellationToken);
+        PermissionDecision reader = await RequireReaderAsync(db, null, identity, projectId, cancellationToken, page);
         IssueRow? row = await db.QuerySingleOrDefaultAsync<IssueRow>(IssueSelect +
             "WHERE i.ProjectId = @ProjectId AND i.Iid = @Iid;", new CollaborationItemParameters(projectId, iid));
         if (row is null || !MaySeeIssue(row, reader, identity)) return null;
@@ -1121,11 +1123,12 @@ public sealed partial class GraftStore
         long iid,
         int skip,
         int take,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        PageReach? page = null)
     {
         if (skip < 0 || take is < 1 or > 100) throw new ArgumentOutOfRangeException(nameof(take));
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
-        PermissionDecision reader = await RequireReaderAsync(db, null, identity, projectId, cancellationToken);
+        PermissionDecision reader = await RequireReaderAsync(db, null, identity, projectId, cancellationToken, page);
         long subjectId = await ResolveSubjectAsync(db, null, projectId, subject, iid);
         // The conversation on a confidential issue is as confidential as the issue.
         if (subject == CommentSubject.Issue && reader.Grant != AccessGrant.Member)
@@ -1223,10 +1226,11 @@ public sealed partial class GraftStore
         SqliteTransaction? transaction,
         AuthenticatedIdentity? identity,
         long projectId,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        PageReach? page = null)
     {
         PermissionDecision permission = await DecideAsync(db, transaction, identity, projectId,
-            ProjectAction.ReadCollaboration, cancellationToken);
+            ProjectAction.ReadCollaboration, cancellationToken, page);
         if (!permission.Allowed) throw new UnauthorizedAccessException(permission.Explanation);
         return permission;
     }
