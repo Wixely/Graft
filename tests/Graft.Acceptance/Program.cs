@@ -179,6 +179,25 @@ try
         await Throws<UnauthorizedAccessException>(() => avatars.SetAvatarAsync(carolIdentity, AvatarOwner.Project, project.Id, replacement),
             "a non-member cannot set a project avatar");
         Check(await avatars.GetAvatarAsync(AvatarOwner.Project, project.Id) is null, "a refused project avatar was not stored");
+
+        // A project banner (ADR 0046) is stored, replaced and removed like a project avatar, under the same permission.
+        ValidatedImage wide = Required(ImageContent.Validate(Png(1600, 300, padding: 300_000)), "banner validates");
+        await Throws<UnauthorizedAccessException>(() => avatars.SetBannerAsync(carolIdentity, project.Id, wide),
+            "a non-member cannot set a project banner");
+        Check(await avatars.GetBannerDigestAsync(project.Id) is null, "a refused banner was not stored");
+        await avatars.SetBannerAsync(avatarAdmin, project.Id, wide);
+        StoredAvatar banner = Required(await avatars.GetBannerAsync(project.Id), "banner reads back");
+        Check(banner.Bytes.SequenceEqual(wide.Bytes) && banner.ContentType == "image/png", "banner bytes round-trip intact");
+        Check(await avatars.GetBannerDigestAsync(project.Id) == banner.Sha256, "the banner's digest is reported without its bytes");
+        await avatars.SetBannerAsync(avatarAdmin, project.Id, replacement);
+        Check(Required(await avatars.GetBannerAsync(project.Id), "replaced banner").ContentType == "image/gif",
+            "setting a banner replaces the previous one");
+        Check(await avatars.GetAvatarAsync(AvatarOwner.Project, project.Id) is null, "a banner is not the project's avatar");
+        await Throws<UnauthorizedAccessException>(() => avatars.RemoveBannerAsync(carolIdentity, project.Id),
+            "a non-member cannot remove a project banner");
+        Check(await avatars.RemoveBannerAsync(avatarAdmin, project.Id), "a banner can be removed");
+        Check(await avatars.GetBannerAsync(project.Id) is null, "a removed banner is gone");
+        Check(!await avatars.RemoveBannerAsync(avatarAdmin, project.Id), "removing an absent banner reports nothing removed");
     }
 
     await using (GraftStore ownership = await GraftStore.OpenAsync(databasePath))

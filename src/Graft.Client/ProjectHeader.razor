@@ -8,58 +8,67 @@
 
 @if (Shown is RepositoryPageResponse repo)
 {
-    <div class="repo-header">
-        <Avatar Url="@repo.Project.AvatarUrl" Name="@repo.Project.Name" Class="avatar-large" />
-        <div>
-            @* One h1 per page. On the project page the project is the subject; under it the page's own
-               heading is, so the project's name is the same size and weight but not a heading. *@
-            @if (Primary)
-            {
-                <h1><span class="namespace">@repo.Project.Namespace.Name /</span> @repo.Project.Name</h1>
-            }
-            else
-            {
-                <p class="repo-title"><a href="@Base"><span class="namespace">@repo.Project.Namespace.Name /</span> @repo.Project.Name</a></p>
-            }
-            <p class="subtitle">@(repo.Project.Description.Length > 0 ? repo.Project.Description : "No description")</p>
-        </div>
-        <VisibilityLabel Visibility="@repo.Project.Visibility" PagePublished="repo.PagePublished" />
-        @if (repo.Project.ForkedFromProject is not null)
+    @* The masthead holds the title row and the tab bar, so a banner (ADR 0046) runs down to and under the tabs. The
+       image is an element rather than a background so it needs no inline style, which the content security policy
+       refuses; it is absolutely placed, so the masthead is as tall before it loads as after and nothing moves. *@
+    <div class="project-masthead @(repo.BannerUrl is null ? "" : "has-banner")">
+        @if (repo.BannerUrl is string banner)
         {
-            <span class="label accent">forked from <a href="@("/" + repo.Project.ForkedFromProject.PathWithNamespace)">@repo.Project.ForkedFromProject.PathWithNamespace</a></span>
+            <img class="project-banner" src="@banner" alt="" />
         }
-        @if (repo.Project.ImportUrl is not null)
-        {
-            <span class="label" title="@repo.Project.ImportUrl">@(repo.Project.Mirror ? "mirror of" : "imported from") <a href="@repo.Project.ImportUrl" rel="noopener noreferrer nofollow">@ImportHost(repo.Project.ImportUrl)</a></span>
-        }
-        @if (Api.Authenticated && !repo.CanManage)
-        {
-            <div class="page-header-actions">
-                <button type="button" class="secondary" @onclick="Fork" disabled="@forking" title="Copy this project into your own namespace, to propose changes from">
-                    <Icon Name="branch" />Fork@(repo.Project.ForksCount > 0 ? $" ({repo.Project.ForksCount})" : "")
-                </button>
+        <div class="repo-header">
+            <Avatar Url="@repo.Project.AvatarUrl" Name="@repo.Project.Name" Class="avatar-large" />
+            <div>
+                @* One h1 per page. On the project page the project is the subject; under it the page's own
+                   heading is, so the project's name is the same size and weight but not a heading. *@
+                @if (Primary)
+                {
+                    <h1><span class="namespace">@repo.Project.Namespace.Name /</span> @repo.Project.Name</h1>
+                }
+                else
+                {
+                    <p class="repo-title"><a href="@Base"><span class="namespace">@repo.Project.Namespace.Name /</span> @repo.Project.Name</a></p>
+                }
+                <p class="subtitle">@(repo.Project.Description.Length > 0 ? repo.Project.Description : "No description")</p>
             </div>
-        }
-    </div>
+            <VisibilityLabel Visibility="@repo.Project.Visibility" PagePublished="repo.PagePublished" />
+            @if (repo.Project.ForkedFromProject is not null)
+            {
+                <span class="label accent">forked from <a href="@("/" + repo.Project.ForkedFromProject.PathWithNamespace)">@repo.Project.ForkedFromProject.PathWithNamespace</a></span>
+            }
+            @if (repo.Project.ImportUrl is not null)
+            {
+                <span class="label" title="@repo.Project.ImportUrl">@(repo.Project.Mirror ? "mirror of" : "imported from") <a href="@repo.Project.ImportUrl" rel="noopener noreferrer nofollow">@ImportHost(repo.Project.ImportUrl)</a></span>
+            }
+            @if (Api.Authenticated && !repo.CanManage)
+            {
+                <div class="page-header-actions">
+                    <button type="button" class="secondary" @onclick="Fork" disabled="@forking" title="Copy this project into your own namespace, to propose changes from">
+                        <Icon Name="branch" />Fork@(repo.Project.ForksCount > 0 ? $" ({repo.Project.ForksCount})" : "")
+                    </button>
+                </div>
+            }
+        </div>
 
-    @* Code, Commits, Add files and Settings are states of the project page rather than pages of their own.
-       On that page they switch in place; everywhere else they are links that open it on the right one. *@
-    <nav class="tabs" aria-label="Project">
-        @Tab("code", "Code", "")
-        @Tab("commits", "Commits", "?tab=commits")
-        <a href="@(Base + "/-/issues")" class="@ActiveClass("issues")" aria-current="@Current("issues")">Issues</a>
-        <a href="@(Base + "/-/merge-requests")" class="@ActiveClass("merge-requests")" aria-current="@Current("merge-requests")">Merge requests</a>
-        <a href="@(Base + "/-/boards")" class="@ActiveClass("boards")" aria-current="@Current("boards")">Boards</a>
-        <a href="@(Base + "/-/milestones")" class="@ActiveClass("milestones")" aria-current="@Current("milestones")">Milestones</a>
-        <a href="@(Base + "/-/pipelines")" class="@ActiveClass("pipelines")" aria-current="@Current("pipelines")">Pipelines</a>
-        <a href="@(Base + "/-/releases")" class="@ActiveClass("releases")" aria-current="@Current("releases")">Releases</a>
-        <a href="@(Base + "/-/wiki")" class="@ActiveClass("wiki")" aria-current="@Current("wiki")">Wiki</a>
-        <a href="@(Base + "/-/snippets")" class="@ActiveClass("snippets")" aria-current="@Current("snippets")">Snippets</a>
-        <a href="@(Base + "/-/packages")" class="@ActiveClass("packages")" aria-current="@Current("packages")">Packages</a>
-        <a href="@(Base + "/-/search")" class="@ActiveClass("search")" aria-current="@Current("search")">Search</a>
-        @if (repo.CanPush) { @Tab("upload", "Add files", "?tab=upload") }
-        @if (repo.CanManage) { @Tab("settings", "Settings", "?tab=settings") }
-    </nav>
+        @* Code, Commits, Add files and Settings are states of the project page rather than pages of their own.
+           On that page they switch in place; everywhere else they are links that open it on the right one. *@
+        <nav class="tabs" aria-label="Project">
+            @Tab("code", "Code", "")
+            @Tab("commits", "Commits", "?tab=commits")
+            <a href="@(Base + "/-/issues")" class="@ActiveClass("issues")" aria-current="@Current("issues")">Issues</a>
+            <a href="@(Base + "/-/merge-requests")" class="@ActiveClass("merge-requests")" aria-current="@Current("merge-requests")">Merge requests</a>
+            <a href="@(Base + "/-/boards")" class="@ActiveClass("boards")" aria-current="@Current("boards")">Boards</a>
+            <a href="@(Base + "/-/milestones")" class="@ActiveClass("milestones")" aria-current="@Current("milestones")">Milestones</a>
+            <a href="@(Base + "/-/pipelines")" class="@ActiveClass("pipelines")" aria-current="@Current("pipelines")">Pipelines</a>
+            <a href="@(Base + "/-/releases")" class="@ActiveClass("releases")" aria-current="@Current("releases")">Releases</a>
+            <a href="@(Base + "/-/wiki")" class="@ActiveClass("wiki")" aria-current="@Current("wiki")">Wiki</a>
+            <a href="@(Base + "/-/snippets")" class="@ActiveClass("snippets")" aria-current="@Current("snippets")">Snippets</a>
+            <a href="@(Base + "/-/packages")" class="@ActiveClass("packages")" aria-current="@Current("packages")">Packages</a>
+            <a href="@(Base + "/-/search")" class="@ActiveClass("search")" aria-current="@Current("search")">Search</a>
+            @if (repo.CanPush) { @Tab("upload", "Add files", "?tab=upload") }
+            @if (repo.CanManage) { @Tab("settings", "Settings", "?tab=settings") }
+        </nav>
+    </div>
 
     <Banner Message="@forkMessage" Kind="error" />
 }

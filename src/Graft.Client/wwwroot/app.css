@@ -463,6 +463,27 @@ a.list-item:hover, button.list-item:hover { background: var(--sunken); text-deco
 }
 .tabs button.active, .tabs a.active { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
 
+/* A project's banner (ADR 0046) runs behind the title row and the tab bar. The image is laid over a dark ground and
+   under a scrim that darkens towards the tabs, so white text reads on any picture, light or dark, in either theme.
+   Labels keep their own filled backgrounds. The masthead's height comes from its padding and contents, never from
+   the image, so the tabs sit at the same place on every page of the project whether or not the image has loaded. */
+.project-masthead.has-banner {
+    position: relative; isolation: isolate; overflow: hidden;
+    margin-bottom: var(--space-4); padding: 72px var(--space-5) 0;
+    border-radius: var(--radius-large); background: #1f2328; color: #ffffff;
+}
+.project-banner { position: absolute; inset: 0; z-index: -2; width: 100%; height: 100%; object-fit: cover; }
+.project-masthead.has-banner::before {
+    content: ""; position: absolute; inset: 0; z-index: -1;
+    background: linear-gradient(to bottom, #00000014 0%, #00000059 50%, #000000b8 100%);
+}
+.has-banner .repo-header h1, .has-banner .repo-header .repo-title a { color: #ffffff; text-shadow: 0 1px 3px #00000099; }
+.has-banner .repo-header .namespace, .has-banner .repo-header .subtitle { color: #ffffffd9; text-shadow: 0 1px 3px #00000099; }
+.has-banner .tabs { margin-bottom: 0; box-shadow: inset 0 -1px 0 #ffffff40; }
+.has-banner .tabs button, .has-banner .tabs a { color: #ffffffc7; }
+.has-banner .tabs button:hover:not(:disabled), .has-banner .tabs a:hover,
+.has-banner .tabs button.active, .has-banner .tabs a.active { color: #ffffff; }
+
 /* Clone options. A <details> disclosure, so the panel opens and closes without a handler of our own and
    stays reachable from the keyboard. The marker is replaced by a caret of our own because the default
    triangle sits oddly inside a button. */
@@ -659,6 +680,7 @@ table.diff td { padding: 0 var(--space-2); vertical-align: top; }
     .sidebar nav a.active { box-shadow: inset 0 -2px 0 var(--accent); }
     .content { padding: var(--space-4); }
     .tabs button, .tabs a { padding: var(--space-3); min-height: 44px; }
+    .project-masthead.has-banner { padding: 48px var(--space-3) 0; }
     .file-row, .list-item { min-height: 44px; }
 }
 

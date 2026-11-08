@@ -4,7 +4,7 @@ namespace Graft.Storage;
 
 public static class GraftSchema
 {
-    public static DnaXMigrationManifest Manifest { get; } = new(26,
+    public static DnaXMigrationManifest Manifest { get; } = new(27,
     [
         DnaXMigration.Sql(1, "initial-identity-project-schema", "Create identity and private project schema", """
             CREATE TABLE Users (
@@ -881,6 +881,20 @@ public static class GraftSchema
                 NextAttemptAtUtc TEXT NOT NULL
             );
             CREATE INDEX IX_ProjectMirrors_Due ON ProjectMirrors(NextAttemptAtUtc);
+            """),
+        // A wide image drawn behind a project's title and tab bar (ADR 0046). Its own table rather than a third
+        // owner type in Avatars, whose CHECK constraint SQLite cannot widen without rebuilding the table; kept in
+        // the database for the same reason avatars are, so a backup holds it with the project it belongs to.
+        DnaXMigration.Sql(27, "project-banners", "Let a project show a banner image above its tabs", """
+            CREATE TABLE ProjectBanners (
+                ProjectId INTEGER NOT NULL PRIMARY KEY REFERENCES Projects(Id) ON DELETE CASCADE,
+                ContentType TEXT NOT NULL,
+                Width INTEGER NOT NULL,
+                Height INTEGER NOT NULL,
+                Bytes BLOB NOT NULL,
+                Sha256 TEXT NOT NULL,
+                UpdatedAtUtc TEXT NOT NULL
+            );
             """)
     ]);
 }

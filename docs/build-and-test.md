@@ -247,7 +247,7 @@ dotnet build tests\Graft.Browser.Fixture\Graft.Browser.Fixture.csproj -c Debug
 dotnet tests\Graft.Browser.Fixture\bin\Debug\net10.0\Graft.Browser.Fixture.dll src\Graft.Server\bin\Debug\net10.0\Graft.Server.dll
 ```
 
-Against a **Debug** server this signs in as `admin` / `admin` with nothing to type, and the fixture prints those credentials. `GRAFT_BROWSER_FIXTURE_USERNAME` and `GRAFT_BROWSER_FIXTURE_PASSWORD` override them; a supplied password is never echoed.
+Against a **Debug** server this signs in as `admin` / `admin` with nothing to type, and the fixture prints those credentials. `GRAFT_BROWSER_FIXTURE_USERNAME` and `GRAFT_BROWSER_FIXTURE_PASSWORD` override them; a supplied password is never echoed. `GRAFT_BROWSER_FIXTURE_BANNER`, the path of a PNG, GIF, JPEG or WebP image, sets it as the banner of the seeded project and of the public `open` one.
 
 The short default works only because Debug builds relax `Graft.Core.PasswordPolicy.MinimumLength` from 16 to 5 for exactly this purpose. A Debug server prints a `WARNING:` line on startup saying so. **Release builds keep the 16-character minimum**, every packaged and deployed artifact is published Release, and the fixture refuses its own default against a Release server:
 

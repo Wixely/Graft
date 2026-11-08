@@ -198,6 +198,7 @@ builder.Services.AddDnaXUploads(options =>
     options.MaximumSessions = UploadLimits.Sessions;
     options.Profiles[UploadLimits.ArchiveProfile] = UploadLimits.Archive;
     options.Profiles[UploadLimits.AvatarProfile] = UploadLimits.Avatar;
+    options.Profiles[UploadLimits.BannerProfile] = UploadLimits.Avatar;
     options.Profiles[UploadLimits.RepositoryFileProfile] = UploadLimits.RepositoryFile;
     options.Profiles[UploadLimits.ReleaseAssetProfile] = UploadLimits.ReleaseAsset;
 });
@@ -2188,6 +2189,89 @@ app.MapMethods("/api/graft/avatars/{ownerType}/{ownerId:long}", ["GET", "HEAD"],
     await context.Response.Body.WriteAsync(avatar.Bytes, context.RequestAborted);
 });
 
+// A project's banner (ADR 0046): one wide image behind the project's title and tab bar. Ingested from the browser's
+// upload transport like an avatar, through the same validator, so only a raster image this server recognised is
+// ever stored or served, never SVG. Setting and removing it needs the permission to manage the project.
+app.MapPost("/api/graft/banners/project/{projectId:long}", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    long projectId = Convert.ToInt64(context.Request.RouteValues["projectId"], System.Globalization.CultureInfo.InvariantCulture);
+
+    UploadIngestRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.UploadIngestRequest, context.RequestAborted);
+    if (request is null || !Guid.TryParse(request.UploadId, out Guid uploadId)) { await ApiError(context, 400, "upload-id"); return; }
+
+    DiskUploadStore uploads = context.RequestServices.GetRequiredService<DiskUploadStore>();
+    string owner = GraftSessionAuthenticationHandler.Owner(browser.Value.Identity);
+    byte[] content = [];
+    try
+    {
+        UploadStatus status = uploads.Get(owner, uploadId);
+        if (!string.Equals(status.Profile, UploadLimits.BannerProfile, StringComparison.Ordinal))
+        { await ApiError(context, 400, "upload was not created for banners"); return; }
+        if (status.Length > ImageContent.MaximumBytes) { await ApiError(context, 413, "banner exceeds the image limit"); return; }
+        await uploads.ReadCompletedAsync(owner, uploadId, async (source, cancellationToken) =>
+        {
+            using MemoryStream buffer = new();
+            await source.CopyToAsync(buffer, cancellationToken);
+            content = buffer.ToArray();
+        }, context.RequestAborted);
+    }
+    catch (UploadException error) { await ApiError(context, error.StatusCode, error.Message); return; }
+
+    ValidatedImage? image = ImageContent.Validate(content);
+    if (image is null) { await ApiError(context, 400, "file is not a supported image"); return; }
+    try
+    {
+        await store.SetBannerAsync(browser.Value.Identity, projectId, image, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "project"); }
+});
+
+app.MapDelete("/api/graft/banners/project/{projectId:long}", async context =>
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString()))
+    { await ApiError(context, 403, "csrf"); return; }
+    long projectId = Convert.ToInt64(context.Request.RouteValues["projectId"], System.Globalization.CultureInfo.InvariantCulture);
+    try
+    {
+        if (!await store.RemoveBannerAsync(browser.Value.Identity, projectId, context.RequestAborted))
+        { await ApiError(context, 404, "banner"); return; }
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "project"); }
+});
+
+// Serving a banner: readable by whoever may read the project's avatar, with the content type chosen at ingest. The
+// address carries the banner's digest as `v`, which only makes a replaced banner a new URL; the ETag still decides.
+app.MapMethods("/api/graft/banners/project/{projectId:long}", ["GET", "HEAD"], async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: false);
+    if (!await OnlyQuery(context, "v")) return;
+    long projectId = Convert.ToInt64(context.Request.RouteValues["projectId"], System.Globalization.CultureInfo.InvariantCulture);
+    if (!(await DecideFor(context, browser?.Identity, projectId, ProjectAction.ReadPage)).Allowed)
+    { await ApiError(context, 404, "project"); return; }
+    StoredAvatar? banner = await store.GetBannerAsync(projectId, context.RequestAborted);
+    if (banner is null) { await ApiError(context, 404, "banner"); return; }
+    string etag = '"' + banner.Sha256 + '"';
+    context.Response.Headers.CacheControl = "no-cache, private";
+    context.Response.Headers.ETag = etag;
+    if (context.Request.GetTypedHeaders().IfNoneMatch?.Any(value => value.Tag.Value == etag || value.Tag.Value == "*") == true)
+    { context.Response.StatusCode = StatusCodes.Status304NotModified; return; }
+    context.Response.ContentType = banner.ContentType;
+    context.Response.ContentLength = banner.Bytes.Length;
+    if (HttpMethods.IsHead(context.Request.Method)) return;
+    await context.Response.Body.WriteAsync(banner.Bytes, context.RequestAborted);
+});
+
 // Serves an image committed to a repository, so a README can show pictures that live beside it. This is the
 // only route that returns repository bytes to a browser as something other than text, so it runs them
 // through the same validator that guards avatars: the content type is the one the bytes prove they are, the
@@ -2327,7 +2411,8 @@ Func<HttpContext, ProjectDetails?, Task> browseProject = async (context, details
                 barePush.Allowed, [], [], [], null, null, details.Project.PagePublished, settings.PublicBrowsing,
                 bareParticipate.Allowed,
                 bareManage.Allowed ? await store.GetApprovalsRequiredAsync(projectId, context.RequestAborted) : 0,
-                bareManage.Allowed && await store.GetRequireCodeOwnerApprovalAsync(projectId, context.RequestAborted)),
+                bareManage.Allowed && await store.GetRequireCodeOwnerApprovalAsync(projectId, context.RequestAborted),
+                await BannerUrl(context, projectId)),
                 ApiJson.Default.RepositoryPageResponse, null, context.RequestAborted);
             return;
         }
@@ -2359,7 +2444,8 @@ Func<HttpContext, ProjectDetails?, Task> browseProject = async (context, details
         int approvalsRequired = manage.Allowed ? await store.GetApprovalsRequiredAsync(projectId, context.RequestAborted) : 0;
         RepositoryPageResponse response = new(project, manage.Allowed, push.Allowed, branches, commits, entries,
             fileResponse, readme, details.Project.PagePublished, settings.PublicBrowsing, participate.Allowed,
-            approvalsRequired, manage.Allowed && await store.GetRequireCodeOwnerApprovalAsync(projectId, context.RequestAborted));
+            approvalsRequired, manage.Allowed && await store.GetRequireCodeOwnerApprovalAsync(projectId, context.RequestAborted),
+            await BannerUrl(context, projectId));
         await context.Response.WriteAsJsonAsync(response, ApiJson.Default.RepositoryPageResponse, null, context.RequestAborted);
     });
 };
@@ -9786,6 +9872,12 @@ static bool TryReadVisibility(string? value, out ProjectVisibility visibility)
         default: visibility = ProjectVisibility.Private; return false;
     }
 }
+
+async Task<string?> BannerUrl(HttpContext context, long projectId) =>
+    await store.GetBannerDigestAsync(projectId, context.RequestAborted) is string digest
+        ? Origin(context) + "/api/graft/banners/project/" + projectId.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+          "?v=" + digest[..16]
+        : null;
 
 string AvatarUrl(HttpContext context, AvatarOwner ownerType, long ownerId) =>
     Origin(context) + "/api/graft/avatars/" + (ownerType == AvatarOwner.Project ? "project/" : "user/") +

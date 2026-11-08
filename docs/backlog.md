@@ -131,6 +131,8 @@ Then the first of the four large items, in the order given:
   `releases` opens releases with their files. The config's grants travel as one value to the authorization decision
   and the store, so a store method never told about pages fails closed. Still no clone, diff, changed-file list or
   branch list, and no page reading over `/api/v4`. [ADR 0045](decisions/0045-semi-public-projects.md).
+- **A project banner.** Set and removed in the project's settings, held to the avatar's formats and limits, and
+  drawn behind the project's title and tab bar on every page under it. [ADR 0046](decisions/0046-project-banners.md).
 
 ## Closed on 2026-11-03
 

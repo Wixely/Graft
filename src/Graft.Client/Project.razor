@@ -604,6 +604,22 @@ git push -u origin main</pre>
         </div>
 
         <div class="panel">
+            <div class="panel-header"><Icon Name="repository" /><h2>Project banner</h2></div>
+            <div class="panel-body">
+                <p class="secondary-text">
+                    A wide image behind the project's name and tabs, on every page of the project. PNG, JPEG, GIF or
+                    WebP, up to 2&nbsp;MB and 4096&nbsp;pixels on a side; about 1600 by 300 suits most screens, and the
+                    picture is cropped to fit. SVG is not accepted.
+                </p>
+                <UploadField Profile="banner" Id="project-banner" OnCompleted="SetProjectBanner" />
+                @if (repo?.BannerUrl is not null)
+                {
+                    <button type="button" class="secondary" @onclick="RemoveProjectBanner" disabled="@busy">Remove banner</button>
+                }
+            </div>
+        </div>
+
+        <div class="panel">
             <div class="panel-header"><h2>Add or update a member</h2></div>
             <div class="panel-body">
                 <form class="form" @onsubmit="SetMember" @onsubmit:preventDefault>
@@ -1396,6 +1412,36 @@ git push -u origin main</pre>
         {
             ApiResult result = await Api.PostAsync($"api/graft/avatars/project/{repo.Project.Id}",
                 new UploadIngestRequest(uploadId), ApiJson.Default.UploadIngestRequest, "Project avatar updated.");
+            Report(result);
+            if (result.Ok) await Load();
+        }
+        finally { busy = false; }
+    }
+
+    /// <summary>Stores a completed upload as the project banner, then reloads so the header draws it.</summary>
+    private async Task SetProjectBanner(string uploadId)
+    {
+        if (busy || repo is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/graft/banners/project/{repo.Project.Id}",
+                new UploadIngestRequest(uploadId), ApiJson.Default.UploadIngestRequest, "Project banner updated.");
+            Report(result);
+            if (result.Ok) await Load();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task RemoveProjectBanner()
+    {
+        if (busy || repo is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.DeleteAsync($"api/graft/banners/project/{repo.Project.Id}", "Project banner removed.");
             Report(result);
             if (result.Ok) await Load();
         }

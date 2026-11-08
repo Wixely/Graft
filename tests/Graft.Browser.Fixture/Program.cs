@@ -155,6 +155,16 @@ try
         await fixture.UpdateIssueAsync(identity, seeded.Id, second.Iid, null, null, CollaborationState.Closed);
         await fixture.CreateMergeProposalAsync(identity, seeded.Id, "lantern", "main",
             "Add a lantern", "Adds one file and changes nothing else, so it should merge cleanly.");
+        // A banner, when a developer names an image to look at one with (ADR 0046). The public project gets it too, so it shows signed out. No image is committed for it.
+        string bannerPath = Environment.GetEnvironmentVariable("GRAFT_BROWSER_FIXTURE_BANNER") ?? "";
+        if (bannerPath.Length > 0)
+        {
+            ValidatedImage banner = ImageContent.Validate(File.ReadAllBytes(bannerPath))
+                ?? throw new InvalidOperationException("GRAFT_BROWSER_FIXTURE_BANNER is not a PNG, GIF, JPEG or WebP image of at most 2 MB.");
+            await fixture.SetBannerAsync(identity, seeded.Id, banner);
+            ProjectInfo open = (await fixture.FindReadyProjectAsync(username, "open"))!;
+            await fixture.SetBannerAsync(identity, open.Id, banner);
+        }
     }
 
     // Echo the credentials only when they are the throwaway defaults, so a supplied password is never logged.

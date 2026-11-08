@@ -152,6 +152,9 @@ entries and decision records as each lands.
   when asked), read-only issues and releases with their files. The config's grants are one `PageReach` value
   handed to the authorization decision and the store by the page routes alone. No clone, diff, changed-file
   list or branch list, and nothing over `/api/v4`. [ADR 0045](decisions/0045-semi-public-projects.md).
+- **A project banner** (2026-11-08). A wide image set from the project's settings, validated and permissioned
+  like the avatar, drawn behind the title row and the tab bar on every project page without moving the tabs.
+  Not for groups, users or the published page, and not settable with a token. [ADR 0046](decisions/0046-project-banners.md).
 - **The token nobody was told about.** The clone menu says, under the clone command, that the password Git
   asks for is a personal access token and names the scope a push needs. The readme has a section on cloning
   and pushing with the `git credential reject` recipe for a helper that cached the refusal.

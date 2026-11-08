@@ -498,7 +498,9 @@ public sealed record RepositoryPageResponse(
     /// so the settings form starts on the stored value rather than on zero, which would quietly remove the
     /// gate the first time anybody saved the form.</summary>
     [property: JsonPropertyName("approvals_required")] int ApprovalsRequired = 0,
-    [property: JsonPropertyName("require_code_owner_approval")] bool RequireCodeOwnerApproval = false);
+    [property: JsonPropertyName("require_code_owner_approval")] bool RequireCodeOwnerApproval = false,
+    /// <summary>The project's banner, drawn behind its title and tab bar, or null when it has none (ADR 0046).</summary>
+    [property: JsonPropertyName("banner_url")] string? BannerUrl = null);
 
 public sealed record VisibilityRequest(string? Visibility);
 public sealed record PagePublishRequest(bool Published);

@@ -1418,6 +1418,42 @@ async Task<string> CheckPublicBrowsing(string address, AuthenticatedIdentity ali
     using (HttpResponseMessage ownerAvatar = await ApiGet(address, "/api/graft/avatars/user/" + alice.UserId, null))
         Check(ownerAvatar.StatusCode == HttpStatusCode.NotFound, "an owner with no avatar set is still a 404");
 
+    // A project banner (ADR 0046). Readable by whoever may read the project's avatar, reported to the browser's
+    // repository view with its digest in the address, and never removable without a browser session.
+    long openId;
+    using (HttpResponseMessage openProject = await ApiGet(address, "/api/v4/projects/alice%2Fopen", null))
+    using (JsonDocument json = JsonDocument.Parse(await openProject.Content.ReadAsStreamAsync()))
+        openId = json.RootElement.GetProperty("id").GetInt64();
+    using (HttpResponseMessage none = await ApiGet(address, "/api/graft/banners/project/" + openId, null))
+        Check(none.StatusCode == HttpStatusCode.NotFound, "a project with no banner answers 404 for it");
+    using (HttpResponseMessage view = await ApiGet(address, "/api/browser/projects/alice/open", null))
+    using (JsonDocument json = JsonDocument.Parse(await view.Content.ReadAsStreamAsync()))
+        Check(json.RootElement.GetProperty("banner_url").ValueKind == JsonValueKind.Null, "and its repository view reports no banner");
+    byte[] bannerBytes = OnePixelPng();
+    await using (GraftStore banners = await GraftStore.OpenAsync(databasePath))
+        await banners.SetBannerAsync(alice, openId, Required(ImageContent.Validate(bannerBytes), "banner image"));
+    string bannerUrl;
+    using (HttpResponseMessage view = await ApiGet(address, "/api/browser/projects/alice/open", null))
+    using (JsonDocument json = JsonDocument.Parse(await view.Content.ReadAsStreamAsync()))
+        bannerUrl = json.RootElement.GetProperty("banner_url").GetString() ?? "";
+    Check(bannerUrl.Contains("/api/graft/banners/project/" + openId + "?v=", StringComparison.Ordinal),
+        "a project with a banner reports its address, with a version, to a visitor");
+    using (HttpResponseMessage served = await ApiGet(address, new Uri(bannerUrl).PathAndQuery, null))
+    {
+        Check(served.IsSuccessStatusCode && served.Content.Headers.ContentType?.MediaType == "image/png"
+            && (await served.Content.ReadAsByteArrayAsync()).SequenceEqual(bannerBytes),
+            "the banner is served to a visitor as the image it was stored as");
+        Check(served.Headers.ETag is not null, "with a validator");
+    }
+    using (HttpResponseMessage extra = await ApiGet(address, "/api/graft/banners/project/" + openId + "?other=1", null))
+        Check(!extra.IsSuccessStatusCode, "the banner route refuses a query it does not take");
+    using (HttpResponseMessage unknown = await ApiGet(address, "/api/graft/banners/project/999999", null))
+        Check(unknown.StatusCode == HttpStatusCode.NotFound, "a banner of a project that does not exist is a 404");
+    using (HttpResponseMessage removed = await ApiSend(address, HttpMethod.Delete, "/api/graft/banners/project/" + openId, null, null))
+        Check(!removed.IsSuccessStatusCode, "a banner cannot be removed without a browser session");
+    using (HttpResponseMessage still = await ApiGet(address, "/api/graft/banners/project/" + openId, null))
+        Check(still.IsSuccessStatusCode, "and the refused removal left it in place");
+
     return address;
 }
 

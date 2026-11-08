@@ -72,6 +72,8 @@ public static class UploadLimits
 {
     public const string ArchiveProfile = "archive";
     public const string AvatarProfile = "avatar";
+    /// <summary>A project banner: the same one small image as an avatar, ingested by its own route.</summary>
+    public const string BannerProfile = "banner";
     public const string RepositoryFileProfile = "repository-file";
     public const string ReleaseAssetProfile = "release-asset";
 
