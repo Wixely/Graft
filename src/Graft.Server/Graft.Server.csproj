@@ -7,7 +7,7 @@
     <DebugType Condition="'$(Configuration)' == 'Release'">none</DebugType>
     <PublishAot Condition="'$(GraftServerAot)' == 'true'">true</PublishAot>
     <PublishIISAssets>false</PublishIISAssets>
-    <RuntimeFrameworkVersion Condition="'$(SelfContained)' == 'true'">10.0.12</RuntimeFrameworkVersion>
+    <RuntimeFrameworkVersion Condition="'$(SelfContained)' == 'true'">10.0.14</RuntimeFrameworkVersion>
     <RestorePackagesWithLockFile Condition="'$(RuntimeIdentifier)' == ''">true</RestorePackagesWithLockFile>
     <NuGetLockFilePath Condition="'$(RuntimeIdentifier)' != ''">$(BaseIntermediateOutputPath)packages.$(RuntimeIdentifier).lock.json</NuGetLockFilePath>
     <ClientPublishDir>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)/../../artifacts/client/'))</ClientPublishDir>
