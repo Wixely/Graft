@@ -28,7 +28,7 @@
     <!-- The visiting side of a CupriNet Shrine only: no overlay, no listener. See ADR 0037. -->
     <PackageReference Include="CupriNet.Shrine" Version="0.6.2" />
     <PackageReference Include="CupriNet.Alembic.BouncyCastle" Version="0.6.2" />
-    <PackageReference Include="Microsoft.Extensions.Hosting.Systemd" Version="10.0.12" />
-    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.12" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Systemd" Version="10.0.14" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.14" />
   </ItemGroup>
 </Project>
