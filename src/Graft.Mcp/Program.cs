@@ -53,6 +53,10 @@ if (!McpArguments.TryParse(args, out McpArguments? parsed, out string? problem))
     await Console.Error.WriteLineAsync(
         "                 Graft as strangers, so they see only what is public. Off by default.");
     await Console.Error.WriteLineAsync(
+        "               --allow-destructive true  with --allow-writes true, permits the tools that delete a");
+    await Console.Error.WriteLineAsync(
+        "                 project or transfer it to another owner. Off by default.");
+    await Console.Error.WriteLineAsync(
         "               --allow-plaintext true  permits an http:// listener off loopback. Tokens then cross");
     await Console.Error.WriteLineAsync(
         "                 that network in the clear, so only for a network you already trust. Off by default.");
@@ -73,7 +77,7 @@ if (settings.CaCertificate is not null)
     }
 }
 
-using GraftConnection connection = new(settings.Server, settings.AllowWrites, trustedRoot);
+using GraftConnection connection = new(settings.Server, settings.AllowWrites, trustedRoot, settings.AllowDestructive);
 
 return settings.Transport == McpTransport.Http
     ? await RunHttp(settings, connection)
@@ -176,6 +180,7 @@ async Task<int> RunHttp(McpArguments options, GraftConnection graft)
     // visible in the logs of a deployment nobody has looked at for six months.
     Console.WriteLine("POSTURE: credentials=" + (options.AllowAnonymous ? "optional" : "required") +
         "; writes=" + (options.AllowWrites ? "allowed" : "refused") +
+        "; destructive=" + (options.AllowDestructive ? "allowed" : "refused") +
         "; transport=" + (options.Certificate is null ? "plaintext" : "TLS"));
     await app.WaitForShutdownAsync();
     return 0;
@@ -231,7 +236,8 @@ namespace Graft.Mcp
         string? Certificate,
         string? CertificatePasswordFile,
         bool AllowAnonymous,
-        bool AllowPlaintext)
+        bool AllowPlaintext,
+        bool AllowDestructive = false)
     {
         public static bool TryParse(string[] values, out McpArguments? result, out string? problem)
         {
@@ -247,7 +253,7 @@ namespace Graft.Mcp
         private static (McpArguments? Settings, string? Problem) Parse(string[] values)
         {
             static (McpArguments?, string?) Refuse(string reason) => (null, reason);
-            if (values.Length is < 2 or > 20 || values.Length % 2 != 0) return Refuse("options come in pairs, as --name value.");
+            if (values.Length is < 2 or > 22 || values.Length % 2 != 0) return Refuse("options come in pairs, as --name value.");
 
             string? server = null;
             string? transport = null;
@@ -259,6 +265,7 @@ namespace Graft.Mcp
             string? certificatePasswordFile = null;
             string? allowAnonymous = null;
             string? allowPlaintext = null;
+            string? allowDestructive = null;
             HashSet<string> seen = new(StringComparer.Ordinal);
             for (int index = 0; index < values.Length; index += 2)
             {
@@ -273,6 +280,7 @@ namespace Graft.Mcp
                 else if (values[index] == "--certificate-password-file") certificatePasswordFile = values[index + 1];
                 else if (values[index] == "--allow-anonymous") allowAnonymous = values[index + 1];
                 else if (values[index] == "--allow-plaintext") allowPlaintext = values[index + 1];
+                else if (values[index] == "--allow-destructive") allowDestructive = values[index + 1];
                 else return Refuse(values[index] + " is not an option this server has.");
             }
 
@@ -281,6 +289,9 @@ namespace Graft.Mcp
             if (transport is not null and not "stdio" and not "http") return Refuse("--transport takes stdio or http.");
             if (allowAnonymous is not null and not "true" and not "false") return Refuse("--allow-anonymous takes true or false.");
             if (allowPlaintext is not null and not "true" and not "false") return Refuse("--allow-plaintext takes true or false.");
+            if (allowDestructive is not null and not "true" and not "false") return Refuse("--allow-destructive takes true or false.");
+            // Refused rather than quietly inert: deleting a project is a write, so the override means nothing alone.
+            if (allowDestructive == "true" && allowWrites != "true") return Refuse("--allow-destructive true needs --allow-writes true.");
             bool anonymous = allowAnonymous == "true";
             bool plaintext = allowPlaintext == "true";
             McpTransport chosen = transport == "http" ? McpTransport.Http : McpTransport.Stdio;
@@ -353,7 +364,7 @@ namespace Graft.Mcp
                 listenAddress, listenPort,
                 certificate is null ? null : Path.GetFullPath(certificate),
                 certificatePasswordFile is null ? null : Path.GetFullPath(certificatePasswordFile),
-                anonymous, plaintext), null);
+                anonymous, plaintext, allowDestructive == "true"), null);
         }
     }
 }

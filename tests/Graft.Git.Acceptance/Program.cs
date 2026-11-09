@@ -1454,6 +1454,54 @@ async Task<string> CheckPublicBrowsing(string address, AuthenticatedIdentity ali
     using (HttpResponseMessage still = await ApiGet(address, "/api/graft/banners/project/" + openId, null))
         Check(still.IsSuccessStatusCode, "and the refused removal left it in place");
 
+    // The token half (ADR 0047): the image as the body, the api scope, and the same validator.
+    TokenGrant bannerApi;
+    TokenGrant bannerRead;
+    await using (GraftStore tokens = await GraftStore.OpenAsync(databasePath))
+    {
+        bannerApi = await tokens.CreateTokenAsync(alice, "banner-api", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1));
+        bannerRead = await tokens.CreateTokenAsync(alice, "banner-read", TokenScope.ReadApi, DateTimeOffset.UtcNow.AddHours(1));
+    }
+    using (HttpResponseMessage state = await ApiGet(address, "/api/graft/projects/alice%2Fopen/banner", null))
+    using (JsonDocument json = JsonDocument.Parse(await state.Content.ReadAsStreamAsync()))
+        Check(state.IsSuccessStatusCode && json.RootElement.GetProperty("banner_url").GetString()!.Contains("?v=", StringComparison.Ordinal),
+            "a visitor reads where a public project's banner is served");
+    using (HttpResponseMessage scoped = await ApiSend(address, HttpMethod.Delete, "/api/graft/projects/alice%2Fopen/banner", bannerRead.Secret, null))
+        Check(scoped.StatusCode == HttpStatusCode.Forbidden, "a read_api token cannot remove a banner");
+    using (HttpResponseMessage svg = await ApiSend(address, HttpMethod.Put, "/api/graft/projects/alice%2Fopen/banner", bannerApi.Secret,
+        new ByteArrayContent("<svg xmlns=\"http://www.w3.org/2000/svg\"/>"u8.ToArray())))
+        Check(svg.StatusCode == HttpStatusCode.BadRequest, "an SVG sent as a banner by a token is refused");
+    using (HttpResponseMessage gone = await ApiSend(address, HttpMethod.Delete, "/api/graft/projects/alice%2Fopen/banner", bannerApi.Secret, null))
+        Check(gone.StatusCode == HttpStatusCode.NoContent, "an api token removes the banner");
+    using (HttpResponseMessage twice = await ApiSend(address, HttpMethod.Delete, "/api/graft/projects/alice%2Fopen/banner", bannerApi.Secret, null))
+        Check(twice.StatusCode == HttpStatusCode.NotFound, "removing it twice is a 404");
+    using (HttpResponseMessage set = await ApiSend(address, HttpMethod.Put, "/api/graft/projects/" + openId + "/banner", bannerApi.Secret,
+        new ByteArrayContent(bannerBytes)))
+    using (JsonDocument json = JsonDocument.Parse(await set.Content.ReadAsStreamAsync()))
+        Check(set.IsSuccessStatusCode && json.RootElement.GetProperty("banner_url").ValueKind == JsonValueKind.String,
+            "an api token sets it again by numeric id, and is told where it is served");
+
+    // GitLab's approval settings, read by a token, with Graft's two fixed behaviours stated.
+    using (HttpResponseMessage rules = await ApiGet(address, "/api/v4/projects/alice%2Fopen/approvals", bannerRead.Secret))
+    using (JsonDocument json = JsonDocument.Parse(await rules.Content.ReadAsStreamAsync()))
+        Check(rules.IsSuccessStatusCode && json.RootElement.GetProperty("approvals_before_merge").GetInt32() == 0 &&
+              json.RootElement.GetProperty("reset_approvals_on_push").GetBoolean() &&
+              !json.RootElement.GetProperty("merge_requests_author_approval").GetBoolean(),
+            "a project's approval settings are readable in GitLab's shape");
+
+    // A transfer by a token that is not the owner's is refused, and to a group is refused by name.
+    using (HttpResponseMessage group = await ApiSend(address, HttpMethod.Put, "/api/v4/projects/alice%2Fopen/transfer", bannerApi.Secret,
+        JsonContent.Create(new { @namespace = "no-such-account" })))
+        Check(group.StatusCode == HttpStatusCode.BadRequest &&
+              (await group.Content.ReadAsStringAsync()).Contains("transferring to a group is not supported", StringComparison.Ordinal),
+            "a transfer to something that is not an active user is refused, naming the group case");
+    using (HttpResponseMessage numeric = await ApiSend(address, HttpMethod.Put, "/api/v4/projects/alice%2Fopen/transfer", bannerApi.Secret,
+        JsonContent.Create(new { @namespace = "42" })))
+        Check(numeric.StatusCode == HttpStatusCode.BadRequest, "a numeric namespace id is refused rather than guessed at");
+    using (HttpResponseMessage readOnly = await ApiSend(address, HttpMethod.Put, "/api/v4/projects/alice%2Fopen/transfer", bannerRead.Secret,
+        JsonContent.Create(new { @namespace = "alice" })))
+        Check(readOnly.StatusCode == HttpStatusCode.Forbidden, "a read_api token cannot transfer a project");
+
     return address;
 }
 

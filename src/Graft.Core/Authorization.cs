@@ -336,14 +336,15 @@ public sealed record PersonalAccessToken(long Id, string Name, TokenScope Scopes
 ///
 /// <para>
 /// Enabled defaults open because the operator starting the endpoint is already the deliberate act; this
-/// switch lets an administrator pause agent access without a redeploy. The other two default closed, the
+/// switch lets an administrator pause agent access without a redeploy. The others default closed, the
 /// same as the launched server's flags did: writes and anonymous callers are each a widening that has to be
-/// asked for.
+/// asked for. Destructive tools, which delete a project or give it away, need writes as well and have their
+/// own switch (ADR 0047), so a server that allowed writes before they existed does not gain them by updating.
 /// </para>
 /// </summary>
-public sealed record McpSettings(bool Enabled, bool AllowWrites, bool AllowAnonymous)
+public sealed record McpSettings(bool Enabled, bool AllowWrites, bool AllowAnonymous, bool AllowDestructive = false)
 {
-    public static McpSettings Default { get; } = new(true, false, false);
+    public static McpSettings Default { get; } = new(true, false, false, false);
 }
 
 /// <summary>A public key registered to an account for Git over SSH. <see cref="Key"/> is the one-line

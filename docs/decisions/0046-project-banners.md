@@ -47,6 +47,7 @@ masthead, with the image behind both.
 - No banner on a group, a user or a published project page (`/-/p/<slug>`). The page has its own layout and no
   tab bar.
 - No way to set one with a token. `/api/v4` has no banner in GitLab's API to follow, and the MCP tools have no
-  banner tool.
+  banner tool. *Closed on 2026-11-09 by [ADR 0047](0047-agent-project-settings.md): `/api/graft/projects/:id/banner`
+  and `graft_set_banner`, `graft_remove_banner`.*
 - No server-side resizing or re-encoding, for the reason `ImageContent` gives: it would mean an image library as
   a dependency.

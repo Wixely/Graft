@@ -99,8 +99,8 @@ create. See [push-to-create evidence](validation/2026-10-13-push-to-create.md) a
 Graft hosts a Model Context Protocol endpoint inside the forge, at `/mcp` on the same port and certificate,
 when started with `--mcp true`. Off by default. Once on, an administrator decides in the browser, under
 Administration, Agent access, whether agents are served, whether they may change anything, and whether
-callers with no token are served at all; those default to serving, no writes, and no anonymous callers, and
-a change applies to the next request. Every caller sends their own personal access token as
+callers with no token are served at all, and whether they may delete or transfer projects; those default to
+serving, no writes, no anonymous callers and no deletion, and a change applies to the next request. Every caller sends their own personal access token as
 `PRIVATE-TOKEN` or `Authorization: Bearer`. The tools still reach Graft over the ordinary REST API, so an
 agent can do exactly what that token could do with curl. The forge prints `MCP: ...` on startup with the
 posture it is running in.
@@ -119,12 +119,14 @@ dotnet src\Graft.Mcp\bin\Debug\net10.0\Graft.Mcp.dll --licences
 Over stdio the credential belongs to the process, so `--token-file` is required. Over the launcher's own
 HTTP listener it belongs to the caller, `--token-file` is refused, and a request without a token is answered
 `401`; `--allow-anonymous true` and `--allow-plaintext true` loosen that and are each off unless asked for.
-Mutating tools are refused unless `--allow-writes true`. There is no option to skip certificate
+Mutating tools are refused unless `--allow-writes true`, and deleting or transferring a project also needs
+`--allow-destructive true`, which is refused without writes. There is no option to skip certificate
 verification; `--ca-certificate` names the certificate to trust.
 
 The shared tool code lives in `src/Graft.McpTools`, referenced by both, so the forge and the launcher cannot
-offer different tools. The set is thirty-five tools; what an agent may do
-through them is bounded by its token's scopes, the project permission, and the administrator's write switch.
+offer different tools. The set is fifty-four tools; what an agent may do
+through them is bounded by its token's scopes, the project permission, and the administrator's switches
+([ADR 0047](decisions/0047-agent-project-settings.md)).
 Account administration, token issue and the agent switches themselves are deliberately not among them; see
 [ADR 0011](decisions/0011-agent-parity.md).
 

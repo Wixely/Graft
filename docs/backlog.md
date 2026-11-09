@@ -133,6 +133,9 @@ Then the first of the four large items, in the order given:
   branch list, and no page reading over `/api/v4`. [ADR 0045](decisions/0045-semi-public-projects.md).
 - **A project banner.** Set and removed in the project's settings, held to the avatar's formats and limits, and
   drawn behind the project's title and tab bar on every page under it. [ADR 0046](decisions/0046-project-banners.md).
+- **Every project setting through the agent tools** (2026-11-09). Banner, tags, review rules, webhooks, the audit
+  trail, transfer and deletion, with token routes for the banner, approvals and transfer.
+  [ADR 0047](decisions/0047-agent-project-settings.md).
 
 ## Closed on 2026-11-03
 
@@ -219,9 +222,9 @@ These are recorded so nobody reopens them as oversights. Each has a decision rec
 
 - **Merging file contents.** Refused by name, with the paths. [ADR 0014](decisions/0014-collaboration.md).
 - **Anonymous writing on a public project.** Refused until there is moderation. Same record.
-- **An agent deleting a project.** Withheld from the Model Context Protocol surface.
-  [ADR 0013](decisions/0013-project-deletion-and-audit.md), joining the four in
-  [ADR 0011](decisions/0011-agent-parity.md).
+- **An agent deleting or transferring a project.** Allowed since 2026-11-09 only behind a fourth administrator
+  switch, off by default, with the path given again to delete. [ADR 0047](decisions/0047-agent-project-settings.md),
+  superseding [ADR 0013](decisions/0013-project-deletion-and-audit.md)'s outright refusal.
 - **Account administration, password resets and token issue over the agent surface.** Withheld.
   [ADR 0011](decisions/0011-agent-parity.md).
 - **Recoverable token secrets off by default.** [ADR 0012](decisions/0012-recoverable-tokens.md).

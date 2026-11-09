@@ -64,12 +64,27 @@ else
 
                 <label class="checkbox"><input type="checkbox" @bind="allowWrites" /> Allow writes</label>
                 <p class="field-hint">
-                    Lets agents create projects, edit a project's name, description and default branch,
-                    change who can see a project, and publish or withdraw project pages, within what each
-                    caller's token already permits. Off, every tool that changes something is refused and
-                    names this switch. Agents never administer accounts or issue tokens, whatever this is
-                    set to.
+                    Lets agents create projects, change a project's settings (name, description, default branch,
+                    visibility, page, avatar, banner, members, tags, review rules and webhooks), and work on its
+                    files, issues and merge requests, within what each caller's token already permits. Off, every
+                    tool that changes something is refused and names this switch. Agents never administer
+                    accounts or issue tokens, whatever this is set to.
                 </p>
+
+                <label class="checkbox"><input type="checkbox" @bind="allowDestructive" disabled="@(!allowWrites)" /> Allow deleting and transferring projects</label>
+                <p class="field-hint">
+                    Lets agents delete a project, with its repository, or hand it to another owner. Needs writes,
+                    and still only what the caller's token permits: the project's owner or an administrator. A
+                    deleted project cannot be recovered.
+                </p>
+
+                @if (allowWrites && allowDestructive && !current.AllowDestructive)
+                {
+                    <div class="banner warning">
+                        <Icon Name="alert" />
+                        <span>An agent holding an owner's token will be one call away from deleting that owner's projects.</span>
+                    </div>
+                }
 
                 <label class="checkbox"><input type="checkbox" @bind="allowAnonymous" /> Serve callers with no token</label>
                 <p class="field-hint">
@@ -99,13 +114,15 @@ else
     private bool enabled;
     private bool allowWrites;
     private bool allowAnonymous;
+    private bool allowDestructive;
     private string message = "";
     private string messageKind = "info";
     private bool loading = true;
     private bool busy;
 
     private bool Changed => current is not null &&
-        (enabled != current.Enabled || allowWrites != current.AllowWrites || allowAnonymous != current.AllowAnonymous);
+        (enabled != current.Enabled || allowWrites != current.AllowWrites || allowAnonymous != current.AllowAnonymous ||
+         allowDestructive != current.AllowDestructive);
 
     protected override async Task OnInitializedAsync()
     {
@@ -135,6 +152,7 @@ else
         enabled = current.Enabled;
         allowWrites = current.AllowWrites;
         allowAnonymous = current.AllowAnonymous;
+        allowDestructive = current.AllowDestructive;
     }
 
     private async Task Save()
@@ -145,7 +163,7 @@ else
         try
         {
             ApiResult<McpSettingsResponse> result = await Api.SendAsync(HttpMethod.Post, "api/graft/admin/mcp",
-                new McpSettingsRequest(enabled, allowWrites, allowAnonymous),
+                new McpSettingsRequest(enabled, allowWrites, allowAnonymous, allowWrites && allowDestructive),
                 ApiJson.Default.McpSettingsRequest, ApiJson.Default.McpSettingsResponse, "Agent access updated. The change applies to the next request.");
             Report(new ApiResult(result.Ok, result.Message));
             if (result.Ok && result.Value is not null) { current = result.Value; Reset(); }

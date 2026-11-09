@@ -119,6 +119,7 @@ const string GlobalPrefix = "/projects";
 const string GlobalNamespace = "projects";
 const string McpSettingsItem = "graft.mcp.settings";
 const string McpWriteRemedy = "An administrator can allow writes under Administration, Agent access.";
+const string McpDestructiveRemedy = "An administrator can allow deleting and transferring projects under Administration, Agent access.";
 McpEndpoint mcpEndpoint = new();
 
 // Browser uploads are mounted under Graft's own API namespace, never GitLab's. GitLab owns "/uploads/..."
@@ -179,7 +180,7 @@ if (settings.Mcp)
         HttpContext context = provider.GetRequiredService<IHttpContextAccessor>().HttpContext
             ?? throw new InvalidOperationException("Graft tools are only constructed for a request.");
         McpSettings live = context.Items[McpSettingsItem] as McpSettings ?? McpSettings.Default with { AllowWrites = false };
-        return new GraftClient(mcpEndpoint.Connection, McpToken(context.Request), live.AllowWrites);
+        return new GraftClient(mcpEndpoint.Connection, McpToken(context.Request), live.AllowWrites, live.AllowDestructive);
     });
     builder.Services.AddMcpServer(options =>
     {
@@ -988,7 +989,7 @@ app.MapPost("/api/graft/admin/mcp", async context =>
     if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
     McpSettingsRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.McpSettingsRequest, context.RequestAborted);
     if (request is null) { await ApiError(context, 400, "settings"); return; }
-    McpSettings updated = new(request.Enabled, request.AllowWrites, request.AllowAnonymous);
+    McpSettings updated = new(request.Enabled, request.AllowWrites, request.AllowAnonymous, request.AllowDestructive);
     try { await store.SetMcpSettingsAsync(browser.Value.Identity, updated, context.RequestAborted); }
     catch (UnauthorizedAccessException) { await ApiError(context, 403, "administrator"); return; }
     await context.Response.WriteAsJsonAsync(McpResponse(updated), ApiJson.Default.McpSettingsResponse, null, context.RequestAborted);
@@ -4042,6 +4043,110 @@ app.MapGet("/api/graft/projects/{projectId}/page", async context =>
     await context.Response.WriteAsJsonAsync(
         new PageStateResponse(project.Details.Project.Id, project.Details.Project.PagePublished),
         ApiJson.Default.PageStateResponse, null, context.RequestAborted);
+});
+
+// A project's banner, for a token (ADR 0047). The browser's routes take an upload receipt and a session, so no API
+// client could set one; this is the plain-HTTP half, shaped like the avatar's: the image is the request body,
+// bounded before it is read and validated by the same code. Under Graft's own prefix because GitLab has no banner.
+app.MapMethods("/api/graft/projects/{projectId}/banner", ["POST", "PUT", "DELETE"], async context =>
+{
+    (bool unresolved, AuthenticatedIdentity? caller) = await AuthenticateApiOptional(context);
+    if (unresolved) return;
+    if (caller is null) { await ApiError(context, 401, "401 Unauthorized"); return; }
+    if (!caller.TokenScopes.HasFlag(TokenScope.Api))
+    { await ApiError(context, 403, "403 Forbidden: insufficient_scope"); return; }
+
+    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.ManageProject);
+    if (project is null) return;
+
+    if (HttpMethods.IsDelete(context.Request.Method))
+    {
+        if (!await OnlyQuery(context)) return;
+        try
+        {
+            if (!await store.RemoveBannerAsync(caller, project.Details.Project.Id, context.RequestAborted))
+            { await ApiError(context, 404, "404 Banner Not Found"); return; }
+            context.Response.StatusCode = StatusCodes.Status204NoContent;
+        }
+        catch (UnauthorizedAccessException) { await ApiError(context, 404, "404 Project Not Found"); }
+        return;
+    }
+
+    if (context.Request.ContentLength > ImageContent.MaximumBytes)
+    { await ApiError(context, 413, "banner exceeds the image limit"); return; }
+    byte[] bytes;
+    using (MemoryStream buffer = new())
+    {
+        await context.Request.Body.CopyToAsync(buffer, context.RequestAborted);
+        if (buffer.Length > ImageContent.MaximumBytes)
+        { await ApiError(context, 413, "banner exceeds the image limit"); return; }
+        bytes = buffer.ToArray();
+    }
+
+    ValidatedImage? image = ImageContent.Validate(bytes);
+    if (image is null) { await ApiError(context, 400, "banner must be a PNG, GIF, JPEG or WebP image"); return; }
+    try { await store.SetBannerAsync(caller, project.Details.Project.Id, image, context.RequestAborted); }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "404 Project Not Found"); return; }
+    await context.Response.WriteAsJsonAsync(
+        new BannerStateResponse(project.Details.Project.Id, await BannerUrl(context, project.Details.Project.Id)),
+        ApiJson.Default.BannerStateResponse, null, context.RequestAborted);
+});
+
+// Reading it back: where the banner is served, or null. Readable by whoever may read the project.
+app.MapGet("/api/graft/projects/{projectId}/banner", async context =>
+{
+    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.ReadRest);
+    if (project is null) return;
+    if (!await OnlyQuery(context)) return;
+    await context.Response.WriteAsJsonAsync(
+        new BannerStateResponse(project.Details.Project.Id, await BannerUrl(context, project.Details.Project.Id)),
+        ApiJson.Default.BannerStateResponse, null, context.RequestAborted);
+});
+
+// GitLab's project-level approval settings. Graft has two of GitLab's facts here, and reports the other two as what
+// Graft always does: a push supersedes approvals, and an author never approves their own (ADR 0015).
+app.MapGet("/api/v4/projects/{projectId}/approvals", async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null) return;
+    if (!await OnlyQuery(context)) return;
+    long projectId = scope.Value.Details.Project.Id;
+    await context.Response.WriteAsJsonAsync(new ProjectApprovalsResponse(
+        await store.GetApprovalsRequiredAsync(projectId, context.RequestAborted),
+        ResetApprovalsOnPush: true, MergeRequestsAuthorApproval: false,
+        await store.GetRequireCodeOwnerApprovalAsync(projectId, context.RequestAborted)),
+        ApiJson.Default.ProjectApprovalsResponse, null, context.RequestAborted);
+});
+
+// GitLab's transfer, to a person. Graft moves a project between accounts; a group as the destination is refused by
+// name rather than read as a username. Only the owner or an administrator may, which the store enforces.
+app.MapMethods("/api/v4/projects/{projectId}/transfer", ["PUT"], async context =>
+{
+    (bool unresolved, AuthenticatedIdentity? caller) = await AuthenticateApiOptional(context);
+    if (unresolved) return;
+    if (caller is null) { await ApiError(context, 401, "401 Unauthorized"); return; }
+    if (!caller.TokenScopes.HasFlag(TokenScope.Api))
+    { await ApiError(context, 403, "403 Forbidden: insufficient_scope"); return; }
+
+    ApiProject? project = await AuthorizeApiProject(context, ProjectAction.ManageProject);
+    if (project is null) return;
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    ProjectTransferRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.ProjectTransferRequest, context.RequestAborted);
+    string target = request?.Namespace?.Trim() ?? "";
+    if (target.Length == 0) { await ApiError(context, 400, "namespace is required"); return; }
+    if (target.All(char.IsAsciiDigit))
+    { await ApiError(context, 400, "namespace must be given as a username; numeric namespace ids are not supported"); return; }
+
+    UserAccount? owner = await store.FindActiveUserAsync(target, context.RequestAborted);
+    if (owner is null)
+    { await ApiError(context, 400, "namespace must name an active user; transferring to a group is not supported"); return; }
+    try { await store.TransferProjectOwnershipAsync(caller, project.Details.Project.Id, owner.Id, context.RequestAborted); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); return; }
+    catch (ProjectOwnershipException error) { await ApiError(context, 409, error.Message); return; }
+    catch (InvalidOperationException error) { await ApiError(context, 400, error.Message); return; }
+
+    ProjectDetails moved = (await store.GetReadyProjectAsync(project.Details.Project.Id, context.RequestAborted))!;
+    await context.Response.WriteAsJsonAsync(await ProjectResponseFor(context, moved), ApiJson.Default.ProjectResponse, null, context.RequestAborted);
 });
 
 // ---------------------------------------------------------------------------------------------------
@@ -9160,7 +9265,7 @@ if (settings.Mcp)
     IPAddress target = settings.ListenAddress.Equals(IPAddress.Any) ? IPAddress.Loopback
         : settings.ListenAddress.Equals(IPAddress.IPv6Any) ? IPAddress.IPv6Loopback
         : settings.ListenAddress;
-    mcpEndpoint.Open(GraftConnection.ToOwnListener(new Uri(serverOrigin + "/"), new IPEndPoint(target, listenPort), certificate, McpWriteRemedy));
+    mcpEndpoint.Open(GraftConnection.ToOwnListener(new Uri(serverOrigin + "/"), new IPEndPoint(target, listenPort), certificate, McpWriteRemedy, McpDestructiveRemedy));
 }
 NotifySystemd("READY=1\nSTATUS=Graft is ready");
 app.Lifetime.ApplicationStopping.Register(() =>
@@ -9182,7 +9287,8 @@ if (settings.Mcp)
     Console.WriteLine("MCP: " + serverOrigin + McpPath +
         "; enabled=" + (posture.Enabled ? "true" : "false") +
         "; credentials=" + (posture.AllowAnonymous ? "optional" : "required") +
-        "; writes=" + (posture.AllowWrites ? "allowed" : "refused"));
+        "; writes=" + (posture.AllowWrites ? "allowed" : "refused") +
+        "; destructive=" + (posture.AllowWrites && posture.AllowDestructive ? "allowed" : "refused"));
 }
 else Console.WriteLine("MCP: off");
 Console.WriteLine("TOKENS: " + (settings.RecoverableTokens
@@ -10068,7 +10174,7 @@ static byte[]? ReadRepositoryFile(Repository repository, string path)
 }
 
 McpSettingsResponse McpResponse(McpSettings current) =>
-    new(current.Enabled, current.AllowWrites, current.AllowAnonymous, serverOrigin + McpPath);
+    new(current.Enabled, current.AllowWrites, current.AllowAnonymous, serverOrigin + McpPath, current.AllowDestructive);
 
 /// <summary>
 /// The caller's Graft token for the agent endpoint. Both spellings are accepted because the API accepts

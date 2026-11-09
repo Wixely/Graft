@@ -18,16 +18,20 @@ namespace Graft.Mcp;
 /// </summary>
 public sealed class GraftConnection : IDisposable
 {
-    public GraftConnection(Uri server, bool allowWrites, X509Certificate2? trustedRoot = null)
-        : this(server, allowWrites, Handler(trustedRoot), "An operator can restart it with --allow-writes true.")
+    public GraftConnection(Uri server, bool allowWrites, X509Certificate2? trustedRoot = null, bool allowDestructive = false)
+        : this(server, allowWrites, allowDestructive, Handler(trustedRoot), "An operator can restart it with --allow-writes true.",
+            "An operator can restart it with --allow-destructive true.")
     {
     }
 
-    private GraftConnection(Uri server, bool allowWrites, SocketsHttpHandler handler, string writeRemedy)
+    private GraftConnection(Uri server, bool allowWrites, bool allowDestructive, SocketsHttpHandler handler,
+        string writeRemedy, string destructiveRemedy)
     {
         ArgumentNullException.ThrowIfNull(server);
         AllowWrites = allowWrites;
+        AllowDestructive = allowDestructive;
         WriteRemedy = writeRemedy;
+        DestructiveRemedy = destructiveRemedy;
         Http = new HttpClient(handler) { BaseAddress = server, Timeout = TimeSpan.FromSeconds(30) };
         Http.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("Graft.Mcp", "1.0"));
     }
@@ -49,7 +53,9 @@ public sealed class GraftConnection : IDisposable
     /// <param name="listener">Where this process is actually listening.</param>
     /// <param name="own">The certificate this process serves, which is the only one accepted.</param>
     /// <param name="writeRemedy">What a refused write tells the agent an administrator could change.</param>
-    public static GraftConnection ToOwnListener(Uri origin, IPEndPoint listener, X509Certificate2 own, string writeRemedy)
+    /// <param name="destructiveRemedy">The same for deleting or transferring a project.</param>
+    public static GraftConnection ToOwnListener(Uri origin, IPEndPoint listener, X509Certificate2 own, string writeRemedy,
+        string destructiveRemedy)
     {
         ArgumentNullException.ThrowIfNull(listener);
         ArgumentNullException.ThrowIfNull(own);
@@ -77,7 +83,7 @@ public sealed class GraftConnection : IDisposable
             CryptographicOperations.FixedTimeEquals(expected, presented.GetCertHash(HashAlgorithmName.SHA256));
         // Writes are decided per caller by the administrator's setting, so the connection's own default is
         // the closed one and the per-request client carries the live answer.
-        return new(origin, allowWrites: false, handler, writeRemedy);
+        return new(origin, allowWrites: false, allowDestructive: false, handler, writeRemedy, destructiveRemedy);
     }
 
     /// <summary>
@@ -121,6 +127,16 @@ public sealed class GraftConnection : IDisposable
     /// would actually change, which differs between a launched process and the forge's own endpoint.</summary>
     public string WriteRemedy { get; }
 
+    /// <summary>
+    /// Whether the tools that delete a project or give it away are permitted, on top of writes (ADR 0047). A
+    /// separate answer because a server that allowed writes before these tools existed should not gain them by
+    /// updating.
+    /// </summary>
+    public bool AllowDestructive { get; }
+
+    /// <summary>What a refused deletion or transfer says would permit it.</summary>
+    public string DestructiveRemedy { get; }
+
     public void Dispose() => Http.Dispose();
 }
 
@@ -144,26 +160,33 @@ public sealed class GraftClient
     private readonly GraftConnection connection;
     private readonly string token;
     private readonly bool allowWrites;
+    private readonly bool allowDestructive;
 
     public GraftClient(GraftConnection connection, string token)
-        : this(connection, token, connection.AllowWrites)
+        : this(connection, token, connection.AllowWrites, connection.AllowDestructive)
     {
     }
 
     /// <summary>A client whose write permission was decided for this caller, as the forge's own endpoint
     /// decides it from the administrator's live setting rather than from how the process was started.</summary>
-    public GraftClient(GraftConnection connection, string token, bool allowWrites)
+    public GraftClient(GraftConnection connection, string token, bool allowWrites, bool allowDestructive = false)
     {
         ArgumentNullException.ThrowIfNull(connection);
         ArgumentNullException.ThrowIfNull(token);
         this.connection = connection;
         this.token = token;
         this.allowWrites = allowWrites;
+        this.allowDestructive = allowDestructive;
     }
 
     public bool AllowWrites => allowWrites;
 
+    /// <summary>Only ever true where writes are: deleting a project is a write before it is anything else.</summary>
+    public bool AllowDestructive => allowWrites && allowDestructive;
+
     public string WriteRemedy => connection.WriteRemedy;
+
+    public string DestructiveRemedy => connection.DestructiveRemedy;
 
     public async Task<(bool Ok, string Body, int Status)> SendAsync(
         HttpMethod method,

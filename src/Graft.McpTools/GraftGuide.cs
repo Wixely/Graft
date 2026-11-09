@@ -196,10 +196,25 @@ public static class GraftGuide
             also creates a branch when the one it is given does not exist, so you need this only when you
             want to start from somewhere other than the default branch.
 
-            There is no tool that deletes a project or a branch, and neither is an omission. The product can
-            do both, from the browser or over the API with a person's own credential. An agent holding a
-            token should not be one call away from ending a repository or removing the branch somebody is
-            working on, so the capability stops at this boundary. Renaming a project does not exist at all.
+            A project's other settings each have a tool, needing Maintainer like the browser's Settings tab:
+            `graft_set_avatar`, `graft_set_banner` and `graft_remove_banner` for its images; `graft_set_member`
+            and `graft_remove_member` for who works on it; `graft_get_review_rules` and
+            `graft_set_review_rules` for the approvals a merge needs; `graft_list_webhooks`,
+            `graft_add_webhook` and `graft_remove_webhook` where the operator turned webhooks on; and
+            `graft_list_activity` to read who changed what. `graft_create_tag` and `graft_delete_tag` need
+            the permission to push, as tagging over Git does.
+
+            Two tools end a project's life where it is: `graft_transfer_project` gives it to another account,
+            which moves its address, and `graft_delete_project` removes it with everything in it, with no
+            undo. Both need the owner or an administrator, and both have a switch of their own beyond writes
+            that an administrator must turn on; `graft_whoami` reports it as `delete_and_transfer_allowed`.
+            Deleting also asks for the project's full path again as `confirm`. Never do either unprompted:
+            perform one only when the person you work for asked for exactly that project.
+
+            There is no tool that deletes a branch, and that is not an omission. The product can, from the
+            browser or over the API with a person's own credential, but an agent should not be one call away
+            from removing the branch somebody is working on. Changing a project's path within its owner does
+            not exist at all.
             """,
 
         ["collaboration"] = """

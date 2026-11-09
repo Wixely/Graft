@@ -154,7 +154,12 @@ entries and decision records as each lands.
   list or branch list, and nothing over `/api/v4`. [ADR 0045](decisions/0045-semi-public-projects.md).
 - **A project banner** (2026-11-08). A wide image set from the project's settings, validated and permissioned
   like the avatar, drawn behind the title row and the tab bar on every project page without moving the tabs.
-  Not for groups, users or the published page, and not settable with a token. [ADR 0046](decisions/0046-project-banners.md).
+  Not for groups, users or the published page. [ADR 0046](decisions/0046-project-banners.md).
+- **Every project setting through the agent tools** (2026-11-09). Thirteen MCP tools (54 in all) for the banner,
+  tags, review rules, webhooks, the audit trail, transfer and deletion. New token routes: `/api/graft/projects/:id/banner`,
+  `GET /api/v4/projects/:id/approvals`, `PUT /api/v4/projects/:id/transfer`. Deleting and transferring need a fourth
+  switch under Administration, Agent access (`--allow-destructive` on the launcher), off by default, so updating the
+  live server changes nothing until an administrator turns it on. [ADR 0047](decisions/0047-agent-project-settings.md).
 - **The token nobody was told about.** The clone menu says, under the clone command, that the password Git
   asks for is a personal access token and names the scope a push needs. The readme has a section on cloning
   and pushing with the `git credential reject` recipe for a helper that cached the refusal.

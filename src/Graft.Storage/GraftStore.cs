@@ -1274,13 +1274,13 @@ public sealed partial class GraftStore : IAsyncDisposable
     /// <summary>
     /// The administrator's Model Context Protocol switches. Read per request by the endpoint rather than
     /// cached, so a change in the browser takes effect on the next call without anything being restarted;
-    /// three indexed rows are cheaper than the request that follows them.
+    /// four indexed rows are cheaper than the request that follows them.
     /// </summary>
     public async Task<McpSettings> GetMcpSettingsAsync(CancellationToken cancellationToken = default)
     {
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
         IEnumerable<SettingRow> rows = await db.QueryAsync<SettingRow>(
-            "SELECT Name, Value FROM ServerSettings WHERE Name IN ('mcp.enabled', 'mcp.allow-writes', 'mcp.allow-anonymous');");
+            "SELECT Name, Value FROM ServerSettings WHERE Name IN ('mcp.enabled', 'mcp.allow-writes', 'mcp.allow-anonymous', 'mcp.allow-destructive');");
         McpSettings settings = McpSettings.Default;
         foreach (SettingRow row in rows)
         {
@@ -1292,6 +1292,7 @@ public sealed partial class GraftStore : IAsyncDisposable
                 "mcp.enabled" => settings with { Enabled = value },
                 "mcp.allow-writes" => settings with { AllowWrites = value },
                 "mcp.allow-anonymous" => settings with { AllowAnonymous = value },
+                "mcp.allow-destructive" => settings with { AllowDestructive = value },
                 _ => settings
             };
         }
@@ -1314,7 +1315,8 @@ public sealed partial class GraftStore : IAsyncDisposable
         {
             ("mcp.enabled", settings.Enabled),
             ("mcp.allow-writes", settings.AllowWrites),
-            ("mcp.allow-anonymous", settings.AllowAnonymous)
+            ("mcp.allow-anonymous", settings.AllowAnonymous),
+            ("mcp.allow-destructive", settings.AllowDestructive)
         })
         {
             await db.ExecuteAsync("""
@@ -1331,7 +1333,8 @@ public sealed partial class GraftStore : IAsyncDisposable
         await AuditAsync(db, transaction, liveActor.UserId, "mcp-settings", "server", null,
             "enabled=" + (settings.Enabled ? "true" : "false") +
             "; allow-writes=" + (settings.AllowWrites ? "true" : "false") +
-            "; allow-anonymous=" + (settings.AllowAnonymous ? "true" : "false"), now);
+            "; allow-anonymous=" + (settings.AllowAnonymous ? "true" : "false") +
+            "; allow-destructive=" + (settings.AllowDestructive ? "true" : "false"), now);
         await transaction.CommitAsync(cancellationToken);
     }
 

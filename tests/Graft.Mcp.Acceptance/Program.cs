@@ -73,6 +73,8 @@ try
                 Directory.CreateDirectory(Path.Combine(repositoriesRoot, created.StorageId));
                 return Task.CompletedTask;
             }, "Not for strangers.");
+        // Somebody to give a project to, so a transfer has a destination that is not its own owner.
+        await fixture.CreateUserAsync(identity, "receiver", password);
         TokenGrant grant = await fixture.CreateTokenAsync(identity, "mcp", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1));
         token = grant.Secret;
     }
@@ -150,7 +152,7 @@ async Task CheckForge(string address, string token, string password)
     using (HttpResponseMessage listing = await Post(client, token, Request(3, "tools/list", "{}")))
     {
         using JsonDocument body = Parse(await listing.Content.ReadAsStringAsync());
-        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 41,
+        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 54,
             "the forge's endpoint advertises every tool");
     }
 
@@ -362,6 +364,8 @@ async Task CheckForge(string address, string token, string password)
             "granting a role either works or says why, and never silently does nothing");
     }
 
+    await CheckProjectSettings(client, browser, address, token);
+
     // What a commit changed. An agent could already see that a commit exists; this is the first time it can
     // see what it did, which is the only question worth asking about one.
     string seeded;
@@ -427,7 +431,7 @@ async Task CheckForge(string address, string token, string password)
         await db.OpenAsync();
         await using Microsoft.Data.Sqlite.SqliteCommand command = db.CreateCommand();
         command.CommandText = "SELECT COUNT(*) FROM AuditEvents WHERE Action = 'mcp-settings' AND Detail LIKE 'enabled=%allow-writes=%allow-anonymous=%';";
-        Check(Convert.ToInt64(await command.ExecuteScalarAsync()) == 4, "every change to the switches is audited with the posture it produced");
+        Check(Convert.ToInt64(await command.ExecuteScalarAsync()) == 6, "every change to the switches is audited with the posture it produced");
     }
 }
 
@@ -449,12 +453,183 @@ async Task CheckForgeWithoutEndpoint(string address, string token)
     }
 }
 
-async Task SetSettings(HttpClient browser, string address, bool enabled, bool allowWrites, bool allowAnonymous)
+/// <summary>
+/// Every project setting the browser's Settings tab changes, through the tools (ADR 0047). Runs with writes allowed
+/// and the destructive switch off, then turns that switch on for transfer and deletion and off again.
+/// </summary>
+async Task CheckProjectSettings(HttpClient client, HttpClient browser, string address, string token)
+{
+    // The banner, from bytes the agent already has, and back off again.
+    string pixel = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    using (HttpResponseMessage set = await Post(client, token, Call(40, "graft_set_banner", $$"""{"project":"admin/shared","imageBase64":"{{pixel}}"}""")))
+    {
+        using JsonDocument body = Parse(await set.Content.ReadAsStringAsync());
+        string result = Text(body);
+        Check(result.Contains("\"banner_set\":true", StringComparison.Ordinal) && result.Contains("/api/graft/banners/project/", StringComparison.Ordinal),
+            "an agent sets a project's banner and is told where it is served");
+    }
+    using (HttpRequestMessage read = new(HttpMethod.Get, "/api/graft/projects/admin%2Fshared/banner"))
+    {
+        read.Headers.Add("PRIVATE-TOKEN", token);
+        using HttpResponseMessage response = await client.SendAsync(read);
+        using JsonDocument body = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        Check(response.IsSuccessStatusCode && body.RootElement.GetProperty("banner_url").ValueKind == JsonValueKind.String,
+            "and a token reads the banner's address back from the same route");
+    }
+    using (HttpResponseMessage bad = await Post(client, token, Call(41, "graft_set_banner", """{"project":"admin/shared","imageBase64":"PHN2Zz48L3N2Zz4="}""")))
+    {
+        using JsonDocument body = Parse(await bad.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("PNG, GIF, JPEG or WebP", StringComparison.Ordinal), "an SVG is refused as a banner, with the formats that are accepted");
+    }
+    using (HttpResponseMessage removed = await Post(client, token, Call(42, "graft_remove_banner", """{"project":"admin/shared"}""")))
+    {
+        using JsonDocument body = Parse(await removed.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("\"banner_removed\":true", StringComparison.Ordinal), "an agent removes the banner");
+    }
+    using (HttpResponseMessage again = await Post(client, token, Call(43, "graft_remove_banner", """{"project":"admin/shared"}""")))
+    {
+        using JsonDocument body = Parse(await again.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("no banner to remove", StringComparison.Ordinal), "and removing one that is not there says so");
+    }
+
+    // Tags: made, listed, refused when they exist, and deleted.
+    using (HttpResponseMessage tagged = await Post(client, token, Call(44, "graft_create_tag", """{"project":"admin/shared","tag":"v1.0.0","reference":"main"}""")))
+    {
+        using JsonDocument body = Parse(await tagged.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("\"commit\":\"", StringComparison.Ordinal), "an agent tags a branch and is told the commit");
+    }
+    using (HttpResponseMessage listed = await Post(client, token, Call(45, "graft_list_tags", """{"project":"admin/shared"}""")))
+    {
+        using JsonDocument body = Parse(await listed.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("\"name\":\"v1.0.0\"", StringComparison.Ordinal), "and lists it");
+    }
+    using (HttpResponseMessage twice = await Post(client, token, Call(46, "graft_create_tag", """{"project":"admin/shared","tag":"v1.0.0","reference":""}""")))
+    {
+        using JsonDocument body = Parse(await twice.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("already exists", StringComparison.Ordinal), "a tag that exists is refused with the server's reason, not moved");
+    }
+    using (HttpResponseMessage untagged = await Post(client, token, Call(47, "graft_delete_tag", """{"project":"admin/shared","tag":"v1.0.0"}""")))
+    {
+        using JsonDocument body = Parse(await untagged.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("\"deleted\":true", StringComparison.Ordinal), "an agent deletes a tag");
+    }
+
+    // Review rules: set, read back, and reset so the rest of the suite merges freely.
+    using (HttpResponseMessage rules = await Post(client, token, Call(48, "graft_set_review_rules",
+        """{"project":"admin/shared","approvalsRequired":"2","requireCodeOwnerApproval":"true"}""")))
+    {
+        using JsonDocument body = Parse(await rules.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("\"approvals_before_merge\":2", StringComparison.Ordinal), "an agent sets the approvals a merge needs");
+    }
+    using (HttpResponseMessage readRules = await Post(client, token, Call(49, "graft_get_review_rules", """{"project":"admin/shared"}""")))
+    {
+        using JsonDocument body = Parse(await readRules.Content.ReadAsStringAsync());
+        string result = Text(body);
+        Check(result.Contains("\"approvals_required\":2", StringComparison.Ordinal) && result.Contains("\"require_code_owner_approval\":true", StringComparison.Ordinal),
+            "and reads both rules back");
+    }
+    using (HttpResponseMessage wrong = await Post(client, token, Call(50, "graft_set_review_rules",
+        """{"project":"admin/shared","approvalsRequired":"11","requireCodeOwnerApproval":""}""")))
+    {
+        using JsonDocument body = Parse(await wrong.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("0 to 10", StringComparison.Ordinal), "an approval count out of range is refused before it is sent");
+    }
+    using (HttpResponseMessage reset = await Post(client, token, Call(51, "graft_set_review_rules",
+        """{"project":"admin/shared","approvalsRequired":"0","requireCodeOwnerApproval":"false"}""")))
+    {
+        using JsonDocument body = Parse(await reset.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("\"approvals_before_merge\":0", StringComparison.Ordinal), "and resets them");
+    }
+
+    // The trail of what the tools just did.
+    using (HttpResponseMessage activity = await Post(client, token, Call(52, "graft_list_activity", """{"project":"admin/shared","page":1}""")))
+    {
+        using JsonDocument body = Parse(await activity.Content.ReadAsStringAsync());
+        string result = Text(body);
+        Check(result.Contains("set-banner", StringComparison.Ordinal) && result.Contains("remove-banner", StringComparison.Ordinal),
+            "an agent reads the project's audit trail, including its own changes");
+    }
+
+    // This server was started without webhooks, so the routes are absent; the tool says which switch that is.
+    using (HttpResponseMessage hooks = await Post(client, token, Call(53, "graft_list_webhooks", """{"project":"admin/shared"}""")))
+    {
+        using JsonDocument body = Parse(await hooks.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("--webhooks true", StringComparison.Ordinal), "webhook tools name the operator's switch when webhooks are off");
+    }
+    using (HttpResponseMessage hook = await Post(client, token, Call(54, "graft_add_webhook",
+        """{"project":"admin/shared","url":"https://example.com/hook","secret":"0123456789abcdef","events":"push"}""")))
+    {
+        using JsonDocument body = Parse(await hook.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("--webhooks true", StringComparison.Ordinal), "including when adding one");
+    }
+
+    // Deleting and transferring: refused with writes on until the administrator's own switch is on too.
+    using (HttpResponseMessage project = await Post(client, token, Call(55, "graft_create_project", """{"path":"doomed","name":"Doomed","description":""}""")))
+        Check(project.IsSuccessStatusCode, "a throwaway project for deletion");
+    using (HttpResponseMessage refused = await Post(client, token, Call(56, "graft_delete_project", """{"project":"admin/doomed","confirm":"admin/doomed"}""")))
+    {
+        using JsonDocument body = Parse(await refused.Content.ReadAsStringAsync());
+        string result = Text(body);
+        Check(result.Contains("delete or transfer", StringComparison.Ordinal) && result.Contains("deleting and transferring", StringComparison.Ordinal),
+            "with writes allowed, deletion is still refused, naming the separate switch");
+    }
+    using (HttpResponseMessage still = await Post(client, token, Call(57, "graft_get_project", """{"project":"admin/doomed"}""")))
+    {
+        using JsonDocument body = Parse(await still.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("admin/doomed", StringComparison.Ordinal), "and the project is still there");
+    }
+
+    await SetSettings(browser, address, enabled: true, allowWrites: true, allowAnonymous: false, allowDestructive: true);
+    using (HttpResponseMessage who = await Post(client, token, Call(58, "graft_whoami", "{}")))
+    {
+        using JsonDocument body = Parse(await who.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("\"delete_and_transfer_allowed\":true", StringComparison.Ordinal), "an agent is told once deletion is allowed");
+    }
+    using (HttpResponseMessage unconfirmed = await Post(client, token, Call(59, "graft_delete_project", """{"project":"doomed","confirm":"doomed"}""")))
+    {
+        using JsonDocument body = Parse(await unconfirmed.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("Not deleted", StringComparison.Ordinal) && Text(body).Contains("admin/doomed", StringComparison.Ordinal),
+            "a deletion confirmed with anything but the full path is refused, naming the path");
+    }
+    using (HttpResponseMessage deleted = await Post(client, token, Call(60, "graft_delete_project", """{"project":"doomed","confirm":"admin/doomed"}""")))
+    {
+        using JsonDocument body = Parse(await deleted.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("\"deleted\":true", StringComparison.Ordinal), "a confirmed deletion goes through");
+    }
+    using (HttpResponseMessage gone = await Post(client, token, Call(61, "graft_get_project", """{"project":"admin/doomed"}""")))
+    {
+        using JsonDocument body = Parse(await gone.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("No such project", StringComparison.Ordinal), "and the project is gone");
+    }
+
+    using (HttpResponseMessage gift = await Post(client, token, Call(62, "graft_create_project", """{"path":"gift","name":"Gift","description":""}""")))
+        Check(gift.IsSuccessStatusCode, "a project to give away");
+    using (HttpResponseMessage nobody = await Post(client, token, Call(63, "graft_transfer_project", """{"project":"admin/gift","newOwner":"nobody-here"}""")))
+    {
+        using JsonDocument body = Parse(await nobody.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("active user", StringComparison.Ordinal), "a transfer to an account that does not exist is refused with the reason");
+    }
+    using (HttpResponseMessage moved = await Post(client, token, Call(64, "graft_transfer_project", """{"project":"admin/gift","newOwner":"receiver"}""")))
+    {
+        using JsonDocument body = Parse(await moved.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("\"path\":\"receiver/gift\"", StringComparison.Ordinal), "a transfer reports the project's new path");
+    }
+
+    // Off again, so the rest of the suite runs with the default.
+    await SetSettings(browser, address, enabled: true, allowWrites: true, allowAnonymous: false);
+    using (HttpResponseMessage closed = await Post(client, token, Call(65, "graft_transfer_project", """{"project":"receiver/gift","newOwner":"admin"}""")))
+    {
+        using JsonDocument body = Parse(await closed.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("delete or transfer", StringComparison.Ordinal), "turning the switch off refuses the next transfer without a restart");
+    }
+}
+
+async Task SetSettings(HttpClient browser, string address, bool enabled, bool allowWrites, bool allowAnonymous, bool allowDestructive = false)
 {
     using HttpRequestMessage request = new(HttpMethod.Post, "/api/graft/admin/mcp");
     request.Headers.Add("Origin", address.TrimEnd('/'));
     request.Headers.Add("X-Graft-CSRF", browser.DefaultRequestHeaders.GetValues("X-Graft-CSRF").Single());
-    request.Content = JsonContent.Create(new { enabled, allow_writes = allowWrites, allow_anonymous = allowAnonymous });
+    request.Content = JsonContent.Create(new { enabled, allow_writes = allowWrites, allow_anonymous = allowAnonymous, allow_destructive = allowDestructive });
     using HttpResponseMessage response = await browser.SendAsync(request);
     Check(response.IsSuccessStatusCode, "an administrator saves the agent settings");
 }
@@ -531,7 +706,7 @@ async Task CheckStdio(string address, bool readOnly)
 
         using JsonDocument tools = await Exchange(client, Request(2, "tools/list", "{}"));
         int count = tools.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength();
-        Check(count == 41, label + " advertises every tool");
+        Check(count == 54, label + " advertises every tool");
 
         using JsonDocument read = await Exchange(client, Call(3, "graft_browse", """{"search":""}"""));
         Check(Text(read).Contains("admin/shared", StringComparison.Ordinal), label + " reads the public listing");
@@ -544,8 +719,14 @@ async Task CheckStdio(string address, bool readOnly)
                 result.Contains("--allow-writes", StringComparison.Ordinal),
                 "a read-only launcher refuses a write and names the switch that would permit it");
         else
+        {
             Check(result.Contains("\"page_published\":true", StringComparison.Ordinal),
                 "a launcher started with writes performs one");
+            using JsonDocument delete = await Exchange(client, Call(5, "graft_delete_project",
+                """{"project":"admin/shared","confirm":"admin/shared"}"""));
+            Check(Text(delete).Contains("--allow-destructive", StringComparison.Ordinal),
+                "but refuses to delete a project without its own override, and names it");
+        }
     }
     finally { Stop(client); }
 }
@@ -584,7 +765,7 @@ async Task CheckHttp(string address, string token)
     using (HttpResponseMessage listing = await Post(client, token, Request(3, "tools/list", "{}")))
     {
         using JsonDocument body = Parse(await listing.Content.ReadAsStringAsync());
-        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 41,
+        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 54,
             "the launcher's HTTP endpoint advertises every tool");
     }
 
@@ -645,6 +826,14 @@ async Task CheckOverrides(string address)
         }
     }
     finally { Stop(open); }
+
+    // Deletion without writes means nothing, so the launcher refuses to start rather than appear to allow it.
+    Process inert = Process.Start(Launch(mcpPath,
+        ["--server", address, "--token-file", tokenFile, "--ca-certificate", caFile, "--allow-destructive", "true"]))!;
+    await inert.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(30));
+    Check(inert.ExitCode == 2 && (await inert.StandardError.ReadToEndAsync()).Contains("needs --allow-writes true", StringComparison.Ordinal),
+        "--allow-destructive without --allow-writes is refused at start");
+    inert.Dispose();
 
     // Plaintext off loopback. Refused unless asked for, which is the assertion that matters: a deployment
     // that forgets the override fails to start rather than quietly serving tokens in the clear.

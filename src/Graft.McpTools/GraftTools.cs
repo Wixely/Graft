@@ -430,6 +430,307 @@ public sealed class GraftTools
             : Failure(GraftClient.Describe(status, response));
     }
 
+    [McpServerTool(Name = "graft_set_banner")]
+    [Description("Sets a project's banner, the wide image drawn behind its title and tab bar, from an image you already have as base64. PNG, GIF, JPEG or WebP, at most 2 MB and 4096 pixels on a side; about 1600 by 300 pixels suits it. Needs the Maintainer role. Refused unless writes are allowed on this server.")]
+    public static async Task<string> SetBanner(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("The image file's bytes, base64 encoded.")] string imageBase64,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowWrites) return Refused(graft, "setting a project's banner");
+
+        byte[] bytes;
+        try { bytes = Convert.FromBase64String(imageBase64 ?? ""); }
+        catch (FormatException) { return Failure("The image must be base64 encoded."); }
+        if (bytes.Length == 0) return Failure("The image is empty.");
+
+        (bool ok, string response, int status) = await graft.SendBytesAsync(HttpMethod.Put,
+            "api/graft/projects/" + Encode(project) + "/banner", bytes, "application/octet-stream", cancellationToken);
+        if (!ok) return Failure(Explain(status, response));
+        return new JsonObject { ["project"] = project, ["banner_set"] = true, ["bytes"] = bytes.Length, ["banner_url"] = Field(response, "banner_url") }.ToJsonString();
+    }
+
+    [McpServerTool(Name = "graft_remove_banner")]
+    [Description("Removes a project's banner, so its header goes back to the plain one. Needs the Maintainer role. Refused unless writes are allowed on this server.")]
+    public static async Task<string> RemoveBanner(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowWrites) return Refused(graft, "removing a project's banner");
+
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Delete,
+            "api/graft/projects/" + Encode(project) + "/banner", null, cancellationToken);
+        if (status == 404 && response.Contains("Banner Not Found", StringComparison.Ordinal))
+            return Failure("The project has no banner to remove.");
+        return ok
+            ? new JsonObject { ["project"] = project, ["banner_removed"] = true }.ToJsonString()
+            : Failure(Explain(status, response));
+    }
+
+    [McpServerTool(Name = "graft_list_tags")]
+    [Description("Lists a project's tags and the commit each one names.")]
+    public static async Task<string> ListTags(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        CancellationToken cancellationToken)
+    {
+        (TagResponse[]? tags, long total, bool truncated, string? error) = await graft.GetListAsync(
+            "api/v4/projects/" + Encode(project) + "/repository/tags?per_page=100", ApiJson.Default.TagResponseArray, cancellationToken);
+        if (error is not null) return Failure(error);
+        return new JsonObject
+        {
+            ["count"] = tags!.Length,
+            ["total"] = total,
+            ["truncated"] = truncated,
+            ["tags"] = Array(tags, tag => new JsonObject
+            {
+                ["name"] = tag.Name,
+                ["commit"] = tag.Commit.Id,
+                ["title"] = tag.Commit.Title
+            })
+        }.ToJsonString();
+    }
+
+    [McpServerTool(Name = "graft_create_tag")]
+    [Description("Creates a lightweight tag pointing at a branch, another tag or a commit. A tag that already exists is refused rather than moved. Needs the permission to push. Refused unless writes are allowed on this server.")]
+    public static async Task<string> CreateTag(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("The new tag's name, such as v1.2.0.")] string tag,
+        [Description("The branch, tag or commit id to tag. Empty tags the branch the project opens at.")] string reference,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowWrites) return Refused(graft, "creating a tag");
+        if (string.IsNullOrWhiteSpace(tag)) return Failure("Give the tag a name.");
+
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Post,
+            "api/v4/projects/" + Encode(project) + "/repository/tags",
+            new JsonObject { ["tag_name"] = tag.Trim(), ["ref"] = Revision(reference) }, cancellationToken);
+        if (!ok) return Failure(Explain(status, response));
+        TagResponse? created = Read(response, ApiJson.Default.TagResponse);
+        return new JsonObject { ["project"] = project, ["tag"] = tag.Trim(), ["commit"] = created?.Commit.Id }.ToJsonString();
+    }
+
+    [McpServerTool(Name = "graft_delete_tag")]
+    [Description("Deletes a tag. The commit it named stays in the history. A release that sat on the tag stays too, reported as having lost it. Needs the permission to push. Refused unless writes are allowed on this server.")]
+    public static async Task<string> DeleteTag(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("The tag's name.")] string tag,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowWrites) return Refused(graft, "deleting a tag");
+        if (string.IsNullOrWhiteSpace(tag)) return Failure("Name the tag to delete.");
+
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Delete,
+            "api/v4/projects/" + Encode(project) + "/repository/tags/" + Uri.EscapeDataString(tag.Trim()), null, cancellationToken);
+        return ok
+            ? new JsonObject { ["project"] = project, ["tag"] = tag.Trim(), ["deleted"] = true }.ToJsonString()
+            : Failure(Explain(status, response));
+    }
+
+    [McpServerTool(Name = "graft_get_review_rules")]
+    [Description("Reads what a merge request needs before it can be merged: how many approvals, and whether a code owner must approve each path a CODEOWNERS file names.")]
+    public static async Task<string> GetReviewRules(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        CancellationToken cancellationToken)
+    {
+        (ProjectApprovalsResponse? rules, string? error) = await graft.GetAsync(
+            "api/v4/projects/" + Encode(project) + "/approvals", ApiJson.Default.ProjectApprovalsResponse, cancellationToken);
+        if (error is not null) return Failure(error);
+        return new JsonObject
+        {
+            ["project"] = project,
+            ["approvals_required"] = rules!.ApprovalsBeforeMerge,
+            ["require_code_owner_approval"] = rules.RequireCodeOwnerApproval,
+            ["note"] = "A push supersedes earlier approvals, and an author cannot approve their own; neither is a setting."
+        }.ToJsonString();
+    }
+
+    [McpServerTool(Name = "graft_set_review_rules")]
+    [Description("Sets what a merge request needs before it can be merged. Only the values given are changed; leave one empty to leave it alone. Needs the Maintainer role. Refused unless writes are allowed on this server.")]
+    public static async Task<string> SetReviewRules(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("How many current approvals a merge needs, 0 to 10; 0 removes the gate. Empty leaves it unchanged.")] string approvalsRequired,
+        [Description("true or false: whether a code owner must approve every changed path a CODEOWNERS file names. Empty leaves it unchanged.")] string requireCodeOwnerApproval,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowWrites) return Refused(graft, "changing a project's review rules");
+
+        JsonObject body = [];
+        if (!string.IsNullOrWhiteSpace(approvalsRequired))
+        {
+            if (!int.TryParse(approvalsRequired.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out int count) || count > 10)
+                return Failure("approvalsRequired must be a whole number from 0 to 10.");
+            body["approvals_before_merge"] = count;
+        }
+        if (!string.IsNullOrWhiteSpace(requireCodeOwnerApproval))
+        {
+            string flag = requireCodeOwnerApproval.Trim().ToLowerInvariant();
+            if (flag is not ("true" or "false")) return Failure("requireCodeOwnerApproval must be true or false.");
+            body["require_code_owner_approval"] = flag == "true";
+        }
+        if (body.Count == 0) return Failure("Give at least one of approvalsRequired or requireCodeOwnerApproval.");
+
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Put,
+            "api/v4/projects/" + Encode(project) + "/approvals", body, cancellationToken);
+        if (!ok) return Failure(Explain(status, response));
+        JsonObject result = new() { ["project"] = project };
+        foreach (KeyValuePair<string, JsonNode?> change in body) result[change.Key] = change.Value?.DeepClone();
+        return result.ToJsonString();
+    }
+
+    [McpServerTool(Name = "graft_list_activity")]
+    [Description("Reads a project's audit trail, newest first: who changed its settings, membership, visibility and so on, and when. Needs the Maintainer role.")]
+    public static async Task<string> ListActivity(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("Which page of 50 entries, from 1. Values below 1 read the first.")] int page,
+        CancellationToken cancellationToken)
+    {
+        int chosen = Math.Max(1, page);
+        (AuditEventResponse[]? events, long total, bool truncated, string? error) = await graft.GetListAsync(
+            "api/v4/projects/" + Encode(project) + "/audit_events?per_page=50&page=" + chosen.ToString(CultureInfo.InvariantCulture),
+            ApiJson.Default.AuditEventResponseArray, cancellationToken);
+        if (error is not null) return Failure(error);
+        return new JsonObject
+        {
+            ["page"] = chosen,
+            ["total"] = total,
+            ["more"] = truncated || total > (long)chosen * 50,
+            ["events"] = Array(events!, entry => new JsonObject
+            {
+                ["at"] = entry.CreatedAt.ToString("O", CultureInfo.InvariantCulture),
+                ["by"] = entry.Details.AuthorName,
+                ["action"] = entry.Details.Action,
+                ["detail"] = entry.Details.CustomMessage
+            })
+        }.ToJsonString();
+    }
+
+    [McpServerTool(Name = "graft_list_webhooks")]
+    [Description("Lists a project's webhooks: the address each calls, the events it asked for and how its last delivery went. Secrets are never shown. Needs the Maintainer role, and a server whose operator turned webhooks on.")]
+    public static async Task<string> ListWebhooks(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        CancellationToken cancellationToken)
+    {
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Get,
+            "api/v4/projects/" + Encode(project) + "/hooks", null, cancellationToken);
+        if (!ok) return Failure(ExplainHooks(status, response));
+        WebhookResponse[] hooks = Read(response, ApiJson.Default.WebhookResponseArray) ?? [];
+        return new JsonObject
+        {
+            ["count"] = hooks.Length,
+            ["webhooks"] = Array(hooks, hook => new JsonObject
+            {
+                ["id"] = hook.Id,
+                ["url"] = hook.Url,
+                ["events"] = new JsonArray([.. hook.Events.Select(name => (JsonNode?)JsonValue.Create(name))]),
+                ["created_by"] = hook.CreatedBy,
+                ["last_status"] = hook.LastStatus,
+                ["last_error"] = hook.LastError
+            })
+        }.ToJsonString();
+    }
+
+    [McpServerTool(Name = "graft_add_webhook")]
+    [Description("Adds a webhook: Graft will POST to the address when the chosen events happen, signed with the secret as X-Graft-Signature (sha256= and an HMAC of the body). The secret is stored and never shown again. Needs the Maintainer role, and a server whose operator turned webhooks on. Refused unless writes are allowed on this server.")]
+    public static async Task<string> AddWebhook(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("An absolute http or https address, with no credentials in it.")] string url,
+        [Description("The signing secret, 16 to 256 characters. The receiver needs the same value.")] string secret,
+        [Description("Comma-separated events: any of push, issue, merge_request, comment.")] string events,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowWrites) return Refused(graft, "adding a webhook");
+        string[] names = (events ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (names.Length == 0) return Failure("Name at least one event: push, issue, merge_request or comment.");
+
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Post,
+            "api/v4/projects/" + Encode(project) + "/hooks",
+            new JsonObject
+            {
+                ["url"] = (url ?? "").Trim(),
+                ["secret"] = secret ?? "",
+                ["events"] = new JsonArray([.. names.Select(name => (JsonNode?)JsonValue.Create(name))])
+            }, cancellationToken);
+        if (!ok) return Failure(ExplainHooks(status, response));
+        WebhookResponse? hook = Read(response, ApiJson.Default.WebhookResponse);
+        return new JsonObject { ["project"] = project, ["id"] = hook?.Id, ["url"] = hook?.Url }.ToJsonString();
+    }
+
+    [McpServerTool(Name = "graft_remove_webhook")]
+    [Description("Removes a webhook by its id, as graft_list_webhooks reports it. Needs the Maintainer role. Refused unless writes are allowed on this server.")]
+    public static async Task<string> RemoveWebhook(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("The webhook's id.")] long id,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowWrites) return Refused(graft, "removing a webhook");
+
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Delete,
+            "api/v4/projects/" + Encode(project) + "/hooks/" + id.ToString(CultureInfo.InvariantCulture), null, cancellationToken);
+        return ok
+            ? new JsonObject { ["project"] = project, ["id"] = id, ["removed"] = true }.ToJsonString()
+            : Failure(ExplainHooks(status, response));
+    }
+
+    [McpServerTool(Name = "graft_transfer_project")]
+    [Description("Gives a project to another account. Its path moves under the new owner's name, so the old clone address and links stop working; the previous owner stays on as a Maintainer. Only the owner or an administrator may. Refused unless an administrator has allowed both writes and deleting and transferring projects.")]
+    public static async Task<string> TransferProject(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("The username of the account that will own it.")] string newOwner,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowDestructive) return RefusedDestructive(graft, "transferring a project");
+        if (string.IsNullOrWhiteSpace(newOwner)) return Failure("Name the account that will own the project.");
+
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Put,
+            "api/v4/projects/" + Encode(project) + "/transfer", new JsonObject { ["namespace"] = newOwner.Trim() }, cancellationToken);
+        if (!ok) return Failure(Explain(status, response));
+        ProjectResponse? moved = Read(response, ApiJson.Default.ProjectResponse);
+        return new JsonObject
+        {
+            ["transferred"] = true,
+            ["path"] = moved?.PathWithNamespace,
+            ["web_url"] = moved?.WebUrl,
+            ["note"] = "The project's address changed; use the new path from now on."
+        }.ToJsonString();
+    }
+
+    [McpServerTool(Name = "graft_delete_project")]
+    [Description("Deletes a project: its repository, issues, merge requests, wiki, releases and everything else, immediately and permanently. There is no undo. Only the owner or an administrator may. Give the project's full path again as confirm, exactly as graft_get_project reports it. Refused unless an administrator has allowed both writes and deleting and transferring projects.")]
+    public static async Task<string> DeleteProject(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("The project's full path, such as alice/widgets, typed out again to confirm.")] string confirm,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowDestructive) return RefusedDestructive(graft, "deleting a project");
+
+        // Confirmed against what the server says the project is, not against the argument: an id or a slug
+        // repeated twice would otherwise confirm nothing about which project is about to go.
+        (ProjectResponse? target, string? error) = await graft.GetAsync(
+            "api/v4/projects/" + Encode(project), ApiJson.Default.ProjectResponse, cancellationToken);
+        if (error is not null) return Failure(error);
+        if (!string.Equals((confirm ?? "").Trim(), target!.PathWithNamespace, StringComparison.Ordinal))
+            return Failure("Not deleted. confirm must be the project's full path, " + target.PathWithNamespace + ".");
+
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Delete,
+            "api/v4/projects/" + target.Id.ToString(CultureInfo.InvariantCulture), null, cancellationToken);
+        return ok
+            ? new JsonObject { ["deleted"] = true, ["path"] = target.PathWithNamespace }.ToJsonString()
+            : Failure(Explain(status, response));
+    }
+
     [McpServerTool(Name = "graft_read_commit")]
     [Description("Reads what one commit changed: the files it touched and the lines it added and removed. Large or binary files are reported rather than printed.")]
     public static async Task<string> ReadCommit(
@@ -606,7 +907,8 @@ public sealed class GraftTools
             ["name"] = user.Name,
             ["state"] = user.State,
             ["web_url"] = user.WebUrl,
-            ["writes_allowed"] = graft.AllowWrites
+            ["writes_allowed"] = graft.AllowWrites,
+            ["delete_and_transfer_allowed"] = graft.AllowDestructive
         }.ToJsonString();
     }
 
@@ -1239,7 +1541,7 @@ public sealed class GraftTools
             JsonArray names = [];
             if (!string.Equals(assignees.Trim(), "none", StringComparison.OrdinalIgnoreCase))
                 foreach (string name in assignees.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
-                    names.Add((JsonNode)JsonValue.Create(name));
+                    names.Add((JsonNode?)JsonValue.Create(name));
             body["assignee_usernames"] = names;
         }
         if (!string.IsNullOrWhiteSpace(due_date))
@@ -1313,8 +1615,51 @@ public sealed class GraftTools
         ["remedy"] = graft.WriteRemedy
     }.ToJsonString();
 
+    private static string RefusedDestructive(GraftClient graft, string action) => new JsonObject
+    {
+        ["error"] = true,
+        ["refused"] = graft.AllowWrites
+            ? "This Graft MCP server does not let agents delete or transfer projects, so " + action + " is not available."
+            : "This Graft MCP server is read-only, so " + action + " is not available.",
+        ["remedy"] = graft.AllowWrites ? graft.DestructiveRemedy : graft.WriteRemedy
+    }.ToJsonString();
+
     private static string Failure(string message) =>
         new JsonObject { ["error"] = true, ["message"] = message }.ToJsonString();
+
+    /// <summary><see cref="GraftClient.Describe"/>, except that a refusal carrying the server's own reason passes it
+    /// on. Settings routes refuse for reasons other than a token's scope (only the owner may transfer, a tag already
+    /// exists), and the generic sentence would send an agent after the wrong fix.</summary>
+    private static string Explain(int status, string body)
+    {
+        if (status is 400 or 403 or 409 or 413 && Field(body, "message") is string reason && reason.Length > 0)
+            return "Graft refused: " + reason;
+        return GraftClient.Describe(status, body);
+    }
+
+    /// <summary>A webhook route that is absent because the operator never turned webhooks on answers 404 exactly
+    /// like a project the caller may not see, so both are named.</summary>
+    private static string ExplainHooks(int status, string body) => status == 404
+        ? "Not found: either no such project or one the token's owner may not see, or this server's operator has not turned webhooks on (--webhooks true)."
+        : Explain(status, body);
+
+    /// <summary>One top-level string field of a JSON reply, or null.</summary>
+    private static string? Field(string body, string name)
+    {
+        try
+        {
+            return JsonNode.Parse(body) is JsonObject root && root[name] is JsonValue value && value.TryGetValue(out string? text)
+                ? text
+                : null;
+        }
+        catch (JsonException) { return null; }
+    }
+
+    private static T? Read<T>(string body, JsonTypeInfo<T> type)
+    {
+        try { return JsonSerializer.Deserialize(body, type); }
+        catch (JsonException) { return default; }
+    }
 
     private static JsonObject Summarise(ProjectResponse project) => new()
     {

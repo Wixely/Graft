@@ -1,7 +1,7 @@
 # 0013: Deleting a project, and letting somebody read the audit trail
 
 - Date: 2026-10-22
-- Status: Accepted, implemented
+- Status: Accepted, implemented; the agent half superseded on 2026-11-09 by [ADR 0047](0047-agent-project-settings.md)
 - Source: A review that found two things the product recorded but could not do, both taken on as fixes
 - Review trigger: Any proposal to let a Maintainer delete a project, to make deletion recoverable or deferred, to widen the audit trail beyond administrators, or to let an agent delete anything
 
@@ -85,6 +85,10 @@ Giving a project's Maintainer a view of their own project's events is a reasonab
 [the backlog](../backlog.md). It is not this.
 
 ## Decision: an agent cannot delete a project
+
+*Superseded on 2026-11-09 by [ADR 0047](0047-agent-project-settings.md), at the project owner's request: an agent may
+delete a project where an administrator has turned on a separate switch, and must confirm with the project's path.
+The reasoning below is why that switch exists and is off by default.*
 
 [ADR 0011](0011-agent-parity.md) withheld four capabilities from the Model Context Protocol surface. Project
 deletion joins them, and for the same kind of reason: it is irreversible and one tool call away.

@@ -510,6 +510,22 @@ public sealed record PagePublishRequest(bool Published);
 /// owns should not grow a field only this server understands.</summary>
 public sealed record PageStateResponse(long ProjectId, bool Published);
 
+/// <summary>Where a project's banner is served, or null when it has none (ADR 0046). Graft's own shape for the
+/// same reason as <see cref="PageStateResponse"/>: GitLab has no banner.</summary>
+public sealed record BannerStateResponse(long ProjectId, [property: JsonPropertyName("banner_url")] string? BannerUrl);
+
+/// <summary>GitLab's project approval settings, as far as Graft has them. <c>reset_approvals_on_push</c> and
+/// <c>merge_requests_author_approval</c> are not settings here but what Graft always does, reported so a GitLab
+/// client reads the truth rather than a default.</summary>
+public sealed record ProjectApprovalsResponse(
+    [property: JsonPropertyName("approvals_before_merge")] int ApprovalsBeforeMerge,
+    [property: JsonPropertyName("reset_approvals_on_push")] bool ResetApprovalsOnPush,
+    [property: JsonPropertyName("merge_requests_author_approval")] bool MergeRequestsAuthorApproval,
+    [property: JsonPropertyName("require_code_owner_approval")] bool RequireCodeOwnerApproval);
+
+/// <summary>GitLab's transfer: the namespace to move a project to. Graft takes a username here.</summary>
+public sealed record ProjectTransferRequest(string? Namespace);
+
 /// <summary>
 /// A published project page, as an anonymous reader sees it. Carries only what the page config named: there
 /// is no field here that could describe the repository behind it.
@@ -624,12 +640,17 @@ public sealed record McpSettingsResponse(
     /// <summary>Whether callers who present no credential are served, as strangers.</summary>
     bool AllowAnonymous,
     /// <summary>Where a client connects, as an absolute URL on the public origin.</summary>
-    string Endpoint);
+    string Endpoint,
+    /// <summary>Whether tools that delete a project or give it away are permitted, on top of writes (ADR 0047).</summary>
+    bool AllowDestructive = false);
 
+/// <summary>The switches as the administrator saves them. <c>allow_destructive</c> absent reads as off, so a client
+/// written before it existed closes it rather than leaving it as it was.</summary>
 public sealed record McpSettingsRequest(
     bool Enabled,
     bool AllowWrites,
-    bool AllowAnonymous);
+    bool AllowAnonymous,
+    bool AllowDestructive = false);
 
 /// <summary>
 /// Confirms a project deletion by naming the project. The browser requires it; the API does not, because
@@ -1462,6 +1483,9 @@ public sealed record ProjectUploadResponse(
 [JsonSerializable(typeof(VisibilityRequest))]
 [JsonSerializable(typeof(PagePublishRequest))]
 [JsonSerializable(typeof(PageStateResponse))]
+[JsonSerializable(typeof(BannerStateResponse))]
+[JsonSerializable(typeof(ProjectApprovalsResponse))]
+[JsonSerializable(typeof(ProjectTransferRequest))]
 [JsonSerializable(typeof(ProjectPageResponse))]
 [JsonSerializable(typeof(PageTreeEntryResponse))]
 [JsonSerializable(typeof(PageHistoryResponse))]
