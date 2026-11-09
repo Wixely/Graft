@@ -109,6 +109,38 @@ The issues and releases are served at the page's own routes, `/api/graft/pages/<
 answers a stranger with a 404 for a page-only project, so a GitLab client does not see them; a reader who
 wants them reads the page. See [ADR 0045](decisions/0045-semi-public-projects.md) for why.
 
+## What the page looks like
+
+Since 2026-11-09 ([ADR 0048](decisions/0048-page-looks-like-the-repository.md)) the page wears the
+repository's own layout: the project's banner and avatar, the title and description, a tab bar, the file table
+with folders and breadcrumbs, and the readme beneath it. Opening a file shows it the way the repository's code
+tab does.
+
+- The file table holds what `files` admits, by folder. With `tree: true` it holds the whole structure, and a
+  file the allowlist does not admit is shown by name, greyed, and cannot be opened.
+- The tabs are Code, then Commits, Issues and Releases when the config opened them, then any `features` links.
+- There is no branch selector, clone menu, archive or commit link, because a page has none of those.
+
+**If the config names a `site` and the operator has a pages origin, the site is the page.** `/-/p/<slug>`
+forwards to it. Add any `?tab=` (`code`, `commits`, `issues`, `releases`) to stay on the forge's page, which is
+how a site links to its own files, issues or releases.
+
+## Pictures in the readme
+
+A readme's pictures are served by the page itself, at `/api/graft/pages/<slug>/image?path=<path>`, to anybody
+the page is published to. **A picture must be matched by `files`**, like anything else the page serves:
+
+```json
+"files": ["README.md", "docs/**/*.md", "docs/**/*.png"]
+```
+
+- Paths resolve the way a forge reads them: relative to the readme's folder, with `./` and `..` understood.
+- PNG, GIF, JPEG and WebP are served, as the type the bytes prove. SVG is not, here or anywhere on the forge,
+  because an SVG is a document that can run script. Video and audio are not supported.
+- A picture `files` does not admit, or one that points off-site or out of the repository, is shown as a link
+  instead of an image, so the readme still says what it referenced.
+- An image opened from the file table is shown in place, with a download button.
+
 ## What a page can never do
 
 A page is a separate read path, not a filter over the repository view. It will not clone, will not show a
@@ -173,7 +205,7 @@ request time to wherever the forge is now.
 
 | Path | What it does |
 | --- | --- |
-| `/<slug>/-/repo` | Redirects to the project's page on the forge. |
+| `/<slug>/-/repo` | Redirects to the project's page on the forge, on its Code tab (`?tab=code`), so the page does not send the reader straight back to the site. |
 | `/<slug>/-/graft.json` | Returns the forge's origin and the project's URLs, for a site that would rather render its own link. |
 
 From a page at the site's root, that is an ordinary relative link with no host in it:
@@ -193,7 +225,7 @@ The JSON is same-origin, so a page can simply fetch it:
   "name": "Lanternry",
   "forge": "https://graft.example.com",
   "project": "https://graft.example.com/projects/lanternry",
-  "page": "https://graft.example.com/-/p/lanternry"
+  "page": "https://graft.example.com/-/p/lanternry?tab=code"
 }
 ```
 

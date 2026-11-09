@@ -160,6 +160,12 @@ entries and decision records as each lands.
   `GET /api/v4/projects/:id/approvals`, `PUT /api/v4/projects/:id/transfer`. Deleting and transferring need a fourth
   switch under Administration, Agent access (`--allow-destructive` on the launcher), off by default, so updating the
   live server changes nothing until an administrator turns it on. [ADR 0047](decisions/0047-agent-project-settings.md).
+- **The published page looks like the repository** (2026-11-09). `/-/p/<slug>` has the code tab's masthead (with
+  the banner), tabs, file table and readme, filled only with what the config admits. A page with a site forwards to
+  it unless `?tab=` is given. Readme pictures load through `/api/graft/pages/<slug>/image`; before this they pointed
+  at a route a page reader is refused, so they were broken. A picture must match `files`. Also fixed: every
+  `/projects/<slug>` page crashed in the browser because the slug route leaves `Namespace` null.
+  [ADR 0048](decisions/0048-page-looks-like-the-repository.md).
 - **The token nobody was told about.** The clone menu says, under the clone command, that the password Git
   asks for is a personal access token and names the scope a push needs. The readme has a section on cloning
   and pushing with the `git credential reject` recipe for a helper that cached the refusal.

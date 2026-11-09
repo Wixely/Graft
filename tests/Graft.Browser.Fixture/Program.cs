@@ -121,6 +121,7 @@ try
     File.WriteAllBytes(Path.Combine(sample, "README.md"), Fixture("sample/README.md"));
     File.WriteAllBytes(Path.Combine(sample, "compose.yaml"), Fixture("sample/compose.yaml"));
     File.WriteAllBytes(Path.Combine(sample, "docs", "guide.md"), Fixture("sample/docs-guide.md"));
+    File.WriteAllBytes(Path.Combine(sample, "docs", "lanternry.png"), Fixture("sample/docs-lanternry.png"));
     File.WriteAllBytes(Path.Combine(sample, "pages", "index.html"), Fixture("sample/pages-index.html"));
     File.WriteAllBytes(Path.Combine(sample, "pages", "about.html"), Fixture("sample/pages-about.html"));
     File.WriteAllBytes(Path.Combine(sample, "pages", "style.css"), Fixture("sample/pages-style.css"));

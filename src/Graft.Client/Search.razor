@@ -129,7 +129,7 @@ else
     private string messageKind = "info";
 
     private bool InProject => Slug.Length > 0;
-    private bool ViaSlug => Namespace.Length == 0;
+    private bool ViaSlug => string.IsNullOrEmpty(Namespace);
     private string ProjectUrl => ViaSlug
         ? $"/projects/{Uri.EscapeDataString(Slug)}"
         : $"/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";

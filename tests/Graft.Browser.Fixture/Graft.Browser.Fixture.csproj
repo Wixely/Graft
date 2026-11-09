@@ -19,6 +19,7 @@
     <EmbeddedResource Include="../../samples/project-page/README.md" LogicalName="sample/README.md" />
     <EmbeddedResource Include="../../samples/project-page/compose.yaml" LogicalName="sample/compose.yaml" />
     <EmbeddedResource Include="../../samples/project-page/docs/guide.md" LogicalName="sample/docs-guide.md" />
+    <EmbeddedResource Include="../../samples/project-page/docs/lanternry.png" LogicalName="sample/docs-lanternry.png" />
     <EmbeddedResource Include="../../samples/project-page/pages/index.html" LogicalName="sample/pages-index.html" />
     <EmbeddedResource Include="../../samples/project-page/pages/about.html" LogicalName="sample/pages-about.html" />
     <EmbeddedResource Include="../../samples/project-page/pages/style.css" LogicalName="sample/pages-style.css" />

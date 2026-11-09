@@ -4,10 +4,15 @@
 @inject IJSRuntime JS
 
 @* A published project page: the curated surface an owner chose to show, which is not the repository and
-   never becomes it. Everything on this page came from the project's own .graft/project.json; nothing is
-   offered by default, so an empty page means the config named nothing rather than that something failed.
-   The directory listing, the history, the issues and the releases each appear only when the config asked
-   for them, and each is served by a route of the page's own that the server decides separately. *@
+   never becomes it. It wears the repository's own layout, the masthead, the tabs, the file table and the
+   readme beneath it, so a reader sees the project as it looks rather than a different product. What fills
+   that layout came from the project's own .graft/project.json and nothing else: the file table holds the
+   files the allowlist admits, the tabs are the surfaces the config opened, and there is no branch, clone,
+   whole-repository download or diff anywhere on it, because a page cannot offer those (ADR 0045).
+
+   A project that publishes a site of its own (site.root, on the pages origin) is sent there instead, since
+   that is the page its owner designed. Any explicit ?tab= stays here, so the site can link back to the
+   files, issues or releases. *@
 
 <PageTitle>@(view?.Title ?? "Project page") &middot; Graft</PageTitle>
 
@@ -22,148 +27,184 @@ else if (view is null)
 }
 else
 {
-    <div class="page-header">
-        <div>
-            <h1>@view.Title</h1>
-            @if (view.Description.Length > 0) { <p class="subtitle">@view.Description</p> }
-        </div>
-        @if (view.SiteUrl is { Length: > 0 })
+    @* The repository's masthead, markup for markup (ProjectHeader), so the banner, the avatar and the tabs sit
+       where they sit on the project itself. The title is the page's, which names no account. *@
+    <div class="project-masthead @(view.BannerUrl is null ? "" : "has-banner")">
+        @if (view.BannerUrl is string banner)
         {
-            <div class="page-header-actions">
-                @* Leaves this origin by design: a project's site is served from a hostname of its own. *@
-                <a class="button primary" href="@view.SiteUrl" target="_blank" rel="noopener noreferrer">
-                    <Icon Name="repository" />Open the site
-                </a>
-            </div>
+            <img class="project-banner" src="@banner" alt="" />
         }
+        <div class="repo-header">
+            <Avatar Url="@view.AvatarUrl" Name="@view.Title" Class="avatar-large" />
+            <div>
+                <h1>@view.Title</h1>
+                <p class="subtitle">@(view.Description.Length > 0 ? view.Description : "No description")</p>
+            </div>
+            <span class="label accent">published page</span>
+        </div>
+
+        <nav class="tabs" aria-label="Project">
+            @Tab("code", "Code")
+            @if (view.History is not null) { @Tab("commits", "Commits") }
+            @if (view.Issues) { @Tab("issues", "Issues") }
+            @if (view.Releases) { @Tab("releases", "Releases") }
+            @* Only what the config named and only what this reader may open: the server decided both. The
+               destinations are the project's own pages, which apply their own rules again on arrival. *@
+            @foreach (PageFeatureResponse feature in view.Features.Where(feature =>
+                !(feature.Name == "issues" && view.Issues) && !(feature.Name == "releases" && view.Releases)))
+            {
+                <a href="@feature.Url">@FeatureLabel(feature.Name)</a>
+            }
+        </nav>
     </div>
 
     <Banner Message="@message" Kind="@messageKind" />
 
-    @if (view.Readme is not null)
+    @if (tab == "code")
     {
-        <div class="panel">
-            <div class="panel-header"><Icon Name="file" /><h2>@view.Readme.Path</h2></div>
-            <div class="panel-body">
-                <article class="markdown">@((MarkupString)view.Readme.Html)</article>
+        <div class="panel overflowing">
+            <div class="panel-header">
+                <Icon Name="branch" />
+                <span class="label accent">default branch</span>
+                <span class="label">@FileCount @(FileCount == 1 ? "file" : "files")</span>
+                <span class="spacer"></span>
+                @if (view.SiteUrl is { Length: > 0 })
+                {
+                    @* Leaves this origin by design: a project's site is served from a hostname of its own. *@
+                    <a class="button primary" href="@view.SiteUrl" rel="noopener noreferrer">
+                        <Icon Name="repository" />Open the site
+                    </a>
+                }
             </div>
         </div>
-    }
 
-    @if (openPath is not null)
-    {
-        <div class="panel">
-            <div class="panel-header"><Icon Name="file" /><h2>@openPath</h2><span class="spacer"></span>
-                <button type="button" class="secondary" @onclick="() => openPath = null">Close</button></div>
-            <div class="panel-body">
-                <pre class="file-view"><code>@openText</code></pre>
+        <nav class="row" aria-label="Path">
+            <button type="button" class="link" @onclick="() => Navigate(string.Empty)">@view.Title</button>
+            @foreach ((string label, string target) in Crumbs())
+            {
+                <span class="muted">/</span>
+                <button type="button" class="link" @onclick="() => Navigate(target)">@label</button>
+            }
+        </nav>
+
+        List<Entry> entries = Entries();
+        <div class="file-table">
+            <div class="file-table-header">
+                <Icon Name="file" />
+                <span>@entries.Count @(entries.Count == 1 ? "entry" : "entries")</span>
             </div>
+            @if (path.Length > 0)
+            {
+                <button type="button" class="file-row" @onclick="Up">
+                    <Icon Name="chevron-left" />
+                    <span class="name">..</span>
+                    <span class="meta">parent directory</span>
+                </button>
+            }
+            @foreach (Entry entry in entries)
+            {
+                @if (entry.Directory || entry.Readable)
+                {
+                    <button type="button" class="file-row @(entry.Directory ? "tree" : "blob")" @onclick="() => Open(entry)">
+                        <Icon Name="@(entry.Directory ? "folder" : "file")" />
+                        <span class="name">@entry.Name</span>
+                        <span class="meta"></span>
+                    </button>
+                }
+                else
+                {
+                    @* Named by the structure listing, not offered by the allowlist: the name is all there is. *@
+                    <div class="file-row blob closed">
+                        <Icon Name="file" />
+                        <span class="name">@entry.Name</span>
+                        <span class="meta">name only</span>
+                    </div>
+                }
+            }
+            @if (entries.Count == 0)
+            {
+                <p class="panel-empty">@(path.Length == 0 ? "This page offers no files." : "This directory is empty.")</p>
+            }
         </div>
-    }
 
-    @if (view.Tree is not null)
-    {
-        @* The structure without the content. Every path on the default branch is named here; only the ones
-           the allowlist admits can be opened, and the server said which, so a reader is never offered a
-           file the file route would refuse. *@
-        <div class="panel">
-            <div class="panel-header"><Icon Name="folder" /><h2>Structure</h2><span class="spacer"></span>
-                <span class="label">@view.Tree.Count(entry => entry.Type == "blob") files</span></div>
-            @if (view.Tree.Count == 0)
-            {
-                <div class="panel-empty">The default branch is empty.</div>
-            }
-            else
-            {
-                <div class="list">
-                    @foreach (PageTreeEntryResponse entry in view.Tree)
-                    {
-                        @if (entry.Readable)
-                        {
-                            <button type="button" class="list-item file-row" @onclick="() => Open(entry.Path)">
-                                <Icon Name="file" />
-                                <span class="list-item-main"><strong>@entry.Path</strong></span>
-                                <Icon Name="chevron-right" />
-                            </button>
-                        }
-                        else
-                        {
-                            <div class="list-item">
-                                <Icon Name="@(entry.Type == "tree" ? "folder" : "file")" Class="icon muted" />
-                                <span class="list-item-main">
-                                    <span class="secondary-text">@entry.Path@(entry.Type == "tree" ? "/" : "")</span>
-                                    @if (entry.Type == "blob") { <small>name only</small> }
-                                </span>
-                            </div>
-                        }
-                    }
-                </div>
-            }
-        </div>
-    }
-    else
-    {
-        <div class="panel">
-            <div class="panel-header"><Icon Name="folder" /><h2>Files</h2><span class="spacer"></span>
-                <span class="label">@view.Files.Count</span></div>
-            @if (view.Files.Count == 0)
-            {
-                <div class="panel-empty">This page offers no files.</div>
-            }
-            else
-            {
-                <div class="list">
-                    @foreach (string file in view.Files)
-                    {
-                        <button type="button" class="list-item file-row" @onclick="() => Open(file)">
-                            <Icon Name="file" />
-                            <span class="list-item-main"><strong>@file</strong></span>
-                        </button>
-                    }
-                </div>
-            }
-        </div>
-    }
+        @if (view.Readme is not null && openPath is null && path.Length == 0)
+        {
+            <div class="panel readme">
+                <div class="panel-header"><Icon Name="file" /><strong>@view.Readme.Path</strong></div>
+                @* The HTML comes from the server's renderer, under the README's rules; its pictures point at the
+                   page's own image route and only at files the allowlist admits. *@
+                <div class="panel-body markdown">@((MarkupString)view.Readme.Html)</div>
+            </div>
+        }
 
-    @if (view.History is not null)
+        @if (openPath is not null)
+        {
+            <div class="panel blob-view">
+                <div class="panel-header">
+                    <Icon Name="file" />
+                    <strong class="mono">@openPath</strong>
+                    <span class="spacer"></span>
+                    @if (openText is not null)
+                    {
+                        <span class="label">@System.Text.Encoding.UTF8.GetByteCount(openText) bytes</span>
+                    }
+                    @if (openImage || openText is not null)
+                    {
+                        <a class="button secondary" href="@(openImage ? ImageUrl(openPath) : FileUrl(openPath))" download="@FileName(openPath)">
+                            <Icon Name="download" />Download
+                        </a>
+                    }
+                    <button type="button" class="secondary" @onclick="CloseFile">Close</button>
+                </div>
+                @if (openImage)
+                {
+                    <img class="blob-image" src="@ImageUrl(openPath)" alt="@openPath" />
+                }
+                else if (openText is null)
+                {
+                    <p class="panel-empty">Binary file. Graft does not render its contents.</p>
+                }
+                else
+                {
+                    <pre>@openText</pre>
+                }
+            </div>
+        }
+    }
+    else if (tab == "commits" && view.History is not null)
     {
         @* What was said and when. Not what changed: there is no diff behind these rows and no link to one. *@
         <div class="panel">
-            <div class="panel-header"><Icon Name="commit" /><h2>History</h2><span class="spacer"></span>
+            <div class="panel-header"><h2>Recent commits</h2><span class="spacer"></span>
                 <span class="label">@view.History.Commits.Count</span></div>
-            @if (view.History.Commits.Count == 0)
-            {
-                <div class="panel-empty">No commits yet.</div>
-            }
-            else
-            {
-                <div class="list">
-                    @foreach (PageCommitResponse commit in view.History.Commits)
-                    {
-                        <div class="list-item">
-                            <Icon Name="commit" />
-                            <span class="list-item-main">
-                                <strong>@commit.Title</strong>
-                                <small>
-                                    <code>@commit.ShortId</code> &middot; @commit.CommittedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")
-                                    @if (commit.AuthorName is { Length: > 0 }) { <span> &middot; @commit.AuthorName</span> }
-                                    @if (commit.AuthorEmail is { Length: > 0 }) { <span> &lt;@commit.AuthorEmail&gt;</span> }
-                                </small>
-                                @if (openCommit == commit.Id && HasBody(commit))
-                                {
-                                    <pre class="commit-message">@commit.Message.Trim()</pre>
-                                }
-                            </span>
-                            @if (HasBody(commit))
+            <div class="list">
+                @foreach (PageCommitResponse commit in view.History.Commits)
+                {
+                    <div class="commit-row">
+                        <code class="sha">@commit.ShortId</code>
+                        <span class="list-item-main">
+                            <strong>@commit.Title</strong>
+                            <small>
+                                @if (commit.AuthorName is { Length: > 0 }) { <span>@commit.AuthorName</span> }
+                                @if (commit.AuthorEmail is { Length: > 0 }) { <span> &lt;@commit.AuthorEmail&gt;</span> }
+                                @if (commit.AuthorName is { Length: > 0 }) { <span> &middot; </span> }
+                                @commit.CommittedAt.ToString("u")
+                            </small>
+                            @if (openCommit == commit.Id && HasBody(commit))
                             {
-                                <button type="button" class="link" @onclick="() => openCommit = openCommit == commit.Id ? null : commit.Id">
-                                    @(openCommit == commit.Id ? "Less" : "More")
-                                </button>
+                                <pre class="commit-message">@commit.Message.Trim()</pre>
                             }
-                        </div>
-                    }
-                </div>
-            }
+                        </span>
+                        @if (HasBody(commit))
+                        {
+                            <button type="button" class="link" @onclick="() => openCommit = openCommit == commit.Id ? null : commit.Id">
+                                @(openCommit == commit.Id ? "Less" : "More")
+                            </button>
+                        }
+                    </div>
+                }
+            </div>
+            @if (view.History.Commits.Count == 0) { <p class="panel-empty">No commits yet.</p> }
             <div class="panel-body">
                 <p class="secondary-text">
                     The @(view.History.Commits.Count == 1 ? "most recent commit" : view.History.Commits.Count + " most recent commits") on the default branch.
@@ -172,8 +213,7 @@ else
             </div>
         </div>
     }
-
-    @if (view.Releases)
+    else if (tab == "releases" && view.Releases)
     {
         <div class="panel">
             <div class="panel-header"><Icon Name="archive" /><h2>Releases</h2><span class="spacer"></span>
@@ -225,8 +265,7 @@ else
             }
         </div>
     }
-
-    @if (view.Issues)
+    else if (tab == "issues" && view.Issues)
     {
         @if (openIssue is not null)
         {
@@ -339,25 +378,6 @@ else
         }
     }
 
-    @* Only what the config named and only what this reader may open: the server decided both. The
-       destinations are the project's own pages, which apply their own rules again on arrival. *@
-    @if (view.Features.Count > 0)
-    {
-        <div class="panel">
-            <div class="panel-header"><Icon Name="issue" /><h2>On this project</h2></div>
-            <div class="list">
-                @foreach (PageFeatureResponse feature in view.Features)
-                {
-                    <a class="list-item" href="@feature.Url">
-                        <Icon Name="@FeatureIcon(feature.Name)" />
-                        <span class="list-item-main"><strong>@FeatureLabel(feature.Name)</strong></span>
-                        <Icon Name="chevron-right" />
-                    </a>
-                }
-            </div>
-        </div>
-    }
-
     <p class="secondary-text">
         This is a published page. The project's repository is not readable from here: what it shows is what
         the project chose to show.
@@ -367,9 +387,19 @@ else
 @code {
     [Parameter] public string Slug { get; set; } = "";
 
+    /// <summary>The surface a link asked for. Present at all, it also keeps a reader here rather than on the
+    /// project's own site, which is how that site links back.</summary>
+    [SupplyParameterFromQuery(Name = "tab")] public string? TabQuery { get; set; }
+
+    /// <summary>One row of the file table: a directory, or a file the page offers or only names.</summary>
+    private sealed record Entry(string Name, string Path, bool Directory, bool Readable);
+
     private ProjectPageResponse? view;
+    private string tab = "code";
+    private string path = "";
     private string? openPath;
-    private string openText = "";
+    private string? openText;
+    private bool openImage;
     private string? openCommit;
     private PageReleaseResponse[]? releases;
     private IssueResponse[]? issues;
@@ -379,13 +409,28 @@ else
     private string message = "";
     private string messageKind = "info";
     private bool loading = true;
+    private string? loadedSlug;
+
+    // The formats the page's image route serves. Anything else opens as text or as "binary".
+    private static readonly string[] ImageExtensions = [".png", ".gif", ".jpg", ".jpeg", ".webp"];
 
     private string PageApi => $"api/graft/pages/{Uri.EscapeDataString(Slug)}";
 
+    private int FileCount => view?.Tree is { } tree ? tree.Count(entry => entry.Type == "blob" && entry.Readable) : view?.Files.Count ?? 0;
+
     protected override async Task OnParametersSetAsync()
     {
+        // A change of ?tab= alone is a change of surface, not of page: nothing is fetched again.
+        if (loadedSlug == Slug && view is not null)
+        {
+            await SelectTab(TabQuery ?? "code");
+            return;
+        }
+
         loading = true;
-        openPath = null;
+        loadedSlug = Slug;
+        path = "";
+        CloseFile();
         openIssue = null;
         issues = null;
         releases = null;
@@ -397,18 +442,135 @@ else
             if (!reached) { message = "Graft could not be reached."; messageKind = "error"; return; }
             view = loaded;
             if (view is null) { message = "No page is published at this address, or it was withdrawn."; return; }
+
+            // The owner designed a site; that is the page. Replacing the entry keeps Back from bouncing here.
+            if (view.SiteUrl is { Length: > 0 } site && TabQuery is null)
+            {
+                Navigation.NavigateTo(site, forceLoad: true, replace: true);
+                return;
+            }
         }
         finally { loading = false; }
 
-        // The two surfaces with routes of their own are fetched after the page itself has rendered, so a
-        // page with many issues is not held up by them and a refused one simply stays empty.
-        if (view.Releases)
+        await SelectTab(TabQuery ?? "code");
+    }
+
+    /// <summary>Renders mermaid diagrams in the readme once it is in the DOM, as the project page does.</summary>
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (view?.Readme?.HasDiagrams != true || tab != "code" || openPath is not null || path.Length > 0) return;
+        try { await JS.InvokeVoidAsync("graftMarkdown.render"); }
+        catch (JSException) { }
+    }
+
+    private RenderFragment Tab(string key, string label) =>
+        @<button type="button" class="@(tab == key ? "active" : "")" aria-current="@(tab == key ? "page" : null)" @onclick="() => SelectTab(key)">@label</button>;
+
+    /// <summary>Opens a surface the page offers. Anything it does not offer is the file table, which every page has.</summary>
+    private async Task SelectTab(string chosen)
+    {
+        tab = chosen switch
+        {
+            "commits" when view?.History is not null => "commits",
+            "issues" when view?.Issues == true => "issues",
+            "releases" when view?.Releases == true => "releases",
+            _ => "code"
+        };
+        // The two surfaces with routes of their own are fetched when first opened, so a page with many issues
+        // is not held up by them and a refused one simply stays empty.
+        if (tab == "releases" && releases is null)
         {
             (bool reached, PageReleaseResponse[]? loaded) = await Api.GetOptionalAsync(PageApi + "/releases", ApiJson.Default.PageReleaseResponseArray);
             releases = reached ? loaded ?? [] : [];
         }
-        if (view.Issues) await LoadIssues();
+        if (tab == "issues" && issues is null) await LoadIssues();
     }
+
+    /// <summary>
+    /// The rows of one directory, from the listing the server already filtered. With the structure published it
+    /// is the tree, where a file may be named but not offered; without it, the folders are only the ones the
+    /// offered files sit in, so a folder never appears that holds nothing a reader can open.
+    /// </summary>
+    private List<Entry> Entries()
+    {
+        if (view is null) return [];
+        string prefix = path.Length == 0 ? "" : path + "/";
+        Dictionary<string, Entry> rows = new(StringComparer.Ordinal);
+        if (view.Tree is not null)
+        {
+            foreach (PageTreeEntryResponse item in view.Tree)
+            {
+                if (!item.Path.StartsWith(prefix, StringComparison.Ordinal)) continue;
+                string rest = item.Path[prefix.Length..];
+                if (rest.Length == 0 || rest.Contains('/')) continue;
+                rows[rest] = new(rest, item.Path, item.Type == "tree", item.Readable);
+            }
+        }
+        else
+        {
+            foreach (string file in view.Files)
+            {
+                if (!file.StartsWith(prefix, StringComparison.Ordinal)) continue;
+                string rest = file[prefix.Length..];
+                int slash = rest.IndexOf('/');
+                if (slash < 0) rows[rest] = new(rest, file, false, true);
+                else rows.TryAdd(rest[..slash], new(rest[..slash], prefix + rest[..slash], true, true));
+            }
+        }
+        // Directories before files, then by name, as the project page orders a tree.
+        return [.. rows.Values.OrderByDescending(entry => entry.Directory).ThenBy(entry => entry.Name, StringComparer.OrdinalIgnoreCase)];
+    }
+
+    private async Task Open(Entry entry)
+    {
+        if (entry.Directory) { Navigate(entry.Path); return; }
+        message = "";
+        if (IsImage(entry.Path))
+        {
+            openPath = entry.Path;
+            openImage = true;
+            openText = null;
+            return;
+        }
+        (bool reached, string? text) = await Api.GetTextAsync(PageApi + "/files/" + Uri.EscapeDataString(entry.Path));
+        if (!reached) { message = "Graft could not be reached."; messageKind = "error"; return; }
+        openPath = entry.Path;
+        openImage = false;
+        openText = text;
+    }
+
+    private void Navigate(string target)
+    {
+        path = target;
+        CloseFile();
+    }
+
+    private void Up()
+    {
+        int separator = path.LastIndexOf('/');
+        Navigate(separator < 0 ? "" : path[..separator]);
+    }
+
+    private void CloseFile()
+    {
+        openPath = null;
+        openText = null;
+        openImage = false;
+    }
+
+    /// <summary>Breadcrumb segments with the path each one navigates to.</summary>
+    private IEnumerable<(string Label, string Target)> Crumbs()
+    {
+        if (path.Length == 0) yield break;
+        string[] segments = path.Split('/');
+        for (int index = 0; index < segments.Length; index++)
+            yield return (segments[index], string.Join('/', segments[..(index + 1)]));
+    }
+
+    private string FileUrl(string file) => "/" + PageApi + "/files/" + Uri.EscapeDataString(file);
+    private string ImageUrl(string file) => "/" + PageApi + "/image?path=" + Uri.EscapeDataString(file);
+    private static string FileName(string file) => file[(file.LastIndexOf('/') + 1)..];
+    private static bool IsImage(string file) => ImageExtensions.Any(extension => file.EndsWith(extension, StringComparison.OrdinalIgnoreCase));
 
     private async Task LoadIssues()
     {
@@ -435,22 +597,6 @@ else
         openIssue = loaded;
     }
 
-    private async Task Open(string file)
-    {
-        if (openPath == file) { openPath = null; return; }
-        message = "";
-        (bool reached, string? text) = await Api.GetTextAsync(PageApi + "/files/" + Uri.EscapeDataString(file));
-        if (!reached) { message = "Graft could not be reached."; messageKind = "error"; return; }
-        if (text is null)
-        {
-            message = $"{file} could not be shown. It may not be text.";
-            messageKind = "error";
-            return;
-        }
-        openPath = file;
-        openText = text;
-    }
-
     /// <summary>Whether a commit said more than its first line.</summary>
     private static bool HasBody(PageCommitResponse commit) => commit.Message.Trim().Length > commit.Title.Trim().Length;
 
@@ -465,13 +611,5 @@ else
         "releases" => "Releases",
         "snippets" => "Snippets",
         _ => name
-    };
-
-    private static string FeatureIcon(string name) => name switch
-    {
-        "merge_requests" => "merge",
-        "wiki" or "snippets" => "file",
-        "releases" => "archive",
-        _ => "issue"
     };
 }

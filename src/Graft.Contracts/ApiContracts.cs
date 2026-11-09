@@ -552,7 +552,11 @@ public sealed record ProjectPageResponse(
     /// <summary>Whether this page's readers may read the project's issues, at the page's own issues route.</summary>
     bool Issues = false,
     /// <summary>Whether this page's readers may read the project's releases, at the page's own releases route.</summary>
-    bool Releases = false);
+    bool Releases = false,
+    /// <summary>The project's avatar, or null when it has none.</summary>
+    [property: JsonPropertyName("avatar_url")] string? AvatarUrl = null,
+    /// <summary>The project's banner (ADR 0046), or null when it has none.</summary>
+    [property: JsonPropertyName("banner_url")] string? BannerUrl = null);
 
 /// <summary>One surface a page links onward to, by GitLab's name and at the project's shareable address.</summary>
 public sealed record PageFeatureResponse(string Name, string Url);

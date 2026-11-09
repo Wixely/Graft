@@ -514,11 +514,16 @@ async Task CheckProjectPages(string address, AuthenticatedIdentity alice, string
     Directory.CreateDirectory(Path.Combine(source, "src"));
     File.WriteAllText(Path.Combine(source, ".graft", "project.json"), """
         {"version":1,"page":{"title":"Sample","description":"Curated.","readme":"README.md",
-         "files":["README.md","docs/**/*.md"],"features":["issues","wiki","issues"],
+         "files":["README.md","docs/**/*.md","docs/**/*.png"],"features":["issues","wiki","issues"],
          "tree":true,"history":{"commits":10,"authors":"names"},"issues":true,"releases":true,
          "site":{"root":"site","index":"index.html"}}}
         """);
-    File.WriteAllText(Path.Combine(source, "README.md"), "# Sample\n\nCurated page.\n");
+    // Three pictures: one the allowlist admits, one it does not, and one that climbs out of the repository.
+    File.WriteAllText(Path.Combine(source, "README.md"),
+        "# Sample\n\nCurated page.\n\n![shown](./docs/pixel.png)\n\n![hidden](src/hidden.png)\n\n![climbing](../outside.png)\n");
+    File.WriteAllBytes(Path.Combine(source, "docs", "pixel.png"), OnePixelPng());
+    File.WriteAllText(Path.Combine(source, "docs", "fake.png"), "<script>alert(1)</script> not an image at all\n");
+    File.WriteAllBytes(Path.Combine(source, "src", "hidden.png"), OnePixelPng());
     File.WriteAllText(Path.Combine(source, "docs", "guide.md"), "# Guide\n");
     File.WriteAllText(Path.Combine(source, "docs", "notes.txt"), "not markdown, must not be listed\n");
     File.WriteAllText(Path.Combine(source, "src", "secret.cs"), "const string Key = \"must-never-be-served\";\n");
@@ -569,8 +574,20 @@ async Task CheckProjectPages(string address, AuthenticatedIdentity alice, string
         using JsonDocument json = JsonDocument.Parse(await page.Content.ReadAsStreamAsync());
         Check(json.RootElement.GetProperty("title").GetString() == "Sample", "and carries the title its config gave it");
         string[] files = [.. json.RootElement.GetProperty("files").EnumerateArray().Select(entry => entry.GetString()!)];
-        Check(files.Length == 2 && files.Contains("README.md") && files.Contains("docs/guide.md"),
+        Check(files.Length == 4 && files.Contains("README.md") && files.Contains("docs/guide.md") &&
+            files.Contains("docs/pixel.png") && files.Contains("docs/fake.png"),
             "and lists exactly the files its allowlist admits");
+        // The readme's pictures, which a page reader cannot fetch from the repository's own image route.
+        string readmeHtml = json.RootElement.GetProperty("readme").GetProperty("html").GetString()!;
+        Check(readmeHtml.Contains("/api/graft/pages/" + slug + "/image?path=docs%2Fpixel.png", StringComparison.Ordinal),
+            "a readme picture the allowlist admits points at the page's own image route, resolved from ./");
+        Check(!readmeHtml.Contains("/api/graft/projects/", StringComparison.Ordinal),
+            "and nothing in the readme points at a repository route a page reader would be refused");
+        Check(readmeHtml.Split("<img ").Length == 2 && !readmeHtml.Contains("image?path=src", StringComparison.Ordinal),
+            "only the admitted picture is an image; the hidden and climbing ones are downgraded to links");
+        Check(json.RootElement.GetProperty("avatar_url").ValueKind == JsonValueKind.Null &&
+            json.RootElement.GetProperty("banner_url").ValueKind == JsonValueKind.Null,
+            "the page reports the project's avatar and banner, which this one has neither of");
         Check(!files.Contains("src/secret.cs") && !files.Contains("docs/notes.txt") && !files.Contains(".graft/project.json"),
             "and nothing else the repository happens to hold");
         Check(json.RootElement.GetProperty("readme").ValueKind != JsonValueKind.Null, "the named readme is rendered");
@@ -676,6 +693,21 @@ async Task CheckProjectPages(string address, AuthenticatedIdentity alice, string
         using (HttpResponseMessage denied = await PagesGet(address, null, "/api/graft/pages/" + slug + "/files/" + Uri.EscapeDataString(refused)))
             Check(denied.StatusCode == System.Net.HttpStatusCode.NotFound, "and refuses one it does not: " + refused);
 
+    // Pictures, through the page: an allowlisted file that proves to be a raster image, to a reader with no
+    // account, and nothing else.
+    string pageImage = "/api/graft/pages/" + slug + "/image?path=";
+    using (HttpResponseMessage picture = await PagesGet(address, null, pageImage + "docs%2Fpixel.png"))
+        Check(picture.IsSuccessStatusCode && picture.Content.Headers.ContentType?.MediaType == "image/png" &&
+            (await picture.Content.ReadAsByteArrayAsync()).AsSpan().SequenceEqual(OnePixelPng()),
+            "a page serves an allowlisted image without an account, as the type its bytes prove (got " + (int)picture.StatusCode + ")");
+    using (HttpResponseMessage fake = await PagesGet(address, null, pageImage + "docs%2Ffake.png"))
+        Check(fake.StatusCode == System.Net.HttpStatusCode.UnsupportedMediaType, "an allowlisted file that is not an image is refused, whatever its name");
+    using (HttpResponseMessage text = await PagesGet(address, null, pageImage + "README.md"))
+        Check(text.StatusCode == System.Net.HttpStatusCode.UnsupportedMediaType, "and so is an allowlisted text file");
+    foreach (string refused in new[] { "src%2Fhidden.png", ".graft%2Fproject.json", "docs%2F..%2Fsrc%2Fhidden.png", "" })
+        using (HttpResponseMessage denied = await PagesGet(address, null, pageImage + refused))
+            Check(denied.StatusCode == System.Net.HttpStatusCode.NotFound, "an image the allowlist does not admit does not exist: '" + refused + "'");
+
     // The repository itself is untouched by any of this: a page grant reaches no repository surface.
     using (HttpResponseMessage browse = await PagesGet(address, null, "/api/browser/projects/alice/pagesample"))
         Check(browse.StatusCode == System.Net.HttpStatusCode.NotFound,
@@ -723,8 +755,8 @@ async Task CheckProjectPages(string address, AuthenticatedIdentity alice, string
     {
         Check(back.StatusCode == System.Net.HttpStatusCode.Found, "a site can link back to the project without naming a host");
         string target = back.Headers.Location?.ToString() ?? "";
-        Check(target.StartsWith(address.TrimEnd('/'), StringComparison.Ordinal) && target.EndsWith("/-/p/" + slug, StringComparison.Ordinal),
-            "and is sent to the project's page on the forge as it is addressed today");
+        Check(target.StartsWith(address.TrimEnd('/'), StringComparison.Ordinal) && target.EndsWith("/-/p/" + slug + "?tab=code", StringComparison.Ordinal),
+            "and is sent to the project's page on the forge as it is addressed today, on a tab, so the page does not send it back to the site");
     }
     using (HttpResponseMessage describe = await PagesGet(address, PagesHost, "/" + slug + "/-/graft.json"))
     {
@@ -732,6 +764,8 @@ async Task CheckProjectPages(string address, AuthenticatedIdentity alice, string
         using JsonDocument json = JsonDocument.Parse(await describe.Content.ReadAsStreamAsync());
         Check(json.RootElement.GetProperty("forge").GetString() == address.TrimEnd('/'), "which reports the forge's current origin");
         Check(json.RootElement.GetProperty("slug").GetString() == slug, "and the project it belongs to");
+        Check(json.RootElement.GetProperty("page").GetString()!.EndsWith("/-/p/" + slug + "?tab=code", StringComparison.Ordinal),
+            "and the page's address on a tab, for the same reason");
     }
 
     // A type that is not on the allowlist is refused rather than guessed at.
@@ -786,7 +820,7 @@ async Task CheckProjectPages(string address, AuthenticatedIdentity alice, string
             "an unparseable config unpublishes the page rather than serving it with defaults");
     using (HttpResponseMessage brokenSite = await PagesGet(address, PagesHost, "/" + slug + "/"))
         Check(brokenSite.StatusCode == System.Net.HttpStatusCode.NotFound, "and takes the site down with it");
-    foreach (string surface in new[] { "/issues", "/issues/1", "/releases", pageDownload.Substring(("/api/graft/pages/" + slug).Length) })
+    foreach (string surface in new[] { "/issues", "/issues/1", "/releases", "/image?path=docs%2Fpixel.png", pageDownload.Substring(("/api/graft/pages/" + slug).Length) })
         using (HttpResponseMessage brokenSurface = await PagesGet(address, null, "/api/graft/pages/" + slug + surface))
             Check(brokenSurface.StatusCode == System.Net.HttpStatusCode.NotFound, "and everything the config had opened: " + surface);
 
@@ -804,7 +838,7 @@ async Task CheckProjectPages(string address, AuthenticatedIdentity alice, string
             !json.RootElement.GetProperty("issues").GetBoolean() && !json.RootElement.GetProperty("releases").GetBoolean(),
             "with no structure, no history, no issues and no releases");
     }
-    foreach (string surface in new[] { "/issues", "/releases" })
+    foreach (string surface in new[] { "/issues", "/releases", "/image?path=docs%2Fpixel.png" })
         using (HttpResponseMessage closed = await PagesGet(address, null, "/api/graft/pages/" + slug + surface))
             Check(closed.StatusCode == System.Net.HttpStatusCode.NotFound, "and the route for each answers as if it did not exist: " + surface);
 }

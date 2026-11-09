@@ -11,6 +11,7 @@ Push this folder's contents to a project, publish the page, and the result is th
 .graft/project.json   the config: what the page offers and where the site lives
 README.md             named by the config, rendered on the page
 docs/guide.md         matched by the config's allowlist
+docs/lanternry.png    matched too, so the readme can show it
 compose.yaml          matched by the config's allowlist
 pages/                the site: index.html, about.html, style.css, lantern.svg
 ```
@@ -24,7 +25,7 @@ The config is the whole feature:
     "title": "Lanternry",
     "description": "A small library for hanging lights on things.",
     "readme": "README.md",
-    "files": ["README.md", "docs/**/*.md", "compose.yaml"],
+    "files": ["README.md", "docs/**/*.md", "docs/**/*.png", "compose.yaml"],
     "site": { "root": "pages", "index": "index.html" }
   }
 }
@@ -80,7 +81,9 @@ curl -k -H "Host: pages.example.test" https://127.0.0.1:7443/lanternry/
 
 ## What to look at
 
-- The page lists exactly three files, and the repository's other files are absent rather than hidden.
+- The page lists exactly four files, and the repository's other files are absent rather than hidden.
+- The readme's picture loads from the page's own image route. Take `docs/**/*.png` out of `files` and it becomes a
+  link instead: a picture is published the same way any file is, by naming it.
 - `README.md` is rendered because the config named it. A project's readme is **not** shown by default.
 - The site's own links and stylesheet work, because the configured index answers for a directory.
 - The site links back to the project with `<a href="-/repo">`, which names no hostname. Graft resolves it to

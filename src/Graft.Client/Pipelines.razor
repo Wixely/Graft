@@ -162,7 +162,7 @@ else
     private string actionMessage = "";
     private bool actionOk;
 
-    private bool ViaSlug => Namespace.Length == 0;
+    private bool ViaSlug => string.IsNullOrEmpty(Namespace);
     private string ProjectUrl => ViaSlug
         ? $"/projects/{Uri.EscapeDataString(Slug)}"
         : $"/{Uri.EscapeDataString(Namespace)}/{Uri.EscapeDataString(Slug)}";

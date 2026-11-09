@@ -2499,10 +2499,15 @@ app.MapGet("/api/graft/pages/{globalSlug}", async context =>
                 catch (DecoderFallbackException) { }
                 if (source is not null)
                 {
-                    string baseUrl = Origin(context) + "/api/graft/projects/" +
-                        details.Project.Id.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/image";
-                    RenderedMarkdown rendered = MarkdownContent.Render(source, path =>
-                        baseUrl + "?ref=HEAD&path=" + Uri.EscapeDataString(path));
+                    // Pictures resolve to the page's own image route, never the repository's: a page reader may
+                    // not browse the repository, so the repository route would refuse every one of them. An
+                    // image the allowlist does not admit is downgraded to a link by the renderer, as an
+                    // off-site one is, so the readme says what it referenced rather than showing a broken icon.
+                    string baseUrl = Origin(context) + "/api/graft/pages/" + Uri.EscapeDataString(details.Project.GlobalSlug) + "/image";
+                    RenderedMarkdown rendered = MarkdownContent.Render(source, reference =>
+                        PageImagePath(file.Path, reference) is string target && PageConfiguration.AllowsFile(page, target)
+                            ? baseUrl + "?path=" + Uri.EscapeDataString(target)
+                            : null);
                     readme = new(file.Path, rendered.Html, rendered.HasDiagrams);
                 }
             }
@@ -2565,7 +2570,13 @@ app.MapGet("/api/graft/pages/{globalSlug}", async context =>
             tree,
             history,
             page.Issues,
-            page.Releases);
+            page.Releases,
+            // The project's own pictures, so the page wears the same masthead as the repository. Both routes
+            // already admit anyone the page admits.
+            await store.HasAvatarAsync(AvatarOwner.Project, details.Project.Id, context.RequestAborted)
+                ? AvatarUrl(context, AvatarOwner.Project, details.Project.Id)
+                : null,
+            await BannerUrl(context, details.Project.Id));
         await context.Response.WriteAsJsonAsync(response, ApiJson.Default.ProjectPageResponse, null, context.RequestAborted);
     });
 });
@@ -2720,6 +2731,47 @@ app.MapGet("/api/graft/pages/{globalSlug}/files/{**filePath}", async context =>
 
         context.Response.ContentType = "text/plain; charset=utf-8";
         await context.Response.WriteAsync(text, context.RequestAborted);
+    });
+});
+
+// One image a published page offers, for the pictures in its readme and for an image opened from its file
+// list. The allowlist is asked first, exactly as for a text file, so a picture is published by naming it in
+// `files` and in no other way. The bytes then pass the validator that guards the repository image route and
+// avatars: a recognised raster format or nothing, the type the bytes prove rather than one the repository
+// declares, and never SVG.
+app.MapMethods("/api/graft/pages/{globalSlug}/image", ["GET", "HEAD"], async context =>
+{
+    if (!await OnlyQuery(context, "path")) return;
+    ProjectInfo? found = await store.FindReadyProjectByGlobalSlugAsync(
+        context.Request.RouteValues["globalSlug"]?.ToString() ?? "", context.RequestAborted);
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: false);
+    if (found is null || !(await DecideFor(context, browser?.Identity, found.Id, ProjectAction.ReadPage)).Allowed)
+    { await ApiError(context, 404, "page"); return; }
+
+    string filePath = context.Request.Query["path"].ToString();
+    await WithRepository(EndpointFor(found), context, async repository =>
+    {
+        PageConfigurationResult config = PageConfiguration.Read(ReadRepositoryFile(repository, PageConfiguration.Path));
+        if (!config.Ok || !PageConfiguration.AllowsFile(config.Settings!, filePath))
+        { await ApiError(context, 404, "image"); return; }
+
+        GitFile? file;
+        try { file = RepositoryView.File(repository, "HEAD", PathMatcher.Normalize(filePath)); }
+        catch (GitInputException) { file = null; }
+        if (file is null) { await ApiError(context, 404, "image"); return; }
+
+        ValidatedImage? image = ImageContent.Validate(file.Content);
+        if (image is null) { await ApiError(context, 415, "that file is not a supported image"); return; }
+
+        string etag = '"' + file.BlobId + '"';
+        context.Response.Headers.CacheControl = "no-cache, private";
+        context.Response.Headers.ETag = etag;
+        if (context.Request.GetTypedHeaders().IfNoneMatch?.Any(value => value.Tag.Value == etag || value.Tag.Value == "*") == true)
+        { context.Response.StatusCode = StatusCodes.Status304NotModified; return; }
+        context.Response.ContentType = image.ContentType;
+        context.Response.ContentLength = image.Bytes.Length;
+        if (HttpMethods.IsHead(context.Request.Method)) return;
+        await context.Response.Body.WriteAsync(image.Bytes, context.RequestAborted);
     });
 });
 
@@ -9156,7 +9208,9 @@ if (settings.PagesOrigin is not null)
         if (requested is "-/repo" or "-/repo/" or "-/graft.json")
         {
             string projectUrl = serverOrigin + GlobalPrefix + "/" + Uri.EscapeDataString(project.GlobalSlug);
-            string pageUrl = serverOrigin + "/-/p/" + Uri.EscapeDataString(project.GlobalSlug);
+            // With an explicit tab: the page sends a reader who arrives without one to this very site (it is the
+            // page the owner designed), so a link back that named no tab would bounce straight here again.
+            string pageUrl = serverOrigin + "/-/p/" + Uri.EscapeDataString(project.GlobalSlug) + "?tab=code";
             if (requested == "-/graft.json")
             {
                 // For a site that would rather render the link itself than follow a redirect. Same origin,
@@ -10107,6 +10161,38 @@ static async Task PagesMiss(HttpContext context, string message)
     context.Response.StatusCode = StatusCodes.Status404NotFound;
     context.Response.ContentType = "text/plain; charset=utf-8";
     await context.Response.WriteAsync(message, context.RequestAborted);
+}
+
+/// <summary>
+/// The repository path an image reference in a page's markdown names, read the way a forge reads it: relative
+/// to the folder of the document it sits in, with <c>.</c> and <c>..</c> resolved and any query or fragment
+/// dropped. Null for a reference that climbs out of the repository or is not a path at all; the renderer
+/// then shows it as a link rather than loading anything.
+/// </summary>
+static string? PageImagePath(string documentPath, string reference)
+{
+    int cut = reference.IndexOfAny(['?', '#']);
+    if (cut >= 0) reference = reference[..cut];
+    try { reference = Uri.UnescapeDataString(reference); }
+    catch (UriFormatException) { return null; }
+    if (reference.Length == 0) return null;
+
+    List<string> segments = [];
+    int folder = documentPath.LastIndexOf('/');
+    if (folder > 0) segments.AddRange(documentPath[..folder].Split('/'));
+    foreach (string segment in reference.Replace('\\', '/').Split('/'))
+    {
+        if (segment.Length == 0 || segment == ".") continue;
+        if (segment == "..")
+        {
+            if (segments.Count == 0) return null;
+            segments.RemoveAt(segments.Count - 1);
+            continue;
+        }
+        segments.Add(segment);
+    }
+    string resolved = PathMatcher.Normalize(string.Join('/', segments));
+    return resolved.Length == 0 ? null : resolved;
 }
 
 /// <summary>

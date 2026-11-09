@@ -549,6 +549,15 @@ a.list-item:hover, button.list-item:hover { background: var(--sunken); text-deco
 .file-row .meta { color: var(--text-muted); font-size: 12px; }
 .file-row.tree svg { color: var(--accent); }
 .file-row.blob svg { color: var(--text-muted); }
+/* A published page's structure names files it does not offer: shown, quieter, and not a control. */
+.file-row.closed .name { color: var(--text-muted); }
+.file-row.closed:hover { background: transparent; }
+.file-row.closed:hover .name { text-decoration: none; }
+/* An image opened from a published page's file table, on the same ground a text file sits on. */
+.blob-view .blob-image {
+    display: block; max-width: 100%; height: auto; margin: 0 auto; padding: var(--space-4);
+    background: var(--sunken); border-top: 1px solid var(--border);
+}
 
 .blob-view pre {
     margin: 0; padding: var(--space-4); overflow: auto;

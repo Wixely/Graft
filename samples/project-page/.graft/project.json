@@ -4,7 +4,7 @@
     "title": "Lanternry",
     "description": "A small library for hanging lights on things.",
     "readme": "README.md",
-    "files": ["README.md", "docs/**/*.md", "compose.yaml"],
+    "files": ["README.md", "docs/**/*.md", "docs/**/*.png", "compose.yaml"],
     "site": { "root": "pages", "index": "index.html" }
   }
 }

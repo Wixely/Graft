@@ -728,7 +728,7 @@ git push -u origin main</pre>
 
     /// <summary>Whether the reader arrived by the instance-wide slug. The owned route always supplies a
     /// namespace, so its absence is what distinguishes the two.</summary>
-    private bool ViaSlug => Namespace.Length == 0;
+    private bool ViaSlug => string.IsNullOrEmpty(Namespace);
 
     /// <summary>The prefix every link on this page is built from, so navigating within a project never
     /// moves the reader onto the other route and never reveals an owner the link deliberately omitted.</summary>
