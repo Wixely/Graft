@@ -13,7 +13,14 @@
 {
     @* Shown beside the repository's own visibility rather than instead of it, because a page and the
        repository behind it are separate answers to separate questions. *@
-    <span class="label">Page published</span>
+    @if (PageSlug is { Length: > 0 })
+    {
+        <a class="label" href="@("/-/p/" + Uri.EscapeDataString(PageSlug))" title="Open the published page">Page published</a>
+    }
+    else
+    {
+        <span class="label">Page published</span>
+    }
 }
 
 @code {
@@ -23,6 +30,9 @@
 
     /// <summary>Whether the curated project page is published. Omitted where it is not known.</summary>
     [Parameter] public bool PagePublished { get; set; }
+
+    /// <summary>The project's instance-wide slug, which makes the published badge a link to the page.</summary>
+    [Parameter] public string? PageSlug { get; set; }
 
     private string? Icon => Visibility switch
     {

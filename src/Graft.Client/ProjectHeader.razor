@@ -31,7 +31,7 @@
                 }
                 <p class="subtitle">@(repo.Project.Description.Length > 0 ? repo.Project.Description : "No description")</p>
             </div>
-            <VisibilityLabel Visibility="@repo.Project.Visibility" PagePublished="repo.PagePublished" />
+            <VisibilityLabel Visibility="@repo.Project.Visibility" PagePublished="repo.PagePublished" PageSlug="@repo.Project.GlobalSlug" />
             @if (repo.Project.ForkedFromProject is not null)
             {
                 <span class="label accent">forked from <a href="@("/" + repo.Project.ForkedFromProject.PathWithNamespace)">@repo.Project.ForkedFromProject.PathWithNamespace</a></span>

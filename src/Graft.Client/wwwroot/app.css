@@ -393,6 +393,8 @@ legend { padding: 0 4px; font-size: 13px; font-weight: 600; }
     color: var(--text-secondary); background: var(--sunken);
     border: 1px solid var(--border); border-radius: 999px; white-space: nowrap;
 }
+a.label { text-decoration: none; }
+a.label:hover { color: var(--accent); border-color: var(--accent-border); }
 .label.accent { color: var(--accent); background: var(--accent-subtle); border-color: var(--accent-border); }
 .label.danger { color: var(--danger); background: var(--danger-subtle); border-color: var(--danger); }
 .label.success { color: var(--success); background: var(--success-subtle); border-color: var(--success); }
@@ -421,14 +423,15 @@ a.list-item:hover, button.list-item:hover { background: var(--sunken); text-deco
 
 .avatar {
     display: grid; place-items: center; flex: none;
-    width: 26px; height: 26px; border-radius: var(--radius);
-    font-size: 12px; font-weight: 700; text-transform: uppercase;
+    width: 32px; height: 32px; border-radius: var(--radius);
+    font-size: 14px; font-weight: 700; text-transform: uppercase;
     color: var(--accent); background: var(--accent-subtle); border: 1px solid var(--accent-border);
     overflow: hidden;
 }
 .avatar img { width: 100%; height: 100%; object-fit: cover; }
-.avatar-large { width: 40px; height: 40px; font-size: 17px; }
-.avatar-small { width: 20px; height: 20px; font-size: 10px; border-radius: 4px; }
+.avatar-large { width: 64px; height: 64px; font-size: 26px; }
+.avatar-project { width: 48px; height: 48px; font-size: 20px; }
+.avatar-small { width: 24px; height: 24px; font-size: 11px; border-radius: 4px; }
 
 /* Repository browser */
 

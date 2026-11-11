@@ -148,17 +148,28 @@ else
                     {
                         <span class="label">@System.Text.Encoding.UTF8.GetByteCount(openText) bytes</span>
                     }
+                    @if (openMarkdown is not null)
+                    {
+                        <button type="button" class="secondary" aria-pressed="@(showSource ? "true" : "false")" @onclick="() => showSource = !showSource">
+                            @(showSource ? "Rendered" : "Source")
+                        </button>
+                    }
                     @if (openImage || openText is not null)
                     {
                         <a class="button secondary" href="@(openImage ? ImageUrl(openPath) : FileUrl(openPath))" download="@FileName(openPath)">
                             <Icon Name="download" />Download
                         </a>
                     }
-                    <button type="button" class="secondary" @onclick="CloseFile">Close</button>
+                    <button type="button" class="secondary" @onclick="() => Go(path, null)">Close</button>
                 </div>
                 @if (openImage)
                 {
                     <img class="blob-image" src="@ImageUrl(openPath)" alt="@openPath" />
+                }
+                else if (openMarkdown is not null && !showSource)
+                {
+                    @* The server's renderer, under the readme's rules and the page's allowlist. *@
+                    <div class="panel-body markdown">@((MarkupString)openMarkdown.Html)</div>
                 }
                 else if (openText is null)
                 {
@@ -378,10 +389,7 @@ else
         }
     }
 
-    <p class="secondary-text">
-        This is a published page. The project's repository is not readable from here: what it shows is what
-        the project chose to show.
-    </p>
+    <p class="secondary-text">This repo is semi-public, not all source is available.</p>
 }
 
 @code {
@@ -391,6 +399,12 @@ else
     /// project's own site, which is how that site links back.</summary>
     [SupplyParameterFromQuery(Name = "tab")] public string? TabQuery { get; set; }
 
+    /// <summary>The file a link asked for, which a rendered document uses to link to another. Like ?tab=, it
+    /// also keeps a reader here rather than on the project's own site.</summary>
+    [SupplyParameterFromQuery(Name = "file")] public string? FileQuery { get; set; }
+    [SupplyParameterFromQuery(Name = "path")] public string? PathQuery { get; set; }
+    private string? appliedLocation;
+
     /// <summary>One row of the file table: a directory, or a file the page offers or only names.</summary>
     private sealed record Entry(string Name, string Path, bool Directory, bool Readable);
 
@@ -399,6 +413,8 @@ else
     private string path = "";
     private string? openPath;
     private string? openText;
+    private ReadmeResponse? openMarkdown;
+    private bool showSource;
     private bool openImage;
     private string? openCommit;
     private PageReleaseResponse[]? releases;
@@ -424,12 +440,14 @@ else
         if (loadedSlug == Slug && view is not null)
         {
             await SelectTab(TabQuery ?? "code");
+            await ApplyLocation();
             return;
         }
 
         loading = true;
         loadedSlug = Slug;
         path = "";
+        appliedLocation = null;
         CloseFile();
         openIssue = null;
         issues = null;
@@ -444,7 +462,7 @@ else
             if (view is null) { message = "No page is published at this address, or it was withdrawn."; return; }
 
             // The owner designed a site; that is the page. Replacing the entry keeps Back from bouncing here.
-            if (view.SiteUrl is { Length: > 0 } site && TabQuery is null)
+            if (view.SiteUrl is { Length: > 0 } site && TabQuery is null && FileQuery is null && PathQuery is null)
             {
                 Navigation.NavigateTo(site, forceLoad: true, replace: true);
                 return;
@@ -453,15 +471,47 @@ else
         finally { loading = false; }
 
         await SelectTab(TabQuery ?? "code");
+        await ApplyLocation();
     }
 
-    /// <summary>Renders mermaid diagrams in the readme once it is in the DOM, as the project page does.</summary>
+    /// <summary>Renders mermaid diagrams in the readme or an open document once it is in the DOM, as the project page does.</summary>
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        if (view?.Readme?.HasDiagrams != true || tab != "code" || openPath is not null || path.Length > 0) return;
+        if (tab != "code") return;
+        bool readmeShown = view?.Readme?.HasDiagrams == true && openPath is null && path.Length == 0;
+        bool documentShown = openMarkdown?.HasDiagrams == true && !showSource;
+        if (!readmeShown && !documentShown) return;
         try { await JS.InvokeVoidAsync("graftMarkdown.render"); }
         catch (JSException) { }
     }
+
+    /// <summary>Opens the folder or file the address names, once per distinct address.</summary>
+    private async Task ApplyLocation()
+    {
+        string location = (PathQuery ?? "") + "\n" + (FileQuery ?? "");
+        if (location == appliedLocation) return;
+        appliedLocation = location;
+        CloseFile();
+        message = "";
+        if (FileQuery is { Length: > 0 } file)
+        {
+            tab = "code";
+            path = file.LastIndexOf('/') is var slash and > 0 ? file[..slash] : "";
+            await OpenFile(file);
+        }
+        else path = PathQuery ?? "";
+    }
+
+    /// <summary>Moves to a folder or file by address, so Back returns here and a document can link to another.</summary>
+    private void Go(string newPath, string? newFile)
+    {
+        string query = newFile is { Length: > 0 } ? "?file=" + QueryPath(newFile)
+            : newPath.Length > 0 ? "?path=" + QueryPath(newPath)
+            : "";
+        Navigation.NavigateTo("/-/p/" + Uri.EscapeDataString(Slug) + query);
+    }
+
+    private static string QueryPath(string value) => string.Join('/', value.Split('/').Select(Uri.EscapeDataString));
 
     private RenderFragment Tab(string key, string label) =>
         @<button type="button" class="@(tab == key ? "active" : "")" aria-current="@(tab == key ? "page" : null)" @onclick="() => SelectTab(key)">@label</button>;
@@ -521,29 +571,33 @@ else
         return [.. rows.Values.OrderByDescending(entry => entry.Directory).ThenBy(entry => entry.Name, StringComparer.OrdinalIgnoreCase)];
     }
 
-    private async Task Open(Entry entry)
+    private void Open(Entry entry)
     {
-        if (entry.Directory) { Navigate(entry.Path); return; }
-        message = "";
-        if (IsImage(entry.Path))
+        if (entry.Directory) Go(entry.Path, null);
+        else Go(path, entry.Path);
+    }
+
+    private async Task OpenFile(string file)
+    {
+        bool offered = view?.Tree is { } tree
+            ? tree.Any(item => item.Path == file && item.Type == "blob" && item.Readable)
+            : view?.Files.Contains(file) == true;
+        if (!offered) { message = "This page does not offer " + file + "."; messageKind = "error"; return; }
+        if (IsImage(file))
         {
-            openPath = entry.Path;
+            openPath = file;
             openImage = true;
-            openText = null;
             return;
         }
-        (bool reached, string? text) = await Api.GetTextAsync(PageApi + "/files/" + Uri.EscapeDataString(entry.Path));
+        (bool reached, string? text) = await Api.GetTextAsync(PageApi + "/files/" + Uri.EscapeDataString(file));
         if (!reached) { message = "Graft could not be reached."; messageKind = "error"; return; }
-        openPath = entry.Path;
-        openImage = false;
+        if (IsMarkdown(file) && text is not null)
+            (_, openMarkdown) = await Api.GetOptionalAsync(PageApi + "/markdown/" + Uri.EscapeDataString(file), ApiJson.Default.ReadmeResponse);
+        openPath = file;
         openText = text;
     }
 
-    private void Navigate(string target)
-    {
-        path = target;
-        CloseFile();
-    }
+    private void Navigate(string target) => Go(target, null);
 
     private void Up()
     {
@@ -555,6 +609,8 @@ else
     {
         openPath = null;
         openText = null;
+        openMarkdown = null;
+        showSource = false;
         openImage = false;
     }
 
@@ -571,6 +627,8 @@ else
     private string ImageUrl(string file) => "/" + PageApi + "/image?path=" + Uri.EscapeDataString(file);
     private static string FileName(string file) => file[(file.LastIndexOf('/') + 1)..];
     private static bool IsImage(string file) => ImageExtensions.Any(extension => file.EndsWith(extension, StringComparison.OrdinalIgnoreCase));
+    private static bool IsMarkdown(string file) =>
+        file.EndsWith(".md", StringComparison.OrdinalIgnoreCase) || file.EndsWith(".markdown", StringComparison.OrdinalIgnoreCase);
 
     private async Task LoadIssues()
     {

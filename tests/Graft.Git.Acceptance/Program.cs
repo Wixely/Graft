@@ -151,6 +151,7 @@ try
     File.WriteAllText(Path.Combine(source, "README.md"), ReadmeCorpus());
     File.WriteAllBytes(Path.Combine(source, "docs", "pixel.png"), OnePixelPng());
     File.WriteAllText(Path.Combine(source, "docs", "fake.png"), "<script>alert(1)</script> not an image at all\n");
+    File.WriteAllText(Path.Combine(source, "docs", "guide.md"), "# Guide\n\n[back](../README.md#rendering-corpus)\n\n![beside it](pixel.png)\n");
     await Git(source, ["add", "."]);
     await Git(source, ["commit", "-m", "README rendering corpus"]);
     await Git(source, ["remote", "set-url", "origin", bobUrl]);
@@ -519,12 +520,15 @@ async Task CheckProjectPages(string address, AuthenticatedIdentity alice, string
          "site":{"root":"site","index":"index.html"}}}
         """);
     // Three pictures: one the allowlist admits, one it does not, and one that climbs out of the repository.
+    // And three links: one relative, one written as the page's own raw text address, and one to a file the
+    // page does not offer.
     File.WriteAllText(Path.Combine(source, "README.md"),
-        "# Sample\n\nCurated page.\n\n![shown](./docs/pixel.png)\n\n![hidden](src/hidden.png)\n\n![climbing](../outside.png)\n");
+        "# Sample\n\nCurated page.\n\n![shown](./docs/pixel.png)\n\n![hidden](src/hidden.png)\n\n![climbing](../outside.png)\n\n" +
+        "[the guide](docs/guide.md#guide) [the raw guide](" + address.TrimEnd('/') + "/api/graft/pages/" + slug + "/files/docs/guide.md) [a secret](src/secret.cs)\n");
     File.WriteAllBytes(Path.Combine(source, "docs", "pixel.png"), OnePixelPng());
     File.WriteAllText(Path.Combine(source, "docs", "fake.png"), "<script>alert(1)</script> not an image at all\n");
     File.WriteAllBytes(Path.Combine(source, "src", "hidden.png"), OnePixelPng());
-    File.WriteAllText(Path.Combine(source, "docs", "guide.md"), "# Guide\n");
+    File.WriteAllText(Path.Combine(source, "docs", "guide.md"), "# Guide\n\n[home](../README.md)\n\n![beside it](pixel.png)\n");
     File.WriteAllText(Path.Combine(source, "docs", "notes.txt"), "not markdown, must not be listed\n");
     File.WriteAllText(Path.Combine(source, "src", "secret.cs"), "const string Key = \"must-never-be-served\";\n");
     File.WriteAllText(Path.Combine(source, "site", "index.html"), "<!doctype html><title>Sample site</title><h1>Sample site</h1>\n");
@@ -585,6 +589,12 @@ async Task CheckProjectPages(string address, AuthenticatedIdentity alice, string
             "and nothing in the readme points at a repository route a page reader would be refused");
         Check(readmeHtml.Split("<img ").Length == 2 && !readmeHtml.Contains("image?path=src", StringComparison.Ordinal),
             "only the admitted picture is an image; the hidden and climbing ones are downgraded to links");
+        Check(readmeHtml.Contains("<a href=\"/-/p/" + slug + "?file=docs/guide.md#guide\">the guide</a>", StringComparison.Ordinal),
+            "a readme link to a file the page offers opens it on the page, rendered");
+        Check(readmeHtml.Contains("<a href=\"/-/p/" + slug + "?file=docs/guide.md\">the raw guide</a>", StringComparison.Ordinal),
+            "and so does one written as the page's raw text address");
+        Check(readmeHtml.Contains("<a href=\"src/secret.cs\">a secret</a>", StringComparison.Ordinal),
+            "a link to a file the page does not offer is left as written");
         Check(json.RootElement.GetProperty("avatar_url").ValueKind == JsonValueKind.Null &&
             json.RootElement.GetProperty("banner_url").ValueKind == JsonValueKind.Null,
             "the page reports the project's avatar and banner, which this one has neither of");
@@ -692,6 +702,25 @@ async Task CheckProjectPages(string address, AuthenticatedIdentity alice, string
     foreach (string refused in new[] { "src/secret.cs", "docs/notes.txt", ".graft/project.json" })
         using (HttpResponseMessage denied = await PagesGet(address, null, "/api/graft/pages/" + slug + "/files/" + Uri.EscapeDataString(refused)))
             Check(denied.StatusCode == System.Net.HttpStatusCode.NotFound, "and refuses one it does not: " + refused);
+
+    // Markdown files, rendered through the page, under the same allowlist.
+    using (HttpResponseMessage rendered = await PagesGet(address, null, "/api/graft/pages/" + slug + "/markdown/" + Uri.EscapeDataString("docs/guide.md")))
+    {
+        Check(rendered.IsSuccessStatusCode, "a page renders a Markdown file its allowlist names (got " + (int)rendered.StatusCode + ")");
+        using JsonDocument json = JsonDocument.Parse(await rendered.Content.ReadAsStreamAsync());
+        string guideHtml = json.RootElement.GetProperty("html").GetString()!;
+        Check(guideHtml.Contains("<h1 id=\"guide\">Guide</h1>", StringComparison.Ordinal) &&
+            guideHtml.Contains("<a href=\"/-/p/" + slug + "?file=README.md\">home</a>", StringComparison.Ordinal) &&
+            guideHtml.Contains("/api/graft/pages/" + slug + "/image?path=docs%2Fpixel.png", StringComparison.Ordinal),
+            "with its links and pictures resolved from its own folder onto the page");
+    }
+    foreach ((string refused, System.Net.HttpStatusCode status) in new[]
+    {
+        ("docs/missing.md", System.Net.HttpStatusCode.NotFound), ("src/secret.cs", System.Net.HttpStatusCode.UnsupportedMediaType),
+        ("docs/notes.txt", System.Net.HttpStatusCode.UnsupportedMediaType)
+    })
+        using (HttpResponseMessage denied = await PagesGet(address, null, "/api/graft/pages/" + slug + "/markdown/" + Uri.EscapeDataString(refused)))
+            Check(denied.StatusCode == status, "and renders nothing else: " + refused + " (got " + (int)denied.StatusCode + ")");
 
     // Pictures, through the page: an allowlisted file that proves to be a raster image, to a reader with no
     // account, and nothing else.
@@ -2918,6 +2947,8 @@ static string ReadmeCorpus() => """
     ### Links and images
 
     [a relative document](docs/guide.md)
+    [a relative folder](docs)
+    [a relative path to nothing](docs/missing.md)
     [an external page](https://example.com/page)
     [an electronic mail address](mailto:someone@example.invalid)
     [an in-document anchor](#ordinary-markdown-that-must-still-render)
@@ -3052,6 +3083,30 @@ async Task CheckReadmeRendering(string address, string username, string password
         "an autolink is treated as strictly as a written link");
     Check(html.Contains("alt=\"an alt text containing onerror=alert(1)\"", StringComparison.Ordinal),
         "text that resembles an attack is kept as text instead of degrading the document");
+
+    // A link to another file or folder opens it in the repository view on the same branch, rather than being
+    // left for the browser to resolve against the site root; a link to nothing is left as written.
+    Check(Regex.IsMatch(html, "<a href=\"/[^\"?]+\\?ref=readme-corpus&amp;file=docs/guide.md\">a relative document</a>"),
+        "a relative link to a document opens it in the repository view, in this tab");
+    Check(Regex.IsMatch(html, "<a href=\"/[^\"?]+\\?ref=readme-corpus&amp;path=docs\">a relative folder</a>"),
+        "and one to a folder opens the folder");
+    Check(html.Contains("<a href=\"docs/missing.md\">", StringComparison.Ordinal), "and one to nothing is left as written");
+    using (HttpResponseMessage document = await client.GetAsync($"/api/browser/projects/{projectId}?ref=readme-corpus&file=docs%2Fguide.md"))
+    {
+        Check(document.IsSuccessStatusCode, "a Markdown file opens in the repository view");
+        using JsonDocument json = JsonDocument.Parse(await document.Content.ReadAsStreamAsync());
+        string rendered = json.RootElement.GetProperty("file_markdown").GetProperty("html").GetString()!;
+        Check(rendered.Contains("<h1 id=\"guide\">Guide</h1>", StringComparison.Ordinal), "and is rendered rather than shown as source");
+        Check(rendered.Contains("?ref=readme-corpus&amp;file=README.md#rendering-corpus\"", StringComparison.Ordinal),
+            "its links resolve from its own folder and keep their anchor");
+        Check(rendered.Contains("/image?ref=readme-corpus&amp;path=docs%2Fpixel.png", StringComparison.Ordinal),
+            "and so do its pictures");
+    }
+    using (HttpResponseMessage picture = await client.GetAsync($"/api/browser/projects/{projectId}?ref=readme-corpus&file=docs%2Fpixel.png"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await picture.Content.ReadAsStreamAsync());
+        Check(json.RootElement.GetProperty("file_markdown").ValueKind == JsonValueKind.Null, "a file that is not Markdown is not rendered");
+    }
 
     // The images a README points at come back through a route of its own, which identifies them by structure.
     string imageRoute = $"/api/graft/projects/{projectId}/image?ref=readme-corpus&path=";

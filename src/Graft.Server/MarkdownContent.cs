@@ -60,9 +60,10 @@ public static partial class MarkdownContent
     /// <summary>
     /// Renders markdown to HTML. <paramref name="resolveImage"/> maps a repository-relative path to a URL
     /// this server will serve, and returns null when the path cannot be resolved; an image it cannot resolve,
-    /// or one pointing off-site, is downgraded to a link rather than fetched.
+    /// or one pointing off-site, is downgraded to a link rather than fetched. <paramref name="resolveLink"/>
+    /// maps a link destination to the address of a page that shows it, and returns null to leave it as written.
     /// </summary>
-    public static RenderedMarkdown Render(string source, Func<string, string?> resolveImage)
+    public static RenderedMarkdown Render(string source, Func<string, string?> resolveImage, Func<string, string?>? resolveLink = null)
     {
         ArgumentNullException.ThrowIfNull(source);
         ArgumentNullException.ThrowIfNull(resolveImage);
@@ -71,7 +72,7 @@ public static partial class MarkdownContent
         foreach (LinkInline link in document.Descendants<LinkInline>())
         {
             if (link.IsImage) RewriteImage(link, resolveImage);
-            else RewriteLink(link);
+            else ResolveLink(link, resolveLink);
         }
 
         // Angle-bracket autolinks are a separate node type, not a LinkInline, so they need handling of their
@@ -112,6 +113,26 @@ public static partial class MarkdownContent
         if (image.FirstChild is null) image.AppendChild(new LiteralInline(original ?? "image"));
         image.GetAttributes().AddClass("external-image");
         RewriteLink(image);
+    }
+
+    /// <summary>
+    /// Sends a link at a document in the repository to the page that renders it, keeping any fragment, rather
+    /// than leaving the browser to resolve it against this site's root. The resolver's answer is built by the
+    /// server, never copied from the document, so it is trusted as an in-site address.
+    /// </summary>
+    private static void ResolveLink(LinkInline link, Func<string, string?>? resolveLink)
+    {
+        if (resolveLink is not null && IsSafeScheme(link.Url) && !link.Url!.StartsWith('#'))
+        {
+            int hash = link.Url.IndexOf('#');
+            string? resolved = resolveLink(hash < 0 ? link.Url : link.Url[..hash]);
+            if (resolved is not null)
+            {
+                link.Url = resolved + (hash < 0 ? "" : link.Url[hash..]);
+                return;
+            }
+        }
+        RewriteLink(link);
     }
 
     /// <summary>

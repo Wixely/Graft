@@ -2435,7 +2435,15 @@ Func<HttpContext, ProjectDetails?, Task> browseProject = async (context, details
         FileResponse? fileResponse = file is null ? null : FileResponseFor(file, revision);
         // The README is rendered for the root of the branch being viewed, so switching branch shows that
         // branch's README. Only the root is considered; a README deeper in the tree is an ordinary file.
-        ReadmeResponse? readme = path.Length == 0 ? ReadmeFor(context, details, repository, revision) : null;
+        // Links inside rendered Markdown stay on whichever route the reader arrived by, as the page's own
+        // links do, so a reader who came by the ownerless slug is not handed the owner's name.
+        string webBase = context.Request.RouteValues["globalSlug"] is string arrivedBySlug
+            ? "/projects/" + Uri.EscapeDataString(arrivedBySlug)
+            : new Uri(ProjectWebUrl(context, details)).AbsolutePath;
+        ReadmeResponse? readme = path.Length == 0 ? ReadmeFor(context, details, repository, revision, webBase) : null;
+        ReadmeResponse? fileMarkdown = file is not null && IsMarkdownPath(file.Path)
+            ? MarkdownFor(context, details, repository, revision, file, webBase)
+            : null;
         // Reported separately from pushing because it is a weaker permission: a Reporter may comment and
         // open an issue without being able to push, so a page that gated its comment box on CanPush would
         // hide it from exactly the people it is for.
@@ -2446,7 +2454,7 @@ Func<HttpContext, ProjectDetails?, Task> browseProject = async (context, details
         RepositoryPageResponse response = new(project, manage.Allowed, push.Allowed, branches, commits, entries,
             fileResponse, readme, details.Project.PagePublished, settings.PublicBrowsing, participate.Allowed,
             approvalsRequired, manage.Allowed && await store.GetRequireCodeOwnerApprovalAsync(projectId, context.RequestAborted),
-            await BannerUrl(context, projectId));
+            await BannerUrl(context, projectId), fileMarkdown);
         await context.Response.WriteAsJsonAsync(response, ApiJson.Default.RepositoryPageResponse, null, context.RequestAborted);
     });
 };
@@ -2492,25 +2500,7 @@ app.MapGet("/api/graft/pages/{globalSlug}", async context =>
             GitFile? file;
             try { file = RepositoryView.File(repository, "HEAD", page.Readme); }
             catch (GitInputException) { file = null; }
-            if (file is not null && file.Content.Length > 0 && file.Content.Length <= MarkdownContent.MaximumBytes)
-            {
-                string? source = null;
-                try { source = new UTF8Encoding(false, true).GetString(file.Content); }
-                catch (DecoderFallbackException) { }
-                if (source is not null)
-                {
-                    // Pictures resolve to the page's own image route, never the repository's: a page reader may
-                    // not browse the repository, so the repository route would refuse every one of them. An
-                    // image the allowlist does not admit is downgraded to a link by the renderer, as an
-                    // off-site one is, so the readme says what it referenced rather than showing a broken icon.
-                    string baseUrl = Origin(context) + "/api/graft/pages/" + Uri.EscapeDataString(details.Project.GlobalSlug) + "/image";
-                    RenderedMarkdown rendered = MarkdownContent.Render(source, reference =>
-                        PageImagePath(file.Path, reference) is string target && PageConfiguration.AllowsFile(page, target)
-                            ? baseUrl + "?path=" + Uri.EscapeDataString(target)
-                            : null);
-                    readme = new(file.Path, rendered.Html, rendered.HasDiagrams);
-                }
-            }
+            if (file is not null) readme = PageMarkdownFor(context, details.Project.GlobalSlug, page, file);
         }
 
         // The listing is produced by asking the allowlist about each path the repository actually holds,
@@ -2731,6 +2721,39 @@ app.MapGet("/api/graft/pages/{globalSlug}/files/{**filePath}", async context =>
 
         context.Response.ContentType = "text/plain; charset=utf-8";
         await context.Response.WriteAsync(text, context.RequestAborted);
+    });
+});
+
+// One Markdown file a published page offers, rendered under the readme's rules. The allowlist is asked first,
+// exactly as for the text route, so this shows nothing that route would refuse.
+app.MapGet("/api/graft/pages/{globalSlug}/markdown/{**filePath}", async context =>
+{
+    if (!await OnlyQuery(context)) return;
+    ProjectInfo? found = await store.FindReadyProjectByGlobalSlugAsync(
+        context.Request.RouteValues["globalSlug"]?.ToString() ?? "", context.RequestAborted);
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: false);
+    if (found is null || !(await DecideFor(context, browser?.Identity, found.Id, ProjectAction.ReadPage)).Allowed)
+    { await ApiError(context, 404, "page"); return; }
+
+    string filePath = context.Request.RouteValues["filePath"]?.ToString() ?? "";
+    try { filePath = Uri.UnescapeDataString(filePath); }
+    catch (UriFormatException) { await ApiError(context, 404, "file"); return; }
+    if (!IsMarkdownPath(filePath)) { await ApiError(context, 415, "that file is not Markdown"); return; }
+
+    await WithRepository(EndpointFor(found), context, async repository =>
+    {
+        PageConfigurationResult config = PageConfiguration.Read(ReadRepositoryFile(repository, PageConfiguration.Path));
+        if (!config.Ok || !PageConfiguration.AllowsFile(config.Settings!, filePath))
+        { await ApiError(context, 404, "file"); return; }
+
+        GitFile? file;
+        try { file = RepositoryView.File(repository, "HEAD", PathMatcher.Normalize(filePath)); }
+        catch (GitInputException) { file = null; }
+        if (file is null) { await ApiError(context, 404, "file"); return; }
+
+        ReadmeResponse? rendered = PageMarkdownFor(context, found.GlobalSlug, config.Settings!, file);
+        if (rendered is null) { await ApiError(context, 415, "that file cannot be rendered"); return; }
+        await context.Response.WriteAsJsonAsync(rendered, ApiJson.Default.ReadmeResponse, null, context.RequestAborted);
     });
 });
 
@@ -9980,7 +10003,7 @@ async Task<ProjectPermissionsResponse?> PermissionsFor(HttpContext context, Proj
 /// route for the same revision, so a README shows the pictures that were committed beside it and nothing
 /// else; anything off-site is downgraded by the renderer rather than fetched.
 /// </summary>
-ReadmeResponse? ReadmeFor(HttpContext context, ProjectDetails details, Repository repository, string revision)
+ReadmeResponse? ReadmeFor(HttpContext context, ProjectDetails details, Repository repository, string revision, string webBase)
 {
     foreach (string name in MarkdownContent.Names)
     {
@@ -9988,18 +10011,64 @@ ReadmeResponse? ReadmeFor(HttpContext context, ProjectDetails details, Repositor
         try { file = RepositoryView.File(repository, revision, name); }
         catch (GitInputException) { continue; }
         if (file is null || file.Content.Length == 0 || file.Content.Length > MarkdownContent.MaximumBytes) continue;
-
-        string source;
-        try { source = new UTF8Encoding(false, true).GetString(file.Content); }
-        catch (DecoderFallbackException) { return null; }
-
-        string baseUrl = Origin(context) + "/api/graft/projects/" +
-            details.Project.Id.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/image";
-        RenderedMarkdown rendered = MarkdownContent.Render(source, path =>
-            baseUrl + "?ref=" + Uri.EscapeDataString(revision) + "&path=" + Uri.EscapeDataString(path));
-        return new(file.Path, rendered.Html, rendered.HasDiagrams);
+        return MarkdownFor(context, details, repository, revision, file, webBase);
     }
     return null;
+}
+
+/// <summary>
+/// Renders a Markdown file from a revision. Pictures and links are read relative to the file's own folder:
+/// a picture resolves to the repository image route, and a link to another file or folder opens it in the
+/// repository view at <paramref name="webBase"/> on the same revision. A link to nothing that exists is left
+/// as written. Null when the file is not UTF-8 or is too large to render.
+/// </summary>
+ReadmeResponse? MarkdownFor(HttpContext context, ProjectDetails details, Repository repository, string revision, GitFile file, string webBase)
+{
+    if (file.Content.Length == 0 || file.Content.Length > MarkdownContent.MaximumBytes) return null;
+    string source;
+    try { source = new UTF8Encoding(false, true).GetString(file.Content); }
+    catch (DecoderFallbackException) { return null; }
+
+    string imageBase = Origin(context) + "/api/graft/projects/" +
+        details.Project.Id.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/image";
+    string reference = revision == "HEAD" ? "" : "ref=" + Uri.EscapeDataString(revision) + "&";
+    RenderedMarkdown rendered = MarkdownContent.Render(source,
+        image => DocumentLinkPath(file.Path, image) is string target
+            ? imageBase + "?ref=" + Uri.EscapeDataString(revision) + "&path=" + Uri.EscapeDataString(target)
+            : null,
+        link =>
+        {
+            if (DocumentLinkPath(file.Path, link) is not string target) return null;
+            try
+            {
+                if (RepositoryView.File(repository, revision, target) is not null)
+                    return webBase + "?" + reference + "file=" + QueryPath(target);
+                if (RepositoryView.Tree(repository, revision, target) is not null)
+                    return webBase + "?" + reference + "path=" + QueryPath(target);
+            }
+            catch (GitInputException) { }
+            return null;
+        });
+    return new(file.Path, rendered.Html, rendered.HasDiagrams);
+}
+
+static bool IsMarkdownPath(string path) =>
+    path.EndsWith(".md", StringComparison.OrdinalIgnoreCase) || path.EndsWith(".markdown", StringComparison.OrdinalIgnoreCase);
+
+/// <summary>A repository path as a query value, with its slashes left readable.</summary>
+static string QueryPath(string path) => string.Join('/', path.Split('/').Select(Uri.EscapeDataString));
+
+/// <summary>
+/// The repository path a link in a document names, when it is a relative path: no scheme, no leading slash
+/// and not an in-document anchor. Read relative to the document's folder, as <see cref="PageImagePath"/> does.
+/// </summary>
+static string? DocumentLinkPath(string documentPath, string reference)
+{
+    if (reference.Length == 0 || reference[0] is '/' or '#' or '?') return null;
+    int colon = reference.IndexOf(':');
+    int slash = reference.IndexOf('/');
+    if (colon >= 0 && (slash < 0 || colon < slash)) return null;
+    return PageImagePath(documentPath, reference);
 }
 
 /// <summary>The header a unified diff prints above a hunk. A range of one line omits its count, and a range
@@ -10161,6 +10230,44 @@ static async Task PagesMiss(HttpContext context, string message)
     context.Response.StatusCode = StatusCodes.Status404NotFound;
     context.Response.ContentType = "text/plain; charset=utf-8";
     await context.Response.WriteAsync(message, context.RequestAborted);
+}
+
+/// <summary>
+/// Renders a Markdown file a published page offers. Pictures resolve to the page's own image route, never the
+/// repository's: a page reader may not browse the repository, so that route would refuse every one of them.
+/// An image the allowlist does not admit is downgraded to a link by the renderer, as an off-site one is. Links
+/// to files the allowlist admits open on the page itself, including links written as the page's own raw text
+/// address, so a reader is shown the document rather than its source.
+/// </summary>
+static ReadmeResponse? PageMarkdownFor(HttpContext context, string globalSlug, PageSettings page, GitFile file)
+{
+    if (file.Content.Length == 0 || file.Content.Length > MarkdownContent.MaximumBytes) return null;
+    string source;
+    try { source = new UTF8Encoding(false, true).GetString(file.Content); }
+    catch (DecoderFallbackException) { return null; }
+
+    string slug = Uri.EscapeDataString(globalSlug);
+    string imageBase = Origin(context) + "/api/graft/pages/" + slug + "/image";
+    string filesRoute = "/api/graft/pages/" + slug + "/files/";
+    RenderedMarkdown rendered = MarkdownContent.Render(source,
+        reference => PageImagePath(file.Path, reference) is string target && PageConfiguration.AllowsFile(page, target)
+            ? imageBase + "?path=" + Uri.EscapeDataString(target)
+            : null,
+        link =>
+        {
+            string? target;
+            string local = link.StartsWith(Origin(context) + "/", StringComparison.OrdinalIgnoreCase) ? link[Origin(context).Length..] : link;
+            if (local.StartsWith(filesRoute, StringComparison.Ordinal))
+            {
+                int query = local.IndexOf('?');
+                target = PageImagePath("", query < 0 ? local[filesRoute.Length..] : local[filesRoute.Length..query]);
+            }
+            else target = DocumentLinkPath(file.Path, link);
+            return target is not null && PageConfiguration.AllowsFile(page, target)
+                ? "/-/p/" + slug + "?file=" + QueryPath(target)
+                : null;
+        });
+    return new(file.Path, rendered.Html, rendered.HasDiagrams);
 }
 
 /// <summary>

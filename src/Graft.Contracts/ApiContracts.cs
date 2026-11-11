@@ -500,7 +500,9 @@ public sealed record RepositoryPageResponse(
     [property: JsonPropertyName("approvals_required")] int ApprovalsRequired = 0,
     [property: JsonPropertyName("require_code_owner_approval")] bool RequireCodeOwnerApproval = false,
     /// <summary>The project's banner, drawn behind its title and tab bar, or null when it has none (ADR 0046).</summary>
-    [property: JsonPropertyName("banner_url")] string? BannerUrl = null);
+    [property: JsonPropertyName("banner_url")] string? BannerUrl = null,
+    /// <summary>The open file rendered, when it is Markdown and small enough, under the README's rules.</summary>
+    [property: JsonPropertyName("file_markdown")] ReadmeResponse? FileMarkdown = null);
 
 public sealed record VisibilityRequest(string? Visibility);
 public sealed record PagePublishRequest(bool Published);

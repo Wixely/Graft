@@ -155,6 +155,12 @@ git push -u origin main</pre>
                     <strong class="mono">@repo.File.FilePath</strong>
                     <span class="spacer"></span>
                     <span class="label">@repo.File.Size bytes</span>
+                    @if (repo.FileMarkdown is not null)
+                    {
+                        <button type="button" class="secondary" aria-pressed="@(showSource ? "true" : "false")" @onclick="() => showSource = !showSource">
+                            @(showSource ? "Rendered" : "Source")
+                        </button>
+                    }
                     @* The only way to get a binary file out of Graft short of cloning, and the only way to
                        get an exact copy of a text one. *@
                     <a class="button secondary" href="@RawUrl(repo.File.FilePath)" download>
@@ -170,7 +176,12 @@ git push -u origin main</pre>
                         </button>
                     }
                 </div>
-                @if (fileText is null)
+                @if (repo.FileMarkdown is not null && !showSource)
+                {
+                    @* The server's renderer, under the same rules as the README above. *@
+                    <div class="panel-body markdown">@((MarkupString)repo.FileMarkdown.Html)</div>
+                }
+                else if (fileText is null)
                 {
                     <p class="panel-empty">Binary file. Graft does not render its contents.</p>
                 }
@@ -755,6 +766,15 @@ git push -u origin main</pre>
     private string path = "";
     private string filePath = "";
     private string? fileText;
+    private bool showSource;
+
+    /// <summary>The branch, folder and file a link asked for. Kept in the address as the reader moves, so a
+    /// rendered document can link to another and Back returns to where the reader was.</summary>
+    [SupplyParameterFromQuery(Name = "ref")] public string? RefQuery { get; set; }
+    [SupplyParameterFromQuery(Name = "path")] public string? PathQuery { get; set; }
+    [SupplyParameterFromQuery(Name = "file")] public string? FileQuery { get; set; }
+    private string? appliedLocation;
+    private string? loadedProject;
     private string message = "";
     private string messageKind = "info";
     private string memberUsername = "";
@@ -867,10 +887,8 @@ git push -u origin main</pre>
             if (!result.Ok) return;
             staged.Clear();
             commitMessage = "";
-            path = "";
-            filePath = "";
             tab = "code";
-            await Load();
+            await Go("", "");
         }
         finally { committing = false; }
     }
@@ -882,13 +900,34 @@ git push -u origin main</pre>
     /// </summary>
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        if (repo?.Readme?.HasDiagrams != true) return;
+        if (repo?.Readme?.HasDiagrams != true && repo?.FileMarkdown?.HasDiagrams != true) return;
         try { await JS.InvokeVoidAsync("graftMarkdown.render"); }
         catch (JSException) { }
     }
 
     protected override async Task OnParametersSetAsync()
     {
+        string location = (RefQuery ?? "") + "\n" + (PathQuery ?? "") + "\n" + (FileQuery ?? "");
+        bool moved = location != appliedLocation;
+        if (moved)
+        {
+            appliedLocation = location;
+            branch = RefQuery ?? "";
+            filePath = FileQuery ?? "";
+            path = filePath.Length > 0 ? Folder(filePath) : PathQuery ?? "";
+            showSource = false;
+        }
+
+        // Moving within a project that is already on screen reloads the view without blanking the page.
+        string project = Namespace + "/" + Slug;
+        if (project == loadedProject && repo is not null)
+        {
+            if (moved) await Load();
+            await ApplyTabQuery();
+            return;
+        }
+        loadedProject = project;
+
         loading = true;
         try
         {
@@ -1025,9 +1064,7 @@ git push -u origin main</pre>
     {
         if (repo is null) return;
         branch = args.Value?.ToString() ?? "";
-        path = "";
-        filePath = "";
-        await Load();
+        await Go("", "");
     }
 
     /// <summary>
@@ -1109,17 +1146,35 @@ git push -u origin main</pre>
 
     private async Task Open(TreeEntryResponse entry)
     {
-        if (entry.Type == "tree") { path = entry.Path; filePath = ""; }
-        else { filePath = entry.Path; }
+        if (entry.Type == "tree") await Go(entry.Path, "");
+        else await Go(path, entry.Path);
+    }
+
+    private Task Navigate(string target) => Go(target, "");
+
+    /// <summary>
+    /// Shows a folder or file and records it in the address. The location is marked applied before navigating,
+    /// so the parameter change that follows does not load it a second time.
+    /// </summary>
+    private async Task Go(string newPath, string newFile)
+    {
+        path = newPath;
+        filePath = newFile;
+        showSource = false;
+        string query = string.Join("&", new[]
+        {
+            branch.Length > 0 ? "ref=" + Uri.EscapeDataString(branch) : "",
+            newFile.Length == 0 && newPath.Length > 0 ? "path=" + QueryPath(newPath) : "",
+            newFile.Length > 0 ? "file=" + QueryPath(newFile) : ""
+        }.Where(part => part.Length > 0));
+        appliedLocation = branch + "\n" + (newFile.Length == 0 ? newPath : "") + "\n" + newFile;
+        Navigation.NavigateTo(ProjectBase + (query.Length > 0 ? "?" + query : ""));
         if (repo is not null) await Load();
     }
 
-    private async Task Navigate(string target)
-    {
-        path = target;
-        filePath = "";
-        if (repo is not null) await Load();
-    }
+    private static string Folder(string file) => file.LastIndexOf('/') is var slash and > 0 ? file[..slash] : "";
+
+    private static string QueryPath(string value) => string.Join('/', value.Split('/').Select(Uri.EscapeDataString));
 
     private async Task Up()
     {
@@ -1287,11 +1342,7 @@ git push -u origin main</pre>
                 $"{file} deleted from {Branch}.");
             Report(result);
             pendingFile = null;
-            if (result.Ok)
-            {
-                filePath = "";
-                await Load();
-            }
+            if (result.Ok) await Go(path, "");
         }
         finally { busy = false; }
     }
