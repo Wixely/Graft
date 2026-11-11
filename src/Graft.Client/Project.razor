@@ -604,6 +604,48 @@ git push -u origin main</pre>
             </div>
         }
 
+        @* Only where Git over SSH is on: a deploy key is an SSH key, and without the listener there is nothing it opens. *@
+        @if (repo.Project.SshUrlToRepo is not null)
+        {
+            <div class="panel">
+                <div class="panel-header"><Icon Name="lock" /><h2>Deploy keys</h2><span class="spacer"></span><span class="label">@deployKeys.Length</span></div>
+                <div class="panel-body">
+                    <p class="secondary-text">
+                        A key for a machine rather than a person, such as a build or deployment server. It opens this project's
+                        repository over SSH and nothing else, belongs to no account, and reads only unless you let it push.
+                    </p>
+                    <form class="form" @onsubmit="AddDeployKey" @onsubmit:preventDefault>
+                        <label for="deploy-key-title">Title</label>
+                        <input id="deploy-key-title" @bind="deployKeyTitle" maxlength="100" autocomplete="off" placeholder="build server" />
+                        <label for="deploy-key">Public key</label>
+                        <textarea id="deploy-key" @bind="deployKeyText" rows="3" autocomplete="off" placeholder="ssh-ed25519 AAAA… build@example"></textarea>
+                        <label class="checkbox"><input type="checkbox" @bind="deployKeyCanPush" /> Allow this key to push</label>
+                        <div class="form-actions">
+                            <button type="submit" disabled="@busy">Add deploy key</button>
+                        </div>
+                    </form>
+                </div>
+                @if (deployKeys.Length > 0)
+                {
+                    <div class="list">
+                        @foreach (DeployKeyResponse key in deployKeys)
+                        {
+                            <div class="list-item">
+                                <span class="list-item-main">
+                                    <strong>@key.Title <span class="label @(key.CanPush ? "warning" : "")">@(key.CanPush ? "read and push" : "read only")</span></strong>
+                                    <small><code>@key.Fingerprint</code> &middot; @(key.LastUsedAt is DateTimeOffset used ? "last used " + used.ToLocalTime().ToString("yyyy-MM-dd") : "never used")</small>
+                                </span>
+                                <span class="list-item-actions">
+                                    <button type="button" class="secondary" @onclick="() => SetDeployKeyPush(key, !key.CanPush)" disabled="@busy">@(key.CanPush ? "Make read only" : "Allow push")</button>
+                                    <button type="button" class="secondary" @onclick="() => RemoveDeployKey(key)" disabled="@busy">Remove</button>
+                                </span>
+                            </div>
+                        }
+                    </div>
+                }
+            </div>
+        }
+
         <div class="panel">
             <div class="panel-header"><Icon Name="repository" /><h2>Project avatar</h2></div>
             <div class="panel-body">
@@ -985,6 +1027,7 @@ git push -u origin main</pre>
         {
             await LoadMembers(repo.Project.Id);
             await LoadHooks();
+            await LoadDeployKeys();
         }
     }
 
@@ -1395,6 +1438,67 @@ git push -u origin main</pre>
             if (!result.Ok) return;
             hookUrl = "";
             await LoadHooks();
+        }
+        finally { busy = false; }
+    }
+
+    private DeployKeyResponse[] deployKeys = [];
+    private string deployKeyTitle = "";
+    private string deployKeyText = "";
+    private bool deployKeyCanPush;
+
+    private async Task LoadDeployKeys()
+    {
+        if (repo is null || repo.Project.SshUrlToRepo is null || !repo.CanManage) return;
+        deployKeys = await Api.GetAsync($"api/projects/{repo.Project.Id}/deploy-keys", ApiJson.Default.DeployKeyResponseArray) ?? [];
+    }
+
+    private async Task AddDeployKey()
+    {
+        if (busy || repo is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/projects/{repo.Project.Id}/deploy-keys",
+                new DeployKeyCreateRequest(deployKeyTitle.Trim(), deployKeyText.Trim(), deployKeyCanPush, null),
+                ApiJson.Default.DeployKeyCreateRequest, deployKeyCanPush ? "Deploy key added; it may push." : "Deploy key added, read only.");
+            Report(result);
+            if (!result.Ok) return;
+            deployKeyTitle = "";
+            deployKeyText = "";
+            deployKeyCanPush = false;
+            await LoadDeployKeys();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task SetDeployKeyPush(DeployKeyResponse key, bool canPush)
+    {
+        if (busy || repo is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/projects/{repo.Project.Id}/deploy-keys/{key.Id}",
+                new DeployKeyUpdateRequest(null, canPush), ApiJson.Default.DeployKeyUpdateRequest,
+                canPush ? key.Title + " may now push." : key.Title + " is read only now.");
+            Report(result);
+            if (result.Ok) await LoadDeployKeys();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task RemoveDeployKey(DeployKeyResponse key)
+    {
+        if (busy || repo is null) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.DeleteAsync($"api/projects/{repo.Project.Id}/deploy-keys/{key.Id}", key.Title + " removed.");
+            Report(result);
+            if (result.Ok) await LoadDeployKeys();
         }
         finally { busy = false; }
     }

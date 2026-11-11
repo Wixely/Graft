@@ -1,0 +1,54 @@
+@inject GraftApi Api
+
+@* Muting an issue or proposal, or the whole project it is in (ADR 0050). Muted, the reader stops hearing about
+   comments, approvals, merges, closes and reopens there; being assigned, asked to review or mentioned still
+   arrives, which the title on each button says. Shown only to a signed-in reader, since a mute is a person's. *@
+
+@if (Api.Authenticated && state is not null)
+{
+    <button type="button" class="secondary" aria-pressed="@(state.ThreadMuted ? "true" : "false")" disabled="@busy" @onclick="ToggleThread"
+            title="@(state.ThreadMuted ? "You hear about this again as a participant." : "Stop hearing about this as a participant. Being assigned, asked to review or mentioned still arrives.")">
+        <Icon Name="bell" />@(state.ThreadMuted ? "Unmute this " + Noun : "Mute this " + Noun)
+    </button>
+    <button type="button" class="secondary" aria-pressed="@(state.ProjectMuted ? "true" : "false")" disabled="@busy" @onclick="ToggleProject"
+            title="@(state.ProjectMuted ? "You hear about this project again as a participant." : "Stop hearing about anything in this project as a participant. Being assigned, asked to review or mentioned still arrives.")">
+        @(state.ProjectMuted ? "Unmute project" : "Mute project")
+    </button>
+}
+
+@code {
+    [Parameter] public long ProjectId { get; set; }
+    /// <summary><c>issue</c> or <c>merge_request</c>.</summary>
+    [Parameter] public string Subject { get; set; } = "issue";
+    [Parameter] public long Iid { get; set; }
+
+    private MuteStateResponse? state;
+    private bool busy;
+    private string? loadedFor;
+
+    private string Noun => Subject == "issue" ? "issue" : "proposal";
+
+    protected override async Task OnParametersSetAsync()
+    {
+        string key = ProjectId + "/" + Subject + "/" + Iid;
+        if (key == loadedFor || ProjectId == 0 || !Api.Authenticated) return;
+        loadedFor = key;
+        state = await Api.GetAsync($"api/projects/{ProjectId}/mute?subject={Subject}&iid={Iid}", ApiJson.Default.MuteStateResponse);
+    }
+
+    private Task ToggleThread() => Set($"api/projects/{ProjectId}/{(Subject == "issue" ? "issues" : "merge-requests")}/{Iid}/mute", !(state?.ThreadMuted ?? false));
+
+    private Task ToggleProject() => Set($"api/projects/{ProjectId}/mute", !(state?.ProjectMuted ?? false));
+
+    private async Task Set(string path, bool muted)
+    {
+        if (busy) return;
+        busy = true;
+        try
+        {
+            await Api.PostAsync(path, new MuteRequest(muted), ApiJson.Default.MuteRequest, muted ? "Muted." : "Unmuted.");
+            state = await Api.GetAsync($"api/projects/{ProjectId}/mute?subject={Subject}&iid={Iid}", ApiJson.Default.MuteStateResponse);
+        }
+        finally { busy = false; }
+    }
+}

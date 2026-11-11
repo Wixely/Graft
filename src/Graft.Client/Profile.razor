@@ -269,17 +269,28 @@ else if (Api.Authenticated)
             <div class="panel-header"><h2>Notifications by email</h2></div>
             <div class="panel-body">
                 <p class="secondary-text">
-                    Your <a href="/-/notifications">inbox</a> always has everything that concerns you. This sends a message
-                    for each entry as well, to the address above.
+                    Your <a href="/-/notifications">inbox</a> always has everything that concerns you. Email is a copy of it,
+                    sent to the address above, either as each entry arrives or as one digest that lists what you have not read.
                     @if (Api.Session?.MailAvailable != true)
                     {
                         <span>This server does not send email, so the choice is kept for a server that does.</span>
                     }
                 </p>
-                <label class="checkbox">
-                    <input type="checkbox" checked="@(Api.Session?.NotifyByEmail == true)" @onchange="ToggleNotifyByEmail" disabled="@busy" />
-                    Email me each notification
-                </label>
+                <fieldset class="choice-group">
+                    <legend class="visually-hidden">Email</legend>
+                    <label class="checkbox">
+                        <input type="radio" name="email-mode" checked="@(EmailMode == "off")" @onchange='() => SetEmailMode("off")' disabled="@busy" />
+                        No email
+                    </label>
+                    <label class="checkbox">
+                        <input type="radio" name="email-mode" checked="@(EmailMode == "each")" @onchange='() => SetEmailMode("each")' disabled="@busy" />
+                        Email me each notification
+                    </label>
+                    <label class="checkbox">
+                        <input type="radio" name="email-mode" checked="@(EmailMode == "digest")" @onchange='() => SetEmailMode("digest")' disabled="@busy" />
+                        Email me a digest of what I have not read
+                    </label>
+                </fieldset>
             </div>
         </div>
     }
@@ -509,16 +520,22 @@ else if (Api.Authenticated)
         finally { busy = false; }
     }
 
-    private async Task ToggleNotifyByEmail(ChangeEventArgs change)
+    private string EmailMode => Api.Session?.NotifyByEmail != true ? "off" : Api.Session.EmailDigest ? "digest" : "each";
+
+    private async Task SetEmailMode(string mode)
     {
         if (busy) return;
         busy = true;
         message = "";
         try
         {
-            bool enabled = change.Value is bool value && value;
-            Report(await Api.PostAsync("api/notifications/email", new NotifyByEmailRequest(enabled), ApiJson.Default.NotifyByEmailRequest,
-                enabled ? "You will get a message for each notification." : "No more messages; the inbox stays."));
+            Report(await Api.PostAsync("api/notifications/email", new NotifyByEmailRequest(mode != "off", mode == "digest"), ApiJson.Default.NotifyByEmailRequest,
+                mode switch
+                {
+                    "each" => "You will get a message for each notification.",
+                    "digest" => "You will get a digest of what you have not read.",
+                    _ => "No more messages; the inbox stays."
+                }));
             await Api.RefreshSessionAsync();
         }
         finally { busy = false; }

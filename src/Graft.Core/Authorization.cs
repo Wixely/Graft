@@ -360,6 +360,22 @@ public sealed record SshKeyInfo(
     DateTimeOffset? ExpiresAtUtc,
     DateTimeOffset? LastUsedAtUtc);
 
+/// <summary>An SSH key one project admits, belonging to no account (ADR 0049).</summary>
+public sealed record DeployKeyInfo(
+    long Id,
+    long ProjectId,
+    string Title,
+    string Type,
+    string Key,
+    string Fingerprint,
+    bool CanPush,
+    DateTimeOffset CreatedAtUtc,
+    DateTimeOffset? ExpiresAtUtc,
+    DateTimeOffset? LastUsedAtUtc);
+
+/// <summary>What a deploy key may do to one project, and the person its pushes are attributed to.</summary>
+public sealed record DeployKeyGrant(long KeyId, long ProjectId, bool CanPush, AuthenticatedIdentity AttributedTo);
+
 /// <summary>
 /// What a member of a group may do. The three project roles, and Owner, which belongs to groups alone: an
 /// Owner manages the group and acts as a Maintainer on its projects.

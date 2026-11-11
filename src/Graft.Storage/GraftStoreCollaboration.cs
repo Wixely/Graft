@@ -68,6 +68,8 @@ public sealed partial class GraftStore
             deliveries.AddRange(await NotifyAddedAsync(db, transaction, author.UserId, projectId, CommentSubject.Issue, id,
                 await ApplyPlanningAsync(db, transaction, projectId, CommentSubject.Issue, id, changes.Labels, changes.AddLabels,
                     changes.RemoveLabels, changes.MilestoneId, changes.Assignees, null, now), now));
+        deliveries.AddRange((await NotifyMentionsAsync(db, transaction, author.UserId, projectId, CommentSubject.Issue, id,
+            Mentions.Find(cleanDescription), PublicBrowsing, now, cancellationToken)).Deliveries);
         await AuditAsync(db, transaction, author.UserId, "open-issue", "issue",
             Reference(projectId, iid), changes?.Confidential == true ? "Confidential issue opened." : "Issue opened.", now);
         await transaction.CommitAsync(cancellationToken);
@@ -295,6 +297,9 @@ public sealed partial class GraftStore
             deliveries.AddRange(await NotifyAddedAsync(db, transaction, editor.UserId, projectId, CommentSubject.Issue, existing.Id,
                 await ApplyPlanningAsync(db, transaction, projectId, CommentSubject.Issue, existing.Id, changes.Labels, changes.AddLabels,
                     changes.RemoveLabels, changes.MilestoneId, changes.Assignees, null, now), now));
+        if (cleanDescription is not null)
+            deliveries.AddRange((await NotifyMentionsAsync(db, transaction, editor.UserId, projectId, CommentSubject.Issue, existing.Id,
+                Mentions.Added(existing.Description, cleanDescription), PublicBrowsing, now, cancellationToken)).Deliveries);
         if (nextState != existing.State)
         {
             await AuditAsync(db, transaction, editor.UserId, nextState == "closed" ? "close-issue" : "reopen-issue",
@@ -402,6 +407,8 @@ public sealed partial class GraftStore
             deliveries.AddRange(await NotifyAddedAsync(db, transaction, author.UserId, projectId, CommentSubject.MergeRequest, id,
                 await ApplyPlanningAsync(db, transaction, projectId, CommentSubject.MergeRequest, id, changes.Labels, changes.AddLabels,
                     changes.RemoveLabels, changes.MilestoneId, changes.Assignees, changes.Reviewers, now), now));
+        deliveries.AddRange((await NotifyMentionsAsync(db, transaction, author.UserId, projectId, CommentSubject.MergeRequest, id,
+            Mentions.Find(cleanDescription), PublicBrowsing, now, cancellationToken)).Deliveries);
         await AuditAsync(db, transaction, author.UserId, "open-merge-request", "merge_request",
             Reference(projectId, iid), $"Merge proposed from {source} into {target}.", now);
         await transaction.CommitAsync(cancellationToken);
@@ -606,6 +613,8 @@ public sealed partial class GraftStore
 
         string now = Now();
         string nextState = state is null ? existing.State : StateName(state)!;
+        string? previousDescription = cleanDescription is null ? null
+            : await db.QuerySingleAsync<string>("SELECT Description FROM MergeRequests WHERE Id = @Id;", new IdParameters(existing.Id), transaction);
         await db.ExecuteAsync("""
             UPDATE MergeRequests
             SET Title = COALESCE(@Title, Title),
@@ -622,6 +631,9 @@ public sealed partial class GraftStore
             deliveries.AddRange(await NotifyAddedAsync(db, transaction, editor.UserId, projectId, CommentSubject.MergeRequest, existing.Id,
                 await ApplyPlanningAsync(db, transaction, projectId, CommentSubject.MergeRequest, existing.Id, changes.Labels, changes.AddLabels,
                     changes.RemoveLabels, changes.MilestoneId, changes.Assignees, changes.Reviewers, now), now));
+        if (cleanDescription is not null)
+            deliveries.AddRange((await NotifyMentionsAsync(db, transaction, editor.UserId, projectId, CommentSubject.MergeRequest, existing.Id,
+                Mentions.Added(previousDescription, cleanDescription), PublicBrowsing, now, cancellationToken)).Deliveries);
         if (nextState != existing.State)
         {
             await AuditAsync(db, transaction, editor.UserId,
@@ -966,9 +978,11 @@ public sealed partial class GraftStore
             new TouchParameters(subjectId, now), transaction);
         // Everybody part of the conversation hears a new comment, except whoever just made it. The
         // participants are read after the insert, so the author of this comment is now one of them for
-        // the next comment and not for this one.
-        List<NotificationDelivery> deliveries = await NotifyAsync(db, transaction, author.UserId, projectId, subject, subjectId, "commented",
-            await ParticipantsAsync(db, transaction, subject, subjectId, author.UserId), now);
+        // the next comment and not for this one. Somebody the comment mentions hears it once, as a mention.
+        (List<NotificationDelivery> deliveries, HashSet<long> mentioned) = await NotifyMentionsAsync(db, transaction, author.UserId, projectId,
+            subject, subjectId, Mentions.Find(cleanBody), PublicBrowsing, now, cancellationToken);
+        deliveries.AddRange(await NotifyAsync(db, transaction, author.UserId, projectId, subject, subjectId, "commented",
+            (await ParticipantsAsync(db, transaction, subject, subjectId, author.UserId)).Where(id => !mentioned.Contains(id)), now));
         await transaction.CommitAsync(cancellationToken);
         await RaiseAsync(deliveries);
         return new(id, author.UserId, author.Username, cleanBody, Instant(now), path, line, side, anchorCommitSha,
@@ -1000,11 +1014,18 @@ public sealed partial class GraftStore
         await RequireEditorAsync(db, transaction, editor, projectId, existing.AuthorUserId, textChanged: true, cancellationToken);
 
         string now = Now();
+        CommentEditedRow before = await db.QuerySingleAsync<CommentEditedRow>("SELECT Body, SubjectType, SubjectId FROM Comments WHERE Id = @Id;",
+            new IdParameters(commentId), transaction);
         await db.ExecuteAsync("UPDATE Comments SET Body = @Body, EditedAtUtc = @Now WHERE Id = @Id;",
             new CommentEditParameters(commentId, cleanBody, now), transaction);
         await AuditAsync(db, transaction, editor.UserId, "edit-comment", "comment",
             commentId.ToString(CultureInfo.InvariantCulture), "Comment edited.", now);
+        // Only a name the edit added is a new mention; the people the comment already named heard it the first time.
+        List<NotificationDelivery> deliveries = (await NotifyMentionsAsync(db, transaction, editor.UserId, projectId,
+            before.SubjectType == "issue" ? CommentSubject.Issue : CommentSubject.MergeRequest, before.SubjectId,
+            Mentions.Added(before.Body, cleanBody), PublicBrowsing, now, cancellationToken)).Deliveries;
         await transaction.CommitAsync(cancellationToken);
+        await RaiseAsync(deliveries);
         return await ReadCommentAsync(db, commentId) ?? throw new CollaborationNotFoundException("Comment is unavailable.");
     }
 

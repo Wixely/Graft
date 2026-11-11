@@ -1,6 +1,32 @@
 # Next-agent handoff
 
-Updated: 2026-11-03. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the project owner.
+Updated: 2026-11-11. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the project owner.
+
+## Added on 2026-11-11: the rest of SSH, and the rest of notifications
+
+The user asked for what ADRs 0031 and 0033 had left: LFS over SSH, deploy keys, administrator-managed keys, mentions,
+muting and digests. [ADR 0049](decisions/0049-ssh-large-files-deploy-keys-administered-keys.md),
+[ADR 0050](decisions/0050-mentions-muting-digests.md). Migrations 28 and 29.
+
+- **SSH.** `GitSshHost` now authenticates an `SshPrincipal` (fingerprint plus account, or none for a deploy key) and
+  decides per command with `AuthorizeAsync`. `git-lfs-authenticate` answers the HTTPS LFS address and a `GraftLfs`
+  ticket from `LfsTickets.cs` (HMAC, in-process key, 30 minutes); `AuthorizeLfsTicket` in `Program.cs` accepts it on
+  `.git/info/lfs/` paths only and re-authorises the key. Deploy keys in `GraftStoreDeployKeys.cs`; admin key methods in
+  `GraftStoreSshKeys.cs`. **Trap found:** SSH held the repository lock for a whole connection, so git-lfs's pre-push
+  `ls-remote` waited on the push's own lock; the lock is now per operation (ADR 0049, Decision 4).
+- **Notifications.** `Graft.Core/Mentions.cs` parses names outside code; `NotifyMentionsAsync` checks each person can
+  read the item (members only unless `store.PublicBrowsing`); participation actions skip `NotificationMutes`; digests
+  by `TakeDueDigestsAsync` and a worker in `Program.cs`, period `--mail-digest-minutes` (argument bound now 56).
+  Browser: Profile email choice, a Muted panel in the inbox, `MuteControls` on issue and proposal pages, Deploy keys in
+  project settings, SSH keys on the Users page.
+- **The suite's helper check.** It failed because the suite installed `git-remote-graft` without the libraries beside
+  it (`Graft.Git.dll`); it now copies the whole build folder. Not a product fault.
+- **Verified.** Git suite 1,509 assertions, nothing skipped. Every new panel driven in headless Edge against the browser
+  fixture (which now starts with `--ssh-port 0`), no console errors; Markdown rendering from earlier the same day too.
+  On the very first driven load the issue page once showed "Sign in" in its header and no mute buttons; it did not
+  happen again in two clean runs and was not explained. MCP suite not rerun: no tool changed.
+- **Next action.** Owner user: deploy, then try a deploy key and an LFS push over SSH against the live forge. Owner
+  implementation agent: if "Sign in" on a signed-in page recurs, look at the session check racing the first render.
 
 ## Added on 2026-11-03, later: releases
 

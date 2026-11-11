@@ -167,6 +167,7 @@ else
         </div>
         <span class="label @(issue.State == "closed" ? "" : "success")">@issue.State</span>
         <div class="page-header-actions">
+            <MuteControls ProjectId="projectId" Subject="issue" Iid="issue.Iid" />
             <a class="button secondary" href="@IssuesUrl"><Icon Name="chevron-left" />Issues</a>
         </div>
     </div>

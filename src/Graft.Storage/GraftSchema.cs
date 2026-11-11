@@ -4,7 +4,7 @@ namespace Graft.Storage;
 
 public static class GraftSchema
 {
-    public static DnaXMigrationManifest Manifest { get; } = new(27,
+    public static DnaXMigrationManifest Manifest { get; } = new(29,
     [
         DnaXMigration.Sql(1, "initial-identity-project-schema", "Create identity and private project schema", """
             CREATE TABLE Users (
@@ -895,6 +895,44 @@ public static class GraftSchema
                 Sha256 TEXT NOT NULL,
                 UpdatedAtUtc TEXT NOT NULL
             );
+            """),
+        // Deploy keys (ADR 0049): a key that opens one project's repository over SSH, read only unless the project
+        // let it push, and belongs to no account. The same key may be added to several projects, one row each, and
+        // is never also an account's key, which is checked in code at both points of entry.
+        DnaXMigration.Sql(28, "deploy-keys", "Let a project admit an SSH key that belongs to no account", """
+            CREATE TABLE DeployKeys (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                Title TEXT NOT NULL,
+                KeyType TEXT NOT NULL,
+                PublicKey TEXT NOT NULL,
+                Fingerprint TEXT NOT NULL,
+                CanPush INTEGER NOT NULL DEFAULT 0 CHECK (CanPush IN (0, 1)),
+                CreatedByUserId INTEGER NULL REFERENCES Users(Id) ON DELETE SET NULL,
+                CreatedAtUtc TEXT NOT NULL,
+                ExpiresAtUtc TEXT NULL,
+                LastUsedAtUtc TEXT NULL,
+                UNIQUE (ProjectId, Fingerprint)
+            );
+
+            CREATE INDEX IX_DeployKeys_Fingerprint ON DeployKeys(Fingerprint);
+            """),
+        // Muting and digests (ADR 0050). A mute is a project, or one issue or proposal in it, that a person does not
+        // want to hear about as a participant; what is addressed to them by name still arrives. A digest is one
+        // message a period instead of one per notification, and the time of the last one is kept so each says only
+        // what is new.
+        DnaXMigration.Sql(29, "notification-mutes-and-digests", "Mute a project or a thread, and take email as a digest", """
+            CREATE TABLE NotificationMutes (
+                UserId INTEGER NOT NULL REFERENCES Users(Id) ON DELETE CASCADE,
+                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                SubjectType TEXT NOT NULL DEFAULT '' CHECK (SubjectType IN ('', 'issue', 'merge_request')),
+                SubjectId INTEGER NOT NULL DEFAULT 0,
+                CreatedAtUtc TEXT NOT NULL,
+                PRIMARY KEY (UserId, ProjectId, SubjectType, SubjectId)
+            );
+
+            ALTER TABLE Users ADD COLUMN EmailDigest INTEGER NOT NULL DEFAULT 0 CHECK (EmailDigest IN (0, 1));
+            ALTER TABLE Users ADD COLUMN LastDigestAtUtc TEXT NULL;
             """)
     ]);
 }

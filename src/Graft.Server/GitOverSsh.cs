@@ -25,6 +25,8 @@ internal sealed partial class GitSshHost(
     string globalNamespace,
     Func<ProjectInfo, RepositoryEndpoint> endpointFor,
     Func<ProjectInfo, AuthenticatedIdentity, List<(string Branch, string? From, string? To)>, Task> pushed,
+    Func<string?> httpsOrigin,
+    LfsTickets lfsTickets,
     Action<string, Exception?> log) : ISshHost
 {
     /// <summary>How long a command waits for a repository another request holds before giving up.</summary>
@@ -33,28 +35,65 @@ internal sealed partial class GitSshHost(
     [GeneratedRegex(@"^(git[- ](upload-pack|receive-pack))\s+'?([^'\s]+)'?\s*$")]
     private static partial Regex CommandPattern();
 
-    public async ValueTask<object?> AuthenticateAsync(string username, SshPublicKey key, bool signatureVerified, CancellationToken cancellationToken) =>
-        await store.ResolveSshKeyAsync(key.Fingerprint, recordUse: signatureVerified, cancellationToken);
+    [GeneratedRegex(@"^git-lfs-authenticate\s+'?([^'\s]+)'?\s+(upload|download)\s*$")]
+    private static partial Regex LfsAuthenticatePattern();
 
-    public string? Greeting(object principal, string username) =>
-        "Welcome to Graft, " + ((AuthenticatedIdentity)principal).Username + ". This server serves Git only; there is no shell.";
+    public async ValueTask<object?> AuthenticateAsync(string username, SshPublicKey key, bool signatureVerified, CancellationToken cancellationToken) =>
+        await ResolvePrincipalAsync(key.Fingerprint, signatureVerified, cancellationToken);
+
+    /// <summary>
+    /// Who a key is: an account, when an account registered it, or a deploy key, when some project admits it and no
+    /// account holds it. A deploy key's projects are decided per command, because which repository it is for is not
+    /// known until the client names one.
+    /// </summary>
+    public async Task<SshPrincipal?> ResolvePrincipalAsync(string fingerprint, bool recordUse, CancellationToken cancellationToken)
+    {
+        AuthenticatedIdentity? account = await store.ResolveSshKeyAsync(fingerprint, recordUse, cancellationToken);
+        if (account is not null) return new(fingerprint, account);
+        return await store.IsDeployKeyAsync(fingerprint, cancellationToken) ? new(fingerprint, null) : null;
+    }
+
+    public string? Greeting(object principal, string username) => ((SshPrincipal)principal).Account is AuthenticatedIdentity account
+        ? "Welcome to Graft, " + account.Username + ". This server serves Git only; there is no shell."
+        : "Welcome to Graft. This is a deploy key; it serves Git for the projects that admit it, and there is no shell.";
+
+    /// <summary>
+    /// Whether this key may do this to this project, and the account the act is attributed to. An account's key acts
+    /// with the account's role, as over HTTPS; a deploy key reads a project that admits it, and pushes only where the
+    /// project said it may. Null for no, whatever the reason.
+    /// </summary>
+    public async Task<AuthenticatedIdentity?> AuthorizeAsync(SshPrincipal principal, ProjectInfo project, ProjectAction action, bool recordUse,
+        CancellationToken cancellationToken)
+    {
+        if (principal.Account is AuthenticatedIdentity account)
+        {
+            PermissionDecision decision = await store.GetPermissionAsync(account, project.Id, action, cancellationToken);
+            if (!publicBrowsing && decision.Grant is not (AccessGrant.Member or AccessGrant.None)) return null;
+            return decision.Allowed ? account : null;
+        }
+        if (action is not (ProjectAction.FetchRepository or ProjectAction.PushRepository)) return null;
+        DeployKeyGrant? grant = await store.FindDeployKeyGrantAsync(principal.Fingerprint, project.Id, recordUse, cancellationToken);
+        if (grant is null || (action == ProjectAction.PushRepository && !grant.CanPush)) return null;
+        return grant.AttributedTo;
+    }
 
     public async Task<int> ExecuteAsync(SshCommand command, CancellationToken cancellationToken)
     {
-        AuthenticatedIdentity identity = (AuthenticatedIdentity)command.Principal;
+        SshPrincipal principal = (SshPrincipal)command.Principal;
+        Match lfs = LfsAuthenticatePattern().Match(command.CommandLine);
+        if (lfs.Success) return await LfsAuthenticateAsync(command, principal, lfs.Groups[1].Value, lfs.Groups[2].Value == "upload", cancellationToken);
         Match match = CommandPattern().Match(command.CommandLine);
         if (!match.Success)
         {
-            await command.WriteErrorAsync("fatal: Graft serves git-upload-pack and git-receive-pack over SSH and nothing else.", cancellationToken);
+            await command.WriteErrorAsync("fatal: Graft serves git-upload-pack, git-receive-pack and git-lfs-authenticate over SSH and nothing else.", cancellationToken);
             return 128;
         }
         string service = "git-" + match.Groups[2].Value;
         ProjectAction action = service == "git-receive-pack" ? ProjectAction.PushRepository : ProjectAction.FetchRepository;
 
         ProjectInfo? project = await ResolveAsync(match.Groups[3].Value, cancellationToken);
-        PermissionDecision? decision = project is null ? null : await store.GetPermissionAsync(identity, project.Id, action, cancellationToken);
-        if (decision is not null && !publicBrowsing && decision.Grant is not (AccessGrant.Member or AccessGrant.None)) decision = null;
-        if (project is null || decision is not { Allowed: true })
+        AuthenticatedIdentity? identity = project is null ? null : await AuthorizeAsync(principal, project, action, recordUse: true, cancellationToken);
+        if (project is null || identity is null)
         {
             // One answer for absent, private and not-yours, as the HTTP transport gives, so the path space
             // cannot be mapped by somebody who holds a key.
@@ -64,30 +103,85 @@ internal sealed partial class GitSshHost(
         }
 
         RepositoryEndpoint endpoint = endpointFor(project);
-        if (!await endpoint.Gate.WaitAsync(RepositoryWait, cancellationToken))
-        {
-            await command.WriteErrorAsync("fatal: the repository is busy; try again shortly.", cancellationToken);
-            return 1;
-        }
         try
         {
             return service == "git-receive-pack"
-                ? await ReceiveAsync(command, identity, project, endpoint.Repository, cancellationToken)
-                : await UploadAsync(command, endpoint.Repository, cancellationToken);
+                ? await ReceiveAsync(command, identity, project, endpoint, cancellationToken)
+                : await UploadAsync(command, endpoint, cancellationToken);
+        }
+        catch (RepositoryBusyException)
+        {
+            await command.WriteErrorAsync("fatal: the repository is busy; try again shortly.", cancellationToken);
+            return 1;
         }
         catch (GitInputException exception)
         {
             await command.WriteErrorAsync("fatal: " + exception.Message, cancellationToken);
             return 128;
         }
+    }
+
+    /// <summary>
+    /// Holds the repository for one operation, as an HTTP request does, never for a whole connection. A push's
+    /// connection stays open while the client runs its pre-push hook, and git-lfs's hook opens a second connection to
+    /// the same repository to list its branches; holding the repository across the first would make the second wait
+    /// for it, and the push would stall until it gave up.
+    /// </summary>
+    private static async Task<T> WithRepositoryAsync<T>(RepositoryEndpoint endpoint, Func<Repository, Task<T>> operation, CancellationToken cancellationToken)
+    {
+        if (!await endpoint.Gate.WaitAsync(RepositoryWait, cancellationToken)) throw new RepositoryBusyException();
+        try { return await operation(endpoint.Repository); }
         finally { endpoint.Gate.Release(); }
+    }
+
+    private sealed class RepositoryBusyException : Exception;
+
+    /// <summary>
+    /// Large files over an SSH remote (ADR 0049). git-lfs asks the SSH server where the HTTPS large-file API is and for a
+    /// credential to use there, then moves the objects over HTTPS. The answer is the repository's own large-file address
+    /// and a ticket naming this key, this project and this operation, good for half an hour. The same refusal as any
+    /// other command when the key may not do the operation, so the path space cannot be probed this way either.
+    /// </summary>
+    private async Task<int> LfsAuthenticateAsync(SshCommand command, SshPrincipal principal, string path, bool upload, CancellationToken cancellationToken)
+    {
+        ProjectInfo? project = await ResolveAsync(path, cancellationToken);
+        AuthenticatedIdentity? identity = project is null ? null
+            : await AuthorizeAsync(principal, project, upload ? ProjectAction.PushRepository : ProjectAction.FetchRepository, recordUse: true, cancellationToken);
+        if (project is null || identity is null)
+        {
+            await command.WriteErrorAsync("fatal: repository not found or you do not have " + (upload ? "push" : "read") + " access: " + path, cancellationToken);
+            return 128;
+        }
+        string? origin = httpsOrigin();
+        if (origin is null)
+        {
+            await command.WriteErrorAsync("fatal: this server has no HTTPS address to send large files to yet; try again shortly.", cancellationToken);
+            return 1;
+        }
+
+        string href = origin.TrimEnd('/') + "/" + string.Join('/', project.Namespace.Split('/').Select(Uri.EscapeDataString)) + "/" +
+            Uri.EscapeDataString(project.Slug) + ".git/info/lfs";
+        using MemoryStream body = new();
+        using (System.Text.Json.Utf8JsonWriter json = new(body))
+        {
+            json.WriteStartObject();
+            json.WriteString("href", href);
+            json.WriteStartObject("header");
+            json.WriteString("Authorization", LfsTickets.Scheme + " " + lfsTickets.Issue(principal.Fingerprint, project.Id, upload, DateTimeOffset.UtcNow));
+            json.WriteEndObject();
+            json.WriteNumber("expires_in", (long)LfsTickets.Lifetime.TotalSeconds);
+            json.WriteEndObject();
+        }
+        body.WriteByte((byte)'\n');
+        await command.Output.WriteAsync(body.ToArray(), cancellationToken);
+        return 0;
     }
 
     /// <summary>
     /// <c>/owner/project.git</c>, <c>owner/project</c>, or <c>/projects/slug.git</c>: the same two paths the
     /// HTTP transport answers, with the same meaning.
     /// </summary>
-    private async Task<ProjectInfo?> ResolveAsync(string path, CancellationToken cancellationToken)
+    public async Task<ProjectInfo?> ResolveAsync(string path, CancellationToken cancellationToken)
     {
         string trimmed = path.Trim('/');
         if (trimmed.EndsWith(".git", StringComparison.Ordinal)) trimmed = trimmed[..^4];
@@ -102,7 +196,7 @@ internal sealed partial class GitSshHost(
     }
 
     /// <summary>Protocol version 2 upload-pack: the capability list, then one command per request until EOF.</summary>
-    private static async Task<int> UploadAsync(SshCommand command, Repository repository, CancellationToken cancellationToken)
+    private static async Task<int> UploadAsync(SshCommand command, RepositoryEndpoint endpoint, CancellationToken cancellationToken)
     {
         bool version2 = command.Environment.TryGetValue("GIT_PROTOCOL", out string? protocol) &&
             protocol.Split(':').Any(part => part.Trim() == "version=2");
@@ -112,7 +206,8 @@ internal sealed partial class GitSshHost(
                 "Git 2.26 or later asks for it by default; older clients can run with -c protocol.version=2.", cancellationToken);
             return 128;
         }
-        await command.Output.WriteAsync(repository.AdvertiseV2("git-upload-pack", serviceHeader: false), cancellationToken);
+        await command.Output.WriteAsync(await WithRepositoryAsync(endpoint, held => Task.FromResult(held.AdvertiseV2("git-upload-pack", serviceHeader: false)), cancellationToken),
+            cancellationToken);
         while (true)
         {
             byte[]? request = await ReadPacketSectionAsync(command.Input, 16 * 1024 * 1024, cancellationToken);
@@ -120,7 +215,9 @@ internal sealed partial class GitSshHost(
             using MemoryStream input = new(request, false);
             using TemporaryStorage staging = new();
             using FileStream output = staging.CreateFile();
-            repository.ServeV2(input, output, cancellationToken);
+            // The answer is staged whole while the repository is held, then sent without it, so a slow reader holds
+            // nothing but its own connection.
+            await WithRepositoryAsync(endpoint, held => { held.ServeV2(input, output, cancellationToken); return Task.FromResult(0); }, cancellationToken);
             output.Position = 0;
             await output.CopyToAsync(command.Output, cancellationToken);
         }
@@ -128,10 +225,13 @@ internal sealed partial class GitSshHost(
 
     /// <summary>Protocol version 0 receive-pack, which is the only one there is: advertise, read the
     /// commands and the pack, apply, report.</summary>
-    private async Task<int> ReceiveAsync(SshCommand command, AuthenticatedIdentity identity, ProjectInfo project, Repository repository,
+    private async Task<int> ReceiveAsync(SshCommand command, AuthenticatedIdentity identity, ProjectInfo project, RepositoryEndpoint endpoint,
         CancellationToken cancellationToken)
     {
-        await command.Output.WriteAsync(repository.Advertise("git-receive-pack", serviceHeader: false), cancellationToken);
+        // Released between the advertisement and the update: the client runs its hooks in between, and the update
+        // checks each reference's old value itself, so a change made meanwhile is refused rather than overwritten.
+        byte[] advertisement = await WithRepositoryAsync(endpoint, held => Task.FromResult(held.Advertise("git-receive-pack", serviceHeader: false)), cancellationToken);
+        await command.Output.WriteAsync(advertisement, cancellationToken);
         byte[]? commands = await ReadPacketSectionAsync(command.Input, 1024 * 1024, cancellationToken);
         // A client with nothing to push sends a flush and goes away.
         if (commands is null || commands.Length <= 4) return 0;
@@ -151,24 +251,27 @@ internal sealed partial class GitSshHost(
         if (expectPack) Pack.Capture(command.Input, request, cancellationToken);
         request.Position = 0;
 
-        Dictionary<string, string> before = new(repository.Refs, StringComparer.Ordinal);
-        byte[] report = repository.Receive(request, cancellationToken);
-        await command.Output.WriteAsync(report, cancellationToken);
-        // Created, moved and deleted branches alike; a deleted one reports no new commit, as over HTTP.
-        List<(string Branch, string? From, string? To)> moved = [];
-        foreach (string name in before.Keys.Union(repository.Refs.Keys, StringComparer.Ordinal))
+        return await WithRepositoryAsync(endpoint, async repository =>
         {
-            if (!name.StartsWith("refs/heads/", StringComparison.Ordinal)) continue;
-            string? old = before.GetValueOrDefault(name);
-            string? id = repository.Refs.GetValueOrDefault(name);
-            if (old != id) moved.Add((name["refs/heads/".Length..], old, id));
-        }
-        if (moved.Count > 0)
-        {
-            try { await pushed(project, identity, moved); }
-            catch (Exception exception) { log("ssh push notification failed", exception); }
-        }
-        return 0;
+            Dictionary<string, string> before = new(repository.Refs, StringComparer.Ordinal);
+            byte[] report = repository.Receive(request, cancellationToken);
+            await command.Output.WriteAsync(report, cancellationToken);
+            // Created, moved and deleted branches alike; a deleted one reports no new commit, as over HTTP.
+            List<(string Branch, string? From, string? To)> moved = [];
+            foreach (string name in before.Keys.Union(repository.Refs.Keys, StringComparer.Ordinal))
+            {
+                if (!name.StartsWith("refs/heads/", StringComparison.Ordinal)) continue;
+                string? old = before.GetValueOrDefault(name);
+                string? id = repository.Refs.GetValueOrDefault(name);
+                if (old != id) moved.Add((name["refs/heads/".Length..], old, id));
+            }
+            if (moved.Count > 0)
+            {
+                try { await pushed(project, identity, moved); }
+                catch (Exception exception) { log("ssh push notification failed", exception); }
+            }
+            return 0;
+        }, cancellationToken);
     }
 
     /// <summary>
@@ -220,3 +323,6 @@ internal sealed partial class GitSshHost(
         }
     }
 }
+
+/// <summary>Who an SSH connection authenticated as: the key, and the account it belongs to, or null for a deploy key.</summary>
+internal sealed record SshPrincipal(string Fingerprint, AuthenticatedIdentity? Account);

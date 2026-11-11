@@ -160,6 +160,47 @@ else
                 </form>
             </div>
         </div>
+
+        @* An account's SSH keys, for somebody who cannot add their own, or a key on a lost machine to take away (ADR 0049). *@
+        <div class="panel">
+            <div class="panel-header"><Icon Name="lock" /><h2>SSH keys</h2></div>
+            <div class="panel-body">
+                <form class="form" @onsubmit="AddKey" @onsubmit:preventDefault>
+                    <label for="keys-user">User</label>
+                    <select id="keys-user" value="@keysUserId" @onchange="KeysUserChanged">
+                        @foreach (UserAccountResponse user in Resettable) { <option value="@user.Id">@user.Username</option> }
+                    </select>
+                    <label for="key-title">Title</label>
+                    <input id="key-title" @bind="keyTitle" maxlength="100" autocomplete="off" />
+                    <label for="key-text">Public key</label>
+                    <textarea id="key-text" @bind="keyText" rows="3" autocomplete="off" placeholder="ssh-ed25519 AAAA… name@example"></textarea>
+                    <div class="form-actions">
+                        <button type="submit" disabled="@busy">Add key to this account</button>
+                    </div>
+                </form>
+            </div>
+            @if (userKeys.Length == 0)
+            {
+                <p class="panel-empty">This account has no SSH keys.</p>
+            }
+            else
+            {
+                <div class="list">
+                    @foreach (SshKeyResponse key in userKeys)
+                    {
+                        <div class="list-item">
+                            <span class="list-item-main">
+                                <strong>@key.Title</strong>
+                                <small><code>@key.Fingerprint</code> &middot; @(key.LastUsedAt is DateTimeOffset used ? "last used " + used.ToLocalTime().ToString("yyyy-MM-dd") : "never used")</small>
+                            </span>
+                            <span class="list-item-actions">
+                                <button type="button" class="secondary" @onclick="() => RemoveKey(key)" disabled="@busy">Remove</button>
+                            </span>
+                        </div>
+                    }
+                </div>
+            }
+        </div>
     }
 
     @if (Disabled.Length > 0)
@@ -235,6 +276,55 @@ else
             emailAddress = users.FirstOrDefault(user => user.Id == emailUserId)?.Email ?? "";
         }
         if (!Disabled.Any(user => user.Id == enableUserId)) enableUserId = Disabled.FirstOrDefault()?.Id ?? 0;
+        if (!Resettable.Any(user => user.Id == keysUserId)) keysUserId = Resettable.FirstOrDefault()?.Id ?? 0;
+        await LoadKeys();
+    }
+
+    private long keysUserId;
+    private SshKeyResponse[] userKeys = [];
+    private string keyTitle = "";
+    private string keyText = "";
+
+    private async Task LoadKeys() =>
+        userKeys = keysUserId == 0 ? [] : await Api.GetAsync($"api/users/{keysUserId}/keys", ApiJson.Default.SshKeyResponseArray) ?? [];
+
+    private async Task KeysUserChanged(ChangeEventArgs change)
+    {
+        keysUserId = long.TryParse(change.Value?.ToString(), out long id) ? id : 0;
+        await LoadKeys();
+    }
+
+    private async Task AddKey()
+    {
+        if (busy || keysUserId == 0) return;
+        busy = true;
+        message = "";
+        try
+        {
+            string who = users.FirstOrDefault(user => user.Id == keysUserId)?.Username ?? "the account";
+            ApiResult result = await Api.PostAsync($"api/users/{keysUserId}/keys", new SshKeyCreateRequest(keyTitle.Trim(), keyText.Trim(), null),
+                ApiJson.Default.SshKeyCreateRequest, "Key added to " + who + ".");
+            Report(result);
+            if (!result.Ok) return;
+            keyTitle = "";
+            keyText = "";
+            await LoadKeys();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task RemoveKey(SshKeyResponse key)
+    {
+        if (busy) return;
+        busy = true;
+        message = "";
+        try
+        {
+            ApiResult result = await Api.DeleteAsync($"api/users/{keysUserId}/keys/{key.Id}", key.Title + " removed.");
+            Report(result);
+            if (result.Ok) await LoadKeys();
+        }
+        finally { busy = false; }
     }
 
     private async Task CreateUser()

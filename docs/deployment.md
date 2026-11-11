@@ -309,9 +309,11 @@ MAIL: off; a forgotten password is reset by an administrator's link
 ```
 
 The forge sends two kinds of message: a password reset link, to the address on the account, valid for an
-hour and once; and, for a person who turned it on under Profile and Email, a copy of each entry in their
-inbox. Delivery is queued and retried three times; a message that cannot be delivered is logged to the error
-output and dropped. Nothing waits for the mail server, and the inbox is the same whether or not it exists.
+hour and once; and, for a person who turned it on under Profile and Email, a copy of their inbox, either each
+entry as it arrives or as a digest listing what is unread and new. A digest goes once a day unless
+`--mail-digest-minutes <minutes>` says otherwise (at most a week). Delivery is queued and retried three times; a
+message that cannot be delivered is logged to the error output and dropped. Nothing waits for the mail server,
+and the inbox is the same whether or not it exists. See [ADR 0050](decisions/0050-mentions-muting-digests.md).
 
 See [ADR 0032](decisions/0032-email-is-optional.md) and [ADR 0033](decisions/0033-notifications.md).
 
@@ -347,14 +349,20 @@ SSH: ssh://git@graft.example.com:2222/<owner>/<project>.git; host key SHA256:…
 
 Give that fingerprint to people, so a first connection has something to check against.
 
-Users register their public keys under **Profile and SSH keys** or through `POST /api/v4/user/keys`. A key
+Users register their public keys under **Profile and SSH keys** or through `POST /api/v4/user/keys`; an
+administrator can add or remove a key on somebody else's account from the **Users** page. A key
 authenticates as its owner for Git and for nothing else: there is no shell, no forwarding, and no command but
-`git-upload-pack` and `git-receive-pack`. Fetches are served in Git protocol version 2, which every Git
-since 2.26 asks for by default; an older client passes `-c protocol.version=2`. Repositories with LFS
-objects are cloned over HTTPS, or with `lfs.url` pointing at the HTTPS address, because `git-lfs-authenticate`
-is not served.
+`git-upload-pack`, `git-receive-pack` and `git-lfs-authenticate`. Fetches are served in Git protocol version 2,
+which every Git since 2.26 asks for by default; an older client passes `-c protocol.version=2`.
 
-See [ADR 0031](decisions/0031-git-over-ssh.md).
+Large files work over an SSH remote. git-lfs asks the SSH server for the HTTPS large-file address and a
+short-lived credential, then moves the objects over HTTPS, so the forge's HTTPS origin (`--origin`) must be
+reachable from the client as well as its SSH port.
+
+A machine that builds or deploys a project gets a **deploy key** under the project's **Settings**: an SSH key that
+belongs to no account, opens that project only, and reads unless the project lets it push.
+
+See [ADR 0031](decisions/0031-git-over-ssh.md) and [ADR 0049](decisions/0049-ssh-large-files-deploy-keys-administered-keys.md).
 
 ### Optional project sites
 

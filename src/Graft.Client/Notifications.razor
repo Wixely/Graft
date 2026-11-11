@@ -23,7 +23,7 @@ else
             <h1>Notifications</h1>
             <p class="subtitle">
                 @(unread == 0 ? "Nothing unread." : unread == 1 ? "One unread." : $"{unread} unread.")
-                Being assigned, asked to review, and whatever happens to an issue or proposal you are part of.
+                Being assigned, asked to review or mentioned, and whatever happens to an issue or proposal you are part of.
             </p>
         </div>
         <div class="page-header-actions">
@@ -63,9 +63,39 @@ else
             </div>
         }
     </div>
+
+    @* What the reader muted, so a mute is never invisible. Muting silences what arrives because you took part;
+       being assigned, asked to review or mentioned still arrives, because that is addressed to you by name. *@
+    <div class="panel">
+        <div class="panel-header"><Icon Name="bell" /><h2>Muted</h2><span class="spacer"></span><span class="label">@mutes.Count</span></div>
+        @if (mutes.Count == 0)
+        {
+            <p class="panel-empty">Nothing muted. Mute a project or a single issue or proposal from its page.</p>
+        }
+        else
+        {
+            <div class="list">
+                @foreach (NotificationMuteResponse mute in mutes)
+                {
+                    <div class="list-item">
+                        <Icon Name="@(mute.TargetType switch { "Issue" => "issue", "MergeRequest" => "merge", _ => "repository" })" />
+                        <span class="list-item-main">
+                            <strong>@(mute.TargetType is null ? mute.ProjectPath : (mute.TargetType == "Issue" ? "#" : "!") + mute.Iid + " " + mute.Title)</strong>
+                            <small>@(mute.TargetType is null ? "the whole project" : mute.ProjectPath) &middot; muted @mute.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd")</small>
+                        </span>
+                        <button type="button" class="secondary" @onclick="() => Unmute(mute)" disabled="@busy">Unmute</button>
+                    </div>
+                }
+            </div>
+        }
+        <div class="panel-body">
+            <p class="secondary-text">You are still told when somebody assigns you, asks you to review, or mentions you.</p>
+        </div>
+    </div>
 }
 
 @code {
+    private List<NotificationMuteResponse> mutes = [];
     private List<NotificationResponse> items = [];
     private long unread;
     private long total;
@@ -95,6 +125,26 @@ else
         items = page?.Items.ToList() ?? [];
         unread = page?.Unread ?? 0;
         total = page?.Total ?? 0;
+        mutes = (await Api.GetAsync("api/notifications/mutes", ApiJson.Default.NotificationMuteResponseArray))?.ToList() ?? [];
+    }
+
+    private async Task Unmute(NotificationMuteResponse mute)
+    {
+        if (busy) return;
+        busy = true;
+        try
+        {
+            string path = $"api/projects/{mute.ProjectId}" + mute.TargetType switch
+            {
+                "Issue" => $"/issues/{mute.Iid}/mute",
+                "MergeRequest" => $"/merge-requests/{mute.Iid}/mute",
+                _ => "/mute"
+            };
+            ApiResult result = await Api.PostAsync(path, new MuteRequest(false), ApiJson.Default.MuteRequest, "Unmuted.");
+            if (!result.Ok) message = result.Message;
+            await Load();
+        }
+        finally { busy = false; }
     }
 
     private async Task ToggleFilter()
@@ -141,6 +191,7 @@ else
         "merged" => "merged",
         "closed" => "closed",
         "reopened" => "reopened",
+        "mentioned" => "mentioned you in",
         _ => action
     };
 }

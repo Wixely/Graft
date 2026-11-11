@@ -329,4 +329,14 @@ public sealed record NotificationPage(IReadOnlyList<Notification> Items, long Un
 
 /// <summary>One notification as it was written, with what a sender needs to know about its recipient. Raised
 /// after the transaction that wrote it commits, so nothing is sent for a change that did not happen.</summary>
-public sealed record NotificationDelivery(long UserId, string Username, string? Email, bool ByEmail, Notification Notification);
+public sealed record NotificationDelivery(long UserId, string Username, string? Email, bool ByEmail, Notification Notification, bool Digest = false);
+
+/// <summary>Whether the caller muted a project, and the issue or proposal asked about in it (ADR 0050).</summary>
+public sealed record MuteState(bool ProjectMuted, bool ThreadMuted);
+
+/// <summary>One thing a person muted: a whole project, or one issue or proposal in it.</summary>
+public sealed record NotificationMute(long ProjectId, string ProjectPath, CommentSubject? Subject, long? Iid, string? Title, DateTimeOffset CreatedAtUtc);
+
+/// <summary>What one digest message carries: the unread notifications since the last one, newest last, and how many
+/// there were in all when there were more than fit.</summary>
+public sealed record NotificationDigest(long UserId, string Username, string Email, IReadOnlyList<Notification> Items, long Total);

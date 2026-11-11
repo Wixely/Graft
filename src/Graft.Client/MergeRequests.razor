@@ -184,6 +184,7 @@ else
         </div>
         <span class="label @StateClass(proposal.State)">@proposal.State</span>
         <div class="page-header-actions">
+            <MuteControls ProjectId="projectId" Subject="merge_request" Iid="proposal.Iid" />
             <a class="button secondary" href="@MergeRequestsUrl"><Icon Name="chevron-left" />Merge requests</a>
         </div>
     </div>

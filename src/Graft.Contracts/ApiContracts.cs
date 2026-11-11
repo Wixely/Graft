@@ -152,7 +152,9 @@ public sealed record SessionResponse(
     /// <summary>Whether the caller asked for a message for each notification.</summary>
     [property: JsonPropertyName("notify_by_email")] bool NotifyByEmail = false,
     /// <summary>Whether the caller signs in with an authenticator app as well as a password.</summary>
-    [property: JsonPropertyName("second_factor_enabled")] bool SecondFactorEnabled = false);
+    [property: JsonPropertyName("second_factor_enabled")] bool SecondFactorEnabled = false,
+    /// <summary>Whether the caller takes email as a periodic digest rather than a message per notification (ADR 0050).</summary>
+    [property: JsonPropertyName("email_digest")] bool EmailDigest = false);
 public sealed record LoginRequest(string Username, string Password);
 public sealed record UserCreateRequest(string Username, string Password);
 public sealed record UserAccountResponse(long Id, string Username, bool IsAdministrator, bool Disabled, string? Email = null,
@@ -181,8 +183,29 @@ public sealed record NotificationResponse(
 
 public sealed record NotificationsResponse(IReadOnlyList<NotificationResponse> Items, long Unread, long Total);
 
-/// <summary>Whether to send a message for each notification as well as keeping it in the inbox.</summary>
-public sealed record NotifyByEmailRequest(bool Enabled);
+/// <summary>Whether to send email as well as keeping the inbox, and whether as a digest. A missing digest leaves that choice alone.</summary>
+public sealed record NotifyByEmailRequest(bool Enabled, bool? Digest = null);
+
+/// <summary>Whether the caller muted a project, and an issue or proposal in it (ADR 0050).</summary>
+public sealed record MuteStateResponse(
+    [property: JsonPropertyName("project_muted")] bool ProjectMuted,
+    [property: JsonPropertyName("thread_muted")] bool ThreadMuted);
+
+/// <summary>Mutes or unmutes.</summary>
+public sealed record MuteRequest(bool Muted);
+
+/// <summary>One thing the caller muted: a project, or an issue or proposal in it.</summary>
+public sealed record NotificationMuteResponse(
+    [property: JsonPropertyName("project_id")] long ProjectId,
+    [property: JsonPropertyName("project_path")] string ProjectPath,
+    [property: JsonPropertyName("target_type")] string? TargetType,
+    long? Iid,
+    string? Title,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt);
+
+/// <summary>GitLab's notification setting for a project, as far as Graft has one: <c>mention</c> when muted,
+/// <c>participating</c> otherwise.</summary>
+public sealed record NotificationSettingsResponse(string Level);
 
 /// <summary>An enrolment in progress: the secret for the authenticator app and the otpauth address that carries it.</summary>
 public sealed record SecondFactorSetupResponse(string Secret, [property: JsonPropertyName("otpauth_uri")] string OtpauthUri);
@@ -608,6 +631,36 @@ public sealed record SshKeyResponse(
     [property: JsonPropertyName("expires_at")] DateTimeOffset? ExpiresAt,
     [property: JsonPropertyName("last_used_at")] DateTimeOffset? LastUsedAt,
     [property: JsonPropertyName("usage_type")] string UsageType = "auth");
+
+/// <summary>A deploy key as GitLab reports it on a project (ADR 0049).</summary>
+public sealed record DeployKeyResponse(
+    long Id,
+    string Title,
+    string Key,
+    string Fingerprint,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt,
+    [property: JsonPropertyName("expires_at")] DateTimeOffset? ExpiresAt,
+    [property: JsonPropertyName("last_used_at")] DateTimeOffset? LastUsedAt,
+    [property: JsonPropertyName("can_push")] bool CanPush,
+    [property: JsonPropertyName("project_id")] long ProjectId);
+
+/// <summary>GitLab's request to add a deploy key.</summary>
+public sealed record DeployKeyCreateRequest(string? Title, string? Key, [property: JsonPropertyName("can_push")] bool? CanPush,
+    [property: JsonPropertyName("expires_at")] string? ExpiresAt);
+
+/// <summary>GitLab's request to change a deploy key: its title, or whether it may push.</summary>
+public sealed record DeployKeyUpdateRequest(string? Title, [property: JsonPropertyName("can_push")] bool? CanPush);
+
+/// <summary>An account's key with the account, as GitLab's <c>/keys</c> answers an administrator.</summary>
+public sealed record KeyWithUserResponse(
+    long Id,
+    string Title,
+    string Key,
+    string Fingerprint,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt,
+    [property: JsonPropertyName("expires_at")] DateTimeOffset? ExpiresAt,
+    [property: JsonPropertyName("last_used_at")] DateTimeOffset? LastUsedAt,
+    UserResponse User);
 
 /// <summary>GitLab's request to add a key: a title, the one-line public key, and an optional expiry date.</summary>
 public sealed record SshKeyCreateRequest(string? Title, string? Key, [property: JsonPropertyName("expires_at")] string? ExpiresAt);
@@ -1432,6 +1485,15 @@ public sealed record ProjectUploadResponse(
 [JsonSerializable(typeof(ProjectMemberResponse[]))]
 [JsonSerializable(typeof(RepositoryPageResponse))]
 [JsonSerializable(typeof(ReadmeResponse))]
+[JsonSerializable(typeof(MuteStateResponse))]
+[JsonSerializable(typeof(MuteRequest))]
+[JsonSerializable(typeof(NotificationMuteResponse[]))]
+[JsonSerializable(typeof(NotificationSettingsResponse))]
+[JsonSerializable(typeof(DeployKeyResponse))]
+[JsonSerializable(typeof(DeployKeyResponse[]))]
+[JsonSerializable(typeof(DeployKeyCreateRequest))]
+[JsonSerializable(typeof(DeployKeyUpdateRequest))]
+[JsonSerializable(typeof(KeyWithUserResponse))]
 [JsonSerializable(typeof(PageFeatureResponse))]
 [JsonSerializable(typeof(SshKeyResponse))]
 [JsonSerializable(typeof(SshKeyResponse[]))]

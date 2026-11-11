@@ -1,7 +1,7 @@
 # 0031: Git over SSH, served by the forge itself
 
 - Date: 2026-10-30
-- Status: Accepted, implemented
+- Status: Accepted, implemented; LFS over SSH, deploy keys and administrator-managed keys built by [ADR 0049](0049-ssh-large-files-deploy-keys-administered-keys.md) on 2026-11-11
 - Source: The order set on 2026-10-30 for the remaining large work: SSH first, then optional email, groups, and the project-scoped audit view. The backlog had carried SSH since 2026-10-22 as "the most requested thing on this list and the most work"
 - Review trigger: A client that cannot connect because of the algorithm set; a request for `git-lfs-authenticate` so LFS works over an SSH remote; a request for deploy keys, signing keys or administrator-managed keys; evidence that a protocol version 0 fetch over SSH is needed; the Linux 3.10.108 acceptance run, which has not exercised this
 

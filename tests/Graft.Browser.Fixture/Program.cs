@@ -243,6 +243,9 @@ async Task<string> StartServer()
     // So a developer gets a working pages origin with no hosts file to edit and no second certificate.
     start.ArgumentList.Add("--pages-origin");
     start.ArgumentList.Add(pagesOrigin);
+    // Git over SSH on a free port, so the clone menu's SSH address and the deploy keys panel can be looked at.
+    start.ArgumentList.Add("--ssh-port");
+    start.ArgumentList.Add("0");
     server = Process.Start(start)!;
     Process active = server;
     // Whatever the server prints after it is ready is forwarded under a prefix, so a developer driving the

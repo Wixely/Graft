@@ -137,6 +137,21 @@ Then the first of the four large items, in the order given:
   trail, transfer and deletion, with token routes for the banner, approvals and transfer.
   [ADR 0047](decisions/0047-agent-project-settings.md).
 
+## Closed on 2026-11-11
+
+- **Markdown files render, and documents link to each other.** A `.md` file opens rendered, with its source a click away,
+  in the repository view and on a published page; relative links in rendered Markdown open the target there instead of
+  the site root, and on a page only for files the allowlist admits. Answers ADR 0048's review trigger for other
+  markdown files on a page.
+- **The rest of SSH.** `git-lfs-authenticate`, so large files work over an SSH remote; deploy keys; an administrator
+  managing another account's keys. [ADR 0049](decisions/0049-ssh-large-files-deploy-keys-administered-keys.md).
+- **The rest of notifications.** Mentions, muting a thread or a project, and email as a digest.
+  [ADR 0050](decisions/0050-mentions-muting-digests.md).
+- **The Git suite's `git-remote-graft` check failed.** Not the helper: the suite installed it by copying only files named
+  `git-remote-graft.*`, and the framework-dependent build also needs `Graft.Git.dll` and the rest beside it, so the
+  installed copy could not start and Git said "Could not read from remote repository". The suite now copies the whole
+  build folder, and the full suite passes again (1,509 assertions).
+
 ## Closed on 2026-11-03
 
 - **Releases, and a durable package source.** A `v*` tag builds single-file executables of the forge, admin tool,
@@ -178,6 +193,7 @@ Then the first of the four large items, in the order given:
 ## Near, and small
 
 Taken top down.
+
 
 Added on 2026-11-01, first in line: the GitLab clients in use, LabCoat and Comeet.
 

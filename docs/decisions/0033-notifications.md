@@ -1,7 +1,7 @@
 # 0033: A notification is an inbox row; email is a copy of it
 
 - Date: 2026-10-30
-- Status: Accepted, implemented
+- Status: Accepted, implemented; mentions, muting and digests built by [ADR 0050](0050-mentions-muting-digests.md) on 2026-11-11
 - Source: The second slice of the email item of 2026-10-30, under the condition that a non-email path exist. [ADR 0032](0032-email-is-optional.md) scoped notifications out of its first slice and said what they would be
 - Review trigger: A request for mentions (`@name` in a body), for notifications about pushes or releases, for per-project muting, for a digest instead of a message per event, or for GitLab's `/todos` fields this does not fill
 

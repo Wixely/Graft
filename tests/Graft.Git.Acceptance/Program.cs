@@ -391,6 +391,9 @@ ProcessStartInfo ServerStart()
         start.ArgumentList.Add(mailSmtpUrl);
         start.ArgumentList.Add("--mail-from");
         start.ArgumentList.Add("graft@test.invalid");
+        // Three seconds, because a test cannot wait for a daily digest.
+        start.ArgumentList.Add("--mail-digest-minutes");
+        start.ArgumentList.Add("0.05");
     }
     return start;
 }
@@ -6150,9 +6153,10 @@ async Task<string> CheckRemoteHelper(string address, AuthenticatedIdentity alice
     string installed = Path.Combine(root, "helper-bin", OperatingSystem.IsWindows() ? "git-remote-graft.exe" : "git-remote-graft");
     Directory.CreateDirectory(Path.GetDirectoryName(installed)!);
     File.Copy(helper, installed, overwrite: true);
-    // A framework-dependent build is an apphost beside its dll, runtimeconfig and deps; a NativeAOT build is one
-    // file and brings nothing. Whatever shares the helper's name comes along, so either kind runs from here.
-    foreach (string beside in Directory.EnumerateFiles(Path.GetDirectoryName(helper)!, Path.GetFileNameWithoutExtension(helper) + ".*"))
+    // A framework-dependent build is an apphost beside its dll, runtimeconfig, deps and the project's own libraries
+    // (Graft.Git among them); a NativeAOT build is one file and brings nothing. Every file beside the helper comes along,
+    // so either kind runs from here.
+    foreach (string beside in Directory.EnumerateFiles(Path.GetDirectoryName(helper)!))
         if (!string.Equals(beside, helper, StringComparison.OrdinalIgnoreCase))
             File.Copy(beside, Path.Combine(Path.GetDirectoryName(installed)!, Path.GetFileName(beside)), overwrite: true);
     helper = installed;
@@ -6210,7 +6214,7 @@ async Task<string> CheckRemoteHelper(string address, AuthenticatedIdentity alice
     string head = (await RunGit(work, ["rev-parse", "HEAD"])).Output.Trim();
     var listed = await RunGit(root, ["ls-remote", AuthenticatedUrl(address, "alice", token, "alice/relayed.git"), "refs/heads/main"]);
     Check(pushed.ExitCode == 0 && pushed.Errors.Contains("graft: sent", StringComparison.Ordinal) && listed.Output.StartsWith(head, StringComparison.Ordinal),
-        "a push larger than a part goes through the helper in parts and moves the branch: " + Redact(pushed.Errors.Trim().Split('\n')[^1]));
+        "a push larger than a part goes through the helper in parts and moves the branch: " + Redact(pushed.Errors.Trim().Length > 3000 ? pushed.Errors.Trim()[^3000..] : pushed.Errors.Trim()));
     var pinned = await RunGit(work, ["config", "--get", "remote.origin.lfsurl"]);
     Check(pinned.Output.Trim() == repository + "/info/lfs", "the helper pins the remote's Git LFS address to the plain https one");
 
@@ -7948,6 +7952,134 @@ async Task CheckNotifications(string address, AuthenticatedIdentity alice, strin
         Check(json.RootElement.GetProperty("unread_notifications").GetInt64() == 0 && !json.RootElement.GetProperty("notify_by_email").GetBoolean(),
             "and the count is zero; email per notification is off by default");
     }
+
+    // Mentions (ADR 0050): a name in a body tells that person, once, if they could read what it is in.
+    foreach (string token in new[] { aliceApi, bobApi, strangerApi })
+        using (HttpResponseMessage cleared = await ApiPost(address, "/api/v4/todos/mark_as_done", token, new { }))
+            Check(cleared.StatusCode == HttpStatusCode.NoContent, "an inbox is cleared before mentions");
+    long mentioning;
+    using (HttpResponseMessage created = await ApiPost(address, prefix + "/issues", aliceApi, new
+    {
+        title = "Who owns the lamp",
+        description = "Over to @" + bobUsername + " and @" + strangerUsername + ". Not `@" + bobUsername + "` in code, nor alice@example.test.\n\n```\n@" + bobUsername + "\n```\n"
+    }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStringAsync());
+        mentioning = json.RootElement.GetProperty("iid").GetInt64();
+    }
+    bobsTodos = await Todos(bobApi);
+    Check(bobsTodos.Length == 1 && bobsTodos[0].GetProperty("action_name").GetString() == "mentioned" &&
+        bobsTodos[0].GetProperty("target").GetProperty("iid").GetInt64() == mentioning,
+        "a member named in a description hears it once, as a mention, however often the name appears");
+    Check((await Todos(strangerApi)).Length == 0, "somebody who cannot read the project hears nothing, so a mention cannot leak a title");
+    Check((await Todos(aliceApi)).Length == 0, "and the author is not told about their own mention");
+    using (HttpResponseMessage strangerMute = await ApiPost(address, prefix + "/issues/" + mentioning + "/unsubscribe", strangerApi, new { }))
+        Check(strangerMute.StatusCode == HttpStatusCode.NotFound, "nor may they mute it, which would say it exists");
+
+    using (HttpResponseMessage joined = await ApiPost(address, prefix + "/issues/" + mentioning + "/notes", bobApi, new { body = "On it." }))
+        Check(joined.StatusCode == HttpStatusCode.Created, "the person mentioned joins the conversation");
+    using (HttpResponseMessage mark = await ApiPost(address, "/api/v4/todos/mark_as_done", bobApi, new { })) { }
+    using (HttpResponseMessage thanked = await ApiPost(address, prefix + "/issues/" + mentioning + "/notes", aliceApi, new { body = "Thanks @" + bobUsername + "." }))
+        Check(thanked.StatusCode == HttpStatusCode.Created, "the author answers, naming them");
+    bobsTodos = await Todos(bobApi);
+    Check(bobsTodos.Length == 1 && bobsTodos[0].GetProperty("action_name").GetString() == "mentioned",
+        "a participant named in a comment hears one mention, not a mention and a comment");
+    using (HttpResponseMessage mark = await ApiPost(address, "/api/v4/todos/mark_as_done", bobApi, new { })) { }
+
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        UserAccount stranger = Required(await store.FindActiveUserAsync(strangerUsername), "stranger account");
+        await store.SetMembershipAsync(alice, projectId, stranger.Id, ProjectRole.Reporter);
+    }
+    using (HttpResponseMessage edited = await ApiPut(address, prefix + "/issues/" + mentioning, aliceApi, new
+    {
+        description = "Over to @" + bobUsername + " and @" + strangerUsername + ", reworded."
+    }))
+        Check(edited.IsSuccessStatusCode, "the description is reworded, keeping the names it had");
+    Check((await Todos(bobApi)).Length == 0 && (await Todos(strangerApi)).Length == 0, "an edit that keeps a mention does not repeat it");
+    long noteId;
+    using (HttpResponseMessage note = await ApiPost(address, prefix + "/issues/" + mentioning + "/notes", aliceApi, new { body = "Thanks, everyone." }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await note.Content.ReadAsStringAsync());
+        noteId = json.RootElement.GetProperty("id").GetInt64();
+    }
+    using (HttpResponseMessage mark = await ApiPost(address, "/api/v4/todos/mark_as_done", bobApi, new { })) { }
+    using (HttpResponseMessage reworded = await ApiPut(address, prefix + "/issues/" + mentioning + "/notes/" + noteId, aliceApi,
+        new { body = "Thanks, everyone, and @" + strangerUsername + " now that you can read this." }))
+        Check(reworded.IsSuccessStatusCode, "a comment is edited to add a name (got " + (int)reworded.StatusCode + ")");
+    JsonElement[] strangersTodos = await Todos(strangerApi);
+    Check(strangersTodos.Length == 1 && strangersTodos[0].GetProperty("action_name").GetString() == "mentioned",
+        "and the name the edit adds is heard, by somebody who may now read it");
+    Check((await Todos(bobApi)).Length == 0, "and nobody else hears the edit");
+
+    // Muting: a thread, then a project. What is addressed to the person by name still arrives.
+    using (HttpResponseMessage muted = await ApiPost(address, prefix + "/issues/" + mentioning + "/unsubscribe", bobApi, new { }))
+        Check(muted.StatusCode == HttpStatusCode.Created, "a participant mutes the issue, through GitLab's unsubscribe");
+    using (HttpResponseMessage again = await ApiPost(address, prefix + "/issues/" + mentioning + "/unsubscribe", bobApi, new { }))
+        Check(again.StatusCode == HttpStatusCode.NotModified, "and muting it twice changes nothing");
+    using (HttpResponseMessage quiet = await ApiPost(address, prefix + "/issues/" + mentioning + "/notes", aliceApi, new { body = "Anyone?" }))
+        Check(quiet.StatusCode == HttpStatusCode.Created, "a comment follows");
+    Check((await Todos(bobApi)).Length == 0, "which the person who muted the issue does not hear");
+    using (HttpResponseMessage named = await ApiPost(address, prefix + "/issues/" + mentioning + "/notes", aliceApi, new { body = "@" + bobUsername + ", are you there?" }))
+        Check(named.StatusCode == HttpStatusCode.Created, "then a comment naming them");
+    Check((await Todos(bobApi)).Count(todo => todo.GetProperty("action_name").GetString() == "mentioned") == 1, "which they do hear: a mute does not silence a mention");
+    using (HttpResponseMessage mark = await ApiPost(address, "/api/v4/todos/mark_as_done", bobApi, new { })) { }
+    using (HttpResponseMessage unmuted = await ApiPost(address, prefix + "/issues/" + mentioning + "/subscribe", bobApi, new { }))
+        Check(unmuted.StatusCode == HttpStatusCode.Created, "subscribing unmutes it");
+    using (HttpResponseMessage heard = await ApiPost(address, prefix + "/issues/" + mentioning + "/notes", aliceApi, new { body = "Back again." }))
+        Check(heard.StatusCode == HttpStatusCode.Created, "and the next comment");
+    Check((await Todos(bobApi)).Count(todo => todo.GetProperty("action_name").GetString() == "commented") == 1, "is heard again");
+    using (HttpResponseMessage mark = await ApiPost(address, "/api/v4/todos/mark_as_done", bobApi, new { })) { }
+
+    using (HttpResponseMessage level = await ApiPutJson(address, prefix + "/notification_settings?level=disabled", bobApi, "{}"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await level.Content.ReadAsStringAsync());
+        Check(level.IsSuccessStatusCode && json.RootElement.GetProperty("level").GetString() == "mention",
+            "a project is muted through GitLab's notification level, and reads back as mention, which is what still arrives");
+    }
+    using (HttpResponseMessage closed = await ApiPut(address, prefix + "/issues/" + mentioning, aliceApi, new { state_event = "close" }))
+        Check(closed.IsSuccessStatusCode, "the issue is closed in the muted project");
+    Check((await Todos(bobApi)).Length == 0, "which the person who muted the project does not hear");
+    using (HttpResponseMessage assigned = await ApiPost(address, prefix + "/issues", aliceApi, new { title = "Still yours", assignee_usernames = new[] { bobUsername } }))
+        Check(assigned.StatusCode == HttpStatusCode.Created, "an assignment is made in the muted project");
+    Check((await Todos(bobApi)).Count(todo => todo.GetProperty("action_name").GetString() == "assigned") == 1, "and the assignee still hears it");
+    using (HttpResponseMessage custom = await ApiPutJson(address, prefix + "/notification_settings?level=custom", bobApi, "{}"))
+        Check(custom.StatusCode == HttpStatusCode.BadRequest, "a custom level is refused by name");
+    using (HttpResponseMessage back = await ApiPutJson(address, prefix + "/notification_settings?level=participating", bobApi, "{}"))
+        Check(back.IsSuccessStatusCode, "and participating unmutes the project");
+    using (HttpResponseMessage read = await ApiGet(address, prefix + "/notification_settings", bobApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await read.Content.ReadAsStringAsync());
+        Check(json.RootElement.GetProperty("level").GetString() == "participating", "as reading it back says");
+    }
+
+    // The browser's mutes: set, listed for undoing, and read back on the thread.
+    using (HttpRequestMessage mute = new(HttpMethod.Post, "/api/projects/" + projectId + "/mute") { Content = JsonContent.Create(new { muted = true }) })
+    {
+        mute.Headers.Add("Origin", address);
+        mute.Headers.Add("X-Graft-CSRF", aliceCsrf);
+        using HttpResponseMessage response = await aliceBrowser.SendAsync(mute);
+        Check(response.StatusCode == HttpStatusCode.NoContent, "the browser mutes a project");
+    }
+    using (HttpResponseMessage mutes = await aliceBrowser.GetAsync("/api/notifications/mutes"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await mutes.Content.ReadAsStringAsync());
+        Check(mutes.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 1 && json.RootElement[0].GetProperty("project_path").GetString() == "alice/inbox" &&
+            json.RootElement[0].GetProperty("target_type").ValueKind == JsonValueKind.Null, "and lists it, so a mute is never invisible");
+    }
+    using (HttpResponseMessage state = await aliceBrowser.GetAsync("/api/projects/" + projectId + "/mute?subject=issue&iid=" + mentioning))
+    {
+        using JsonDocument json = JsonDocument.Parse(await state.Content.ReadAsStringAsync());
+        Check(json.RootElement.GetProperty("project_muted").GetBoolean() && !json.RootElement.GetProperty("thread_muted").GetBoolean(),
+            "an issue's page reads the project muted and the issue not");
+    }
+    using (HttpRequestMessage unmute = new(HttpMethod.Post, "/api/projects/" + projectId + "/mute") { Content = JsonContent.Create(new { muted = false }) })
+    {
+        unmute.Headers.Add("Origin", address);
+        unmute.Headers.Add("X-Graft-CSRF", aliceCsrf);
+        using HttpResponseMessage response = await aliceBrowser.SendAsync(unmute);
+        Check(response.StatusCode == HttpStatusCode.NoContent, "and unmutes it");
+    }
     aliceBrowser.Dispose();
 }
 
@@ -8165,6 +8297,41 @@ async Task<string> CheckMail(string address, string bobUsername, string bobPassw
         Check(json.RootElement.GetProperty("notify_by_email").GetBoolean() && json.RootElement.GetProperty("unread_notifications").GetInt64() >= 2,
             "the preference shows on the session, and both assignments are in the inbox whether or not they were mailed");
     }
+
+    // A digest instead (ADR 0050): one message a period listing what is unread and new, and nothing per notification.
+    Check(serverLines.Any(line => line.StartsWith("MAIL DIGEST: every 0.05 minutes", StringComparison.Ordinal)), "the server says how often digests go");
+    while (inbox.TryDequeue(out _)) { }
+    using (HttpResponseMessage digestOn = await Post(bobAgain, bobAgainCsrf, address, "/api/notifications/email", new { enabled = true, digest = true }))
+        Check(digestOn.StatusCode == HttpStatusCode.NoContent, "the person asks for a digest instead");
+    using (HttpResponseMessage session = await bobAgain.GetAsync("/api/session"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await session.Content.ReadAsStringAsync());
+        Check(json.RootElement.GetProperty("notify_by_email").GetBoolean() && json.RootElement.GetProperty("email_digest").GetBoolean(), "which the session shows");
+    }
+    foreach (string title in new[] { "First for the digest", "Second for the digest" })
+        using (HttpResponseMessage assigned = await ApiPost(address, "/api/v4/projects/" + inboxProjectId + "/issues", aliceApiForMail,
+            new { title, assignee_usernames = new[] { bobUsername } }))
+            Check(assigned.StatusCode == HttpStatusCode.Created, "an assignment is made for the digest: " + title);
+    List<(string To, string Body)> digests = [];
+    for (int waited = 0; waited < 150 && digests.Count == 0; waited++)
+    {
+        await Task.Delay(100);
+        while (inbox.TryDequeue(out (string To, string Body) arrived)) digests.Add(arrived);
+    }
+    await Task.Delay(1500);
+    while (inbox.TryDequeue(out (string To, string Body) late)) digests.Add(late);
+    string digestBody = digests.Count == 1 ? digests[0].Body : "";
+    int digestBlank = digestBody.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+    string digestText = digestBlank < 0 ? "" : Encoding.UTF8.GetString(Convert.FromBase64String(digestBody[(digestBlank + 4)..].Replace("\r\n", "")));
+    Check(digests.Count == 1 && digests[0].To == "Bob@Example.test" && digestBody.Contains("[Graft] 2 notifications for " + bobUsername, StringComparison.Ordinal),
+        "one digest arrives for both, and no message for each (got " + digests.Count + ")");
+    Check(digestText.Contains("First for the digest", StringComparison.Ordinal) && digestText.Contains("Second for the digest", StringComparison.Ordinal) &&
+        !digestText.Contains("After opting in", StringComparison.Ordinal),
+        "it lists what arrived since the digest was asked for, and nothing from before");
+    await Task.Delay(4000);
+    Check(inbox.IsEmpty, "and with nothing new, no further digest is sent");
+    using (HttpResponseMessage digestOff = await Post(bobAgain, bobAgainCsrf, address, "/api/notifications/email", new { enabled = false, digest = false }))
+        Check(digestOff.StatusCode == HttpStatusCode.NoContent, "email is turned off again");
     bobAgain.Dispose();
 
     smtpLife.Cancel();
@@ -8228,6 +8395,7 @@ async Task CheckSsh(string address, AuthenticatedIdentity alice, string bobUsern
     string aliceApi;
     string aliceReadApi;
     string bobApi;
+    string adminApi;
     await using (GraftStore fixture = await GraftStore.OpenAsync(databasePath))
     {
         UserAccount bob = Required(await fixture.FindActiveUserAsync(bobUsername), "bob account");
@@ -8235,6 +8403,9 @@ async Task CheckSsh(string address, AuthenticatedIdentity alice, string bobUsern
         aliceApi = (await fixture.CreateTokenAsync(alice, "ssh-api", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
         aliceReadApi = (await fixture.CreateTokenAsync(alice, "ssh-read-api", TokenScope.ReadApi, DateTimeOffset.UtcNow.AddHours(1))).Secret;
         bobApi = (await fixture.CreateTokenAsync(bobIdentity, "ssh-bob-api", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        UserAccount admin = Required(await fixture.FindActiveUserAsync("admin"), "admin account");
+        adminApi = (await fixture.CreateTokenAsync(new(admin.Id, admin.Username, true, IdentityKind.BrowserSession), "ssh-admin", TokenScope.Api,
+            DateTimeOffset.UtcNow.AddHours(1))).Secret;
     }
 
     // Real keys, made by OpenSSH.
@@ -8367,6 +8538,202 @@ async Task CheckSsh(string address, AuthenticatedIdentity alice, string bobUsern
     await GitFails(root, ["-c", "core.sshCommand=" + Ssh(ed25519), "ls-remote", remote], "a removed key no longer authenticates");
     await Git(root, ["-c", "core.sshCommand=" + Ssh(rsa), "ls-remote", remote]);
     Check(true, "while the account's other keys still do");
+
+    // Keys an administrator manages on somebody else's account (ADR 0049).
+    string accountKeys = "/api/v4/users/" + alice.UserId.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/keys";
+    using (HttpResponseMessage hidden = await ApiGet(address, accountKeys, bobApi))
+        Check(hidden.StatusCode == System.Net.HttpStatusCode.NotFound, "another account's keys are not listed to somebody who is not an administrator");
+    using (HttpResponseMessage own = await ApiGet(address, accountKeys, aliceReadApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await own.Content.ReadAsStringAsync());
+        Check(own.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 2, "the account lists its own keys by its id");
+    }
+    using (HttpResponseMessage listed = await ApiGet(address, accountKeys, adminApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await listed.Content.ReadAsStringAsync());
+        Check(listed.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 2, "an administrator lists them");
+    }
+    string adminSet = await KeyGen("admin-set", "-t", "ed25519");
+    string adminSetBody = """{"title":"set by admin","key":""" + JsonSerializer.Serialize(File.ReadAllText(adminSet + ".pub")) + "}";
+    using (HttpResponseMessage refused = await ApiPostJson(address, accountKeys, aliceApi, adminSetBody))
+        Check(refused.StatusCode == System.Net.HttpStatusCode.Forbidden, "only an administrator adds a key to an account, even its own by this route");
+    long adminSetId;
+    using (HttpResponseMessage added = await ApiPostJson(address, accountKeys, adminApi, adminSetBody))
+    {
+        Check(added.StatusCode == System.Net.HttpStatusCode.Created, "an administrator adds a key to another account (got " + (int)added.StatusCode + ")");
+        using JsonDocument json = JsonDocument.Parse(await added.Content.ReadAsStringAsync());
+        adminSetId = json.RootElement.GetProperty("id").GetInt64();
+    }
+    await Git(root, ["-c", "core.sshCommand=" + Ssh(adminSet), "ls-remote", remote]);
+    Check(true, "and the key works for that account");
+    string adminSetFingerprint = await FingerprintOf(adminSet + ".pub");
+    using (HttpResponseMessage whose = await ApiGet(address, "/api/v4/keys?fingerprint=" + Uri.EscapeDataString(adminSetFingerprint), adminApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await whose.Content.ReadAsStringAsync());
+        Check(whose.IsSuccessStatusCode && json.RootElement.GetProperty("user").GetProperty("username").GetString() == "alice" &&
+            json.RootElement.GetProperty("id").GetInt64() == adminSetId, "an administrator finds whose key a fingerprint is");
+    }
+    using (HttpResponseMessage notAdmin = await ApiGet(address, "/api/v4/keys/" + adminSetId, aliceApi))
+        Check(notAdmin.StatusCode == System.Net.HttpStatusCode.Forbidden, "and nobody else may ask");
+    using (HttpResponseMessage removed = await ApiDelete(address, accountKeys + "/" + adminSetId, adminApi))
+        Check(removed.StatusCode == System.Net.HttpStatusCode.NoContent, "an administrator removes another account's key");
+    await GitFails(root, ["-c", "core.sshCommand=" + Ssh(adminSet), "ls-remote", remote], "which stops working at once");
+
+    // Deploy keys: a key that opens one project and belongs to no account.
+    long sshProjectId;
+    using (HttpResponseMessage project = await ApiGet(address, "/api/v4/projects/alice%2Fsshsample", aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await project.Content.ReadAsStringAsync());
+        sshProjectId = json.RootElement.GetProperty("id").GetInt64();
+    }
+    string projectKeys = "/api/v4/projects/" + sshProjectId.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/deploy_keys";
+    string deploy = await KeyGen("deploy", "-t", "ed25519");
+    string deployBody = """{"title":"ci","key":""" + JsonSerializer.Serialize(File.ReadAllText(deploy + ".pub")) + "}";
+    using (HttpResponseMessage readOnly = await ApiPostJson(address, projectKeys, aliceReadApi, deployBody))
+        Check(readOnly.StatusCode == System.Net.HttpStatusCode.Forbidden, "a read_api token cannot add a deploy key");
+    using (HttpResponseMessage outsider = await ApiPostJson(address, projectKeys, bobApi, deployBody))
+        Check(outsider.StatusCode is System.Net.HttpStatusCode.NotFound or System.Net.HttpStatusCode.Forbidden, "nor can an account that cannot manage the project");
+    using (HttpResponseMessage accountKey = await ApiPostJson(address, projectKeys, aliceApi,
+        """{"title":"mine","key":""" + JsonSerializer.Serialize(File.ReadAllText(rsa + ".pub")) + "}"))
+        Check(accountKey.StatusCode == System.Net.HttpStatusCode.BadRequest, "an account's key cannot also be a deploy key");
+    long deployId;
+    using (HttpResponseMessage created = await ApiPostJson(address, projectKeys, aliceApi, deployBody))
+    {
+        Check(created.StatusCode == System.Net.HttpStatusCode.Created, "a Maintainer adds a deploy key (got " + (int)created.StatusCode + ")");
+        using JsonDocument json = JsonDocument.Parse(await created.Content.ReadAsStringAsync());
+        deployId = json.RootElement.GetProperty("id").GetInt64();
+        Check(!json.RootElement.GetProperty("can_push").GetBoolean() && json.RootElement.GetProperty("fingerprint").GetString() == await FingerprintOf(deploy + ".pub"),
+            "read only unless asked, with the fingerprint ssh-keygen reports");
+    }
+    using (HttpResponseMessage asAccount = await ApiPostJson(address, "/api/v4/user/keys", bobApi, deployBody))
+        Check(asAccount.StatusCode == System.Net.HttpStatusCode.BadRequest, "and a deploy key cannot then be registered to an account");
+    string deployClone = Path.Combine(root, "ssh-deploy-clone");
+    await Git(root, ["-c", "core.sshCommand=" + Ssh(deploy), "clone", "-q", remote, deployClone]);
+    Check(File.Exists(Path.Combine(deployClone, "README.md")), "a deploy key clones the project that admits it");
+    File.WriteAllText(Path.Combine(deployClone, "deployed.txt"), "from the deploy key\n");
+    await Git(deployClone, ["add", "."]);
+    await Git(deployClone, ["commit", "-q", "-m", "From a deploy key"]);
+    await GitFails(deployClone, ["-c", "core.sshCommand=" + Ssh(deploy), "push", remote, "HEAD:main"], "a read-only deploy key cannot push");
+    await GitFails(root, ["-c", "core.sshCommand=" + Ssh(deploy), "ls-remote", sshBase + "/alice/pagesample.git"], "and reaches no other project");
+    using (HttpResponseMessage allowed = await ApiPutJson(address, projectKeys + "/" + deployId, aliceApi, """{"can_push":true}"""))
+    {
+        using JsonDocument json = JsonDocument.Parse(await allowed.Content.ReadAsStringAsync());
+        Check(allowed.IsSuccessStatusCode && json.RootElement.GetProperty("can_push").GetBoolean(), "a Maintainer lets it push");
+    }
+    await Git(deployClone, ["-c", "core.sshCommand=" + Ssh(deploy), "push", remote, "HEAD:main"]);
+    Check((await Git(root, ["-c", "core.sshCommand=" + Ssh(rsa), "ls-remote", remote, "refs/heads/main"])).StartsWith(
+        (await Git(deployClone, ["rev-parse", "HEAD"])).Trim(), StringComparison.Ordinal), "and then it pushes");
+    (int deployGreetExit, string deployGreeting, _) = await RunTool("ssh", root, [.. Ssh(deploy).Split(' ').Skip(1).Select(part => part.Trim('"')),
+        "-T", "-p", sshBase[(sshBase.LastIndexOf(':') + 1)..], "git@127.0.0.1"]);
+    Check(deployGreetExit == 0 && deployGreeting.Contains("deploy key", StringComparison.Ordinal), "a deploy key is greeted as one, naming no account");
+    using (HttpResponseMessage readOnlyList = await ApiGet(address, projectKeys, aliceReadApi))
+        Check(readOnlyList.StatusCode == System.Net.HttpStatusCode.Forbidden,
+            "a read_api token cannot read a project's deploy keys, as it cannot read its other settings");
+    using (HttpResponseMessage list = await ApiGet(address, projectKeys, aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await list.Content.ReadAsStringAsync());
+        Check(list.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 1 && json.RootElement[0].GetProperty("last_used_at").ValueKind == JsonValueKind.String,
+            "an api token lists the project's deploy keys, with the use recorded");
+    }
+    using (HttpResponseMessage all = await ApiGet(address, "/api/v4/deploy_keys", adminApi))
+        Check(all.IsSuccessStatusCode && (await all.Content.ReadAsStringAsync()).Contains(await FingerprintOf(deploy + ".pub"), StringComparison.Ordinal),
+            "an administrator lists every deploy key on the server");
+    using (HttpResponseMessage notAll = await ApiGet(address, "/api/v4/deploy_keys", aliceApi))
+        Check(notAll.StatusCode == System.Net.HttpStatusCode.Forbidden, "and nobody else may");
+
+    // Large files over an SSH remote: git-lfs asks the SSH server where to send them and for a credential.
+    string port = sshBase[(sshBase.LastIndexOf(':') + 1)..];
+    if ((await RunGit(root, ["lfs", "version"])).ExitCode == 0)
+    {
+        string lfsWork = Path.Combine(root, "ssh-lfs");
+        await Git(root, ["-c", "core.sshCommand=" + Ssh(rsa), "clone", "-q", remote, lfsWork]);
+        await Git(lfsWork, ["lfs", "install", "--local"]);
+        await Git(lfsWork, ["lfs", "track", "*.bin"]);
+        byte[] big = new byte[512 * 1024];
+        RandomNumberGenerator.Fill(big);
+        File.WriteAllBytes(Path.Combine(lfsWork, "weights.bin"), big);
+        await Git(lfsWork, ["add", "."]);
+        await Git(lfsWork, ["commit", "-q", "-m", "A large file over SSH"]);
+        // Traced and bounded rather than through RunGit, so a hang reports what git-lfs was doing instead of a bare timeout.
+        async Task<(int ExitCode, string Output, string Errors)> Traced(string directory, string[] arguments)
+        {
+            ProcessStartInfo start = new("git") { WorkingDirectory = directory, UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+            foreach (string key in start.Environment.Keys.Where(key => key.StartsWith("GIT_", StringComparison.OrdinalIgnoreCase)).ToArray())
+                start.Environment.Remove(key);
+            start.Environment["GIT_CONFIG_GLOBAL"] = gitConfig;
+            start.Environment["GIT_CONFIG_NOSYSTEM"] = "1";
+            start.Environment["GIT_TERMINAL_PROMPT"] = "0";
+            start.Environment["GIT_TRACE"] = "1";
+            start.Environment["GIT_TRANSFER_TRACE"] = "1";
+            foreach (string value in new[] { "user.name=Fixture", "user.email=fixture@example.invalid", "credential.helper=", "http.sslVerify=false" })
+            { start.ArgumentList.Add("-c"); start.ArgumentList.Add(value); }
+            foreach (string argument in arguments) start.ArgumentList.Add(argument);
+            using Process process = Process.Start(start)!;
+            Task<string> output = process.StandardOutput.ReadToEndAsync();
+            Task<string> errors = process.StandardError.ReadToEndAsync();
+            bool finished = await Task.WhenAny(process.WaitForExitAsync(), Task.Delay(TimeSpan.FromSeconds(45))) is Task done && process.HasExited;
+            if (!finished) process.Kill(entireProcessTree: true);
+            await process.WaitForExitAsync();
+            string trace = await errors;
+            return (finished ? process.ExitCode : -1, await output, trace.Length > 6000 ? trace[^6000..] : trace);
+        }
+        (int pushExit, string pushOut, string pushErr) = await Traced(lfsWork, ["-c", "core.sshCommand=" + Ssh(rsa), "push", "origin", "HEAD:main"]);
+        if (pushExit != 0) Console.WriteLine("LFS OVER SSH TRACE:\n" + Redact(pushErr));
+        string bigOid = Convert.ToHexStringLower(SHA256.HashData(big));
+        Check(pushExit == 0 && File.Exists(Path.Combine(repositoriesRoot, (await StorageIdOf(sshProjectId))!, "lfs", bigOid[..2], bigOid[2..4], bigOid)),
+            "a push to an SSH remote carries its large files, by way of git-lfs-authenticate (exit " + pushExit + ": " + Redact(pushOut + pushErr) + ")");
+
+        // The deploy key fetches them too, once it has the commit.
+        await Git(deployClone, ["-c", "core.sshCommand=" + Ssh(deploy), "pull", "-q", "--no-rebase", "origin", "main"]);
+        await Git(deployClone, ["lfs", "install", "--local"]);
+        (int pullExit, string pullOut, string pullErr) = await RunGit(deployClone, ["-c", "core.sshCommand=" + Ssh(deploy), "lfs", "pull"]);
+        bool restored = File.Exists(Path.Combine(deployClone, "weights.bin")) && File.ReadAllBytes(Path.Combine(deployClone, "weights.bin")).AsSpan().SequenceEqual(big);
+        Check(restored, "a deploy key fetches the large files over SSH as well (exit " + pullExit + ": " + Redact(pullOut + pullErr) + ")");
+
+        // The ticket by hand: what it opens, and what it does not.
+        async Task<(string Href, string Authorization)> Authenticate(string key, string operation)
+        {
+            (int exit, string output, string errors) = await RunTool("ssh", root, [.. Ssh(key).Split(' ').Skip(1).Select(part => part.Trim('"')),
+                "-p", port, "git@127.0.0.1", "git-lfs-authenticate", "alice/sshsample.git", operation]);
+            if (exit != 0) throw new InvalidOperationException("git-lfs-authenticate failed: " + errors);
+            using JsonDocument json = JsonDocument.Parse(output);
+            return (json.RootElement.GetProperty("href").GetString()!, json.RootElement.GetProperty("header").GetProperty("Authorization").GetString()!);
+        }
+        async Task<HttpResponseMessage> WithTicket(HttpMethod method, string url, string authorization, byte[]? body = null)
+        {
+            using HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false };
+            using HttpClient client = new(handler) { Timeout = TimeSpan.FromSeconds(20) };
+            using HttpRequestMessage request = new(method, url);
+            request.Headers.TryAddWithoutValidation("Authorization", authorization);
+            if (body is not null) { request.Content = new ByteArrayContent(body); request.Content.Headers.ContentType = new("application/octet-stream"); }
+            HttpResponseMessage response = await client.SendAsync(request);
+            await response.Content.LoadIntoBufferAsync();
+            return response;
+        }
+        (string href, string ticket) = await Authenticate(rsa, "download");
+        Check(href.EndsWith("/alice/sshsample.git/info/lfs", StringComparison.Ordinal) && ticket.StartsWith("GraftLfs ", StringComparison.Ordinal),
+            "git-lfs-authenticate answers the repository's large-file address and a credential for it");
+        using (HttpResponseMessage fetched = await WithTicket(HttpMethod.Get, href + "/objects/" + bigOid, ticket))
+            Check(fetched.IsSuccessStatusCode && (await fetched.Content.ReadAsByteArrayAsync()).AsSpan().SequenceEqual(big), "the credential downloads the object");
+        using (HttpResponseMessage upload = await WithTicket(HttpMethod.Put, href + "/objects/" + Convert.ToHexStringLower(SHA256.HashData([1, 2, 3])), ticket, [1, 2, 3]))
+            Check(upload.StatusCode == System.Net.HttpStatusCode.NotFound, "a download credential cannot upload");
+        using (HttpResponseMessage repository = await WithTicket(HttpMethod.Get, href[..^"/info/lfs".Length] + "/info/refs?service=git-upload-pack", ticket))
+            Check(repository.StatusCode == System.Net.HttpStatusCode.Unauthorized, "and opens nothing but the large files: not the repository itself");
+        using (HttpResponseMessage elsewhere = await WithTicket(HttpMethod.Get, href.Replace("/alice/sshsample.git/", "/alice/heavy.git/", StringComparison.Ordinal) + "/objects/" + bigOid, ticket))
+            Check(elsewhere.StatusCode == System.Net.HttpStatusCode.NotFound, "nor another project's");
+        using (HttpResponseMessage forged = await WithTicket(HttpMethod.Get, href + "/objects/" + bigOid, ticket[..^2] + (ticket.EndsWith("AA", StringComparison.Ordinal) ? "BB" : "AA")))
+            Check(forged.StatusCode == System.Net.HttpStatusCode.Unauthorized, "a credential that was altered is refused");
+        (int strangerExit, _, string strangerErrors) = await RunTool("ssh", root, [.. Ssh(bobKey).Split(' ').Skip(1).Select(part => part.Trim('"')),
+            "-p", port, "git@127.0.0.1", "git-lfs-authenticate", "alice/sshsample.git", "download"]);
+        Check(strangerExit != 0 && strangerErrors.Contains("repository not found", StringComparison.Ordinal),
+            "an account with no role is given the same refusal as for Git");
+    }
+    else Console.WriteLine("SKIP: git-lfs is not installed, so LFS over SSH is not exercised.");
+
+    // A removed deploy key stops at once.
+    using (HttpResponseMessage removed = await ApiDelete(address, projectKeys + "/" + deployId, aliceApi))
+        Check(removed.StatusCode == System.Net.HttpStatusCode.NoContent, "a Maintainer removes the deploy key");
+    await GitFails(root, ["-c", "core.sshCommand=" + Ssh(deploy), "ls-remote", remote], "and it no longer opens the project");
 }
 
 async Task<(int ExitCode, string Output, string Errors)> RunTool(string file, string directory, string[] arguments, IReadOnlyDictionary<string, string>? environment = null)

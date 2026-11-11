@@ -42,7 +42,7 @@ if (args.Length == 1 && args[0] == "--licences")
 
 if (!Arguments.TryParse(args, out Arguments? parsedSettings))
 {
-    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>] [--mcp true|false] [--pages-origin <https origin>] [--recoverable-tokens true|false] [--webhooks true|false] [--ssh-port <0-65535>] [--ssh-host <name>] [--mail-smtp <smtp|smtp+starttls|smtps URL>] [--mail-from <address>] [--mail-password-file <UTF-8 path>] [--runner-port <0-65535>] [--runner-host <name>] [--runner-downloads <directory>] [--runner-chunk-threshold <MiB|off>] [--runner-chunk-size <1-64 MiB>] [--push-delete true|false] [--url-import off|public|any] [--mirror-interval <15-10080 minutes>] [--transfer-part-size <1-95 MiB>].");
+    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>] [--mcp true|false] [--pages-origin <https origin>] [--recoverable-tokens true|false] [--webhooks true|false] [--ssh-port <0-65535>] [--ssh-host <name>] [--mail-smtp <smtp|smtp+starttls|smtps URL>] [--mail-from <address>] [--mail-password-file <UTF-8 path>] [--runner-port <0-65535>] [--runner-host <name>] [--runner-downloads <directory>] [--runner-chunk-threshold <MiB|off>] [--runner-chunk-size <1-64 MiB>] [--push-delete true|false] [--url-import off|public|any] [--mirror-interval <15-10080 minutes>] [--transfer-part-size <1-95 MiB>] [--mail-digest-minutes <minutes, default 1440>].");
     Console.Error.WriteLine("       Graft.Server --licences  prints the third-party notices this build redistributes.");
     Console.Error.WriteLine("       Graft.Server --version   prints the release this is.");
     return 2;
@@ -54,6 +54,8 @@ Directory.CreateDirectory(settings.Repositories);
 using MaintenanceLease maintenanceLease = MaintenanceLease.Acquire(settings.Database, settings.Repositories);
 await using GraftStore store = await GraftStore.OpenAsync(settings.Database, default,
     TimeSpan.FromMinutes(settings.SessionMinutes));
+// A mention reaches somebody who is not a member only on a server that serves anything to non-members (ADR 0050).
+store.PublicBrowsing = settings.PublicBrowsing;
 WebAssets assets = new();
 ConcurrentDictionary<string, Lazy<RepositoryEndpoint>> repositories = new(StringComparer.Ordinal);
 byte[] csrfKey = RandomNumberGenerator.GetBytes(32);
@@ -65,6 +67,9 @@ string? serverOrigin = null;
 // Git over SSH, started once the HTTP side is up so the clone URLs it advertises exist. Declared here because
 // the project response needs the port that was actually bound, which a test learns only after the start.
 Graft.Ssh.SshServer? sshServer = null;
+// Signs the credentials git-lfs-authenticate hands out over SSH, which the large-file routes then accept (ADR 0049).
+LfsTickets lfsTickets = new();
+GitSshHost? gitSshHost = null;
 // Runners, when the operator named a port: a CupriNet Shrine runners reach from their install script's Intonation.
 Graft.Server.RunnerHost? runners = null;
 Graft.Ssh.SshHostKey? sshHostKey = null;
@@ -239,28 +244,38 @@ await using MailSender? mail = settings.Mail is null ? null : new MailSender(set
 // an address, on a server that can send. The row exists either way, so the inbox never depends on mail.
 store.NotificationCreated = delivery =>
 {
-    if (mail is null || !delivery.ByEmail || delivery.Email is null) return Task.CompletedTask;
+    // A person who takes email as a digest gets this in the next one instead (ADR 0050).
+    if (mail is null || !delivery.ByEmail || delivery.Digest || delivery.Email is null) return Task.CompletedTask;
     Notification note = delivery.Notification;
-    string what = (note.Subject == CommentSubject.Issue ? "issue #" : "proposal !") + note.Iid.ToString(System.Globalization.CultureInfo.InvariantCulture);
-    string verb = note.Action switch
-    {
-        "assigned" => "assigned you",
-        "review_requested" => "asked you to review",
-        "commented" => "commented on",
-        "approved" => "approved",
-        "merged" => "merged",
-        "closed" => "closed",
-        "reopened" => "reopened",
-        _ => note.Action
-    };
-    string url = (serverOrigin ?? "") + "/" + note.ProjectPath + "/-/" + (note.Subject == CommentSubject.Issue ? "issues/" : "merge-requests/") +
-        note.Iid.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    string what = NotificationWhat(note);
+    string verb = NotificationVerb(note.Action);
+    string url = NotificationLink(serverOrigin ?? "", note);
     mail.Send(delivery.Email, "[" + note.ProjectPath + "] " + note.ActorUsername + " " + verb + " " + what + ": " + note.Title,
         "Hello " + delivery.Username + ",\n\n" + note.ActorUsername + " " + verb + " " + what + " in " + note.ProjectPath + ":\n\n    " + note.Title +
         "\n\n" + url + "\n\nYou are receiving this because you asked for a message for each notification, under Profile and Email. " +
         "Turn it off there; the inbox at " + (serverOrigin ?? "") + "/-/notifications stays either way.\n");
     return Task.CompletedTask;
 };
+
+static string NotificationWhat(Notification note) =>
+    (note.Subject == CommentSubject.Issue ? "issue #" : "proposal !") + note.Iid.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+static string NotificationVerb(string action) => action switch
+{
+    "assigned" => "assigned you",
+    "review_requested" => "asked you to review",
+    "commented" => "commented on",
+    "approved" => "approved",
+    "merged" => "merged",
+    "closed" => "closed",
+    "reopened" => "reopened",
+    "mentioned" => "mentioned you in",
+    _ => action
+};
+
+static string NotificationLink(string origin, Notification note) =>
+    origin + "/" + note.ProjectPath + "/-/" + (note.Subject == CommentSubject.Issue ? "issues/" : "merge-requests/") +
+    note.Iid.ToString(System.Globalization.CultureInfo.InvariantCulture);
 // A project under a nested group is addressed as `team/platform/api.git`, more segments than the Git routes
 // below were written for. Ahead of routing, a path with more than one namespace segment before `.git` is
 // folded into one encoded segment, `team%2Fplatform/api.git`, so the existing two-segment routes serve it;
@@ -464,7 +479,8 @@ app.MapGet("/api/session", async context =>
         response = new(true, browser.Value.Identity.Username, browser.Value.Identity.IsAdministrator,
             Csrf(browser.Value.Secret), userId, avatarUrl, settings.PublicBrowsing, settings.Mcp, settings.Webhooks, mail is not null,
             account?.Email, await store.CountUnreadNotificationsAsync(userId, context.RequestAborted),
-            await store.GetNotifyByEmailAsync(userId, context.RequestAborted), await store.HasSecondFactorAsync(userId, context.RequestAborted));
+            await store.GetNotifyByEmailAsync(userId, context.RequestAborted), await store.HasSecondFactorAsync(userId, context.RequestAborted),
+            await store.GetEmailDigestAsync(userId, context.RequestAborted));
     }
     await context.Response.WriteAsJsonAsync(response, ApiJson.Default.SessionResponse, null, context.RequestAborted);
 });
@@ -1784,7 +1800,7 @@ app.MapPost("/api/notifications/email", async context =>
     if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
     NotifyByEmailRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.NotifyByEmailRequest, context.RequestAborted);
     if (request is null) { await ApiError(context, 400, "enabled"); return; }
-    await store.SetNotifyByEmailAsync(browser.Value.Identity, request.Enabled, context.RequestAborted);
+    await store.SetNotifyByEmailAsync(browser.Value.Identity, request.Enabled, request.Digest, context.RequestAborted);
     context.Response.StatusCode = StatusCodes.Status204NoContent;
 });
 
@@ -2918,24 +2934,9 @@ async Task AddSshKey(HttpContext context, AuthenticatedIdentity identity)
     SshKeyCreateRequest? request;
     try { request = await context.Request.ReadFromJsonAsync(ApiJson.Default.SshKeyCreateRequest, context.RequestAborted); }
     catch (JsonException) { await ApiError(context, 400, "400 Bad Request: body is not valid JSON"); return; }
-    string title = request?.Title?.Trim() ?? "";
-    if (title.Length is 0 or > 100) { await ApiError(context, 400, "400 Bad Request: title is required and at most 100 characters"); return; }
-    if (request?.Key is null || request.Key.Length > 2 * Graft.Ssh.SshPublicKey.MaximumBlobBytes + 300)
-    { await ApiError(context, 400, "400 Bad Request: key is required"); return; }
-    Graft.Ssh.SshPublicKey? key = Graft.Ssh.SshPublicKey.ParseAuthorizedKey(request.Key);
-    if (key is null)
-    {
-        await ApiError(context, 400, "400 Bad Request: key is invalid; Graft accepts ssh-ed25519, ecdsa-sha2-nistp256/384/521 and ssh-rsa of 2048 bits or more, as one line");
-        return;
-    }
-    DateTimeOffset? expires = null;
-    if (!string.IsNullOrWhiteSpace(request.ExpiresAt))
-    {
-        if (!DateOnly.TryParseExact(request.ExpiresAt.Trim(), "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture,
-            System.Globalization.DateTimeStyles.None, out DateOnly date) || date <= DateOnly.FromDateTime(DateTime.UtcNow))
-        { await ApiError(context, 400, "400 Bad Request: expires_at must be a future date as YYYY-MM-DD"); return; }
-        expires = new DateTimeOffset(date.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero);
-    }
+    var parsed = await ReadKey(context, request?.Title, request?.Key, request?.ExpiresAt);
+    if (parsed is null) return;
+    (Graft.Ssh.SshPublicKey key, string title, DateTimeOffset? expires) = parsed.Value;
     try
     {
         SshKeyInfo added = await store.AddSshKeyAsync(identity, title, key.Type, key.ToAuthorizedKeyLine(), key.Fingerprint, expires, context.RequestAborted);
@@ -2944,6 +2945,31 @@ async Task AddSshKey(HttpContext context, AuthenticatedIdentity identity)
     }
     catch (SshKeyConflictException) { await ApiError(context, 400, "400 Bad Request: fingerprint has already been taken"); }
     catch (InvalidOperationException exception) { await ApiError(context, 400, "400 Bad Request: " + exception.Message); }
+}
+
+/// <summary>A key from a request, for an account or a project: a title, the one-line key the SSH server will verify, and
+/// an optional future expiry date. Writes the refusal and returns null when any of the three is wrong.</summary>
+async Task<(Graft.Ssh.SshPublicKey Key, string Title, DateTimeOffset? Expires)?> ReadKey(HttpContext context, string? rawTitle, string? rawKey, string? expiresAt)
+{
+    string title = rawTitle?.Trim() ?? "";
+    if (title.Length is 0 or > 100) { await ApiError(context, 400, "400 Bad Request: title is required and at most 100 characters"); return null; }
+    if (rawKey is null || rawKey.Length > 2 * Graft.Ssh.SshPublicKey.MaximumBlobBytes + 300)
+    { await ApiError(context, 400, "400 Bad Request: key is required"); return null; }
+    Graft.Ssh.SshPublicKey? key = Graft.Ssh.SshPublicKey.ParseAuthorizedKey(rawKey);
+    if (key is null)
+    {
+        await ApiError(context, 400, "400 Bad Request: key is invalid; Graft accepts ssh-ed25519, ecdsa-sha2-nistp256/384/521 and ssh-rsa of 2048 bits or more, as one line");
+        return null;
+    }
+    DateTimeOffset? expires = null;
+    if (!string.IsNullOrWhiteSpace(expiresAt))
+    {
+        if (!DateOnly.TryParseExact(expiresAt.Trim(), "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.None, out DateOnly date) || date <= DateOnly.FromDateTime(DateTime.UtcNow))
+        { await ApiError(context, 400, "400 Bad Request: expires_at must be a future date as YYYY-MM-DD"); return null; }
+        expires = new DateTimeOffset(date.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero);
+    }
+    return (key, title, expires);
 }
 
 static SshKeyResponse SshKeyResponseFor(SshKeyInfo key) =>
@@ -7612,6 +7638,391 @@ app.MapPost("/api/projects/{projectId:long}/comments/{commentId:long}", async co
     await UpdateNote(context, scope.Value.Details, scope.Value.Identity);
 });
 
+// ---------------------------------------------------------------------------------------------------
+// Deploy keys (ADR 0049) and muting (ADR 0050), twice like the planning routes below: GitLab's family, and the
+// browser's with its hyphenated spelling. A deploy key is managed by whoever manages the project; a mute belongs to
+// the person who set it, on what they may read.
+// ---------------------------------------------------------------------------------------------------
+
+foreach ((string root, bool browserFamily) in new[] { ("/api/projects/{projectId:long}", true), ("/api/v4/projects/{projectId}", false) })
+{
+    async Task<(ProjectDetails Details, AuthenticatedIdentity? Identity)?> Scope(HttpContext context, bool write) =>
+        browserFamily ? await BrowserCollaboration(context, write) : await ApiCollaboration(context);
+    string keys = browserFamily ? "/deploy-keys" : "/deploy_keys";
+
+    app.MapGet(root + keys, async context =>
+    {
+        var scope = await Scope(context, false);
+        if (scope is null || await SignedIn(context, scope.Value.Identity, write: false) is not AuthenticatedIdentity identity) return;
+        if (!await OnlyQuery(context, "page", "per_page")) return;
+        try
+        {
+            IReadOnlyList<DeployKeyInfo> list = await store.ListDeployKeysAsync(identity, scope.Value.Details.Project.Id, context.RequestAborted);
+            await context.Response.WriteAsJsonAsync(list.Select(DeployKeyResponseFor).ToArray(), ApiJson.Default.DeployKeyResponseArray, null, context.RequestAborted);
+        }
+        catch (UnauthorizedAccessException) { await ApiError(context, 403, "403 Forbidden"); }
+    });
+
+    app.MapGet(root + keys + "/{keyId:long}", async context =>
+    {
+        var scope = await Scope(context, false);
+        if (scope is null || await SignedIn(context, scope.Value.Identity, write: false) is not AuthenticatedIdentity identity) return;
+        if (!await OnlyQuery(context)) return;
+        try
+        {
+            DeployKeyInfo? key = await store.GetDeployKeyAsync(identity, scope.Value.Details.Project.Id, RouteId(context, "keyId"), context.RequestAborted);
+            if (key is null) { await ApiError(context, 404, "404 Deploy Key Not Found"); return; }
+            await context.Response.WriteAsJsonAsync(DeployKeyResponseFor(key), ApiJson.Default.DeployKeyResponse, null, context.RequestAborted);
+        }
+        catch (UnauthorizedAccessException) { await ApiError(context, 403, "403 Forbidden"); }
+    });
+
+    app.MapPost(root + keys, async context =>
+    {
+        var scope = await Scope(context, true);
+        if (scope is null || await SignedIn(context, scope.Value.Identity, write: true) is not AuthenticatedIdentity identity) return;
+        if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+        DeployKeyCreateRequest? request;
+        try { request = await context.Request.ReadFromJsonAsync(ApiJson.Default.DeployKeyCreateRequest, context.RequestAborted); }
+        catch (JsonException) { await ApiError(context, 400, "400 Bad Request: body is not valid JSON"); return; }
+        var parsed = await ReadKey(context, request?.Title, request?.Key, request?.ExpiresAt);
+        if (parsed is null) return;
+        try
+        {
+            DeployKeyInfo added = await store.AddDeployKeyAsync(identity, scope.Value.Details.Project.Id, parsed.Value.Title, parsed.Value.Key.Type,
+                parsed.Value.Key.ToAuthorizedKeyLine(), parsed.Value.Key.Fingerprint, request!.CanPush == true, parsed.Value.Expires, context.RequestAborted);
+            context.Response.StatusCode = StatusCodes.Status201Created;
+            await context.Response.WriteAsJsonAsync(DeployKeyResponseFor(added), ApiJson.Default.DeployKeyResponse, null, context.RequestAborted);
+        }
+        catch (SshKeyConflictException) { await ApiError(context, 400, "400 Bad Request: fingerprint has already been taken"); }
+        catch (InvalidOperationException exception) { await ApiError(context, 400, "400 Bad Request: " + exception.Message); }
+        catch (UnauthorizedAccessException) { await ApiError(context, 403, "403 Forbidden"); }
+    });
+
+    app.MapMethods(root + keys + "/{keyId:long}", [browserFamily ? "POST" : "PUT"], async context =>
+    {
+        var scope = await Scope(context, true);
+        if (scope is null || await SignedIn(context, scope.Value.Identity, write: true) is not AuthenticatedIdentity identity) return;
+        if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+        DeployKeyUpdateRequest? request;
+        try { request = await context.Request.ReadFromJsonAsync(ApiJson.Default.DeployKeyUpdateRequest, context.RequestAborted); }
+        catch (JsonException) { await ApiError(context, 400, "400 Bad Request: body is not valid JSON"); return; }
+        try
+        {
+            DeployKeyInfo? updated = await store.UpdateDeployKeyAsync(identity, scope.Value.Details.Project.Id, RouteId(context, "keyId"),
+                request?.Title, request?.CanPush, context.RequestAborted);
+            if (updated is null) { await ApiError(context, 404, "404 Deploy Key Not Found"); return; }
+            await context.Response.WriteAsJsonAsync(DeployKeyResponseFor(updated), ApiJson.Default.DeployKeyResponse, null, context.RequestAborted);
+        }
+        catch (ArgumentException exception) { await ApiError(context, 400, "400 Bad Request: " + exception.Message); }
+        catch (UnauthorizedAccessException) { await ApiError(context, 403, "403 Forbidden"); }
+    });
+
+    app.MapDelete(root + keys + "/{keyId:long}", async context =>
+    {
+        var scope = await Scope(context, true);
+        if (scope is null || await SignedIn(context, scope.Value.Identity, write: true) is not AuthenticatedIdentity identity) return;
+        try
+        {
+            if (await store.DeleteDeployKeyAsync(identity, scope.Value.Details.Project.Id, RouteId(context, "keyId"), context.RequestAborted))
+                context.Response.StatusCode = StatusCodes.Status204NoContent;
+            else await ApiError(context, 404, "404 Deploy Key Not Found");
+        }
+        catch (UnauthorizedAccessException) { await ApiError(context, 403, "403 Forbidden"); }
+    });
+
+    app.MapPost(root + keys + "/{keyId:long}/enable", async context =>
+    {
+        var scope = await Scope(context, true);
+        if (scope is null || await SignedIn(context, scope.Value.Identity, write: true) is not AuthenticatedIdentity identity) return;
+        try
+        {
+            DeployKeyInfo? enabled = await store.EnableDeployKeyAsync(identity, scope.Value.Details.Project.Id, RouteId(context, "keyId"), context.RequestAborted);
+            if (enabled is null) { await ApiError(context, 404, "404 Deploy Key Not Found"); return; }
+            context.Response.StatusCode = StatusCodes.Status201Created;
+            await context.Response.WriteAsJsonAsync(DeployKeyResponseFor(enabled), ApiJson.Default.DeployKeyResponse, null, context.RequestAborted);
+        }
+        catch (InvalidOperationException exception) { await ApiError(context, 400, "400 Bad Request: " + exception.Message); }
+        catch (UnauthorizedAccessException) { await ApiError(context, 403, "403 Forbidden"); }
+    });
+}
+
+// Muting, for the browser: the state for a project and optionally one thread in it, and a switch for each.
+app.MapGet("/api/projects/{projectId:long}/mute", async context =>
+{
+    var scope = await BrowserCollaboration(context, write: false);
+    if (scope is null || await SignedIn(context, scope.Value.Identity, write: false) is not AuthenticatedIdentity identity) return;
+    if (!await OnlyQuery(context, "subject", "iid")) return;
+    string subjectText = context.Request.Query["subject"].ToString();
+    CommentSubject? subject = subjectText switch { "" => null, "issue" => CommentSubject.Issue, "merge_request" => CommentSubject.MergeRequest, _ => (CommentSubject)(-1) };
+    long? iid = long.TryParse(context.Request.Query["iid"].ToString(), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out long number) ? number : null;
+    if (subject is (CommentSubject)(-1) || (subject is not null && iid is null)) { await ApiError(context, 400, "subject is issue or merge_request, with an iid"); return; }
+    try
+    {
+        MuteState state = await store.GetMuteStateAsync(identity, scope.Value.Details.Project.Id, subject, iid, context.RequestAborted);
+        await context.Response.WriteAsJsonAsync(new MuteStateResponse(state.ProjectMuted, state.ThreadMuted), ApiJson.Default.MuteStateResponse, null, context.RequestAborted);
+    }
+    catch (CollaborationNotFoundException) { await ApiError(context, 404, "not found"); }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "project"); }
+});
+
+foreach ((string suffix, CommentSubject? subject) in new (string, CommentSubject?)[] { ("/mute", null), ("/issues/{iid:long}/mute", CommentSubject.Issue), ("/merge-requests/{iid:long}/mute", CommentSubject.MergeRequest) })
+{
+    app.MapPost("/api/projects/{projectId:long}" + suffix, async context =>
+    {
+        var scope = await BrowserCollaboration(context, write: true);
+        if (scope is null || await SignedIn(context, scope.Value.Identity, write: true) is not AuthenticatedIdentity identity) return;
+        if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+        MuteRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.MuteRequest, context.RequestAborted);
+        if (request is null) { await ApiError(context, 400, "muted"); return; }
+        try
+        {
+            await store.SetMutedAsync(identity, scope.Value.Details.Project.Id, subject, subject is null ? null : Number(context), request.Muted, context.RequestAborted);
+            context.Response.StatusCode = StatusCodes.Status204NoContent;
+        }
+        catch (CollaborationNotFoundException) { await ApiError(context, 404, "not found"); }
+        catch (UnauthorizedAccessException) { await ApiError(context, 404, "project"); }
+    });
+}
+
+app.MapGet("/api/notifications/mutes", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!await OnlyQuery(context)) return;
+    IReadOnlyList<NotificationMute> mutes = await store.ListMutesAsync(browser.Value.Identity, context.RequestAborted);
+    await context.Response.WriteAsJsonAsync(mutes.Select(mute => new NotificationMuteResponse(mute.ProjectId, mute.ProjectPath,
+        mute.Subject switch { CommentSubject.Issue => "Issue", CommentSubject.MergeRequest => "MergeRequest", _ => null },
+        mute.Iid, mute.Title, mute.CreatedAtUtc)).ToArray(), ApiJson.Default.NotificationMuteResponseArray, null, context.RequestAborted);
+});
+
+// GitLab's subscriptions, read the other way round: Graft tells a participant about everything unless they mute it,
+// so unsubscribing mutes the thread and subscribing unmutes it. 304 when nothing changed, as GitLab answers.
+foreach ((string kind, CommentSubject subject) in new[] { ("issues", CommentSubject.Issue), ("merge_requests", CommentSubject.MergeRequest) })
+{
+    foreach ((string verb, bool muted) in new[] { ("subscribe", false), ("unsubscribe", true) })
+    {
+        app.MapPost("/api/v4/projects/{projectId}/" + kind + "/{iid:long}/" + verb, async context =>
+        {
+            var scope = await ApiCollaboration(context);
+            if (scope is null || await SignedIn(context, scope.Value.Identity, write: true) is not AuthenticatedIdentity identity) return;
+            long projectId = scope.Value.Details.Project.Id;
+            try
+            {
+                if (!await store.SetMutedAsync(identity, projectId, subject, Number(context), muted, context.RequestAborted))
+                { context.Response.StatusCode = StatusCodes.Status304NotModified; return; }
+                context.Response.StatusCode = StatusCodes.Status201Created;
+                if (subject == CommentSubject.Issue)
+                {
+                    Issue issue = (await store.FindIssueAsync(identity, projectId, Number(context), context.RequestAborted))!;
+                    await context.Response.WriteAsJsonAsync(await IssueResponseFor(context, scope.Value.Details, issue), ApiJson.Default.IssueResponse, null, context.RequestAborted);
+                }
+                else
+                {
+                    MergeProposal proposal = (await store.FindMergeProposalAsync(identity, projectId, Number(context), null, context.RequestAborted))!;
+                    await context.Response.WriteAsJsonAsync(await FullMergeResponse(context, scope.Value.Details, proposal), ApiJson.Default.MergeRequestResponse, null, context.RequestAborted);
+                }
+            }
+            catch (CollaborationNotFoundException) { await ApiError(context, 404, subject == CommentSubject.Issue ? "404 Issue Not Found" : "404 Merge Request Not Found"); }
+            catch (UnauthorizedAccessException) { await ApiError(context, 404, "404 Project Not Found"); }
+        });
+    }
+}
+
+// GitLab's notification level for a project. Graft has two states, so `disabled` and `mention` mute the project and
+// every other level unmutes it; reading answers `mention` for a muted project, because what still arrives is what is
+// addressed to the person, and `participating` otherwise. `custom` is refused: Graft has no per-event switches.
+app.MapGet("/api/v4/projects/{projectId}/notification_settings", async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null || await SignedIn(context, scope.Value.Identity, write: false) is not AuthenticatedIdentity identity) return;
+    if (!await OnlyQuery(context)) return;
+    MuteState state = await store.GetMuteStateAsync(identity, scope.Value.Details.Project.Id, null, null, context.RequestAborted);
+    await context.Response.WriteAsJsonAsync(new NotificationSettingsResponse(state.ProjectMuted ? "mention" : "participating"),
+        ApiJson.Default.NotificationSettingsResponse, null, context.RequestAborted);
+});
+
+app.MapPut("/api/v4/projects/{projectId}/notification_settings", async context =>
+{
+    var scope = await ApiCollaboration(context);
+    if (scope is null || await SignedIn(context, scope.Value.Identity, write: true) is not AuthenticatedIdentity identity) return;
+    string level = context.Request.Query["level"].ToString();
+    if (level.Length == 0 && context.Request.HasFormContentType) level = (await context.Request.ReadFormAsync(context.RequestAborted))["level"].ToString();
+    bool? muted = level switch
+    {
+        "disabled" or "mention" => true,
+        "participating" or "watch" or "global" => false,
+        _ => null
+    };
+    if (muted is null) { await ApiError(context, 400, "400 Bad Request: level is disabled, mention, participating, watch or global; Graft has no custom level"); return; }
+    await store.SetMutedAsync(identity, scope.Value.Details.Project.Id, null, null, muted.Value, context.RequestAborted);
+    await context.Response.WriteAsJsonAsync(new NotificationSettingsResponse(muted.Value ? "mention" : "participating"),
+        ApiJson.Default.NotificationSettingsResponse, null, context.RequestAborted);
+});
+
+// An account's keys, for the account or an administrator, and managed by an administrator (ADR 0049). GitLab lets
+// anybody read `/users/:id/keys`; Graft does not, for the reason ADR 0041 made its user directory administrators' only.
+app.MapGet("/api/v4/users/{userId:long}/keys", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!await OnlyQuery(context, "page", "per_page")) return;
+    try
+    {
+        IReadOnlyList<SshKeyInfo>? keys = await store.ListUserSshKeysAsync(identity, RouteId(context, "userId"), context.RequestAborted);
+        if (keys is null) { await ApiError(context, 404, "404 User Not Found"); return; }
+        await context.Response.WriteAsJsonAsync(keys.Select(SshKeyResponseFor).ToArray(), ApiJson.Default.SshKeyResponseArray, null, context.RequestAborted);
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "404 User Not Found"); }
+});
+
+app.MapGet("/api/v4/users/{userId:long}/keys/{keyId:long}", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!await OnlyQuery(context)) return;
+    try
+    {
+        SshKeyInfo? key = (await store.ListUserSshKeysAsync(identity, RouteId(context, "userId"), context.RequestAborted))?
+            .FirstOrDefault(item => item.Id == RouteId(context, "keyId"));
+        if (key is null) { await ApiError(context, 404, "404 Key Not Found"); return; }
+        await context.Response.WriteAsJsonAsync(SshKeyResponseFor(key), ApiJson.Default.SshKeyResponse, null, context.RequestAborted);
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "404 User Not Found"); }
+});
+
+app.MapPost("/api/v4/users/{userId:long}/keys", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!identity.TokenScopes.HasFlag(TokenScope.Api)) { await ApiError(context, 403, "403 Forbidden: insufficient_scope"); return; }
+    if (!identity.IsAdministrator) { await ApiError(context, 403, "403 Forbidden"); return; }
+    await AddUserKey(context, identity, RouteId(context, "userId"));
+});
+
+app.MapDelete("/api/v4/users/{userId:long}/keys/{keyId:long}", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!identity.TokenScopes.HasFlag(TokenScope.Api)) { await ApiError(context, 403, "403 Forbidden: insufficient_scope"); return; }
+    if (!identity.IsAdministrator) { await ApiError(context, 403, "403 Forbidden"); return; }
+    if (await store.DeleteUserSshKeyAsync(identity, RouteId(context, "userId"), RouteId(context, "keyId"), context.RequestAborted))
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    else await ApiError(context, 404, "404 Key Not Found");
+});
+
+// Whose key is this: by id, or by fingerprint from a log line. Administrators only, as GitLab has it.
+app.MapGet("/api/v4/keys/{keyId:long}", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!await OnlyQuery(context)) return;
+    if (!identity.IsAdministrator) { await ApiError(context, 403, "403 Forbidden"); return; }
+    await WriteKeyWithUser(context, await store.FindSshKeyAsync(identity, RouteId(context, "keyId"), null, context.RequestAborted));
+});
+
+app.MapGet("/api/v4/keys", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!await OnlyQuery(context, "fingerprint")) return;
+    if (!identity.IsAdministrator) { await ApiError(context, 403, "403 Forbidden"); return; }
+    string fingerprint = context.Request.Query["fingerprint"].ToString();
+    if (fingerprint.Length == 0) { await ApiError(context, 400, "400 Bad Request: fingerprint is required"); return; }
+    await WriteKeyWithUser(context, await store.FindSshKeyAsync(identity, null, fingerprint, context.RequestAborted));
+});
+
+app.MapGet("/api/v4/deploy_keys", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!await OnlyQuery(context, "page", "per_page", "public")) return;
+    if (!identity.IsAdministrator) { await ApiError(context, 403, "403 Forbidden"); return; }
+    IReadOnlyList<DeployKeyInfo> all = await store.ListAllDeployKeysAsync(identity, context.RequestAborted);
+    await context.Response.WriteAsJsonAsync(all.Select(DeployKeyResponseFor).ToArray(), ApiJson.Default.DeployKeyResponseArray, null, context.RequestAborted);
+});
+
+// The same for the browser's Users page.
+app.MapGet("/api/users/{userId:long}/keys", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!await OnlyQuery(context)) return;
+    try
+    {
+        IReadOnlyList<SshKeyInfo>? keys = await store.ListUserSshKeysAsync(browser.Value.Identity, RouteId(context, "userId"), context.RequestAborted);
+        if (keys is null) { await ApiError(context, 404, "user"); return; }
+        await context.Response.WriteAsJsonAsync(keys.Select(SshKeyResponseFor).ToArray(), ApiJson.Default.SshKeyResponseArray, null, context.RequestAborted);
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 404, "user"); }
+});
+
+app.MapPost("/api/users/{userId:long}/keys", async context =>
+{
+    if (await BrowserAdministrator(context) is not AuthenticatedIdentity identity) return;
+    await AddUserKey(context, identity, RouteId(context, "userId"));
+});
+
+app.MapDelete("/api/users/{userId:long}/keys/{keyId:long}", async context =>
+{
+    if (await BrowserAdministrator(context) is not AuthenticatedIdentity identity) return;
+    if (await store.DeleteUserSshKeyAsync(identity, RouteId(context, "userId"), RouteId(context, "keyId"), context.RequestAborted))
+        context.Response.StatusCode = StatusCodes.Status204NoContent;
+    else await ApiError(context, 404, "key");
+});
+
+async Task<AuthenticatedIdentity?> BrowserAdministrator(HttpContext context)
+{
+    if (context.Request.Headers.Origin.ToString() != serverOrigin) { await ApiError(context, 403, "origin"); return null; }
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return null;
+    if (!VerifyCsrf(browser.Value.Secret, context.Request.Headers["X-Graft-CSRF"].ToString())) { await ApiError(context, 403, "csrf"); return null; }
+    if (!browser.Value.Identity.IsAdministrator) { await ApiError(context, 403, "administrator"); return null; }
+    return browser.Value.Identity;
+}
+
+async Task AddUserKey(HttpContext context, AuthenticatedIdentity identity, long userId)
+{
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    SshKeyCreateRequest? request;
+    try { request = await context.Request.ReadFromJsonAsync(ApiJson.Default.SshKeyCreateRequest, context.RequestAborted); }
+    catch (JsonException) { await ApiError(context, 400, "400 Bad Request: body is not valid JSON"); return; }
+    var parsed = await ReadKey(context, request?.Title, request?.Key, request?.ExpiresAt);
+    if (parsed is null) return;
+    try
+    {
+        SshKeyInfo added = await store.AddUserSshKeyAsync(identity, userId, parsed.Value.Title, parsed.Value.Key.Type, parsed.Value.Key.ToAuthorizedKeyLine(),
+            parsed.Value.Key.Fingerprint, parsed.Value.Expires, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status201Created;
+        await context.Response.WriteAsJsonAsync(SshKeyResponseFor(added), ApiJson.Default.SshKeyResponse, null, context.RequestAborted);
+    }
+    catch (KeyNotFoundException) { await ApiError(context, 404, "404 User Not Found"); }
+    catch (SshKeyConflictException) { await ApiError(context, 400, "400 Bad Request: fingerprint has already been taken"); }
+    catch (InvalidOperationException exception) { await ApiError(context, 400, "400 Bad Request: " + exception.Message); }
+    catch (UnauthorizedAccessException) { await ApiError(context, 403, "403 Forbidden"); }
+}
+
+async Task WriteKeyWithUser(HttpContext context, (SshKeyInfo Key, string Username)? found)
+{
+    if (found is null) { await ApiError(context, 404, "404 Key Not Found"); return; }
+    SshKeyInfo key = found.Value.Key;
+    await context.Response.WriteAsJsonAsync(new KeyWithUserResponse(key.Id, key.Title, key.Key, key.Fingerprint, key.CreatedAtUtc, key.ExpiresAtUtc,
+        key.LastUsedAtUtc, await AuthorFor(context, key.UserId, found.Value.Username)), ApiJson.Default.KeyWithUserResponse, null, context.RequestAborted);
+}
+
+/// <summary>A caller who must be signed in, holding a token scope that allows the act when the caller is a token.</summary>
+async Task<AuthenticatedIdentity?> SignedIn(HttpContext context, AuthenticatedIdentity? identity, bool write)
+{
+    if (identity is null) { await ApiError(context, 401, "401 Unauthorized"); return null; }
+    if (identity.Kind == IdentityKind.PersonalAccessToken && !identity.TokenScopes.HasFlag(TokenScope.Api) &&
+        (write || !identity.TokenScopes.HasFlag(TokenScope.ReadApi)))
+    { await ApiError(context, 403, "403 Forbidden: insufficient_scope"); return null; }
+    return identity;
+}
+
+static DeployKeyResponse DeployKeyResponseFor(DeployKeyInfo key) =>
+    new(key.Id, key.Title, key.Key, key.Fingerprint, key.CreatedAtUtc, key.ExpiresAtUtc, key.LastUsedAtUtc, key.CanPush, key.ProjectId);
+
 // Planning routes, twice like everything else in this family. The browser family keeps the hyphenated
 // spelling it already uses; the API family is GitLab's.
 foreach ((string root, bool browserFamily) in new[] { ("/api/projects/{projectId:long}", true), ("/api/v4/projects/{projectId}", false) })
@@ -9415,7 +9826,9 @@ if (settings.SshPort >= 0)
         async (project, identity, moved) => { await NotifyPushAt(serverOrigin!, project, identity, moved); await CreatePushPipelines(project, identity, moved);
             // The SSH host calls this while it still holds the repository, which RecordPushes reads; so after, not inside.
             _ = Task.Run(() => RecordPushes(project, identity, moved)); },
+        () => serverOrigin, lfsTickets,
         (text, exception) => app.Logger.LogInformation(exception, "{Message}", text));
+    gitSshHost = gitHost;
     sshServer = new(new Graft.Ssh.SshServerOptions
     {
         Address = settings.ListenAddress,
@@ -9428,6 +9841,44 @@ if (settings.SshPort >= 0)
     Console.WriteLine("SSH: " + SshBase(new Uri(serverOrigin!).Host) + "/<owner>/<project>.git; host key " + sshHostKey.Fingerprint);
 }
 else Console.WriteLine("SSH: off");
+// Digests (ADR 0050): one message a period for each person who asked for email that way, carrying the unread
+// notifications since the last. Only with mail; without it the preference is kept and honoured once mail exists.
+if (mail is not null)
+{
+    CancellationTokenSource digestStop = new();
+    app.Lifetime.ApplicationStopping.Register(digestStop.Cancel);
+    TimeSpan digestTick = TimeSpan.FromTicks(Math.Clamp(settings.DigestPeriod.Ticks / 4, TimeSpan.FromSeconds(1).Ticks, TimeSpan.FromMinutes(1).Ticks));
+    _ = Task.Run(async () =>
+    {
+        while (!digestStop.IsCancellationRequested)
+        {
+            try
+            {
+                foreach (NotificationDigest digest in await store.TakeDueDigestsAsync(settings.DigestPeriod, digestStop.Token))
+                {
+                    StringBuilder body = new();
+                    body.Append("Hello ").Append(digest.Username).Append(",\n\nSince your last digest:\n\n");
+                    foreach (Notification note in digest.Items)
+                        body.Append("- ").Append(note.ProjectPath).Append(": ").Append(note.ActorUsername).Append(" ").Append(NotificationVerb(note.Action))
+                            .Append(" ").Append(NotificationWhat(note)).Append(": ").Append(note.Title).Append("\n  ")
+                            .Append(NotificationLink(serverOrigin ?? "", note)).Append("\n");
+                    if (digest.Total > digest.Items.Count)
+                        body.Append("\n...and ").Append((digest.Total - digest.Items.Count).ToString(System.Globalization.CultureInfo.InvariantCulture))
+                            .Append(" more in the inbox.\n");
+                    body.Append("\nThe inbox is at ").Append(serverOrigin ?? "").Append("/-/notifications. You are receiving this because you asked for ")
+                        .Append("email as a digest, under Profile and Email.\n");
+                    mail.Send(digest.Email, "[Graft] " + digest.Total.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                        (digest.Total == 1 ? " notification" : " notifications") + " for " + digest.Username, body.ToString());
+                }
+            }
+            catch (OperationCanceledException) { break; }
+            catch (Exception exception) { Console.Error.WriteLine("MAIL: digest failed: " + exception.Message); }
+            try { await Task.Delay(digestTick, digestStop.Token); }
+            catch (OperationCanceledException) { break; }
+        }
+    });
+    Console.WriteLine("MAIL DIGEST: every " + settings.DigestPeriod.TotalMinutes.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture) + " minutes");
+}
 if (importClient is not null)
 {
     mirrors = await MirrorWorker.StartAsync(store, TimeSpan.FromMinutes(settings.MirrorIntervalMinutes), UpdateMirror,
@@ -9479,6 +9930,9 @@ async Task<AuthorizedRepository?> Authorize(HttpContext context, ProjectAction a
     ProjectInfo? project = byGlobalSlug
         ? await store.FindReadyProjectByGlobalSlugAsync(projectSlug, context.RequestAborted)
         : await store.FindReadyProjectAsync(projectNamespace, projectSlug, context.RequestAborted);
+    string authorization = context.Request.Headers.Authorization.ToString();
+    if (authorization.StartsWith(LfsTickets.Scheme + " ", StringComparison.Ordinal))
+        return await AuthorizeLfsTicket(context, project, action, authorization[(LfsTickets.Scheme.Length + 1)..]);
     AuthenticatedIdentity? identity = await Authenticate(context);
 
     // Push to a path that does not exist yet, and the project is created to receive it. Only on a push:
@@ -9509,6 +9963,38 @@ async Task<AuthorizedRepository?> Authorize(HttpContext context, ProjectAction a
     }
     context.Response.StatusCode = StatusCodes.Status404NotFound;
     return null;
+}
+
+/// <summary>
+/// A request carrying the credential git-lfs-authenticate issued over SSH (ADR 0049). Accepted on the large-file routes
+/// only, because it was issued for the objects beside a repository and not for the repository. The key it names is
+/// resolved and authorised again, so what the key may do now is what the ticket may do, and never more than the
+/// project and operation it was issued for.
+/// </summary>
+async Task<AuthorizedRepository?> AuthorizeLfsTicket(HttpContext context, ProjectInfo? project, ProjectAction action, string ticket)
+{
+    bool largeFiles = context.Request.Path.Value?.Contains(".git/info/lfs/", StringComparison.Ordinal) == true;
+    (string Fingerprint, long ProjectId, bool Upload)? read = lfsTickets.Read(ticket, DateTimeOffset.UtcNow);
+    if (!largeFiles || read is null || gitSshHost is null)
+    {
+        context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+        context.Response.Headers.WWWAuthenticate = "Basic realm=\"Graft Git\", charset=\"UTF-8\"";
+        return null;
+    }
+    if (project is null || project.Id != read.Value.ProjectId || (action == ProjectAction.PushRepository && !read.Value.Upload))
+    {
+        context.Response.StatusCode = StatusCodes.Status404NotFound;
+        return null;
+    }
+    SshPrincipal? principal = await gitSshHost.ResolvePrincipalAsync(read.Value.Fingerprint, recordUse: false, context.RequestAborted);
+    AuthenticatedIdentity? identity = principal is null ? null
+        : await gitSshHost.AuthorizeAsync(principal, project, action, recordUse: false, context.RequestAborted);
+    if (identity is null)
+    {
+        context.Response.StatusCode = StatusCodes.Status404NotFound;
+        return null;
+    }
+    return new(project, identity, new(true, null, "SSH key", "Authorised by an SSH key through git-lfs-authenticate."), EndpointFor(project));
 }
 
 /// <summary>
@@ -10568,12 +11054,12 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
     string? Certificate, string? CertificatePasswordFile, bool PublicBrowsing, bool PushToCreate, int SessionMinutes, bool Mcp,
     string? PagesOrigin, bool RecoverableTokens, bool Webhooks, int SshPort, string? SshHost, MailSettings? Mail,
     int RunnerPort, string? RunnerHost, string? RunnerDownloads, long RunnerChunkThreshold, long RunnerChunkBytes, bool PushDelete,
-    UrlImportPolicy UrlImport, int MirrorIntervalMinutes, long TransferPartBytes)
+    UrlImportPolicy UrlImport, int MirrorIntervalMinutes, long TransferPartBytes, TimeSpan DigestPeriod)
 {
     public static bool TryParse(string[] values, out Arguments? result)
     {
         result = null;
-        if (values.Length is < 4 or > 54 || values.Length % 2 != 0) return false;
+        if (values.Length is < 4 or > 56 || values.Length % 2 != 0) return false;
         string? database = null;
         string? repositories = null;
         string? listen = null;
@@ -10601,6 +11087,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         string? urlImport = null;
         string? mirrorInterval = null;
         string? transferPartSize = null;
+        string? mailDigestMinutes = null;
         HashSet<string> seen = new(StringComparer.Ordinal);
         for (int index = 0; index < values.Length; index += 2)
         {
@@ -10632,6 +11119,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             else if (values[index] == "--url-import") urlImport = values[index + 1];
             else if (values[index] == "--mirror-interval") mirrorInterval = values[index + 1];
             else if (values[index] == "--transfer-part-size") transferPartSize = values[index + 1];
+            else if (values[index] == "--mail-digest-minutes") mailDigestMinutes = values[index + 1];
             else return false;
         }
         if (string.IsNullOrWhiteSpace(database) || string.IsNullOrWhiteSpace(repositories)) return false;
@@ -10770,6 +11258,13 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         if (transferPartSize is not null && (!long.TryParse(transferPartSize, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out partMebibytes) ||
             partMebibytes is < 1 or > 95))
             return false;
+        // How often a person who asked for email as a digest gets one (ADR 0050), in minutes: a day unless the operator
+        // says otherwise, and at most a week. Fractions are accepted, because a test cannot wait a day.
+        if (string.IsNullOrWhiteSpace(mailDigestMinutes)) mailDigestMinutes = null;
+        double digestMinutes = 1440;
+        if (mailDigestMinutes is not null && (!double.TryParse(mailDigestMinutes, System.Globalization.NumberStyles.AllowDecimalPoint, System.Globalization.CultureInfo.InvariantCulture, out digestMinutes) ||
+            digestMinutes is <= 0 or > 10080))
+            return false;
         if (certificatePasswordFile is not null && certificate is null) return false;
         if (!IPAddress.IsLoopback(address) && certificate is null) return false;
         if (!IPAddress.IsLoopback(address) && origin is null) return false;
@@ -10782,7 +11277,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             publicBrowsing == "true", pushToCreate == "true", window, mcp == "true",
             pagesOrigin, recoverableTokens == "true", webhooks == "true", sshPortNumber, sshHost, mail,
             runnerPortNumber, runnerHost, runnerDownloads is null ? null : Path.GetFullPath(runnerDownloads), chunkThreshold, chunkBytes, pushDelete != "false",
-            importPolicy, intervalMinutes, partMebibytes * 1024 * 1024);
+            importPolicy, intervalMinutes, partMebibytes * 1024 * 1024, TimeSpan.FromMinutes(digestMinutes));
         return true;
     }
 }

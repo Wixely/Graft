@@ -25,6 +25,20 @@ public sealed partial class GraftStore
     /// <summary>Most notifications kept per person; beyond it the oldest read ones go.</summary>
     private const int MaximumNotificationsPerUser = 500;
 
+    /// <summary>
+    /// Whether this server serves anything to somebody who is not a member. A mention reaches a non-member only when it
+    /// does: the store's own rules would let a public project's stranger read the issue, but on a server whose operator
+    /// turned public browsing off, the inbox entry would name something the link then refuses.
+    /// </summary>
+    public bool PublicBrowsing { get; set; }
+
+    /// <summary>The events a participant hears about because they took part. Muting silences these; being assigned,
+    /// asked to review or mentioned is addressed to the person by name and always arrives (ADR 0050).</summary>
+    private static readonly HashSet<string> ParticipationActions = new(StringComparer.Ordinal) { "commented", "approved", "merged", "closed", "reopened" };
+
+    /// <summary>Most items one digest lists; beyond it the message says how many more there were.</summary>
+    private const int MaximumDigestItems = 100;
+
     public async Task<NotificationPage> ListNotificationsAsync(AuthenticatedIdentity actor, bool unreadOnly, int page, int perPage,
         CancellationToken cancellationToken = default)
     {
@@ -72,13 +86,182 @@ public sealed partial class GraftStore
             new MarkAllReadParameters(liveActor.UserId, Now()));
     }
 
-    /// <summary>Whether the caller wants a message for each notification. Off by default; the inbox is always there.</summary>
-    public async Task SetNotifyByEmailAsync(AuthenticatedIdentity actor, bool enabled, CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Whether the caller wants email, and whether as one message per notification or as a digest. Off by default; the
+    /// inbox is always there. Null <paramref name="digest"/> leaves that choice alone. Turning the digest on starts its
+    /// clock now, so the first one carries what arrives from here on rather than everything the inbox ever held.
+    /// </summary>
+    public async Task SetNotifyByEmailAsync(AuthenticatedIdentity actor, bool enabled, bool? digest = null, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(actor);
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
         AuthenticatedIdentity liveActor = await RequireLiveIdentityAsync(db, null, actor, cancellationToken);
-        await db.ExecuteAsync("UPDATE Users SET NotifyByEmail = @Enabled WHERE Id = @Id;", new FlagParameters(liveActor.UserId, enabled ? 1 : 0));
+        await db.ExecuteAsync("""
+            UPDATE Users
+            SET LastDigestAtUtc = CASE WHEN @Digest = 1 AND (EmailDigest = 0 OR NotifyByEmail = 0) THEN @NowUtc ELSE LastDigestAtUtc END,
+                NotifyByEmail = @Enabled,
+                EmailDigest = CASE WHEN @Digest = -1 THEN EmailDigest ELSE @Digest END
+            WHERE Id = @Id;
+            """, new EmailPreferenceParameters(liveActor.UserId, enabled ? 1 : 0, digest is null ? -1 : digest.Value ? 1 : 0, Now()));
+    }
+
+    public async Task<bool> GetEmailDigestAsync(long userId, CancellationToken cancellationToken = default)
+    {
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        return await db.ExecuteScalarAsync<long>("SELECT COALESCE((SELECT EmailDigest FROM Users WHERE Id = @UserId), 0);",
+            new UserParameters(userId)) != 0;
+    }
+
+    /// <summary>
+    /// The digests that are due, each marked sent in the same transaction so two workers, or a restart, never send one
+    /// twice. Due means the person asked for email as a digest, has an address, and the last one went at least
+    /// <paramref name="period"/> ago. Only unread notifications are listed: one already read in the inbox needs no
+    /// message. A person with nothing new is skipped, and their clock still moves.
+    /// </summary>
+    public async Task<IReadOnlyList<NotificationDigest>> TakeDueDigestsAsync(TimeSpan period, CancellationToken cancellationToken = default)
+    {
+        if (period <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(period));
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
+        DateTimeOffset nowInstant = DateTimeOffset.UtcNow;
+        string now = nowInstant.ToString("O", CultureInfo.InvariantCulture);
+        string cutoff = (nowInstant - period).ToString("O", CultureInfo.InvariantCulture);
+        IEnumerable<DigestRecipientRow> due = await db.QueryAsync<DigestRecipientRow>("""
+            SELECT Id, Username, Email, LastDigestAtUtc FROM Users
+            WHERE NotifyByEmail = 1 AND EmailDigest = 1 AND Disabled = 0 AND Email IS NOT NULL
+              AND (LastDigestAtUtc IS NULL OR LastDigestAtUtc <= @Cutoff);
+            """, new DigestDueParameters(cutoff), transaction);
+        List<NotificationDigest> digests = [];
+        foreach (DigestRecipientRow recipient in due.ToArray())
+        {
+            string since = recipient.LastDigestAtUtc ?? cutoff;
+            long total = await db.ExecuteScalarAsync<long>(
+                "SELECT COUNT(*) FROM Notifications WHERE UserId = @UserId AND ReadAtUtc IS NULL AND CreatedAtUtc > @Since;",
+                new DigestItemsParameters(recipient.Id, since, MaximumDigestItems), transaction);
+            if (total > 0)
+            {
+                IEnumerable<NotificationRow> rows = await db.QueryAsync<NotificationRow>(NotificationSelect + "\n" + """
+                    WHERE n.UserId = @UserId AND n.ReadAtUtc IS NULL AND n.CreatedAtUtc > @Since
+                    ORDER BY n.Id
+                    LIMIT @Limit;
+                    """, new DigestItemsParameters(recipient.Id, since, MaximumDigestItems), transaction);
+                digests.Add(new(recipient.Id, recipient.Username, recipient.Email, rows.Select(ToNotification).ToArray(), total));
+            }
+            await db.ExecuteAsync("UPDATE Users SET LastDigestAtUtc = @NowUtc WHERE Id = @UserId;", new DigestStampParameters(recipient.Id, now), transaction);
+        }
+        await transaction.CommitAsync(cancellationToken);
+        return digests;
+    }
+
+    /// <summary>Whether the caller muted this project, and this issue or proposal in it. Needs what reading it needs.</summary>
+    public async Task<MuteState> GetMuteStateAsync(AuthenticatedIdentity actor, long projectId, CommentSubject? subject, long? iid,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(actor);
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        AuthenticatedIdentity live = await RequireLiveIdentityAsync(db, null, actor, cancellationToken);
+        long subjectId = await RequireMutableAsync(db, null, live, projectId, subject, iid, cancellationToken);
+        bool project = await db.ExecuteScalarAsync<long>(
+            "SELECT COUNT(*) FROM NotificationMutes WHERE UserId = @UserId AND ProjectId = @ProjectId AND SubjectType = '' AND SubjectId = 0;",
+            new MuteParameters(live.UserId, projectId, "", 0, ""), null) > 0;
+        bool thread = subject is not null && await db.ExecuteScalarAsync<long>(
+            "SELECT COUNT(*) FROM NotificationMutes WHERE UserId = @UserId AND ProjectId = @ProjectId AND SubjectType = @SubjectType AND SubjectId = @SubjectId;",
+            new MuteParameters(live.UserId, projectId, SubjectName(subject.Value), subjectId, ""), null) > 0;
+        return new(project, thread);
+    }
+
+    /// <summary>
+    /// Mutes or unmutes a project, or with <paramref name="subject"/> one issue or proposal in it, for the caller.
+    /// Returns whether anything changed, which GitLab's subscribe routes report as 304 when it did not.
+    /// </summary>
+    public async Task<bool> SetMutedAsync(AuthenticatedIdentity actor, long projectId, CommentSubject? subject, long? iid, bool muted,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(actor);
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
+        AuthenticatedIdentity live = await RequireLiveIdentityAsync(db, transaction, actor, cancellationToken);
+        long subjectId = await RequireMutableAsync(db, transaction, live, projectId, subject, iid, cancellationToken);
+        MuteParameters key = new(live.UserId, projectId, subject is null ? "" : SubjectName(subject.Value), subject is null ? 0 : subjectId, Now());
+        int changed = muted
+            ? await db.ExecuteAsync("""
+                INSERT INTO NotificationMutes (UserId, ProjectId, SubjectType, SubjectId, CreatedAtUtc)
+                VALUES (@UserId, @ProjectId, @SubjectType, @SubjectId, @CreatedAtUtc)
+                ON CONFLICT DO NOTHING;
+                """, key, transaction)
+            : await db.ExecuteAsync(
+                "DELETE FROM NotificationMutes WHERE UserId = @UserId AND ProjectId = @ProjectId AND SubjectType = @SubjectType AND SubjectId = @SubjectId;",
+                key, transaction);
+        await transaction.CommitAsync(cancellationToken);
+        return changed > 0;
+    }
+
+    /// <summary>Everything the caller muted, newest first, for the inbox page to list and undo.</summary>
+    public async Task<IReadOnlyList<NotificationMute>> ListMutesAsync(AuthenticatedIdentity actor, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(actor);
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        AuthenticatedIdentity live = await RequireLiveIdentityAsync(db, null, actor, cancellationToken);
+        IEnumerable<MuteRow> rows = await db.QueryAsync<MuteRow>("""
+            SELECT m.ProjectId, o.Username AS Namespace, p.Slug, m.SubjectType,
+                   COALESCE(i.Iid, r.Iid) AS Iid, COALESCE(i.Title, r.Title) AS Title, m.CreatedAtUtc
+            FROM NotificationMutes m
+            JOIN Projects p ON p.Id = m.ProjectId AND p.State = 'ready'
+            JOIN Users o ON o.Id = p.OwnerUserId
+            LEFT JOIN Issues i ON m.SubjectType = 'issue' AND i.Id = m.SubjectId
+            LEFT JOIN MergeRequests r ON m.SubjectType = 'merge_request' AND r.Id = m.SubjectId
+            WHERE m.UserId = @UserId AND (m.SubjectType = '' OR COALESCE(i.Id, r.Id) IS NOT NULL)
+            ORDER BY m.CreatedAtUtc DESC;
+            """, new UserParameters(live.UserId));
+        return [.. rows.Select(row => new NotificationMute(row.ProjectId, row.Namespace + "/" + row.Slug,
+            row.SubjectType switch { "issue" => CommentSubject.Issue, "merge_request" => CommentSubject.MergeRequest, _ => (CommentSubject?)null },
+            row.Iid, row.Title, Instant(row.CreatedAtUtc)))];
+    }
+
+    /// <summary>A person may mute what they may read, and nothing else, so a mute cannot be used to learn whether an
+    /// issue exists. Returns the issue or proposal's row id, or zero for the project itself.</summary>
+    private static async Task<long> RequireMutableAsync(SqliteConnection db, SqliteTransaction? transaction, AuthenticatedIdentity identity,
+        long projectId, CommentSubject? subject, long? iid, CancellationToken cancellationToken)
+    {
+        PermissionDecision reader = await RequireReaderAsync(db, transaction, identity, projectId, cancellationToken);
+        if (subject is null) return 0;
+        if (iid is null) throw new ArgumentException("A thread is named by its number.", nameof(iid));
+        long subjectId = await ResolveSubjectAsync(db, transaction, projectId, subject.Value, iid.Value);
+        if (subject == CommentSubject.Issue)
+        {
+            IssueRow? issue = await db.QuerySingleOrDefaultAsync<IssueRow>(IssueSelect + "WHERE i.Id = @Id;", new IdParameters(subjectId), transaction);
+            if (issue is null || !MaySeeIssue(issue, reader, identity)) throw new CollaborationNotFoundException("Issue is unavailable.");
+        }
+        return subjectId;
+    }
+
+    /// <summary>
+    /// Tells each person a body mentions, once, with <c>mentioned</c>, and returns who that was so the caller can leave
+    /// them out of a broader notice about the same act. A name that is nobody, a disabled account, the actor, and anybody
+    /// who could not read the issue or proposal are passed over in silence: a mention must never tell a stranger a title.
+    /// </summary>
+    private static async Task<(List<NotificationDelivery> Deliveries, HashSet<long> Mentioned)> NotifyMentionsAsync(SqliteConnection db,
+        SqliteTransaction transaction, long actorUserId, long projectId, CommentSubject subject, long subjectId, IReadOnlyList<string> names,
+        bool reachNonMembers, string now, CancellationToken cancellationToken)
+    {
+        HashSet<long> mentioned = [];
+        if (names.Count == 0) return ([], mentioned);
+        IEnumerable<IdentityRow> people = await db.QueryAsync<IdentityRow>("""
+            SELECT Id, Username, IsAdministrator, Disabled FROM Users
+            WHERE Disabled = 0 AND Id <> @UserId AND instr(@Names, ',' || NormalizedUsername || ',') > 0;
+            """, new MentionLookupParameters(actorUserId, "," + string.Join(',', names) + ","), transaction);
+        ConfidentialRow? confidential = subject == CommentSubject.Issue
+            ? await db.QuerySingleOrDefaultAsync<ConfidentialRow>("SELECT Confidential, AuthorUserId FROM Issues WHERE Id = @Id;", new IdParameters(subjectId), transaction)
+            : null;
+        foreach (IdentityRow person in people.ToArray())
+        {
+            AuthenticatedIdentity identity = new(person.Id, person.Username, person.IsAdministrator != 0, IdentityKind.BrowserSession);
+            PermissionDecision reader = await DecideAsync(db, transaction, identity, projectId, ProjectAction.ReadCollaboration, cancellationToken);
+            if (!reader.Allowed || (reader.Grant != AccessGrant.Member && !reachNonMembers)) continue;
+            if (confidential is { Confidential: not 0 } && reader.Grant != AccessGrant.Member && confidential.AuthorUserId != person.Id) continue;
+            mentioned.Add(person.Id);
+        }
+        return (await NotifyAsync(db, transaction, actorUserId, projectId, subject, subjectId, "mentioned", mentioned, now), mentioned);
     }
 
     public async Task<bool> GetNotifyByEmailAsync(long userId, CancellationToken cancellationToken = default)
@@ -124,17 +307,26 @@ public sealed partial class GraftStore
         if (distinct.Count == 0) return deliveries;
 
         string kind = SubjectName(subject);
+        if (ParticipationActions.Contains(action))
+        {
+            HashSet<long> muted = [.. await db.QueryAsync<long>("""
+                SELECT UserId FROM NotificationMutes
+                WHERE ProjectId = @ProjectId AND ((SubjectType = '' AND SubjectId = 0) OR (SubjectType = @SubjectType AND SubjectId = @SubjectId));
+                """, new MutedParameters(projectId, kind, subjectId), transaction)];
+            distinct.RemoveAll(muted.Contains);
+            if (distinct.Count == 0) return deliveries;
+        }
         NotificationSubjectRow? about = await db.QuerySingleOrDefaultAsync<NotificationSubjectRow>(subject == CommentSubject.Issue
             ? "SELECT i.Iid, i.Title, o.Username AS Namespace, p.Slug FROM Issues i JOIN Projects p ON p.Id = i.ProjectId JOIN Users o ON o.Id = p.OwnerUserId WHERE i.Id = @Id;"
             : "SELECT m.Iid, m.Title, o.Username AS Namespace, p.Slug FROM MergeRequests m JOIN Projects p ON p.Id = m.ProjectId JOIN Users o ON o.Id = p.OwnerUserId WHERE m.Id = @Id;",
             new IdParameters(subjectId), transaction);
         if (about is null) return deliveries;
-        string actorUsername = (await db.QuerySingleOrDefaultAsync<RecipientRow>("SELECT Id, Username, Email, NotifyByEmail FROM Users WHERE Id = @Id;", new IdParameters(actorUserId), transaction))?.Username ?? "";
+        string actorUsername = (await db.QuerySingleOrDefaultAsync<RecipientRow>("SELECT Id, Username, Email, NotifyByEmail, EmailDigest FROM Users WHERE Id = @Id;", new IdParameters(actorUserId), transaction))?.Username ?? "";
 
         foreach (long userId in distinct)
         {
             RecipientRow? recipient = await db.QuerySingleOrDefaultAsync<RecipientRow>(
-                "SELECT Id, Username, Email, NotifyByEmail FROM Users WHERE Id = @Id AND Disabled = 0;", new IdParameters(userId), transaction);
+                "SELECT Id, Username, Email, NotifyByEmail, EmailDigest FROM Users WHERE Id = @Id AND Disabled = 0;", new IdParameters(userId), transaction);
             if (recipient is null) continue;
             long id = await db.QuerySingleAsync<long>("""
                 INSERT INTO Notifications (UserId, ProjectId, Action, SubjectType, SubjectIid, Title, ActorUserId, CreatedAtUtc, ReadAtUtc)
@@ -146,7 +338,8 @@ public sealed partial class GraftStore
                     SELECT Id FROM Notifications WHERE UserId = @UserId ORDER BY Id DESC LIMIT @Limit);
                 """, new TrimParameters(userId, MaximumNotificationsPerUser), transaction);
             deliveries.Add(new(userId, recipient.Username, recipient.Email, recipient.NotifyByEmail != 0,
-                new(id, projectId, about.Namespace + "/" + about.Slug, action, subject, about.Iid, about.Title, actorUsername, Instant(now), null)));
+                new(id, projectId, about.Namespace + "/" + about.Slug, action, subject, about.Iid, about.Title, actorUsername, Instant(now), null),
+                recipient.EmailDigest != 0));
         }
         return deliveries;
     }
@@ -198,7 +391,18 @@ internal sealed record MarkAllReadParameters(long UserId, string NowUtc);
 internal sealed record FlagParameters(long Id, int Enabled);
 internal sealed record ParticipantParameters(string SubjectType, long SubjectId, long Except);
 internal sealed record NotificationSubjectRow(long Iid, string Title, string Namespace, string Slug);
-internal sealed record RecipientRow(long Id, string Username, string? Email, long NotifyByEmail);
+internal sealed record RecipientRow(long Id, string Username, string? Email, long NotifyByEmail, long EmailDigest);
+internal sealed record EmailPreferenceParameters(long Id, int Enabled, int Digest, string NowUtc);
+internal sealed record DigestDueParameters(string Cutoff);
+internal sealed record DigestRecipientRow(long Id, string Username, string Email, string? LastDigestAtUtc);
+internal sealed record DigestItemsParameters(long UserId, string Since, int Limit);
+internal sealed record DigestStampParameters(long UserId, string NowUtc);
+internal sealed record MuteParameters(long UserId, long ProjectId, string SubjectType, long SubjectId, string CreatedAtUtc);
+internal sealed record MutedParameters(long ProjectId, string SubjectType, long SubjectId);
+internal sealed record MuteRow(long ProjectId, string Namespace, string Slug, string SubjectType, long? Iid, string? Title, string CreatedAtUtc);
+internal sealed record MentionLookupParameters(long UserId, string Names);
+internal sealed record ConfidentialRow(long Confidential, long AuthorUserId);
+internal sealed record CommentEditedRow(string Body, string SubjectType, long SubjectId);
 internal sealed record NotificationInsertParameters(long UserId, long ProjectId, string Action, string SubjectType, long SubjectIid, string Title,
     long ActorUserId, string CreatedAtUtc);
 internal sealed record TrimParameters(long UserId, int Limit);
