@@ -42,7 +42,7 @@ if (args.Length == 1 && args[0] == "--licences")
 
 if (!Arguments.TryParse(args, out Arguments? parsedSettings))
 {
-    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>] [--mcp true|false] [--pages-origin <https origin>] [--recoverable-tokens true|false] [--webhooks true|false] [--ssh-port <0-65535>] [--ssh-host <name>] [--mail-smtp <smtp|smtp+starttls|smtps URL>] [--mail-from <address>] [--mail-password-file <UTF-8 path>] [--runner-port <0-65535>] [--runner-host <name>] [--runner-downloads <directory>] [--runner-chunk-threshold <MiB|off>] [--runner-chunk-size <1-64 MiB>] [--push-delete true|false] [--url-import off|public|any] [--mirror-interval <15-10080 minutes>] [--transfer-part-size <1-95 MiB>] [--mail-digest-minutes <minutes, default 1440>].");
+    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>] [--mcp true|false] [--pages-origin <https origin>] [--pages-root-redirect true|false] [--recoverable-tokens true|false] [--webhooks true|false] [--ssh-port <0-65535>] [--ssh-host <name>] [--mail-smtp <smtp|smtp+starttls|smtps URL>] [--mail-from <address>] [--mail-password-file <UTF-8 path>] [--runner-port <0-65535>] [--runner-host <name>] [--runner-downloads <directory>] [--runner-chunk-threshold <MiB|off>] [--runner-chunk-size <1-64 MiB>] [--push-delete true|false] [--url-import off|public|any] [--mirror-interval <15-10080 minutes>] [--transfer-part-size <1-95 MiB>] [--mail-digest-minutes <minutes, default 1440>].");
     Console.Error.WriteLine("       Graft.Server --licences  prints the third-party notices this build redistributes.");
     Console.Error.WriteLine("       Graft.Server --version   prints the release this is.");
     return 2;
@@ -9616,6 +9616,7 @@ if (settings.PagesOrigin is not null)
             //
             // Found rather than Moved Permanently: this address may yet serve something of its own, and a
             // permanent redirect is the one thing a browser will not let us take back.
+            if (!settings.PagesRootRedirect) { await PagesMiss(context, "No site is published at that address."); return; }
             context.Response.StatusCode = StatusCodes.Status302Found;
             context.Response.Headers.Location = serverOrigin;
             return;
@@ -9786,7 +9787,8 @@ Console.WriteLine("TOKENS: " + (settings.RecoverableTokens
 Console.WriteLine("PUSH DELETE: " + (settings.PushDelete
     ? "on; a push may delete a branch or tag, except the default branch"
     : "off; branches and tags are deleted on the forge"));
-Console.WriteLine(settings.PagesOrigin is null ? "PAGES: off" : "PAGES: " + settings.PagesOrigin + "/<project-slug>/");
+Console.WriteLine(settings.PagesOrigin is null ? "PAGES: off" : "PAGES: " + settings.PagesOrigin + "/<project-slug>/"
+    + (settings.PagesRootRedirect ? "; the root redirects to the forge" : "; the root answers not found"));
 Console.WriteLine("WEBHOOKS: " + (settings.Webhooks
     ? "on; a project Maintainer can make this server call an address of their choosing"
     : "off"));
@@ -11071,12 +11073,12 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
     string? Certificate, string? CertificatePasswordFile, bool PublicBrowsing, bool PushToCreate, int SessionMinutes, bool Mcp,
     string? PagesOrigin, bool RecoverableTokens, bool Webhooks, int SshPort, string? SshHost, MailSettings? Mail,
     int RunnerPort, string? RunnerHost, string? RunnerDownloads, long RunnerChunkThreshold, long RunnerChunkBytes, bool PushDelete,
-    UrlImportPolicy UrlImport, int MirrorIntervalMinutes, long TransferPartBytes, TimeSpan DigestPeriod)
+    UrlImportPolicy UrlImport, int MirrorIntervalMinutes, long TransferPartBytes, TimeSpan DigestPeriod, bool PagesRootRedirect)
 {
     public static bool TryParse(string[] values, out Arguments? result)
     {
         result = null;
-        if (values.Length is < 4 or > 56 || values.Length % 2 != 0) return false;
+        if (values.Length is < 4 or > 58 || values.Length % 2 != 0) return false;
         string? database = null;
         string? repositories = null;
         string? listen = null;
@@ -11088,6 +11090,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         string? sessionMinutes = null;
         string? mcp = null;
         string? pagesOrigin = null;
+        string? pagesRootRedirect = null;
         string? recoverableTokens = null;
         string? webhooks = null;
         string? sshPort = null;
@@ -11120,6 +11123,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             else if (values[index] == "--session-minutes") sessionMinutes = values[index + 1];
             else if (values[index] == "--mcp") mcp = values[index + 1];
             else if (values[index] == "--pages-origin") pagesOrigin = values[index + 1];
+            else if (values[index] == "--pages-root-redirect") pagesRootRedirect = values[index + 1];
             else if (values[index] == "--recoverable-tokens") recoverableTokens = values[index + 1];
             else if (values[index] == "--webhooks") webhooks = values[index + 1];
             else if (values[index] == "--ssh-port") sshPort = values[index + 1];
@@ -11166,6 +11170,10 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             !string.IsNullOrEmpty(pagesUri.UserInfo) || !string.IsNullOrEmpty(pagesUri.Query) ||
             !string.IsNullOrEmpty(pagesUri.Fragment)))
             return false;
+        // Whether the root of the pages hostname, which belongs to no project, sends a reader to the forge.
+        // On by default; off answers it as any other address with no site. Empty means unset, as above.
+        if (string.IsNullOrWhiteSpace(pagesRootRedirect)) pagesRootRedirect = null;
+        if (pagesRootRedirect is not null and not "true" and not "false") return false;
         // How long a signed-in browser stays signed in without being used. Bounded at both ends: below five
         // minutes nobody could get anything done, and the ceiling is the absolute lifetime a session can
         // reach however much it is used, so a larger number here would be a setting that did nothing.
@@ -11294,7 +11302,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             publicBrowsing == "true", pushToCreate == "true", window, mcp == "true",
             pagesOrigin, recoverableTokens == "true", webhooks == "true", sshPortNumber, sshHost, mail,
             runnerPortNumber, runnerHost, runnerDownloads is null ? null : Path.GetFullPath(runnerDownloads), chunkThreshold, chunkBytes, pushDelete != "false",
-            importPolicy, intervalMinutes, partMebibytes * 1024 * 1024, TimeSpan.FromMinutes(digestMinutes));
+            importPolicy, intervalMinutes, partMebibytes * 1024 * 1024, TimeSpan.FromMinutes(digestMinutes), pagesRootRedirect != "false");
         return true;
     }
 }

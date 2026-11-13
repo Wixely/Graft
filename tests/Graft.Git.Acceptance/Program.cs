@@ -40,6 +40,7 @@ string? runnerChunkThreshold = null;
 string? runnerChunkSize = null;
 // Whether a push may delete a reference. Left unsaid unless false, so the default is what the suite exercises.
 bool pushDelete = true;
+bool pagesRootRedirect = true;
 // Which addresses a restart lets the forge import from (--url-import), or null for a forge that imports from nowhere.
 string? urlImport = null;
 // The part size a restart gives chunked transfers (--transfer-part-size, in MiB), or null for the default.
@@ -243,6 +244,7 @@ try
     await CheckPackages(address, aliceIdentity, "carol");
     await CheckCompressedGitRequests(address, aliceIdentity);
     address = await CheckPushDeletion(address, aliceIdentity);
+    address = await CheckPagesRootRedirectOff(address);
     await CheckGitLabClientShapes(address, aliceIdentity, bob.Username);
     await CheckClientSurfaces(address, aliceIdentity, bob.Username, alicePassword, bobPassword, adminPassword);
     await CheckGitEngine(address, aliceIdentity);
@@ -369,6 +371,11 @@ ProcessStartInfo ServerStart()
             start.ArgumentList.Add("--runner-chunk-size");
             start.ArgumentList.Add(runnerChunkSize);
         }
+    }
+    if (!pagesRootRedirect)
+    {
+        start.ArgumentList.Add("--pages-root-redirect");
+        start.ArgumentList.Add("false");
     }
     if (!pushDelete)
     {
@@ -9266,6 +9273,25 @@ async Task<string> CheckPushDeletion(string address, AuthenticatedIdentity alice
     address = await StartServer();
     Check(serverLines.Any(line => line.StartsWith("PUSH DELETE: on", StringComparison.Ordinal)), "and it is on again by default");
     return address;
+}
+
+// The root of the pages hostname redirects to the forge unless the operator says otherwise; the redirect itself is
+// asserted with the project pages. Off, it is one more address with no site.
+async Task<string> CheckPagesRootRedirectOff(string address)
+{
+    Check(serverLines.Any(line => line.StartsWith("PAGES: ", StringComparison.Ordinal) && line.EndsWith("the root redirects to the forge", StringComparison.Ordinal)),
+        "the forge says the pages root redirects by default");
+    await StopServer();
+    pagesRootRedirect = false;
+    address = await StartServer();
+    using (HttpResponseMessage root = await PagesGet(address, "pages.graft.test", "/"))
+        Check(root.StatusCode == System.Net.HttpStatusCode.NotFound && root.Headers.Location is null,
+            "with --pages-root-redirect false the pages root is not found (got " + (int)root.StatusCode + ")");
+    Check(serverLines.Any(line => line.StartsWith("PAGES: ", StringComparison.Ordinal) && line.EndsWith("the root answers not found", StringComparison.Ordinal)),
+        "and the forge says so");
+    await StopServer();
+    pagesRootRedirect = true;
+    return await StartServer();
 }
 
 async Task CheckCompressedGitRequests(string address, AuthenticatedIdentity alice)

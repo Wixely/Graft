@@ -75,6 +75,9 @@ services:
       # cannot share an origin with the session cookie and the API. See docs/project-pages.md.
       - --pages-origin
       - ${GRAFT_PAGES_ORIGIN:-}
+      # Whether the root of that hostname, which belongs to no project, redirects to the forge. Empty means on.
+      - --pages-root-redirect
+      - ${GRAFT_PAGES_ROOT_REDIRECT:-}
       # Whether a token's secret stays readable after it is issued. Off is the only state in which a leaked
       # database is not a leaked set of credentials; see docs/decisions/0012-recoverable-tokens.md.
       - --recoverable-tokens

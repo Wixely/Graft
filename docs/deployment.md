@@ -386,6 +386,17 @@ The forge prints which it is using at startup:
 PAGES: https://pages.example.com/<project-slug>/
 ```
 
+The root of that hostname belongs to no project, so it redirects to the forge. That is on by default;
+`--pages-root-redirect false` (`GRAFT_PAGES_ROOT_REDIRECT=false`) answers it as not found instead. The
+startup line says which.
+
+A reverse proxy must pass a redirect's `Location` header through unchanged. The root, and a site's
+`/<project-slug>/-/repo` link back to its project, both redirect from the pages hostname to the forge's, and a
+proxy that rewrites the host in response headers to match the request turns each into a redirect to the pages
+hostname itself. IIS Application Request Routing does this by default: clear **Reverse rewrite host in
+response headers** under the server's **Application Request Routing Cache**, **Server Proxy Settings**. The
+check is `curl -I https://pages.example.com/`, whose `Location` must name the forge.
+
 See [project pages](project-pages.md) for the repository-side config, and
 [ADR 0006](decisions/0006-project-pages-and-public-browsing.md) for why the second hostname is not optional.
 
