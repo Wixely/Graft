@@ -58,7 +58,9 @@ public sealed record ProjectResponse(
     /// <summary>Why the first import failed, while it has not yet succeeded.</summary>
     [property: JsonPropertyName("import_error")] string? ImportError = null,
     /// <summary>Whether the project is kept up to date from <see cref="ImportUrl"/>: GitLab's pull mirror.</summary>
-    bool Mirror = false);
+    bool Mirror = false,
+    /// <summary>Whether the project's curated page is published. Graft's own field, additive as the slug is.</summary>
+    [property: JsonPropertyName("page_published")] bool PagePublished = false);
 
 /// <summary>GitLab's `permissions`: the caller's access level on the project, and through its group, which Graft folds into one.</summary>
 public sealed record ProjectPermissionsResponse(

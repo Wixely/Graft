@@ -83,14 +83,16 @@ else
             <div class="list">
                 @foreach (ProjectResponse project in projects)
                 {
-                    <a class="list-item" href="/@project.PathWithNamespace">
+                    @* A row rather than one link, because the page badge is a link of its own and a link
+                       cannot sit inside another. The project link is stretched over the row in the stylesheet. *@
+                    <div class="list-item linked">
                         <Avatar Url="@project.AvatarUrl" Name="@project.Name" Class="avatar-project" />
-                        <span class="list-item-main">
+                        <a class="list-item-main" href="/@project.PathWithNamespace">
                             <strong>@project.NameWithNamespace</strong>
                             <small>@(project.Description.Length > 0 ? project.Description : "No description")</small>
-                        </span>
-                        <VisibilityLabel Visibility="@project.Visibility" />
-                    </a>
+                        </a>
+                        <VisibilityLabel Visibility="@project.Visibility" PagePublished="project.PagePublished" PageSlug="@project.GlobalSlug" />
+                    </div>
                 }
             </div>
         }

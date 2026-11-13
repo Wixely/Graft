@@ -10453,7 +10453,7 @@ async Task<ProjectResponse> ProjectResponseForLocked(HttpContext context, Projec
         forks.UpstreamId is long upstreamId ? new ForkedFromResponse(upstreamId, forks.UpstreamPath!, origin + "/" + forks.UpstreamPath) : null,
         forks.ForksCount, stars, permissions, owner,
         mirror?.Url, mirror?.ImportStatus ?? "none", mirror is { LastSuccessAtUtc: null, Status: MirrorStatus.Failed } ? mirror.LastError : null,
-        mirror?.Enabled ?? false);
+        mirror?.Enabled ?? false, details.Project.PagePublished);
 }
 
 // The projects among these ids that the caller may read, in the order given.

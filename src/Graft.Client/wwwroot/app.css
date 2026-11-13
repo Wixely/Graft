@@ -413,6 +413,13 @@ a.label:hover { color: var(--accent); border-color: var(--accent-border); }
     min-height: 44px;
 }
 a.list-item:hover, button.list-item:hover { background: var(--sunken); text-decoration: none; }
+/* A row that is one link everywhere except where it holds another: the main link covers the row, and a
+   link beside it is lifted above that cover. */
+.list-item.linked { position: relative; }
+.list-item.linked:hover { background: var(--sunken); }
+.list-item.linked > a.list-item-main { color: inherit; text-decoration: none; }
+.list-item.linked > a.list-item-main::after { content: ""; position: absolute; inset: 0; }
+.list-item.linked > a.label { position: relative; z-index: 1; }
 .list-item-main { min-width: 0; flex: 1 1 auto; }
 .list-item-main strong { display: block; font-weight: 600; }
 .list-item-main small { display: block; margin-top: 1px; color: var(--text-secondary); font-size: 12px; }
