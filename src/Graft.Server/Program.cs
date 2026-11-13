@@ -2602,7 +2602,7 @@ async Task<(ProjectInfo Project, ProjectDetails Details, AuthenticatedIdentity? 
     ProjectDetails details = (await store.GetReadyProjectAsync(found.Id, context.RequestAborted))!;
 
     RepositoryEndpoint endpoint = EndpointFor(found);
-    if (!await endpoint.Gate.WaitAsync(0, context.RequestAborted)) { await ApiError(context, 429, "429 Too Many Requests"); return null; }
+    if (!await endpoint.EnterBrieflyAsync(context.RequestAborted)) { await ApiError(context, 429, "429 Too Many Requests"); return null; }
     PageConfigurationResult config;
     try { config = PageConfiguration.Read(ReadRepositoryFile(endpoint.Repository, PageConfiguration.Path)); }
     finally { endpoint.Gate.Release(); }
@@ -2788,30 +2788,31 @@ app.MapMethods("/api/graft/pages/{globalSlug}/image", ["GET", "HEAD"], async con
     { await ApiError(context, 404, "page"); return; }
 
     string filePath = context.Request.Query["path"].ToString();
-    await WithRepository(EndpointFor(found), context, async repository =>
+    // The repository is held only for the read. The bytes are sent after it is let go, so a slow reader
+    // of one picture does not keep everyone else out of the project.
+    GitFile? file = null;
+    if (!await WithRepository(EndpointFor(found), context, repository =>
     {
         PageConfigurationResult config = PageConfiguration.Read(ReadRepositoryFile(repository, PageConfiguration.Path));
-        if (!config.Ok || !PageConfiguration.AllowsFile(config.Settings!, filePath))
-        { await ApiError(context, 404, "image"); return; }
-
-        GitFile? file;
+        if (!config.Ok || !PageConfiguration.AllowsFile(config.Settings!, filePath)) return Task.CompletedTask;
         try { file = RepositoryView.File(repository, "HEAD", PathMatcher.Normalize(filePath)); }
-        catch (GitInputException) { file = null; }
-        if (file is null) { await ApiError(context, 404, "image"); return; }
+        catch (GitInputException) { }
+        return Task.CompletedTask;
+    })) return;
+    if (file is null) { await ApiError(context, 404, "image"); return; }
 
-        ValidatedImage? image = ImageContent.Validate(file.Content);
-        if (image is null) { await ApiError(context, 415, "that file is not a supported image"); return; }
+    ValidatedImage? image = ImageContent.Validate(file.Content);
+    if (image is null) { await ApiError(context, 415, "that file is not a supported image"); return; }
 
-        string etag = '"' + file.BlobId + '"';
-        context.Response.Headers.CacheControl = "no-cache, private";
-        context.Response.Headers.ETag = etag;
-        if (context.Request.GetTypedHeaders().IfNoneMatch?.Any(value => value.Tag.Value == etag || value.Tag.Value == "*") == true)
-        { context.Response.StatusCode = StatusCodes.Status304NotModified; return; }
-        context.Response.ContentType = image.ContentType;
-        context.Response.ContentLength = image.Bytes.Length;
-        if (HttpMethods.IsHead(context.Request.Method)) return;
-        await context.Response.Body.WriteAsync(image.Bytes, context.RequestAborted);
-    });
+    string etag = '"' + file.BlobId + '"';
+    context.Response.Headers.CacheControl = "no-cache, private";
+    context.Response.Headers.ETag = etag;
+    if (context.Request.GetTypedHeaders().IfNoneMatch?.Any(value => value.Tag.Value == etag || value.Tag.Value == "*") == true)
+    { context.Response.StatusCode = StatusCodes.Status304NotModified; return; }
+    context.Response.ContentType = image.ContentType;
+    context.Response.ContentLength = image.Bytes.Length;
+    if (HttpMethods.IsHead(context.Request.Method)) return;
+    await context.Response.Body.WriteAsync(image.Bytes, context.RequestAborted);
 });
 
 // The same page, reached by the project's instance-wide slug. It lives under Graft's own prefix rather than
@@ -10400,15 +10401,17 @@ RepositoryEndpoint EndpointFor(ProjectInfo project)
     return endpoint;
 }
 
-async Task WithRepository(RepositoryEndpoint endpoint, HttpContext context, Func<Repository, Task> action)
+// False means the repository stayed busy and the 429 has already been written.
+async Task<bool> WithRepository(RepositoryEndpoint endpoint, HttpContext context, Func<Repository, Task> action)
 {
-    if (!await endpoint.Gate.WaitAsync(0, context.RequestAborted))
+    if (!await endpoint.EnterBrieflyAsync(context.RequestAborted))
     {
         await ApiError(context, 429, "429 Too Many Requests");
-        return;
+        return false;
     }
     try { await action(endpoint.Repository); }
     finally { endpoint.Gate.Release(); }
+    return true;
 }
 
 async Task<ProjectResponse> ProjectResponseFor(HttpContext context, ProjectDetails details)
@@ -11004,6 +11007,20 @@ sealed class RepositoryEndpoint(Repository repository)
 {
     public Repository Repository { get; } = repository;
     public SemaphoreSlim Gate { get; } = new(1, 1);
+
+    private static readonly TimeSpan BriefWait = TimeSpan.FromSeconds(5);
+    private const int MaxWaiting = 16;
+    private int waiting;
+
+    // A page with several pictures asks for them at once, so a browser request waits its turn briefly
+    // instead of being refused. The line is short and bounded because anyone may stand in it.
+    public async Task<bool> EnterBrieflyAsync(CancellationToken cancellationToken)
+    {
+        if (Gate.Wait(0, CancellationToken.None)) return true;
+        if (Interlocked.Increment(ref waiting) > MaxWaiting) { Interlocked.Decrement(ref waiting); return false; }
+        try { return await Gate.WaitAsync(BriefWait, cancellationToken); }
+        finally { Interlocked.Decrement(ref waiting); }
+    }
 }
 
 /// <summary>

@@ -732,6 +732,13 @@ async Task CheckProjectPages(string address, AuthenticatedIdentity alice, string
         Check(picture.IsSuccessStatusCode && picture.Content.Headers.ContentType?.MediaType == "image/png" &&
             (await picture.Content.ReadAsByteArrayAsync()).AsSpan().SequenceEqual(OnePixelPng()),
             "a page serves an allowlisted image without an account, as the type its bytes prove (got " + (int)picture.StatusCode + ")");
+    // A readme with several pictures asks for them all at once, and each must arrive rather than be
+    // refused because another one was being read.
+    HttpResponseMessage[] together = await Task.WhenAll(Enumerable.Range(0, 12)
+        .Select(_ => PagesGet(address, null, pageImage + "docs%2Fpixel.png")));
+    Check(together.All(response => response.IsSuccessStatusCode),
+        "twelve pictures asked for at once all arrive (got " + string.Join(",", together.Select(response => (int)response.StatusCode)) + ")");
+    foreach (HttpResponseMessage response in together) response.Dispose();
     using (HttpResponseMessage fake = await PagesGet(address, null, pageImage + "docs%2Ffake.png"))
         Check(fake.StatusCode == System.Net.HttpStatusCode.UnsupportedMediaType, "an allowlisted file that is not an image is refused, whatever its name");
     using (HttpResponseMessage text = await PagesGet(address, null, pageImage + "README.md"))
@@ -8636,7 +8643,9 @@ async Task CheckSsh(string address, AuthenticatedIdentity alice, string bobUsern
             "an api token lists the project's deploy keys, with the use recorded");
     }
     using (HttpResponseMessage all = await ApiGet(address, "/api/v4/deploy_keys", adminApi))
-        Check(all.IsSuccessStatusCode && (await all.Content.ReadAsStringAsync()).Contains(await FingerprintOf(deploy + ".pub"), StringComparison.Ordinal),
+        // The serializer writes a plus sign as +, and about half of all fingerprints hold one.
+        Check(all.IsSuccessStatusCode && (await all.Content.ReadAsStringAsync()).Replace("\\u002B", "+", StringComparison.Ordinal)
+                .Contains(await FingerprintOf(deploy + ".pub"), StringComparison.Ordinal),
             "an administrator lists every deploy key on the server");
     using (HttpResponseMessage notAll = await ApiGet(address, "/api/v4/deploy_keys", aliceApi))
         Check(notAll.StatusCode == System.Net.HttpStatusCode.Forbidden, "and nobody else may");
