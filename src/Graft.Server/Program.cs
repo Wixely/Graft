@@ -323,15 +323,22 @@ app.Use(async (context, next) =>
         context.Request.Path.StartsWithSegments("/v2") ||
         (context.Request.Path.Value?.Contains("/packages/", StringComparison.Ordinal) == true && context.Request.Method is "PUT" or "POST") ||
         // A page artifact arrives as one archive. The route bounds it by the administrator's own limit as it reads.
-        (context.Request.Path.Value?.Contains("/page-artifacts/", StringComparison.Ordinal) == true && context.Request.Method is "PUT") ||
-        // A release file, sent as the request body or fetched back, is as large as a package (ADR 0052).
-        // The browser's receipt for one carries no bytes, but copying and hashing what was staged takes as long.
-        (context.Request.Path.StartsWithSegments("/api") && context.Request.Path.Value!.Contains("/releases/", StringComparison.Ordinal) &&
-            (context.Request.Path.Value.Contains("/assets/files/", StringComparison.Ordinal) || context.Request.Path.Value.EndsWith("/assets", StringComparison.Ordinal)));
+        (context.Request.Path.Value?.Contains("/page-artifacts/", StringComparison.Ordinal) == true && context.Request.Method is "PUT");
+    // A release file, sent as the request body or fetched back, is as large as a package (ADR 0052). Its own bound,
+    // not Git's: the token route takes the whole file as the body, and the store refuses past 2 GiB anyway. The
+    // browser's receipt for one carries no bytes, but copying and hashing what was staged takes as long.
+    bool releaseFile = context.Request.Path.StartsWithSegments("/api") && context.Request.Path.Value!.Contains("/releases/", StringComparison.Ordinal) &&
+        (context.Request.Path.Value.Contains("/assets/files/", StringComparison.Ordinal) || context.Request.Path.Value.EndsWith("/assets", StringComparison.Ordinal));
     if (context.Request.Path.Value?.EndsWith(".git/git-receive-pack", StringComparison.Ordinal) == true || largeFile)
     {
         IHttpMaxRequestBodySizeFeature? bodySize = context.Features.Get<IHttpMaxRequestBodySizeFeature>();
         if (bodySize is { IsReadOnly: false }) bodySize.MaxRequestBodySize = Limits.RequestBytes;
+    }
+    if (releaseFile)
+    {
+        IHttpMaxRequestBodySizeFeature? bodySize = context.Features.Get<IHttpMaxRequestBodySizeFeature>();
+        if (bodySize is { IsReadOnly: false }) bodySize.MaxRequestBodySize = GraftStore.MaximumAssetBytes;
+        largeFile = true;
     }
     // A part of a chunked transfer is at most the configured part size; the transfer as a whole may be a push's.
     bool transferPart = context.Request.Path.Value?.Contains(".git/graft/transfers", StringComparison.Ordinal) == true;

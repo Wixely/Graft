@@ -6784,11 +6784,30 @@ async Task<string> CheckReleasePublishing(string address, AuthenticatedIdentity 
         using JsonDocument json = JsonDocument.Parse(await stored.Content.ReadAsStringAsync());
         JsonElement file = json.RootElement.GetProperty("assets").GetProperty("files").EnumerateArray().Single(entry => entry.GetProperty("file_name").GetString() == "large.bin");
         Check(stored.StatusCode == HttpStatusCode.Created && file.GetProperty("size").GetInt64() == large.Length &&
-            file.GetProperty("sha256").GetString() == Convert.ToHexStringLower(SHA256.HashData(large)), "a 40 MiB file, larger than a release file could be before, is stored and hashed");
+            file.GetProperty("sha256").GetString() == Convert.ToHexStringLower(SHA256.HashData(large)),
+            "a 40 MiB file through the token route, past the server's 16 MiB default for a request, is stored and hashed");
     }
     using (HttpResponseMessage download = await ApiGet(address, release + "/assets/files/large.bin", aliceApi))
         Check(download.IsSuccessStatusCode && download.Content.Headers.ContentLength == large.Length &&
             (await download.Content.ReadAsByteArrayAsync()).AsSpan().SequenceEqual(large), "and downloads whole");
+    // One byte past 2 GiB, declared and never sent: refused on the declaration, before anything is written.
+    {
+        int before = Directory.GetFiles(filesOnDisk).Length;
+        Uri origin = new(address);
+        using System.Net.Sockets.TcpClient tcp = new();
+        await tcp.ConnectAsync(origin.Host, origin.Port);
+        await using System.Net.Security.SslStream tls = new(tcp.GetStream(), false, (_, _, _, _) => true);
+        await tls.AuthenticateAsClientAsync(origin.Host);
+        string head = "PUT " + release + "/assets/files/too-large.bin HTTP/1.1\r\nHost: " + origin.Authority + "\r\nPRIVATE-TOKEN: " + aliceApi +
+            "\r\nContent-Type: application/octet-stream\r\nContent-Length: " + (GraftStore.MaximumAssetBytes + 1).ToString(System.Globalization.CultureInfo.InvariantCulture) + "\r\n\r\n";
+        await tls.WriteAsync(Encoding.ASCII.GetBytes(head));
+        await tls.FlushAsync();
+        byte[] answer = new byte[4096];
+        int read = await tls.ReadAsync(answer).AsTask().WaitAsync(TimeSpan.FromSeconds(20));
+        string status = Encoding.ASCII.GetString(answer, 0, read).Split("\r\n", 2)[0];
+        Check(status.StartsWith("HTTP/1.1 413", StringComparison.Ordinal) && Directory.GetFiles(filesOnDisk).Length == before,
+            "a release file declared one byte past 2 GiB is refused with 413 before its body is read");
+    }
     using (HttpResponseMessage removed = await ApiDelete(address, release + "/assets/files/large.bin", aliceApi))
         Check(removed.IsSuccessStatusCode && Directory.GetFiles(filesOnDisk).Length == 3, "removing a file removes it from disk");
 
