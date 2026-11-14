@@ -137,6 +137,13 @@ Then the first of the four large items, in the order given:
   trail, transfer and deletion, with token routes for the banner, approvals and transfer.
   [ADR 0047](decisions/0047-agent-project-settings.md).
 
+## Closed on 2026-11-13
+
+- **Page artifacts.** A build that is not in the repository, uploaded as one zip, private until promoted, then part
+  of the project's site; WebAssembly, audio and video among the served types, and an administrator's list of more.
+  [ADR 0051](decisions/0051-page-artifacts.md). Left open there: cross-origin isolation for threaded builds,
+  publishing from a runner job, and sites sharing one origin.
+
 ## Closed on 2026-11-11
 
 - **Markdown files render, and documents link to each other.** A `.md` file opens rendered, with its source a click away,

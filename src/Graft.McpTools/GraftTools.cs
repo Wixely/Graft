@@ -930,6 +930,95 @@ public sealed class GraftTools
             : Failure(GraftClient.Describe(status, response));
     }
 
+    [McpServerTool(Name = "graft_list_page_artifacts")]
+    [Description("Lists a project's page artifacts: named folders of uploaded files, such as a browser build, that are not in the repository. Each is private until promoted; a promoted one is served as part of the project's site, at the url given, while the project's page is published. Shows each file and the content type it would be served as, or null when the server does not serve that type.")]
+    public static async Task<string> ListPageArtifacts(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        CancellationToken cancellationToken)
+    {
+        (PageArtifactListResponse? list, string? error) = await graft.GetAsync(
+            "api/graft/projects/" + Encode(project) + "/page-artifacts", ApiJson.Default.PageArtifactListResponse, cancellationToken);
+        if (error is not null) return Failure(error);
+        return new JsonObject
+        {
+            ["project"] = project,
+            ["page_published"] = list!.PagePublished,
+            ["pages_origin_configured"] = list.PagesAvailable,
+            ["served_under"] = list.Prefix + "/<name>/",
+            ["largest_upload_bytes"] = list.MaximumBytes,
+            ["artifacts"] = Array(list.Artifacts, PageArtifactJson)
+        }.ToJsonString();
+    }
+
+    [McpServerTool(Name = "graft_upload_page_artifact")]
+    [Description("Uploads a page artifact from a zip archive you already have as base64, replacing any artifact of the same name as a whole. A new artifact starts private; one that is already promoted stays promoted, so its new files are public at once. A single folder wrapping everything in the archive is dropped. An archive too large to pass as base64 (roughly 10 MB) is sent instead with an HTTP PUT of the zip to /api/graft/projects/<project>/page-artifacts/<name>, with a token. Needs the Developer role. Refused unless writes are allowed on this server.")]
+    public static async Task<string> UploadPageArtifact(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("The artifact's name: up to 40 lower-case letters, digits, '-' and '_'. It becomes a folder in the site's address.")] string name,
+        [Description("The zip archive's bytes, base64 encoded.")] string zipBase64,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowWrites) return Refused(graft, "uploading a page artifact");
+        byte[] bytes;
+        try { bytes = Convert.FromBase64String(zipBase64 ?? ""); }
+        catch (FormatException) { return Failure("The archive must be base64 encoded."); }
+        if (bytes.Length == 0) return Failure("The archive is empty.");
+
+        (bool ok, string response, int status) = await graft.SendBytesAsync(HttpMethod.Put,
+            "api/graft/projects/" + Encode(project) + "/page-artifacts/" + Uri.EscapeDataString((name ?? "").Trim()),
+            bytes, "application/zip", cancellationToken);
+        if (!ok) return Failure(Explain(status, response));
+        return Created(response, ApiJson.Default.PageArtifactResponse, PageArtifactJson);
+    }
+
+    [McpServerTool(Name = "graft_set_page_artifact_promoted")]
+    [Description("Promotes a page artifact, which makes its files public on the pages origin as part of the project's site, or withdraws it again. A promoted artifact is only reachable while the project's page is published. Needs the Maintainer role. Refused unless writes are allowed on this server.")]
+    public static async Task<string> SetPageArtifactPromoted(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("The artifact's name.")] string name,
+        [Description("True to promote the artifact, false to withdraw it.")] bool promoted,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowWrites) return Refused(graft, "promoting or withdrawing a page artifact");
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Put,
+            "api/graft/projects/" + Encode(project) + "/page-artifacts/" + Uri.EscapeDataString((name ?? "").Trim()) + "/promotion",
+            new JsonObject { ["promoted"] = promoted }, cancellationToken);
+        if (!ok) return Failure(Explain(status, response));
+        return Created(response, ApiJson.Default.PageArtifactResponse, PageArtifactJson);
+    }
+
+    [McpServerTool(Name = "graft_delete_page_artifact")]
+    [Description("Deletes a page artifact and its files. If it was promoted, its part of the project's site stops answering at once. This cannot be undone. Needs the Maintainer role. Refused unless deleting is allowed on this server.")]
+    public static async Task<string> DeletePageArtifact(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("The artifact's name.")] string name,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowDestructive) return RefusedDestructive(graft, "deleting a page artifact");
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Delete,
+            "api/graft/projects/" + Encode(project) + "/page-artifacts/" + Uri.EscapeDataString((name ?? "").Trim()), null, cancellationToken);
+        return ok
+            ? new JsonObject { ["project"] = project, ["name"] = name, ["deleted"] = true }.ToJsonString()
+            : Failure(Explain(status, response));
+    }
+
+    private static JsonObject PageArtifactJson(PageArtifactResponse artifact) => new()
+    {
+        ["name"] = artifact.Name,
+        ["promoted"] = artifact.Promoted,
+        ["url"] = artifact.Url,
+        ["files"] = artifact.FileCount,
+        ["bytes"] = artifact.Bytes,
+        ["updated_at"] = artifact.UpdatedAt.ToString("O", CultureInfo.InvariantCulture),
+        ["updated_by"] = artifact.UpdatedBy,
+        ["contents"] = Array(artifact.Files, file => new JsonObject { ["path"] = file.Path, ["size"] = file.Size, ["served_as"] = file.ContentType }),
+        ["contents_truncated"] = artifact.FilesTruncated
+    };
+
     [McpServerTool(Name = "graft_list_issues")]
     [Description("Lists a project's issues, newest first. State may be opened, closed, or all.")]
     public static async Task<string> ListIssues(

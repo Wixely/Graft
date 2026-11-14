@@ -1,0 +1,200 @@
+@* A project's page artifacts (ADR 0051), in its settings: what has been uploaded, which of it is promoted to
+   the project's site, and a place to upload another. Shown to whoever can manage the project, since promoting
+   decides what a stranger can read. *@
+@inject GraftApi Api
+
+<div class="panel">
+    <div class="panel-header">
+        <Icon Name="archive" /><h2>Page artifacts</h2><span class="spacer"></span>
+        @if (list is not null) { <span class="label">@list.Artifacts.Length</span> }
+    </div>
+    <div class="panel-body">
+        <p class="secondary-text">
+            A page artifact is a folder of files that is not in the repository, such as a browser build of the
+            project, uploaded as one zip archive. It is private until you promote it. A promoted artifact is
+            served as part of the project's site, under <code>@(list?.Prefix ?? "a")/&lt;name&gt;/</code>, for
+            as long as the project page is published.
+        </p>
+        <Banner Message="@message" Kind="@messageKind" />
+        @if (list is { PagesAvailable: false })
+        {
+            <div class="banner warning">
+                <Icon Name="alert" />
+                <span>This server has no separate address for project sites, so a promoted artifact is not reachable until an operator configures one.</span>
+            </div>
+        }
+        else if (list is { PagePublished: false } && list.Artifacts.Any(artifact => artifact.Promoted))
+        {
+            <div class="banner warning">
+                <Icon Name="alert" />
+                <span>The project page is not published, so nothing promoted here is reachable yet.</span>
+            </div>
+        }
+    </div>
+    @if (list is null)
+    {
+        <p role="status" class="panel-empty">@(loading ? "Loading…" : "The page artifacts could not be read.")</p>
+    }
+    else if (list.Artifacts.Length == 0)
+    {
+        <p class="panel-empty">Nothing uploaded.</p>
+    }
+    else
+    {
+        <div class="list">
+            @foreach (PageArtifactResponse artifact in list.Artifacts)
+            {
+                <div class="list-item">
+                    <Icon Name="folder" />
+                    <span class="list-item-main">
+                        <strong>
+                            @artifact.Name
+                            @if (artifact.Promoted) { <span class="label accent">promoted</span> } else { <span class="label">private</span> }
+                        </strong>
+                        <small>
+                            @artifact.FileCount @(artifact.FileCount == 1 ? "file" : "files") &middot; @Size(artifact.Bytes) &middot;
+                            @artifact.UpdatedBy &middot; @artifact.UpdatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")
+                        </small>
+                        @if (artifact.Url is not null)
+                        {
+                            <small><a href="@artifact.Url" rel="noopener noreferrer">@artifact.Url</a></small>
+                        }
+                        <span class="list-labels">
+                            @foreach (PageArtifactFileResponse file in artifact.Files.Take(12))
+                            {
+                                <a class="label" title="@(file.ContentType ?? "This file type is not served. An administrator can add it.")"
+                                   href="@($"/api/projects/{ProjectId}/page-artifacts/{artifact.Name}/files/{EscapePath(file.Path)}")" download>
+                                    @file.Path@(file.ContentType is null ? " (not served)" : "")
+                                </a>
+                            }
+                            @if (artifact.FileCount > 12) { <span class="secondary-text">and @(artifact.FileCount - 12) more</span> }
+                        </span>
+                    </span>
+                    <button type="button" class="link" @onclick="() => SetPromoted(artifact, !artifact.Promoted)" disabled="@busy">
+                        @(artifact.Promoted ? "Withdraw" : "Promote")
+                    </button>
+                    <button type="button" class="link danger-text" @onclick="() => Delete(artifact)" disabled="@busy">
+                        @(confirming == artifact.Name ? "Confirm delete" : "Delete")
+                    </button>
+                </div>
+            }
+        </div>
+    }
+    <div class="panel-body">
+        <form class="form" @onsubmit:preventDefault>
+            <label for="page-artifact-name">Upload an artifact named</label>
+            <input id="page-artifact-name" @bind="name" @bind:event="oninput" maxlength="40" pattern="[a-z0-9][a-z0-9_\-]*"
+                   placeholder="demo" autocomplete="off" spellcheck="false" />
+            <p class="field-hint">
+                Lower-case letters, digits, <code>-</code> and <code>_</code>. The name becomes a folder in the
+                site's address, and uploading to a name that exists replaces everything in it; a promoted
+                artifact stays promoted. Up to @Size(list?.MaximumBytes ?? 0) as a zip archive. Pages inside it
+                must use relative addresses.
+            </p>
+        </form>
+        @if (NameIsValid)
+        {
+            <UploadField Profile="page-artifact" Id="page-artifact-upload" OnCompleted="Ingest" />
+        }
+        <p class="field-hint">
+            From a script: <code>PUT /api/graft/projects/@ProjectId/page-artifacts/&lt;name&gt;</code> with the
+            zip as the body and a token.
+        </p>
+    </div>
+</div>
+
+@code {
+    [Parameter, EditorRequired] public long ProjectId { get; set; }
+
+    private PageArtifactListResponse? list;
+    private string name = "";
+    private string message = "";
+    private string messageKind = "info";
+    private string? confirming;
+    private bool loading = true;
+    private bool busy;
+    private long loadedFor;
+
+    private bool NameIsValid => name.Length is > 0 and <= 40 && (char.IsAsciiLetterLower(name[0]) || char.IsAsciiDigit(name[0])) &&
+        name.All(c => char.IsAsciiLetterLower(c) || char.IsAsciiDigit(c) || c is '-' or '_');
+
+    protected override async Task OnParametersSetAsync()
+    {
+        if (loadedFor == ProjectId) return;
+        loadedFor = ProjectId;
+        await Load();
+    }
+
+    private async Task Load()
+    {
+        try
+        {
+            (bool reached, PageArtifactListResponse? loaded) =
+                await Api.GetOptionalAsync($"api/projects/{ProjectId}/page-artifacts", ApiJson.Default.PageArtifactListResponse);
+            if (reached) list = loaded;
+        }
+        finally { loading = false; }
+    }
+
+    private async Task Ingest(string uploadId)
+    {
+        if (!NameIsValid) { Report(ApiResult.Refused("Give the artifact a name, then upload the archive again.")); return; }
+        if (busy) return;
+        busy = true;
+        try
+        {
+            string target = name;
+            ApiResult result = await Api.PostAsync($"api/projects/{ProjectId}/page-artifacts/{target}",
+                new UploadIngestRequest(uploadId), ApiJson.Default.UploadIngestRequest,
+                $"Uploaded {target}. It is private until promoted, unless it already was.");
+            Report(result);
+            if (result.Ok) await Load();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task SetPromoted(PageArtifactResponse artifact, bool promoted)
+    {
+        if (busy) return;
+        busy = true;
+        confirming = null;
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/projects/{ProjectId}/page-artifacts/{artifact.Name}/promotion",
+                new PageArtifactPromotionRequest(promoted), ApiJson.Default.PageArtifactPromotionRequest,
+                promoted ? $"{artifact.Name} is promoted: its files are part of the project's site." : $"{artifact.Name} is withdrawn.");
+            Report(result);
+            if (result.Ok) await Load();
+        }
+        finally { busy = false; }
+    }
+
+    /// <summary>The second click is the confirmation, as it is for deleting a file.</summary>
+    private async Task Delete(PageArtifactResponse artifact)
+    {
+        if (busy) return;
+        if (confirming != artifact.Name) { confirming = artifact.Name; return; }
+        busy = true;
+        confirming = null;
+        try
+        {
+            ApiResult result = await Api.DeleteAsync($"api/projects/{ProjectId}/page-artifacts/{artifact.Name}", $"{artifact.Name} is deleted.");
+            Report(result);
+            if (result.Ok) await Load();
+        }
+        finally { busy = false; }
+    }
+
+    private void Report(ApiResult result)
+    {
+        message = result.Message;
+        messageKind = result.Ok ? "success" : "error";
+    }
+
+    private static string EscapePath(string path) => string.Join('/', path.Split('/').Select(Uri.EscapeDataString));
+
+    private static string Size(long bytes) =>
+        bytes >= 1024 * 1024 ? (bytes / (1024.0 * 1024.0)).ToString("0.#", System.Globalization.CultureInfo.InvariantCulture) + " MiB" :
+        bytes >= 1024 ? (bytes / 1024.0).ToString("0.#", System.Globalization.CultureInfo.InvariantCulture) + " KiB" :
+        bytes + " bytes";
+}

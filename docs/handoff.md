@@ -1,6 +1,26 @@
 # Next-agent handoff
 
-Updated: 2026-11-11. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the project owner.
+Updated: 2026-11-13. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the project owner.
+
+## Added on 2026-11-13: page artifacts
+
+The user wants a project page that carries a playable WebAssembly demo whose build is not committed, over a project
+that may stay private. [ADR 0051](decisions/0051-page-artifacts.md). Migration 30.
+
+- **What it is.** A named folder of files uploaded as one zip, on disk under `page-artifacts/<name>/<generation>/`
+  in the repository directory (`PageArtifactFiles.cs`), with a row in `PageArtifacts` (`GraftStorePageArtifacts.cs`).
+  Private until a Maintainer promotes it; then the pages middleware in `Program.cs` serves it at
+  `<slug>/a/<name>/`, before it looks at the repository and without taking the repository's gate.
+- **Routes.** Two families from one loop in `Program.cs`: `/api/projects/{id}/page-artifacts` for the browser and
+  `/api/graft/projects/{id}/page-artifacts` for a token. A member who lacks the role gets 403 here, not the 404 the
+  older token routes give.
+- **Administrator settings.** `PageServingSettings` in `Graft.Core`: the prefix, the size limit and added file
+  types, as rows in `ServerSettings`, edited at `/-/admin/pages` (`PagesAdmin.razor`). Read per request.
+- **Config.** `page.site.artifact`; a site now needs `root` or `artifact`, and `PageSite.Root` may be empty.
+- **Agents.** Four tools; the tool count is 58 and three assertions in `tests/Graft.Mcp.Acceptance` say so.
+- **Not verified.** A real game build from the live deployment, and the NativeAOT publish of this change.
+- **Next action (project owner).** Build the game with relative addresses, upload it, promote it, and say whether
+  the demo should also appear inside the repository-style page; that needs a frame, which was declined.
 
 ## Added on 2026-11-11: the rest of SSH, and the rest of notifications
 

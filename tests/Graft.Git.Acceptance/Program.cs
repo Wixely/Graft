@@ -231,6 +231,7 @@ try
     // Last, because writing a file creates a branch and several checks above count branches.
     await CheckApiFileWrites(address, aliceIdentity, project.Id);
     await CheckProjectPages(address, aliceIdentity, source);
+    await CheckPageArtifacts(address, aliceIdentity, bob.Username, adminPassword, alicePassword);
     await CheckCollaboration(address, aliceIdentity, bob.Username, "carol");
     await CheckProjectDeletion(address, aliceIdentity, administratorIdentity, bob.Username, alicePassword);
     await CheckReview(address, aliceIdentity, bob.Username, "carol");
@@ -887,6 +888,308 @@ async Task CheckProjectPages(string address, AuthenticatedIdentity alice, string
     foreach (string surface in new[] { "/issues", "/releases", "/image?path=docs%2Fpixel.png" })
         using (HttpResponseMessage closed = await PagesGet(address, null, "/api/graft/pages/" + slug + surface))
             Check(closed.StatusCode == System.Net.HttpStatusCode.NotFound, "and the route for each answers as if it did not exist: " + surface);
+}
+
+/// <summary>
+/// Page artifacts (ADR 0051): a build that is not in the repository, uploaded as one archive, private until a
+/// Maintainer promotes it, and then part of the project's site on the pages origin. The project here is private
+/// throughout, which is the case the feature exists for.
+/// </summary>
+async Task CheckPageArtifacts(string address, AuthenticatedIdentity alice, string bobUsername, string adminPassword, string alicePassword)
+{
+    const string PagesHost = "pages.graft.test";
+    long projectId;
+    string slug;
+    string storageId;
+    string aliceApi;
+    string bobApi;
+    await using (GraftStore fixture = await GraftStore.OpenAsync(databasePath))
+    {
+        ProjectInfo created = await fixture.CreateProjectWithRepositoryAsync(alice, "gamesample", "Game sample",
+            (project, token) => { token.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, project.StorageId)); return Task.CompletedTask; },
+            "A private project whose demo is a page artifact.");
+        projectId = created.Id;
+        slug = created.GlobalSlug;
+        storageId = created.StorageId;
+        UserAccount bob = Required(await fixture.FindActiveUserAsync(bobUsername), "bob account");
+        await fixture.SetMembershipAsync(alice, projectId, bob.Id, ProjectRole.Developer);
+        aliceApi = (await fixture.CreateTokenAsync(alice, "artifacts", TokenScope.Api | TokenScope.WriteRepository, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        bobApi = (await fixture.CreateTokenAsync(new(bob.Id, bob.Username, false, IdentityKind.BrowserSession), "artifacts-developer", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        await fixture.SetPagePublishedAsync(alice, projectId, true);
+    }
+
+    static byte[] Archive(params (string Path, byte[] Content)[] files)
+    {
+        using MemoryStream packed = new();
+        using (System.IO.Compression.ZipArchive zip = new(packed, System.IO.Compression.ZipArchiveMode.Create, leaveOpen: true))
+            foreach ((string path, byte[] content) in files)
+            {
+                using Stream entry = zip.CreateEntry(path, System.IO.Compression.CompressionLevel.NoCompression).Open();
+                entry.Write(content);
+            }
+        return packed.ToArray();
+    }
+    static byte[] Text(string value) => Encoding.UTF8.GetBytes(value);
+
+    string api = "/api/graft/projects/" + projectId + "/page-artifacts";
+    string site = "/" + slug + "/a/demo/";
+    byte[] module = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+    byte[] sound = [.. Enumerable.Range(0, 64).Select(value => (byte)value)];
+    // Shaped like what a bundler writes: a page, a loader and a module with a hash in their names, wrapped in
+    // the folder the bundler built into.
+    byte[] first = Archive(
+        ("dist/index.html", Text("<!doctype html><title>Game</title><script type=\"module\" src=\"./game-1111.js\"></script>")),
+        ("dist/game-1111.js", Text("export default 1;")),
+        ("dist/game-1111_bg.wasm", module),
+        ("dist/audio/theme.ogg", sound),
+        ("dist/notes.xyz", Text("not a type this server knows")));
+
+    using (HttpResponseMessage nothing = await PagesGet(address, PagesHost, site))
+        Check(nothing.StatusCode == HttpStatusCode.NotFound, "an artifact nobody uploaded is not on the pages origin");
+
+    foreach ((string label, byte[] body) in new[]
+    {
+        ("an upload that is not a zip archive is refused", Text("<html>not an archive</html>")),
+        ("an archive naming a path above itself is refused", Archive(("dist/ok.txt", Text("ok")), ("../escape.txt", Text("no")))),
+        ("an archive holding a hidden file is refused", Archive(("index.html", Text("ok")), (".git/config", Text("no")))),
+        ("an archive holding a device name is refused", Archive(("index.html", Text("ok")), ("sub/NUL.txt", Text("no")))),
+        ("an archive holding two paths that differ only by case is refused", Archive(("Index.html", Text("a")), ("index.html", Text("b")))),
+        ("an archive with no files is refused", Archive())
+    })
+        using (HttpResponseMessage refused = await ApiPutBytes(address, api + "/demo", aliceApi, body, "application/zip"))
+            Check(refused.StatusCode == HttpStatusCode.BadRequest, label);
+    using (HttpResponseMessage badName = await ApiPutBytes(address, api + "/Demo%20Build", aliceApi, first, "application/zip"))
+        Check(badName.StatusCode == HttpStatusCode.BadRequest, "a name that is not a lower-case folder name is refused");
+    using (HttpResponseMessage anonymous = await ApiPutBytes(address, api + "/demo", null, first, "application/zip"))
+        Check(anonymous.StatusCode == HttpStatusCode.Unauthorized, "an upload with no token is refused");
+    Check(!Directory.Exists(Path.Combine(repositoriesRoot, storageId, "page-artifacts", "demo")), "and none of the refused uploads left anything behind");
+
+    // A Developer uploads; that is a build, like a package. Promoting is the Maintainer's.
+    using (HttpResponseMessage uploaded = await ApiPutBytes(address, api + "/demo", bobApi, first, "application/zip"))
+    {
+        Check(uploaded.StatusCode == HttpStatusCode.Created, "a Developer uploads a page artifact as one archive");
+        using JsonDocument json = JsonDocument.Parse(await uploaded.Content.ReadAsStringAsync());
+        Check(!json.RootElement.GetProperty("promoted").GetBoolean() && json.RootElement.GetProperty("url").ValueKind == JsonValueKind.Null,
+            "it starts private, with no public address");
+        Check(json.RootElement.GetProperty("file_count").GetInt32() == 5, "it holds every file in the archive");
+        JsonElement[] files = [.. json.RootElement.GetProperty("files").EnumerateArray()];
+        Check(files.Any(file => file.GetProperty("path").GetString() == "game-1111_bg.wasm" && file.GetProperty("content_type").GetString() == "application/wasm"),
+            "the folder wrapping the archive is dropped, and a WebAssembly module is a type the server serves");
+        Check(files.Any(file => file.GetProperty("path").GetString() == "audio/theme.ogg" && file.GetProperty("content_type").GetString() == "audio/ogg"), "so is audio");
+        Check(files.Any(file => file.GetProperty("path").GetString() == "notes.xyz" && file.GetProperty("content_type").ValueKind == JsonValueKind.Null),
+            "and a file of a type it does not serve is stored and flagged");
+    }
+    using (HttpResponseMessage hidden = await PagesGet(address, PagesHost, site))
+        Check(hidden.StatusCode == HttpStatusCode.NotFound, "an uploaded artifact is not public until it is promoted");
+    using (HttpResponseMessage download = await ApiGet(address, api + "/demo/files/audio/theme.ogg", bobApi))
+    {
+        Check(download.IsSuccessStatusCode && (await download.Content.ReadAsByteArrayAsync()).SequenceEqual(sound), "a member downloads a file from a private artifact");
+        Check(download.Content.Headers.ContentDisposition?.DispositionType == "attachment" && download.Content.Headers.ContentType?.MediaType == "application/octet-stream",
+            "as an attachment, never as the type its name suggests");
+    }
+    using (HttpResponseMessage stranger = await ApiGet(address, api + "/demo/files/index.html", null))
+        Check(stranger.StatusCode == HttpStatusCode.NotFound, "a stranger cannot, and is not told the project exists");
+    using (HttpResponseMessage strangerList = await ApiGet(address, api, null))
+        Check(strangerList.StatusCode == HttpStatusCode.NotFound, "nor list the project's artifacts");
+
+    using (HttpResponseMessage developer = await ApiPutJson(address, api + "/demo/promotion", bobApi, """{"promoted":true}"""))
+        Check(developer.StatusCode == HttpStatusCode.Forbidden, "a Developer cannot promote an artifact");
+    using (HttpResponseMessage hidden = await PagesGet(address, PagesHost, site))
+        Check(hidden.StatusCode == HttpStatusCode.NotFound, "and the refused promotion changed nothing");
+    using (HttpResponseMessage promoted = await ApiPutJson(address, api + "/demo/promotion", aliceApi, """{"promoted":true}"""))
+    {
+        Check(promoted.IsSuccessStatusCode, "a Maintainer promotes it");
+        using JsonDocument json = JsonDocument.Parse(await promoted.Content.ReadAsStringAsync());
+        Check(json.RootElement.GetProperty("url").GetString() == "https://" + PagesHost + site, "and is told where it is now served");
+    }
+
+    string firstTag;
+    using (HttpResponseMessage index = await PagesGet(address, PagesHost, site))
+    {
+        Check(index.IsSuccessStatusCode && index.Content.Headers.ContentType?.MediaType == "text/html", "a promoted artifact's folder answers with its index page");
+        Check((await index.Content.ReadAsStringAsync()).Contains("game-1111.js", StringComparison.Ordinal), "which is the uploaded file");
+        Check(index.Headers.TryGetValues("Content-Security-Policy", out IEnumerable<string>? policy) && policy.Single() == "frame-ancestors 'none'",
+            "under the pages origin's own containment");
+    }
+    using (HttpResponseMessage bare = await PagesGet(address, PagesHost, site.TrimEnd('/')))
+        Check(bare.StatusCode == HttpStatusCode.Found && bare.Headers.Location?.OriginalString == site,
+            "the folder without its slash redirects to it, by path alone so a proxy has no host to rewrite");
+    using (HttpResponseMessage wasm = await PagesGet(address, PagesHost, site + "game-1111_bg.wasm"))
+    {
+        Check(wasm.IsSuccessStatusCode && wasm.Content.Headers.ContentType?.MediaType == "application/wasm", "a WebAssembly module is served as one");
+        Check((await wasm.Content.ReadAsByteArrayAsync()).SequenceEqual(module), "byte for byte, because the page that loads it may pin its checksum");
+        firstTag = wasm.Headers.ETag?.Tag ?? "";
+        Check(firstTag.Length > 2 && wasm.Headers.CacheControl?.NoCache == true, "with a validator, so a returning browser need not download it again");
+    }
+    using (HttpResponseMessage unchanged = await PagesSend(address, PagesHost, site + "game-1111_bg.wasm", request => request.Headers.TryAddWithoutValidation("If-None-Match", firstTag)))
+        Check(unchanged.StatusCode == HttpStatusCode.NotModified, "and one that still holds it is told so");
+    using (HttpResponseMessage part = await PagesSend(address, PagesHost, site + "audio/theme.ogg", request => request.Headers.Range = new(8, 15)))
+    {
+        Check(part.StatusCode == HttpStatusCode.PartialContent && part.Content.Headers.ContentType?.MediaType == "audio/ogg", "media answers a range request, which a player needs to seek");
+        Check((await part.Content.ReadAsByteArrayAsync()).SequenceEqual(sound[8..16]), "with exactly the bytes asked for");
+    }
+    using (HttpResponseMessage unknown = await PagesGet(address, PagesHost, site + "notes.xyz"))
+        Check(unknown.StatusCode == HttpStatusCode.NotFound, "a file of a type the server does not serve stays unserved");
+    using (HttpResponseMessage missing = await PagesGet(address, PagesHost, site + "game-9999.js"))
+        Check(missing.StatusCode == HttpStatusCode.NotFound, "and a file that is not in the artifact is not found");
+    using (HttpResponseMessage other = await PagesGet(address, PagesHost, "/" + slug + "/a/other/"))
+        Check(other.StatusCode == HttpStatusCode.NotFound, "nor is an artifact of another name");
+    using (HttpResponseMessage forge = await PagesGet(address, null, site))
+        Check(forge.Content.Headers.ContentType?.MediaType != "text/html" || !(await forge.Content.ReadAsStringAsync()).Contains("game-1111.js", StringComparison.Ordinal),
+            "the forge's own origin never serves an artifact's page");
+    using (HttpResponseMessage listed = await ApiGet(address, api, bobApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await listed.Content.ReadAsStringAsync());
+        Check(listed.IsSuccessStatusCode && json.RootElement.GetProperty("prefix").GetString() == "a" && json.RootElement.GetProperty("page_published").GetBoolean() &&
+            json.RootElement.GetProperty("artifacts").EnumerateArray().Single().GetProperty("promoted").GetBoolean(),
+            "a member lists the artifacts, the path they are served under and whether the page is published");
+    }
+
+    // A new build replaces the old one whole, and stays promoted: the names a bundler writes change every time.
+    byte[] second = Archive(
+        ("index.html", Text("<!doctype html><title>Game</title><script type=\"module\" src=\"./game-2222.js\"></script>")),
+        ("game-2222.js", Text("export default 2;")),
+        ("game-2222_bg.wasm", module),
+        ("docs/index.html", Text("<!doctype html><title>Manual</title>")),
+        ("notes.xyz", Text("still not a type this server knows")));
+    using (HttpResponseMessage replaced = await ApiPutBytes(address, api + "/demo", bobApi, second, "application/zip"))
+    {
+        Check(replaced.StatusCode == HttpStatusCode.OK, "uploading to a name that exists replaces the artifact");
+        using JsonDocument json = JsonDocument.Parse(await replaced.Content.ReadAsStringAsync());
+        Check(json.RootElement.GetProperty("promoted").GetBoolean() && json.RootElement.GetProperty("file_count").GetInt32() == 5, "which stays promoted and holds only the new files");
+    }
+    using (HttpResponseMessage index = await PagesGet(address, PagesHost, site))
+        Check((await index.Content.ReadAsStringAsync()).Contains("game-2222.js", StringComparison.Ordinal), "the site serves the new build");
+    using (HttpResponseMessage nested = await PagesGet(address, PagesHost, site + "docs/"))
+        Check(nested.IsSuccessStatusCode && (await nested.Content.ReadAsStringAsync()).Contains("Manual", StringComparison.Ordinal), "a folder inside it answers with its own index page");
+    using (HttpResponseMessage old = await PagesGet(address, PagesHost, site + "game-1111.js"))
+        Check(old.StatusCode == HttpStatusCode.NotFound, "and nothing of the old one");
+    using (HttpResponseMessage wasm = await PagesSend(address, PagesHost, site + "game-2222_bg.wasm", request => request.Headers.TryAddWithoutValidation("If-None-Match", firstTag)))
+        Check(wasm.StatusCode == HttpStatusCode.OK, "a validator from the old build does not match the new one");
+    Check(Directory.GetDirectories(Path.Combine(repositoriesRoot, storageId, "page-artifacts", "demo")).Length == 1, "the old build's files are gone from disk");
+
+    // A site can be an artifact alone: the config names it as the front door and commits nothing else.
+    string source = Path.Combine(root, "artifact-source");
+    Directory.CreateDirectory(Path.Combine(source, ".graft"));
+    await Git(source, ["init", "--initial-branch=main"]);
+    File.WriteAllText(Path.Combine(source, "README.md"), "# Game sample\n");
+    File.WriteAllText(Path.Combine(source, ".graft", "project.json"), """{"version":1,"page":{"files":["README.md"],"site":{"artifact":"demo"}}}""");
+    await Git(source, ["add", "."]);
+    await Git(source, ["commit", "-m", "A site that is a page artifact"]);
+    await Git(source, ["push", AuthenticatedUrl(address, "alice", aliceApi, "alice/gamesample.git"), "main"]);
+    using (HttpResponseMessage page = await PagesGet(address, null, "/api/graft/pages/" + slug))
+    {
+        using JsonDocument json = JsonDocument.Parse(await page.Content.ReadAsStringAsync());
+        Check(page.IsSuccessStatusCode && json.RootElement.GetProperty("site_url").GetString() == "https://" + PagesHost + site,
+            "a page whose site is an artifact sends its readers straight to it");
+    }
+    using (HttpResponseMessage front = await PagesGet(address, PagesHost, "/" + slug + "/"))
+        Check(front.StatusCode == HttpStatusCode.Found && front.Headers.Location?.OriginalString == site, "and the site's own root leads there too");
+    using (HttpResponseMessage elsewhere = await PagesGet(address, PagesHost, "/" + slug + "/README.md"))
+        Check(elsewhere.StatusCode == HttpStatusCode.NotFound, "a site with no folder in the repository serves no repository file");
+
+    // The administrator's settings: the prefix, the size limit and the file types.
+    (HttpClient admin, string adminCsrf) = await BrowserSession(address, "admin", adminPassword);
+    async Task<HttpResponseMessage> Configure(HttpClient client, string csrf, object body)
+    {
+        using HttpRequestMessage request = new(HttpMethod.Post, "/api/graft/admin/pages") { Content = JsonContent.Create(body) };
+        request.Headers.Add("Origin", address);
+        request.Headers.Add("X-Graft-CSRF", csrf);
+        return await client.SendAsync(request);
+    }
+    using (HttpResponseMessage current = await admin.GetAsync("/api/graft/admin/pages"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await current.Content.ReadAsStringAsync());
+        Check(current.IsSuccessStatusCode && json.RootElement.GetProperty("artifact_prefix").GetString() == "a" &&
+            json.RootElement.GetProperty("artifact_maximum_mebibytes").GetInt32() == 256 && json.RootElement.GetProperty("file_types").GetArrayLength() == 0,
+            "an administrator reads the defaults: artifacts under a, 256 MiB, no added types");
+        Check(json.RootElement.GetProperty("built_in_file_types").EnumerateArray().Any(type => type.GetProperty("extension").GetString() == ".wasm"),
+            "beside the built-in types, for reference");
+    }
+    (HttpClient member, string memberCsrf) = await BrowserSession(address, "alice", alicePassword);
+    using (HttpResponseMessage denied = await Configure(member, memberCsrf, new { artifact_prefix = "x", artifact_maximum_mebibytes = 1, file_types = Array.Empty<object>() }))
+        Check(denied.StatusCode == HttpStatusCode.Forbidden, "nobody else can change them");
+    using (HttpResponseMessage deniedRead = await member.GetAsync("/api/graft/admin/pages"))
+        Check(deniedRead.StatusCode == HttpStatusCode.Forbidden, "or read them");
+    member.Dispose();
+    foreach ((string label, object body) in new (string, object)[]
+    {
+        ("a prefix that is Graft's own namespace on a site is refused", new { artifact_prefix = "-", artifact_maximum_mebibytes = 256, file_types = Array.Empty<object>() }),
+        ("a prefix of more than one segment is refused", new { artifact_prefix = "a/b", artifact_maximum_mebibytes = 256, file_types = Array.Empty<object>() }),
+        ("a limit of nothing is refused", new { artifact_prefix = "a", artifact_maximum_mebibytes = 0, file_types = Array.Empty<object>() }),
+        ("a content type that is not one is refused", new { artifact_prefix = "a", artifact_maximum_mebibytes = 256, file_types = new[] { new { extension = ".xyz", content_type = "text plain\r\nX-Injected: 1" } } }),
+        ("an extension that is a path is refused", new { artifact_prefix = "a", artifact_maximum_mebibytes = 256, file_types = new[] { new { extension = "../x", content_type = "text/plain" } } })
+    })
+        using (HttpResponseMessage refused = await Configure(admin, adminCsrf, body))
+            Check(refused.StatusCode == HttpStatusCode.BadRequest, label);
+
+    using (HttpResponseMessage changed = await Configure(admin, adminCsrf,
+        new { artifact_prefix = "builds", artifact_maximum_mebibytes = 1, file_types = new[] { new { extension = "XYZ", content_type = "text/plain; charset=utf-8" } } }))
+    {
+        using JsonDocument json = JsonDocument.Parse(await changed.Content.ReadAsStringAsync());
+        Check(changed.IsSuccessStatusCode && json.RootElement.GetProperty("file_types")[0].GetProperty("extension").GetString() == ".xyz",
+            "an administrator moves the prefix, lowers the limit and adds a file type, which is stored in its plain form");
+    }
+    using (HttpResponseMessage moved = await PagesGet(address, PagesHost, "/" + slug + "/builds/demo/"))
+        Check(moved.IsSuccessStatusCode, "the artifact answers under the new prefix on the next request");
+    using (HttpResponseMessage old = await PagesGet(address, PagesHost, site))
+        Check(old.StatusCode == HttpStatusCode.NotFound, "and no longer under the old one");
+    using (HttpResponseMessage added = await PagesGet(address, PagesHost, "/" + slug + "/builds/demo/notes.xyz"))
+        Check(added.IsSuccessStatusCode && added.Content.Headers.ContentType?.MediaType == "text/plain", "the added file type is served as the type the administrator gave it");
+    using (HttpResponseMessage front = await PagesGet(address, PagesHost, "/" + slug + "/"))
+        Check(front.Headers.Location?.OriginalString == "/" + slug + "/builds/demo/", "and the site's front door follows the prefix");
+    byte[] heavy = new byte[1024 * 1024 + 4096];
+    Random.Shared.NextBytes(heavy);
+    using (HttpResponseMessage tooLarge = await ApiPutBytes(address, api + "/heavy", aliceApi, Archive(("index.html", heavy)), "application/zip"))
+        Check(tooLarge.StatusCode == HttpStatusCode.RequestEntityTooLarge, "an archive over the administrator's limit is refused");
+    Check(!Directory.Exists(Path.Combine(repositoriesRoot, storageId, "page-artifacts", "heavy")), "and leaves nothing behind");
+    using (HttpResponseMessage restored = await Configure(admin, adminCsrf, new { artifact_prefix = "a", artifact_maximum_mebibytes = 256, file_types = Array.Empty<object>() }))
+        Check(restored.IsSuccessStatusCode, "the defaults are restored");
+    admin.Dispose();
+    using (HttpResponseMessage back = await PagesGet(address, PagesHost, site + "notes.xyz"))
+        Check(back.StatusCode == HttpStatusCode.NotFound, "and the removed file type stops being served");
+
+    // The page's publish switch stands over everything on the pages origin, promoted artifacts included.
+    await using (GraftStore fixture = await GraftStore.OpenAsync(databasePath))
+        await fixture.SetPagePublishedAsync(alice, projectId, false);
+    using (HttpResponseMessage withdrawnPage = await PagesGet(address, PagesHost, site))
+        Check(withdrawnPage.StatusCode == HttpStatusCode.NotFound, "withdrawing the project page takes a promoted artifact down with it");
+    await using (GraftStore fixture = await GraftStore.OpenAsync(databasePath))
+        await fixture.SetPagePublishedAsync(alice, projectId, true);
+    using (HttpResponseMessage republished = await PagesGet(address, PagesHost, site))
+        Check(republished.IsSuccessStatusCode, "and publishing it again brings the artifact back");
+
+    using (HttpResponseMessage withdrawn = await ApiPutJson(address, api + "/demo/promotion", aliceApi, """{"promoted":false}"""))
+        Check(withdrawn.IsSuccessStatusCode, "a Maintainer withdraws the artifact");
+    using (HttpResponseMessage gone = await PagesGet(address, PagesHost, site))
+        Check(gone.StatusCode == HttpStatusCode.NotFound, "and it stops answering at once");
+    using (HttpResponseMessage developer = await ApiDelete(address, api + "/demo", bobApi))
+        Check(developer.StatusCode == HttpStatusCode.Forbidden, "a Developer cannot delete an artifact");
+    using (HttpResponseMessage deleted = await ApiDelete(address, api + "/demo", aliceApi))
+        Check(deleted.StatusCode == HttpStatusCode.NoContent, "a Maintainer deletes it");
+    Check(!Directory.Exists(Path.Combine(repositoriesRoot, storageId, "page-artifacts", "demo")), "and its files are gone from disk");
+    using (HttpResponseMessage again = await ApiDelete(address, api + "/demo", aliceApi))
+        Check(again.StatusCode == HttpStatusCode.NotFound, "deleting one that is not there says so");
+    using (HttpResponseMessage audit = await ApiGet(address, "/api/v4/projects/" + projectId + "/audit_events", aliceApi))
+    {
+        string text = await audit.Content.ReadAsStringAsync();
+        Check(audit.IsSuccessStatusCode && text.Contains("promote-page-artifact", StringComparison.Ordinal) && text.Contains("upload-page-artifact", StringComparison.Ordinal) &&
+            text.Contains("delete-page-artifact", StringComparison.Ordinal), "the project's audit trail records the upload, the promotion and the deletion");
+    }
+}
+
+async Task<HttpResponseMessage> PagesSend(string address, string host, string path, Action<HttpRequestMessage> prepare)
+{
+    HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false, AllowAutoRedirect = false };
+    HttpClient client = new(handler) { Timeout = TimeSpan.FromSeconds(20) };
+    HttpRequestMessage request = new(HttpMethod.Get, address.TrimEnd('/') + path);
+    request.Headers.Host = host;
+    prepare(request);
+    HttpResponseMessage response = await client.SendAsync(request);
+    request.Dispose();
+    client.Dispose();
+    handler.Dispose();
+    return response;
 }
 
 /// <summary>

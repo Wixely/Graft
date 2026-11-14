@@ -207,6 +207,7 @@ builder.Services.AddDnaXUploads(options =>
     options.Profiles[UploadLimits.BannerProfile] = UploadLimits.Avatar;
     options.Profiles[UploadLimits.RepositoryFileProfile] = UploadLimits.RepositoryFile;
     options.Profiles[UploadLimits.ReleaseAssetProfile] = UploadLimits.ReleaseAsset;
+    options.Profiles[UploadLimits.PageArtifactProfile] = UploadLimits.PageArtifact;
 });
 builder.WebHost.ConfigureKestrel(options =>
 {
@@ -313,7 +314,9 @@ app.Use(async (context, next) =>
         context.Request.Path.Value!.Contains("/archive", StringComparison.Ordinal);
     bool largeFile = context.Request.Path.Value?.Contains(".git/info/lfs/objects/", StringComparison.Ordinal) == true ||
         context.Request.Path.StartsWithSegments("/v2") ||
-        (context.Request.Path.Value?.Contains("/packages/", StringComparison.Ordinal) == true && context.Request.Method is "PUT" or "POST");
+        (context.Request.Path.Value?.Contains("/packages/", StringComparison.Ordinal) == true && context.Request.Method is "PUT" or "POST") ||
+        // A page artifact arrives as one archive. The route bounds it by the administrator's own limit as it reads.
+        (context.Request.Path.Value?.Contains("/page-artifacts/", StringComparison.Ordinal) == true && context.Request.Method is "PUT");
     if (context.Request.Path.Value?.EndsWith(".git/git-receive-pack", StringComparison.Ordinal) == true || largeFile)
     {
         IHttpMaxRequestBodySizeFeature? bodySize = context.Features.Get<IHttpMaxRequestBodySizeFeature>();
@@ -2571,7 +2574,11 @@ app.MapGet("/api/graft/pages/{globalSlug}", async context =>
             files,
             page.Site is null || settings.PagesOrigin is null
                 ? null
-                : settings.PagesOrigin.TrimEnd('/') + "/" + Uri.EscapeDataString(details.Project.GlobalSlug) + "/",
+                // A site whose front door is a page artifact is linked to there directly, sparing the reader
+                // the redirect the site's root would give them.
+                : page.Site.Artifact is { } frontDoor
+                    ? PageArtifactUrl(details.Project, frontDoor, await store.GetPageServingSettingsAsync(context.RequestAborted))
+                    : settings.PagesOrigin.TrimEnd('/') + "/" + Uri.EscapeDataString(details.Project.GlobalSlug) + "/",
             features,
             tree,
             history,
@@ -4204,6 +4211,231 @@ app.MapGet("/api/graft/projects/{projectId}/banner", async context =>
         new BannerStateResponse(project.Details.Project.Id, await BannerUrl(context, project.Details.Project.Id)),
         ApiJson.Default.BannerStateResponse, null, context.RequestAborted);
 });
+
+// Page artifacts (ADR 0051): named folders of uploaded files that a project's site may serve. Private until a
+// Maintainer promotes one; a promoted one answers on the pages origin under the administrator's prefix, and
+// nowhere on this origin except as a download for somebody who could read the repository anyway.
+//
+// Two families, as elsewhere: the browser's under /api/projects with a session, and a token's under Graft's own
+// prefix, because GitLab has no such thing. Uploading needs the permission to push; promoting, withdrawing and
+// deleting need the permission to manage the project.
+foreach ((string root, bool browserFamily) in new[] { ("/api/projects/{projectId:long}", true), ("/api/graft/projects/{projectId}", false) })
+{
+    async Task<(ProjectDetails Details, AuthenticatedIdentity? Identity)?> Reader(HttpContext context)
+    {
+        if (!browserFamily)
+        {
+            ApiProject? project = await AuthorizeApiProject(context, ProjectAction.BrowseRepository);
+            return project is null ? null : (project.Details, project.Identity);
+        }
+        (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: false);
+        long projectId = RouteId(context, "projectId");
+        ProjectDetails? details = await store.GetReadyProjectAsync(projectId, context.RequestAborted);
+        if (details is null || !(await DecideFor(context, browser?.Identity, projectId, ProjectAction.BrowseRepository)).Allowed)
+        { await ApiError(context, 404, "project"); return null; }
+        return (details, browser?.Identity);
+    }
+
+    // Somebody who can see the project and may not do this is told so, not told the project is missing: a
+    // Developer who uploads builds should learn that promoting is a Maintainer's, in as many words.
+    async Task<(ProjectDetails Details, AuthenticatedIdentity Identity)?> Writer(HttpContext context, ProjectAction action)
+    {
+        if (browserFamily) return await CiWriter(context, browserFamily: true, action);
+        AuthenticatedIdentity? caller = await RequireApiWriter(context);
+        if (caller is null) return null;
+        ApiProject? project = await AuthorizeApiProject(context, ProjectAction.BrowseRepository);
+        if (project is null) return null;
+        PermissionDecision decision = await DecideFor(context, caller, project.Details.Project.Id, action);
+        if (!decision.Allowed) { await ApiError(context, 403, decision.Explanation); return null; }
+        return (project.Details, caller);
+    }
+
+    app.MapGet(root + "/page-artifacts", async context =>
+    {
+        var scope = await Reader(context);
+        if (scope is null) return;
+        if (!await OnlyQuery(context)) return;
+        PageServingSettings serving = await store.GetPageServingSettingsAsync(context.RequestAborted);
+        IReadOnlyList<PageArtifact> artifacts;
+        try { artifacts = await store.ListPageArtifactsAsync(scope.Value.Identity, scope.Value.Details.Project.Id, context.RequestAborted); }
+        catch (UnauthorizedAccessException) { await ApiError(context, 404, "project"); return; }
+        await context.Response.WriteAsJsonAsync(new PageArtifactListResponse(
+            [.. artifacts.Select(artifact => PageArtifactResponseFor(scope.Value.Details.Project, artifact, serving))],
+            serving.ArtifactPrefix, serving.ArtifactMaximumBytes, settings.PagesOrigin is not null, scope.Value.Details.Project.PagePublished),
+            ApiJson.Default.PageArtifactListResponse, null, context.RequestAborted);
+    });
+
+    // One file, as a download: how somebody who can read the repository looks at an artifact before it is
+    // promoted. Always an attachment and never the type its name suggests, so nothing uploaded renders here.
+    app.MapGet(root + "/page-artifacts/{name}/files/{**path}", async context =>
+    {
+        var scope = await Reader(context);
+        if (scope is null) return;
+        if (!await OnlyQuery(context)) return;
+        string name = context.Request.RouteValues["name"]?.ToString() ?? "";
+        string path = context.Request.RouteValues["path"]?.ToString() ?? "";
+        PageArtifact? artifact;
+        try { artifact = await store.FindPageArtifactAsync(scope.Value.Identity, scope.Value.Details.Project.Id, name, context.RequestAborted); }
+        catch (UnauthorizedAccessException) { await ApiError(context, 404, "project"); return; }
+        string? file = artifact is null ? null : PageArtifactFilesOf(scope.Value.Details.Project).Resolve(artifact.Name, artifact.Generation, path);
+        if (file is null) { await ApiError(context, 404, "404 File Not Found"); return; }
+        using FileStream content = new(file, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, FileOptions.Asynchronous);
+        await WriteDownloadStream(context, content, Path.GetFileName(file), "application/octet-stream");
+    });
+
+    if (browserFamily)
+    {
+        // The browser's upload: a receipt from the upload transport, which has already staged the archive.
+        app.MapPost(root + "/page-artifacts/{name}", async context =>
+        {
+            var scope = await Writer(context, ProjectAction.PushRepository);
+            if (scope is null) return;
+            if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+            UploadIngestRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.UploadIngestRequest, context.RequestAborted);
+            if (request is null || !Guid.TryParse(request.UploadId, out Guid uploadId)) { await ApiError(context, 400, "upload-id"); return; }
+            DiskUploadStore uploads = context.RequestServices.GetRequiredService<DiskUploadStore>();
+            string owner = GraftSessionAuthenticationHandler.Owner(scope.Value.Identity);
+            try
+            {
+                UploadStatus status = uploads.Get(owner, uploadId);
+                if (!string.Equals(status.Profile, UploadLimits.PageArtifactProfile, StringComparison.Ordinal))
+                { await ApiError(context, 400, "upload was not created for page artifacts"); return; }
+                await uploads.ReadCompletedAsync(owner, uploadId,
+                    async (source, cancellationToken) => await ReceivePageArtifact(context, scope.Value.Details, scope.Value.Identity, source),
+                    context.RequestAborted);
+            }
+            catch (UploadException error) { await ApiError(context, error.StatusCode, error.Message); }
+        });
+    }
+    else
+    {
+        // A token's upload: the archive is the request body.
+        app.MapPut(root + "/page-artifacts/{name}", async context =>
+        {
+            var scope = await Writer(context, ProjectAction.PushRepository);
+            if (scope is null) return;
+            if (!await OnlyQuery(context)) return;
+            await ReceivePageArtifact(context, scope.Value.Details, scope.Value.Identity, context.Request.Body);
+        });
+    }
+
+    app.MapMethods(root + "/page-artifacts/{name}/promotion", ["PUT", "POST"], async context =>
+    {
+        var scope = await Writer(context, ProjectAction.ManageProject);
+        if (scope is null) return;
+        if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+        PageArtifactPromotionRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.PageArtifactPromotionRequest, context.RequestAborted);
+        if (request is null) { await ApiError(context, 400, "promoted"); return; }
+        string name = context.Request.RouteValues["name"]?.ToString() ?? "";
+        try
+        {
+            PageArtifact artifact = await store.SetPageArtifactPromotedAsync(scope.Value.Identity, scope.Value.Details.Project.Id, name, request.Promoted, context.RequestAborted);
+            PageServingSettings serving = await store.GetPageServingSettingsAsync(context.RequestAborted);
+            await context.Response.WriteAsJsonAsync(PageArtifactResponseFor(scope.Value.Details.Project, artifact, serving),
+                ApiJson.Default.PageArtifactResponse, null, context.RequestAborted);
+        }
+        catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Page Artifact Not Found"); }
+        catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    });
+
+    app.MapDelete(root + "/page-artifacts/{name}", async context =>
+    {
+        var scope = await Writer(context, ProjectAction.ManageProject);
+        if (scope is null) return;
+        if (!await OnlyQuery(context)) return;
+        string name = context.Request.RouteValues["name"]?.ToString() ?? "";
+        try
+        {
+            // The row first: once it is gone nothing can be served, whatever happens to the files.
+            PageArtifact deleted = await store.DeletePageArtifactAsync(scope.Value.Identity, scope.Value.Details.Project.Id, name, context.RequestAborted);
+            PageArtifactFilesOf(scope.Value.Details.Project).DeleteArtifact(deleted.Name);
+            context.Response.StatusCode = StatusCodes.Status204NoContent;
+        }
+        catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Page Artifact Not Found"); }
+        catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    });
+}
+
+PageArtifactFiles PageArtifactFilesOf(ProjectInfo project) => new(Path.Combine(settings.Repositories, project.StorageId));
+
+/// <summary>Unpacks an uploaded archive as a new generation of the named artifact and answers with what it became.</summary>
+async Task ReceivePageArtifact(HttpContext context, ProjectDetails project, AuthenticatedIdentity identity, Stream archive)
+{
+    string name = context.Request.RouteValues["name"]?.ToString() ?? "";
+    PageServingSettings serving = await store.GetPageServingSettingsAsync(context.RequestAborted);
+    if (context.Request.ContentLength > serving.ArtifactMaximumBytes && ReferenceEquals(archive, context.Request.Body))
+    { await ApiError(context, 413, "The page artifact is larger than this server's limit of " + serving.ArtifactMaximumMebibytes + " MiB."); return; }
+    PageArtifactFiles files = PageArtifactFilesOf(project.Project);
+    string? generation = null;
+    try
+    {
+        (generation, int count, long bytes) = await files.ReceiveAsync(name, archive, serving.ArtifactMaximumBytes, context.RequestAborted);
+        (PageArtifact artifact, string? replaced) = await store.PutPageArtifactAsync(identity, project.Project.Id, name, generation, count, bytes, context.RequestAborted);
+        generation = null;
+        // After the row has moved: a reader that began on the old files may lose them mid-response, and one that
+        // begins now is given the new ones. Nothing is ever served from a mixture.
+        if (replaced is not null && replaced != artifact.Generation) files.DeleteGeneration(name, replaced);
+        context.Response.StatusCode = replaced is null ? StatusCodes.Status201Created : StatusCodes.Status200OK;
+        await context.Response.WriteAsJsonAsync(PageArtifactResponseFor(project.Project, artifact, serving),
+            ApiJson.Default.PageArtifactResponse, null, context.RequestAborted);
+    }
+    catch (PageArtifactException error) { await ApiError(context, error.StatusCode, error.Message); }
+    catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+    finally { if (generation is not null) files.DeleteGeneration(name, generation); }
+}
+
+PageArtifactResponse PageArtifactResponseFor(ProjectInfo project, PageArtifact artifact, PageServingSettings serving)
+{
+    IReadOnlyList<(string Path, long Size)> files = PageArtifactFilesOf(project).List(artifact.Name, artifact.Generation, 200, out bool truncated);
+    return new(artifact.Name, artifact.Promoted, artifact.FileCount, artifact.Bytes, artifact.UpdatedAt, artifact.UpdatedByUsername,
+        artifact.Promoted && settings.PagesOrigin is not null ? PageArtifactUrl(project, artifact.Name, serving) : null,
+        [.. files.Select(file => new PageArtifactFileResponse(file.Path, file.Size, SiteContentTypes.For(file.Path, serving.FileTypes)))],
+        truncated);
+}
+
+/// <summary>Where a promoted artifact answers on the pages origin. Only meaningful when there is one.</summary>
+string PageArtifactUrl(ProjectInfo project, string name, PageServingSettings serving) =>
+    settings.PagesOrigin!.TrimEnd('/') + "/" + Uri.EscapeDataString(project.GlobalSlug) + "/" + serving.ArtifactPrefix + "/" + name + "/";
+
+// What an administrator decides about the pages origin: the path page artifacts answer under, how large one may
+// be, and the file types served beyond the built-in list. Kept in the database beside the agent switches, so a
+// change applies to the next request and needs no restart.
+app.MapGet("/api/graft/admin/pages", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
+    if (browser is null) return;
+    if (!browser.Value.Identity.IsAdministrator) { await ApiError(context, 403, "administrator"); return; }
+    if (!await OnlyQuery(context)) return;
+    PageServingSettings current = await store.GetPageServingSettingsAsync(context.RequestAborted);
+    await context.Response.WriteAsJsonAsync(PageServingResponse(current), ApiJson.Default.PageServingSettingsResponse, null, context.RequestAborted);
+});
+
+app.MapPost("/api/graft/admin/pages", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await BrowserWriter(context);
+    if (browser is null) return;
+    if (!browser.Value.Identity.IsAdministrator) { await ApiError(context, 403, "administrator"); return; }
+    if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+    PageServingSettingsRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.PageServingSettingsRequest, context.RequestAborted);
+    if (request is null) { await ApiError(context, 400, "settings"); return; }
+    PageServingSettings? wanted = PageServingSettings.Normalize(request.ArtifactPrefix, request.ArtifactMaximumMebibytes,
+        (request.FileTypes ?? []).Select(type => new SiteFileType(type.Extension, type.ContentType)), out string problem);
+    if (wanted is null) { await ApiError(context, 400, problem); return; }
+    try
+    {
+        PageServingSettings updated = await store.SetPageServingSettingsAsync(browser.Value.Identity, wanted, context.RequestAborted);
+        await context.Response.WriteAsJsonAsync(PageServingResponse(updated), ApiJson.Default.PageServingSettingsResponse, null, context.RequestAborted);
+    }
+    catch (UnauthorizedAccessException) { await ApiError(context, 403, "administrator"); }
+    catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+});
+
+PageServingSettingsResponse PageServingResponse(PageServingSettings current) =>
+    new(current.ArtifactPrefix, current.ArtifactMaximumMebibytes,
+        [.. current.FileTypes.Select(type => new PageFileTypeEntry(type.Extension, type.ContentType))],
+        [.. SiteContentTypes.BuiltIn.Select(type => new PageFileTypeEntry(type.Extension, type.ContentType))],
+        settings.PagesOrigin);
 
 // GitLab's project-level approval settings. Graft has two of GitLab's facts here, and reports the other two as what
 // Graft always does: a push supersedes approvals, and an author never approves their own (ADR 0015).
@@ -9631,7 +9863,8 @@ if (settings.PagesOrigin is not null)
 
         // A directory asks for the configured index, which is what makes links inside a site work.
         string requested = segments.Length > 1 ? segments[1] : "";
-        bool directory = requested.Length == 0 || requested.EndsWith('/');
+        // Read from the path as it arrived: the segments above were taken after trimming its slashes.
+        bool directory = requested.Length == 0 || context.Request.Path.Value!.EndsWith('/');
 
         // Links back to the forge, resolved here rather than written into the repository.
         //
@@ -9670,37 +9903,96 @@ if (settings.PagesOrigin is not null)
             return;
         }
 
-        await WithRepository(EndpointFor(project), context, async repository =>
+        PageServingSettings serving = await store.GetPageServingSettingsAsync(context.RequestAborted);
+
+        // A promoted page artifact (ADR 0051), under the administrator's prefix. Looked up before the
+        // repository, so where an artifact and a committed file claim one path the artifact answers: promoting
+        // is the newer and more deliberate act. Nothing here reads the repository or its config. The page being
+        // published was decided above, promotion is in the database, and an artifact that is not promoted is
+        // simply not found, so the request falls through to whatever the repository has at that path.
+        string artifactPrefix = serving.ArtifactPrefix + "/";
+        if (requested.StartsWith(artifactPrefix, StringComparison.Ordinal))
+        {
+            string[] parts = requested[artifactPrefix.Length..].Split('/', 2);
+            PageArtifact? artifact = PageArtifacts.IsName(parts[0])
+                ? await store.FindPromotedPageArtifactAsync(project.Id, parts[0], context.RequestAborted)
+                : null;
+            if (artifact is not null)
+            {
+                if (parts.Length == 1 && !directory)
+                {
+                    // The folder without its slash. Relative links inside it need the slash, so say so; with a
+                    // path and no host, because a proxy in front may rewrite the host of a full address.
+                    context.Response.StatusCode = StatusCodes.Status302Found;
+                    context.Response.Headers.Location = context.Request.PathBase.Add(context.Request.Path).Value + "/" + context.Request.QueryString.Value;
+                    return;
+                }
+                string inside = parts.Length == 1 ? "index.html" : directory ? parts[1] + "/index.html" : parts[1];
+                string? artifactType = SiteContentTypes.For(inside, serving.FileTypes);
+                if (artifactType is null) { await PagesMiss(context, "That file type is not served."); return; }
+                string? file = PageArtifactFilesOf(project).Resolve(artifact.Name, artifact.Generation, inside);
+                if (file is null) { await PagesMiss(context, "That file is not part of this site."); return; }
+
+                // The generation is new with every upload and the files under it never change, so it is all a
+                // browser needs to know whether what it holds is current. Ranges, because media asks for them.
+                context.Response.Headers.CacheControl = "no-cache";
+                await Results.File(file, artifactType, fileDownloadName: null, lastModified: null,
+                    entityTag: new Microsoft.Net.Http.Headers.EntityTagHeaderValue("\"" + artifact.Generation + "\""),
+                    enableRangeProcessing: true).ExecuteAsync(context);
+                return;
+            }
+        }
+
+        // The repository is read under its gate and answered after it, so a slow reader of a large file does
+        // not hold up the next request for the same project.
+        byte[]? content = null;
+        string? contentType = null;
+        string? miss = null;
+        string? frontDoor = null;
+        if (!await WithRepository(EndpointFor(project), context, repository =>
         {
             PageConfigurationResult config = PageConfiguration.Read(ReadRepositoryFile(repository, PageConfiguration.Path));
             // An invalid config unpublishes the page rather than falling back to defaults: a parse failure
             // means nobody has said what may be served, and the safe reading of that is nothing.
             if (!config.Ok || config.Settings!.Site is null)
-            { await PagesMiss(context, "No site is published at that address."); return; }
+            { miss = "No site is published at that address."; return Task.CompletedTask; }
 
             PageSite site = config.Settings.Site;
-            string path = site.Root + "/" + (directory ? requested + site.Index : requested);
+            // A site whose front door is a page artifact: the root of the site is that artifact's folder.
+            if (requested.Length == 0 && site.Artifact is not null)
+            { frontDoor = site.Artifact; return Task.CompletedTask; }
+
+            string path = site.Root + "/" + (!directory ? requested : requested.Length == 0 ? site.Index : requested + "/" + site.Index);
             // Checked against the configured root even though it was just built from it. The matcher is the
             // one authority on what a page may serve, and a path that reached here another way must still
             // pass it.
             if (!PageConfiguration.AllowsSiteFile(config.Settings, path))
-            { await PagesMiss(context, "That file is not part of this site."); return; }
+            { miss = "That file is not part of this site."; return Task.CompletedTask; }
 
             // The type comes from the extension, never from the bytes. A repository can name a file
             // anything, and letting the file choose its own type is how a site serves script where the
             // operator expected an image.
-            string? contentType = SiteContentTypes.For(path);
-            if (contentType is null) { await PagesMiss(context, "That file type is not served."); return; }
+            contentType = SiteContentTypes.For(path, serving.FileTypes);
+            if (contentType is null) { miss = "That file type is not served."; return Task.CompletedTask; }
 
-            byte[]? content = ReadRepositoryFile(repository, path);
-            if (content is null) { await PagesMiss(context, "That file is not part of this site."); return; }
+            content = ReadRepositoryFile(repository, path);
+            if (content is null) miss = "That file is not part of this site.";
+            return Task.CompletedTask;
+        })) return;
 
-            context.Response.ContentType = contentType;
-            context.Response.Headers.CacheControl = "no-cache";
-            context.Response.ContentLength = content.Length;
-            if (!HttpMethods.IsHead(context.Request.Method))
-                await context.Response.Body.WriteAsync(content, context.RequestAborted);
-        });
+        if (frontDoor is not null)
+        {
+            context.Response.StatusCode = StatusCodes.Status302Found;
+            context.Response.Headers.Location = "/" + Uri.EscapeDataString(project.GlobalSlug) + "/" + artifactPrefix + frontDoor + "/";
+            return;
+        }
+        if (miss is not null || content is null || contentType is null)
+        { await PagesMiss(context, miss ?? "That file is not part of this site."); return; }
+
+        context.Response.Headers.CacheControl = "no-cache";
+        await Results.Bytes(content, contentType, fileDownloadName: null, enableRangeProcessing: true, lastModified: null,
+            entityTag: new Microsoft.Net.Http.Headers.EntityTagHeaderValue(
+                "\"" + Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(content)) + "\"")).ExecuteAsync(context);
     });
 }
 

@@ -537,6 +537,49 @@ public sealed record PagePublishRequest(bool Published);
 /// owns should not grow a field only this server understands.</summary>
 public sealed record PageStateResponse(long ProjectId, bool Published);
 
+/// <summary>One file inside a page artifact, and the type it would be served as; null when its extension is
+/// not on the server's list, which means the pages origin refuses it.</summary>
+public sealed record PageArtifactFileResponse(string Path, long Size, string? ContentType);
+
+/// <summary>
+/// A page artifact (ADR 0051): a named folder of uploaded files, private until promoted. <c>Url</c> is where a
+/// promoted one answers on the pages origin, and is null when it is not promoted or the server has no pages
+/// origin; it answers there only while the project's page is published.
+/// </summary>
+public sealed record PageArtifactResponse(
+    string Name,
+    bool Promoted,
+    int FileCount,
+    long Bytes,
+    DateTimeOffset UpdatedAt,
+    string UpdatedBy,
+    string? Url,
+    PageArtifactFileResponse[] Files,
+    bool FilesTruncated = false);
+
+/// <summary>A project's page artifacts, with what an uploader needs to know about this server.</summary>
+public sealed record PageArtifactListResponse(
+    PageArtifactResponse[] Artifacts,
+    string Prefix,
+    long MaximumBytes,
+    bool PagesAvailable,
+    bool PagePublished);
+
+public sealed record PageArtifactPromotionRequest(bool Promoted);
+
+/// <summary>One extension and its content type, in an administrator's list of served file types.</summary>
+public sealed record PageFileTypeEntry(string Extension, string ContentType);
+
+/// <summary>What an administrator decides about the pages origin, with the built-in types for reference.</summary>
+public sealed record PageServingSettingsResponse(
+    string ArtifactPrefix,
+    int ArtifactMaximumMebibytes,
+    PageFileTypeEntry[] FileTypes,
+    PageFileTypeEntry[] BuiltInFileTypes,
+    string? PagesOrigin);
+
+public sealed record PageServingSettingsRequest(string ArtifactPrefix, int ArtifactMaximumMebibytes, PageFileTypeEntry[]? FileTypes);
+
 /// <summary>Where a project's banner is served, or null when it has none (ADR 0046). Graft's own shape for the
 /// same reason as <see cref="PageStateResponse"/>: GitLab has no banner.</summary>
 public sealed record BannerStateResponse(long ProjectId, [property: JsonPropertyName("banner_url")] string? BannerUrl);
@@ -1553,6 +1596,11 @@ public sealed record ProjectUploadResponse(
 [JsonSerializable(typeof(VisibilityRequest))]
 [JsonSerializable(typeof(PagePublishRequest))]
 [JsonSerializable(typeof(PageStateResponse))]
+[JsonSerializable(typeof(PageArtifactResponse))]
+[JsonSerializable(typeof(PageArtifactListResponse))]
+[JsonSerializable(typeof(PageArtifactPromotionRequest))]
+[JsonSerializable(typeof(PageServingSettingsResponse))]
+[JsonSerializable(typeof(PageServingSettingsRequest))]
 [JsonSerializable(typeof(BannerStateResponse))]
 [JsonSerializable(typeof(ProjectApprovalsResponse))]
 [JsonSerializable(typeof(ProjectTransferRequest))]

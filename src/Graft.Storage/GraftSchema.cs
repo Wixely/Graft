@@ -4,7 +4,7 @@ namespace Graft.Storage;
 
 public static class GraftSchema
 {
-    public static DnaXMigrationManifest Manifest { get; } = new(29,
+    public static DnaXMigrationManifest Manifest { get; } = new(30,
     [
         DnaXMigration.Sql(1, "initial-identity-project-schema", "Create identity and private project schema", """
             CREATE TABLE Users (
@@ -933,6 +933,24 @@ public static class GraftSchema
 
             ALTER TABLE Users ADD COLUMN EmailDigest INTEGER NOT NULL DEFAULT 0 CHECK (EmailDigest IN (0, 1));
             ALTER TABLE Users ADD COLUMN LastDigestAtUtc TEXT NULL;
+            """),
+        // Page artifacts (ADR 0051): a named folder of files uploaded beside the repository. Private until
+        // promoted; a promoted one is served on the pages origin as part of the project's site. The files are on
+        // disk under the generation named here, and a new upload is a new generation, so the row is the switch.
+        DnaXMigration.Sql(30, "page-artifacts", "Uploaded files a project's site may serve once promoted", """
+            CREATE TABLE PageArtifacts (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                Name TEXT NOT NULL,
+                Generation TEXT NOT NULL,
+                Promoted INTEGER NOT NULL DEFAULT 0 CHECK (Promoted IN (0, 1)),
+                FileCount INTEGER NOT NULL,
+                Bytes INTEGER NOT NULL,
+                UpdatedByUserId INTEGER NOT NULL REFERENCES Users(Id),
+                CreatedAtUtc TEXT NOT NULL,
+                UpdatedAtUtc TEXT NOT NULL,
+                UNIQUE (ProjectId, Name)
+            );
             """)
     ]);
 }

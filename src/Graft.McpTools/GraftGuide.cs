@@ -168,6 +168,18 @@ public static class GraftGuide
             A site is served only from a separate hostname an operator configures, because repository HTML
             cannot share an origin with the session cookie and the API. Within a site, a page can link back
             to the forge without naming a hostname by linking to `-/repo`.
+
+            A site does not have to be committed. A page artifact is a named folder of files uploaded beside
+            the repository as one zip archive, such as a WebAssembly build: `graft_upload_page_artifact`, or
+            an HTTP PUT of the zip to `/api/graft/projects/<project>/page-artifacts/<name>`. It is private
+            until a Maintainer promotes it with `graft_set_page_artifact_promoted`; then it is served on the
+            pages hostname at `<slug>/a/<name>/` (the `a` is the administrator's to change), and only while
+            the page is published. Uploading again replaces the whole folder and keeps its promotion. Where
+            a promoted artifact and a committed file claim the same path, the artifact answers. A site can
+            be an artifact alone: `"site": { "artifact": "<name>" }` makes that artifact the front door.
+            Pages inside an artifact must use relative addresses, because they are served under a folder.
+            Only file types on the server's list are served; `graft_list_page_artifacts` shows any that
+            are not.
             """,
 
         ["writing"] = """

@@ -152,7 +152,7 @@ async Task CheckForge(string address, string token, string password)
     using (HttpResponseMessage listing = await Post(client, token, Request(3, "tools/list", "{}")))
     {
         using JsonDocument body = Parse(await listing.Content.ReadAsStringAsync());
-        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 54,
+        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 58,
             "the forge's endpoint advertises every tool");
     }
 
@@ -579,7 +579,59 @@ async Task CheckProjectSettings(HttpClient client, HttpClient browser, string ad
         Check(Text(body).Contains("admin/doomed", StringComparison.Ordinal), "and the project is still there");
     }
 
+    // Page artifacts (ADR 0051): a build an agent has as an archive, uploaded private and then promoted.
+    string build;
+    using (MemoryStream packed = new())
+    {
+        using (System.IO.Compression.ZipArchive zip = new(packed, System.IO.Compression.ZipArchiveMode.Create, leaveOpen: true))
+        {
+            foreach ((string path, string text) in new[] { ("dist/index.html", "<!doctype html><title>Demo</title>"), ("dist/demo.wasm", "\0asm"), ("dist/notes.xyz", "?") })
+            {
+                using Stream entry = zip.CreateEntry(path).Open();
+                entry.Write(Encoding.UTF8.GetBytes(text));
+            }
+        }
+        build = Convert.ToBase64String(packed.ToArray());
+    }
+    using (HttpResponseMessage uploaded = await Post(client, token, Call(70, "graft_upload_page_artifact", $$"""{"project":"admin/shared","name":"demo","zipBase64":"{{build}}"}""")))
+    {
+        using JsonDocument body = Parse(await uploaded.Content.ReadAsStringAsync());
+        string result = Text(body);
+        Check(result.Contains("\"name\":\"demo\"", StringComparison.Ordinal) && result.Contains("\"promoted\":false", StringComparison.Ordinal) && result.Contains("\"files\":3", StringComparison.Ordinal),
+            "an agent uploads a page artifact from an archive, and it starts private");
+        Check(result.Contains("\"path\":\"demo.wasm\"", StringComparison.Ordinal) && result.Contains("application/wasm", StringComparison.Ordinal),
+            "the folder wrapping the archive is dropped, and each file says what it would be served as");
+        Check(result.Contains("\"path\":\"notes.xyz\",\"size\":1,\"served_as\":null", StringComparison.Ordinal), "including the one this server would refuse to serve");
+    }
+    using (HttpResponseMessage bad = await Post(client, token, Call(71, "graft_upload_page_artifact", """{"project":"admin/shared","name":"Not A Name","zipBase64":"UEsFBgAAAAAAAAAAAAAAAAAAAAAAAA=="}""")))
+    {
+        using JsonDocument body = Parse(await bad.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("\"error\":true", StringComparison.Ordinal), "a name that is not a folder name is refused");
+    }
+    using (HttpResponseMessage promoted = await Post(client, token, Call(72, "graft_set_page_artifact_promoted", """{"project":"admin/shared","name":"demo","promoted":true}""")))
+    {
+        using JsonDocument body = Parse(await promoted.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("\"promoted\":true", StringComparison.Ordinal), "an agent promotes a page artifact");
+    }
+    using (HttpResponseMessage listed = await Post(client, token, Call(73, "graft_list_page_artifacts", """{"project":"admin/shared"}""")))
+    {
+        using JsonDocument body = Parse(await listed.Content.ReadAsStringAsync());
+        string result = Text(body);
+        Check(result.Contains("\"served_under\":\"a/", StringComparison.Ordinal) && result.Contains("\"name\":\"demo\"", StringComparison.Ordinal),
+            "and lists a project's page artifacts with where they are served");
+    }
+    using (HttpResponseMessage refused = await Post(client, token, Call(74, "graft_delete_page_artifact", """{"project":"admin/shared","name":"demo"}""")))
+    {
+        using JsonDocument body = Parse(await refused.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("refused", StringComparison.Ordinal), "deleting a page artifact is refused until deletion is allowed");
+    }
+
     await SetSettings(browser, address, enabled: true, allowWrites: true, allowAnonymous: false, allowDestructive: true);
+    using (HttpResponseMessage removed = await Post(client, token, Call(75, "graft_delete_page_artifact", """{"project":"admin/shared","name":"demo"}""")))
+    {
+        using JsonDocument body = Parse(await removed.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("\"deleted\":true", StringComparison.Ordinal), "and deleted once it is");
+    }
     using (HttpResponseMessage who = await Post(client, token, Call(58, "graft_whoami", "{}")))
     {
         using JsonDocument body = Parse(await who.Content.ReadAsStringAsync());
@@ -706,7 +758,7 @@ async Task CheckStdio(string address, bool readOnly)
 
         using JsonDocument tools = await Exchange(client, Request(2, "tools/list", "{}"));
         int count = tools.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength();
-        Check(count == 54, label + " advertises every tool");
+        Check(count == 58, label + " advertises every tool");
 
         using JsonDocument read = await Exchange(client, Call(3, "graft_browse", """{"search":""}"""));
         Check(Text(read).Contains("admin/shared", StringComparison.Ordinal), label + " reads the public listing");
@@ -765,7 +817,7 @@ async Task CheckHttp(string address, string token)
     using (HttpResponseMessage listing = await Post(client, token, Request(3, "tools/list", "{}")))
     {
         using JsonDocument body = Parse(await listing.Content.ReadAsStringAsync());
-        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 54,
+        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 58,
             "the launcher's HTTP endpoint advertises every tool");
     }
 

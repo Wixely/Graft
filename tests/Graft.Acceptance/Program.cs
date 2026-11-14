@@ -414,6 +414,31 @@ try
         Check(!PageConfiguration.AllowsSiteFile(full.Settings!, "README.md"), "and a file outside it is not, even though it is allowlisted");
         Check(SiteContentTypes.For("index.html") == "text/html; charset=utf-8", "a site file's type comes from its extension");
         Check(SiteContentTypes.For("payload.exe") is null, "and an extension that is not on the list has no type at all");
+        Check(SiteContentTypes.For("game_bg.WASM") == "application/wasm" && SiteContentTypes.For("a/theme.ogg") == "audio/ogg" && SiteContentTypes.For("intro.mp4") == "video/mp4",
+            "a browser build's module and its media are on the list");
+        Check(SiteContentTypes.For("level.ron", [new(".ron", "text/plain")]) == "text/plain" && SiteContentTypes.For("level.ron") is null,
+            "a type an administrator added is served, and only where it was added");
+        Check(SiteContentTypes.For("index.html", [new(".html", "text/plain")]) == "text/plain", "an added type replaces a built-in one of the same extension");
+
+        // Page artifacts (ADR 0051): the names and paths that are accepted, and the administrator's settings.
+        Check(PageArtifacts.IsName("demo") && PageArtifacts.IsName("web-build_2") && !PageArtifacts.IsName("Demo") && !PageArtifacts.IsName("-") &&
+            !PageArtifacts.IsName("a/b") && !PageArtifacts.IsName("") && !PageArtifacts.IsName(new string('a', 41)), "a page artifact's name is one lower-case folder name");
+        Check(PageArtifacts.Segments("audio/theme.ogg") is { Length: 2 } && PageArtifacts.Segments("../x") is null && PageArtifacts.Segments("a//b") is null &&
+            PageArtifacts.Segments(".env") is null && PageArtifacts.Segments("a\\b") is null && PageArtifacts.Segments("a/con.txt") is null &&
+            PageArtifacts.Segments("a:b") is null && PageArtifacts.Segments("trailing.") is null && PageArtifacts.Segments("/rooted") is null,
+            "a path inside one is relative, visible and means the same on every file system");
+        Check(PageServingSettings.Normalize(" A ", 64, [new("RON", "Text/Plain; charset=utf-8")], out _) is { ArtifactPrefix: "a", FileTypes: [{ Extension: ".ron", ContentType: "text/plain; charset=utf-8" }] },
+            "the administrator's settings are stored in one plain form");
+        Check(PageServingSettings.Normalize("-", 64, [], out _) is null && PageServingSettings.Normalize("a", 0, [], out _) is null &&
+            PageServingSettings.Normalize("a", 64, [new(".x", "text/plain\r\nX: 1")], out _) is null &&
+            PageServingSettings.Normalize("a", 64, [new(".x", "a/b"), new("x", "c/d")], out _) is null,
+            "and a prefix, a limit or a file type that is not one is refused");
+        PageConfigurationResult artifactSite = PageConfiguration.Read(Encoding.UTF8.GetBytes("""{"version":1,"page":{"site":{"artifact":"demo"}}}"""));
+        Check(artifactSite.Settings?.Site is { Artifact: "demo", Root: "" } && !PageConfiguration.AllowsSiteFile(artifactSite.Settings, "README.md"),
+            "a site may be a page artifact alone, which opens no file in the repository");
+        Check(!PageConfiguration.Read(Encoding.UTF8.GetBytes("""{"version":1,"page":{"site":{"artifact":"../x"}}}""")).Ok &&
+            !PageConfiguration.Read(Encoding.UTF8.GetBytes("""{"version":1,"page":{"site":{}}}""")).Ok,
+            "and a site that names neither a folder nor an artifact, or an artifact that is not a name, is an error");
     }
 
     // Import by address (ADR 0042): what an address may be, and which hosts a public-only server may reach.

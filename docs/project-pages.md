@@ -46,6 +46,7 @@ Every field is optional, and so is the file. What is absent is absent.
 | `files` | The patterns that decide which files the page offers. |
 | `site.root` | The folder served as a website. |
 | `site.index` | The file that answers for a directory. Defaults to `index.html`. |
+| `site.artifact` | A [page artifact](#page-artifacts-a-site-that-is-not-committed) that is the site's front door. A site needs `root`, `artifact` or both. |
 
 ### Patterns
 
@@ -178,8 +179,12 @@ there is no API, no session, no upload route and no browser shell: a request for
 Within it:
 
 - Only files under `site.root` are reachable. Everything else in the repository is not there.
-- Content types come from a fixed list of extensions, never from the file's bytes. An extension that is not
-  on the list is not served at all.
+- Content types come from a list of extensions, never from the file's bytes. An extension that is not on the
+  list is not served at all. The built-in list covers web pages, styles, scripts, images, fonts, audio, video,
+  WebAssembly modules and opaque program data; an administrator adds more under **Administration, Project
+  sites**.
+- Files carry a validator and answer range requests, so a returning browser does not download a large file
+  again and a media player can seek.
 - Responses carry `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and
   `frame-ancestors 'none'`.
 
@@ -187,15 +192,69 @@ The root of the pages origin belongs to no project, so it redirects to the forge
 URL back to the host lands somewhere useful rather than on an explanation of the URL shape. An unknown
 project is still a 404, so the redirect never hides a typo.
 
-The root of the pages origin belongs to no project, so it redirects to the forge. Somebody who trims a
-site's URL back to the host lands somewhere useful rather than on an explanation of a URL shape they cannot
-act on. An unknown project is still a 404, so the redirect never hides a typo.
-
 The address is the project's instance-wide slug, so a shared site URL names no account:
 
 ```
 https://pages.example.com/<project-slug>/
 ```
+
+## Page artifacts: a site that is not committed
+
+Some of what a site serves should not be in the repository: a browser build of a game, generated
+documentation, anything compiled. A **page artifact** is a named folder of such files, uploaded beside the
+repository as one zip archive ([ADR 0051](decisions/0051-page-artifacts.md)).
+
+- **Private until promoted.** An uploaded artifact is served nowhere public. Somebody who can read the
+  repository can list it and download its files.
+- **Promoting is a Maintainer's act**, like publishing the page, and is recorded in the project's audit
+  trail. Uploading needs only Developer.
+- **A promoted artifact is part of the site.** It answers on the pages origin at
+  `<project-slug>/a/<name>/`, and only while the project page is published. It is never served from the
+  forge's own address.
+- **Uploading again replaces the whole folder** and keeps its promotion, so publishing a new build is one
+  step. Nothing of the old build is left.
+- **Where an artifact and a committed file claim the same path, the artifact answers.**
+
+The project can stay private throughout. The page is public, the promoted artifact is public, and nothing
+else is.
+
+Upload from a script with a token:
+
+```powershell
+Compress-Archive -Path dist\* -DestinationPath demo.zip -Force
+Invoke-RestMethod -Method Put -InFile demo.zip -ContentType application/zip `
+  -Headers @{ 'PRIVATE-TOKEN' = $token } `
+  -Uri https://graft.example.com/api/graft/projects/<project>/page-artifacts/demo
+```
+
+or from the project's **Settings**, under **Page artifacts**, where promoting, withdrawing and deleting also
+live. Agents have `graft_upload_page_artifact`, `graft_set_page_artifact_promoted`,
+`graft_list_page_artifacts` and `graft_delete_page_artifact`.
+
+A site can be an artifact alone, with nothing committed but the config:
+
+```json
+{ "version": 1, "page": { "site": { "artifact": "demo" } } }
+```
+
+The project page then forwards to the artifact, as it does to any site. A committed site can instead link
+to `a/demo/`, or load a script from it, without naming it in the config.
+
+Three things to know when building one:
+
+- **Use relative addresses.** An artifact is served under a folder, and Graft does not rewrite files. A
+  bundler that writes addresses from the host's root needs telling; for `trunk`, that is
+  `trunk build --public-url ./`.
+- **Only listed file types are served.** The settings panel and the list route mark a file whose type is not.
+- **Everything promoted is public in full.** A WebAssembly module can be downloaded and taken apart, so
+  promote only a build you are content to hand out.
+
+An administrator can change the `a` in the address, the largest artifact (256 MiB by default) and the
+served file types under **Administration, Project sites**. Changing the path moves every promoted artifact
+on the server at once.
+
+Not done: the cross-origin isolation headers a threaded build needs, and any separation between one
+project's site and another's in the browser. Every site on the pages origin shares its storage.
 
 ## Linking back to the forge
 

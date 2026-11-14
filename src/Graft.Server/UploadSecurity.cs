@@ -76,6 +76,7 @@ public static class UploadLimits
     public const string BannerProfile = "banner";
     public const string RepositoryFileProfile = "repository-file";
     public const string ReleaseAssetProfile = "release-asset";
+    public const string PageArtifactProfile = "page-artifact";
 
     /// <summary>Total staged bytes admitted across all owners, including completed receipts until expiry.</summary>
     public const long ReservedBytes = 64L * 1024 * 1024 * 1024;
@@ -165,6 +166,27 @@ public static class UploadLimits
         ConcurrentFiles = 1,
         MaximumFiles = 10,
         MaximumFileBytes = Graft.Storage.GraftStore.MaximumAssetBytes,
+        Lifetime = TimeSpan.FromHours(6)
+    };
+
+    /// <summary>
+    /// A page artifact: one zip archive holding a build (ADR 0051). Chunked like a release file, and capped at
+    /// the largest size an administrator can allow; the limit actually in force is theirs, read at ingest.
+    /// </summary>
+    public static readonly UploadProfile PageArtifact = new()
+    {
+        Multiple = false,
+        Chunking = true,
+        ChunkBytes = 8 * 1024 * 1024,
+        Resume = true,
+        AutomaticRetry = true,
+        RetryLimit = 3,
+        PersistMetadata = true,
+        PersistFileBytes = 0,
+        DragAndDrop = true,
+        ConcurrentFiles = 1,
+        MaximumFiles = 1,
+        MaximumFileBytes = Graft.Core.PageServingSettings.LargestArtifactMaximumMebibytes * 1024L * 1024L,
         Lifetime = TimeSpan.FromHours(6)
     };
 }

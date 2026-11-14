@@ -3,8 +3,12 @@ using System.Text.Json.Serialization;
 
 namespace Graft.Core;
 
-/// <summary>Where a project's static site lives in the repository, and which file answers for a directory.</summary>
-public sealed record PageSite(string Root, string Index);
+/// <summary>
+/// Where a project's static site lives, and which file answers for a directory. The root is a folder in the
+/// repository, or empty when the site is not committed at all; the artifact, when named, is the promoted page
+/// artifact that answers at the site's front door.
+/// </summary>
+public sealed record PageSite(string Root, string Index, string? Artifact = null);
 
 /// <summary>How much of a commit's author a page's history shows.</summary>
 public enum PageAuthors
@@ -286,14 +290,28 @@ public static class PageConfiguration
         {
             if (siteValue.ValueKind != JsonValueKind.Object) return new(null, "page.site must be an object.");
             foreach (JsonProperty property in siteValue.EnumerateObject())
-                if (property.Name is not ("root" or "index"))
+                if (property.Name is not ("root" or "index" or "artifact"))
                     return new(null, "The page config has a field Graft does not understand: page.site." + property.Name);
 
-            if (!siteValue.TryGetProperty("root", out JsonElement rootValue) || rootValue.ValueKind != JsonValueKind.String)
-                return new(null, "page.site needs a root directory.");
-            string root = PathMatcher.Normalize(rootValue.GetString());
-            if (root.Length == 0) return new(null, "page.site.root is not a directory inside the repository.");
-            if (IsReserved(root)) return new(null, "page.site.root may not be the " + ReservedDirectory + " directory.");
+            // A site is a folder in the repository, a page artifact uploaded beside it, or both. The artifact
+            // names the front door; it grants nothing, because only a promoted artifact is ever served.
+            string? artifact = null;
+            if (siteValue.TryGetProperty("artifact", out JsonElement artifactValue))
+            {
+                if (artifactValue.ValueKind != JsonValueKind.String || !PageArtifacts.IsName(artifactValue.GetString()))
+                    return new(null, "page.site.artifact must be the name of a page artifact.");
+                artifact = artifactValue.GetString();
+            }
+
+            string root = "";
+            if (siteValue.TryGetProperty("root", out JsonElement rootValue))
+            {
+                if (rootValue.ValueKind != JsonValueKind.String) return new(null, "page.site needs a root directory.");
+                root = PathMatcher.Normalize(rootValue.GetString());
+                if (root.Length == 0) return new(null, "page.site.root is not a directory inside the repository.");
+                if (IsReserved(root)) return new(null, "page.site.root may not be the " + ReservedDirectory + " directory.");
+            }
+            else if (artifact is null) return new(null, "page.site needs a root directory.");
 
             string index = "index.html";
             if (siteValue.TryGetProperty("index", out JsonElement indexValue))
@@ -304,7 +322,7 @@ public static class PageConfiguration
                 // different at every depth and is more likely a misunderstanding than an intent.
                 if (index.Length == 0 || index.Contains('/')) return new(null, "page.site.index must be a single file name.");
             }
-            site = new(root, index);
+            site = new(root, index, artifact);
         }
 
         return new(new PageSettings(title, description, image, readme, files, features, site, tree, history, issues, releases), null);
@@ -326,7 +344,9 @@ public static class PageConfiguration
     public static bool AllowsSiteFile(PageSettings settings, string path)
     {
         ArgumentNullException.ThrowIfNull(settings);
-        if (settings.Site is null) return false;
+        // A site made only of a page artifact has no folder in the repository, and an empty root must not read
+        // as "the whole repository".
+        if (settings.Site is null || settings.Site.Root.Length == 0) return false;
         string normalized = PathMatcher.Normalize(path);
         if (normalized.Length == 0 || IsReserved(normalized)) return false;
         return PathMatcher.IsInside(settings.Site.Root, normalized);
@@ -371,16 +391,178 @@ public static class SiteContentTypes
         [".woff"] = "font/woff",
         [".woff2"] = "font/woff2",
         [".ttf"] = "font/ttf",
-        [".pdf"] = "application/pdf"
+        [".otf"] = "font/otf",
+        [".pdf"] = "application/pdf",
+        [".csv"] = "text/csv; charset=utf-8",
+        [".vtt"] = "text/vtt; charset=utf-8",
+        [".map"] = "application/json; charset=utf-8",
+        [".webmanifest"] = "application/manifest+json; charset=utf-8",
+        [".avif"] = "image/avif",
+        [".apng"] = "image/apng",
+        [".bmp"] = "image/bmp",
+        // What a browser build of a program is made of: the module itself and the opaque data it loads.
+        [".wasm"] = "application/wasm",
+        [".bin"] = "application/octet-stream",
+        [".data"] = "application/octet-stream",
+        [".dat"] = "application/octet-stream",
+        [".pck"] = "application/octet-stream",
+        [".zip"] = "application/zip",
+        [".glb"] = "model/gltf-binary",
+        [".gltf"] = "model/gltf+json",
+        [".mp3"] = "audio/mpeg",
+        [".ogg"] = "audio/ogg",
+        [".oga"] = "audio/ogg",
+        [".opus"] = "audio/ogg",
+        [".wav"] = "audio/wav",
+        [".flac"] = "audio/flac",
+        [".m4a"] = "audio/mp4",
+        [".aac"] = "audio/aac",
+        [".weba"] = "audio/webm",
+        [".mp4"] = "video/mp4",
+        [".m4v"] = "video/mp4",
+        [".webm"] = "video/webm",
+        [".ogv"] = "video/ogg",
+        [".mov"] = "video/quicktime"
     };
+
+    /// <summary>The built-in list, for an administrator's screen to show beside what was added to it.</summary>
+    public static IReadOnlyList<SiteFileType> BuiltIn { get; } =
+        [.. ByExtension.OrderBy(pair => pair.Key, StringComparer.Ordinal).Select(pair => new SiteFileType(pair.Key, pair.Value))];
 
     /// <summary>
     /// The type to serve a path as, or null when the extension is not on the list. Unknown is refused
     /// rather than sent as a default type, because a default is a decision about somebody else's bytes.
     /// </summary>
-    public static string? For(string path)
+    public static string? For(string path) => For(path, null);
+
+    /// <summary>The same, with what an administrator added consulted first, so an addition may also replace a
+    /// built-in type.</summary>
+    public static string? For(string path, IReadOnlyList<SiteFileType>? added)
     {
         string extension = System.IO.Path.GetExtension(path ?? "");
-        return extension.Length != 0 && ByExtension.TryGetValue(extension, out string? type) ? type : null;
+        if (extension.Length == 0) return null;
+        if (added is not null)
+            foreach (SiteFileType type in added)
+                if (string.Equals(type.Extension, extension, StringComparison.OrdinalIgnoreCase)) return type.ContentType;
+        return ByExtension.TryGetValue(extension, out string? builtIn) ? builtIn : null;
     }
 }
+
+/// <summary>One extension and the content type a site file with it is served as.</summary>
+public sealed record SiteFileType(string Extension, string ContentType);
+
+/// <summary>
+/// What an administrator decides about the pages origin (ADR 0051): the path page artifacts answer under, how
+/// large one may be, and the file types served beyond the built-in list.
+/// </summary>
+public sealed record PageServingSettings(string ArtifactPrefix, int ArtifactMaximumMebibytes, IReadOnlyList<SiteFileType> FileTypes)
+{
+    public const string DefaultArtifactPrefix = "a";
+    public const int DefaultArtifactMaximumMebibytes = 256;
+    public const int LargestArtifactMaximumMebibytes = 2048;
+    public const int MaximumFileTypes = 100;
+
+    public static PageServingSettings Default { get; } = new(DefaultArtifactPrefix, DefaultArtifactMaximumMebibytes, []);
+
+    public long ArtifactMaximumBytes => ArtifactMaximumMebibytes * 1024L * 1024L;
+
+    /// <summary>
+    /// The settings as they will be stored, or the reason they cannot be. Extensions are lower-cased and given
+    /// their dot; a type is a bare <c>type/subtype</c>, optionally with <c>; charset=utf-8</c>.
+    /// </summary>
+    public static PageServingSettings? Normalize(string? prefix, int maximumMebibytes, IEnumerable<SiteFileType>? fileTypes, out string problem)
+    {
+        problem = "";
+        string cleanPrefix = (prefix ?? "").Trim().Trim('/').ToLowerInvariant();
+        // One segment, and never `-`: that is Graft's own namespace on a site, resolved before any file.
+        if (!PageArtifacts.IsName(cleanPrefix))
+        { problem = "The artifact path is one segment of lower-case letters, digits, '-' and '_', starting with a letter or digit."; return null; }
+        if (maximumMebibytes is < 1 or > LargestArtifactMaximumMebibytes)
+        { problem = "The largest page artifact is between 1 and " + LargestArtifactMaximumMebibytes + " MiB."; return null; }
+
+        List<SiteFileType> types = [];
+        foreach (SiteFileType entry in fileTypes ?? [])
+        {
+            string extension = (entry.Extension ?? "").Trim().ToLowerInvariant();
+            if (extension.Length > 0 && extension[0] != '.') extension = "." + extension;
+            string type = (entry.ContentType ?? "").Trim().ToLowerInvariant();
+            if (extension.Length is < 2 or > 17 || !extension.Skip(1).All(c => char.IsAsciiLetterLower(c) || char.IsAsciiDigit(c)))
+            { problem = "A file type's extension is a dot and up to 16 letters or digits: " + entry.Extension; return null; }
+            if (!IsContentType(type))
+            { problem = "A file type's content type looks like type/subtype: " + entry.ContentType; return null; }
+            if (types.Any(existing => existing.Extension == extension))
+            { problem = "The extension " + extension + " is listed twice."; return null; }
+            types.Add(new(extension, type));
+        }
+        if (types.Count > MaximumFileTypes) { problem = "At most " + MaximumFileTypes + " file types can be added."; return null; }
+        return new(cleanPrefix, maximumMebibytes, types);
+    }
+
+    private static bool IsContentType(string value)
+    {
+        const string Charset = "; charset=utf-8";
+        if (value.EndsWith(Charset, StringComparison.Ordinal)) value = value[..^Charset.Length];
+        string[] parts = value.Split('/');
+        return value.Length <= 100 && parts.Length == 2 && parts.All(part => part.Length > 0 && char.IsAsciiLetterOrDigit(part[0]) &&
+            part.All(c => char.IsAsciiLetterLower(c) || char.IsAsciiDigit(c) || c is '.' or '+' or '-' or '_'));
+    }
+}
+
+/// <summary>
+/// The rules a page artifact's name and the paths inside it follow. A page artifact is a named folder of files
+/// uploaded beside a repository and, once promoted, served on the pages origin as part of the project's site.
+/// </summary>
+public static class PageArtifacts
+{
+    public const int MaximumNameLength = 40;
+    public const int MaximumFiles = 2000;
+    public const int MaximumPathLength = 240;
+
+    /// <summary>Whether this is a name: one URL segment that is also a safe directory name everywhere.</summary>
+    public static bool IsName(string? name) =>
+        name is { Length: > 0 and <= MaximumNameLength } && (char.IsAsciiLetterLower(name[0]) || char.IsAsciiDigit(name[0])) &&
+        name.All(c => char.IsAsciiLetterLower(c) || char.IsAsciiDigit(c) || c is '-' or '_');
+
+    /// <summary>
+    /// A path inside an artifact, as its segments, or null when it is not one this server will store or serve.
+    /// Nothing hidden, nothing relative, and nothing a Windows or a Linux file system would read differently
+    /// from the way it was written.
+    /// </summary>
+    public static string[]? Segments(string? path)
+    {
+        if (path is not { Length: > 0 and <= MaximumPathLength } || path.Contains('\\')) return null;
+        string[] segments = path.Split('/');
+        foreach (string segment in segments)
+        {
+            if (segment.Length == 0 || segment[0] == '.' || segment[^1] is '.' or ' ') return null;
+            foreach (char c in segment)
+                if (c < 0x20 || c == 0x7f || c is ':' or '*' or '?' or '"' or '<' or '>' or '|') return null;
+            string stem = segment.Split('.')[0];
+            if (stem.Length is 3 or 4 && Reserved.Contains(stem.ToUpperInvariant())) return null;
+        }
+        return segments;
+    }
+
+    // Names Windows gives to devices in every directory, whatever extension follows.
+    private static readonly HashSet<string> Reserved = new(StringComparer.Ordinal)
+    {
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
+    };
+}
+
+/// <summary>
+/// One page artifact as the database knows it. The generation names the directory its current files are in;
+/// an upload writes a new one and the row moves to it, so a reader never sees half of two builds.
+/// </summary>
+public sealed record PageArtifact(
+    long Id,
+    long ProjectId,
+    string Name,
+    string Generation,
+    bool Promoted,
+    int FileCount,
+    long Bytes,
+    string UpdatedByUsername,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset UpdatedAt);

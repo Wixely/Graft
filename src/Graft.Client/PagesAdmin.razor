@@ -1,0 +1,184 @@
+@page "/-/admin/pages"
+@inject GraftApi Api
+@inject NavigationManager Navigation
+
+<PageTitle>Project sites &middot; Graft</PageTitle>
+
+@if (loading)
+{
+    <p role="status" class="secondary-text">Loading…</p>
+}
+else if (!Api.IsAdministrator)
+{
+    <div class="page-header"><div><h1>Project sites</h1><p class="subtitle">This page requires an administrator account.</p></div></div>
+}
+else if (current is null)
+{
+    <div class="page-header"><div><h1>Project sites</h1><p class="subtitle">The settings could not be read.</p></div></div>
+    <Banner Message="@message" Kind="@messageKind" />
+}
+else
+{
+    <div class="page-header">
+        <div><h1>Project sites</h1><p class="subtitle">What the address for project sites serves, and how page artifacts reach it.</p></div>
+    </div>
+
+    <Banner Message="@message" Kind="@messageKind" />
+
+    <div class="panel">
+        <div class="panel-header"><Icon Name="settings" /><h2>Address</h2><span class="spacer"></span>
+            <span class="label @(current.PagesOrigin is null ? "" : "success")">@(current.PagesOrigin is null ? "Not configured" : "Serving")</span></div>
+        <div class="panel-body">
+            @if (current.PagesOrigin is null)
+            {
+                <p class="secondary-text">
+                    Project sites are served from a hostname of their own, which an operator names by starting Graft
+                    with <span class="mono">--pages-origin</span>. Until then nothing below is reachable, though it
+                    can be set.
+                </p>
+            }
+            else
+            {
+                <p class="mono">@current.PagesOrigin/&lt;project-slug&gt;/</p>
+                <p class="secondary-text">
+                    Chosen by the operator at start-up. Everything on it is public, and it carries no session, so
+                    nothing a project puts there can act as a signed-in person.
+                </p>
+            }
+        </div>
+    </div>
+
+    <div class="panel">
+        <div class="panel-header"><h2>Page artifacts and file types</h2></div>
+        <div class="panel-body">
+            <form class="form" @onsubmit="Save" @onsubmit:preventDefault>
+                <label for="artifact-prefix">Path that page artifacts are served under</label>
+                <input id="artifact-prefix" @bind="prefix" @bind:event="oninput" maxlength="40" pattern="[a-z0-9][a-z0-9_\-]*"
+                       autocomplete="off" spellcheck="false" required />
+                <p class="field-hint">
+                    A promoted artifact answers at <span class="mono">&lt;project-slug&gt;/@(prefix.Length > 0 ? prefix : "a")/&lt;name&gt;/</span>.
+                    Changing this moves every promoted artifact on the server at once and breaks links to the old
+                    address, so leave it at <span class="mono">a</span> unless a site needs that folder for itself.
+                </p>
+
+                <label for="artifact-maximum">Largest page artifact, in MiB</label>
+                <input id="artifact-maximum" type="number" min="1" max="2048" @bind="maximumMebibytes" required />
+                <p class="field-hint">
+                    Applies to the archive as uploaded and again to its contents once unpacked. Between 1 and 2048.
+                </p>
+
+                <label for="file-types">More file types to serve</label>
+                <textarea id="file-types" rows="6" @bind="fileTypes" @bind:event="oninput" spellcheck="false"
+                          placeholder=".ron text/plain; charset=utf-8"></textarea>
+                <p class="field-hint">
+                    One per line: an extension, a space, and the content type to send, such as
+                    <span class="mono">.ktx2 image/ktx2</span>. A file whose extension is on neither list is not
+                    served at all, from a repository or from an artifact. An entry here replaces a built-in type
+                    of the same extension.
+                </p>
+
+                <div class="form-actions">
+                    <button type="submit" disabled="@(busy || !Changed)">@(busy ? "Saving…" : "Save")</button>
+                    <button type="button" class="secondary" @onclick="Reset" disabled="@(busy || !Changed)">Discard</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <div class="panel">
+        <div class="panel-header"><h2>Built-in file types</h2><span class="spacer"></span><span class="label">@current.BuiltInFileTypes.Length</span></div>
+        <div class="panel-body">
+            <p class="secondary-text">
+                Served without being listed above. The type always comes from the extension and never from the
+                file's contents.
+            </p>
+            <p class="list-labels">
+                @foreach (PageFileTypeEntry type in current.BuiltInFileTypes)
+                {
+                    <span class="label" title="@type.ContentType">@type.Extension</span>
+                }
+            </p>
+        </div>
+    </div>
+}
+
+@code {
+    private PageServingSettingsResponse? current;
+    private string prefix = "";
+    private int maximumMebibytes;
+    private string fileTypes = "";
+    private string message = "";
+    private string messageKind = "info";
+    private bool loading = true;
+    private bool busy;
+
+    private bool Changed => current is not null &&
+        (prefix != current.ArtifactPrefix || maximumMebibytes != current.ArtifactMaximumMebibytes || Normal(fileTypes) != Lines(current.FileTypes));
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            if (!await Api.EnsureSessionAsync())
+            {
+                if (Api.Reachable) Navigation.NavigateTo("/-/login", replace: true);
+                return;
+            }
+            if (Api.IsAdministrator) await Load();
+        }
+        finally { loading = false; }
+    }
+
+    private async Task Load()
+    {
+        (bool reached, PageServingSettingsResponse? settings) =
+            await Api.GetOptionalAsync("api/graft/admin/pages", ApiJson.Default.PageServingSettingsResponse);
+        if (!reached) { Report(ApiResult.Refused("Graft could not be reached.")); return; }
+        current = settings;
+        Reset();
+    }
+
+    private void Reset()
+    {
+        if (current is null) return;
+        prefix = current.ArtifactPrefix;
+        maximumMebibytes = current.ArtifactMaximumMebibytes;
+        fileTypes = Lines(current.FileTypes);
+    }
+
+    private async Task Save()
+    {
+        if (busy || current is null) return;
+        List<PageFileTypeEntry> entries = [];
+        foreach (string line in Normal(fileTypes).Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            int space = line.IndexOf(' ');
+            if (space <= 0) { Report(ApiResult.Refused("Each file type is an extension, a space and a content type: " + line)); return; }
+            entries.Add(new(line[..space], line[(space + 1)..].Trim()));
+        }
+        busy = true;
+        try
+        {
+            ApiResult<PageServingSettingsResponse> result = await Api.SendAsync(HttpMethod.Post, "api/graft/admin/pages",
+                new PageServingSettingsRequest(prefix.Trim(), maximumMebibytes, [.. entries]),
+                ApiJson.Default.PageServingSettingsRequest, ApiJson.Default.PageServingSettingsResponse,
+                "Project site settings updated. The change applies to the next request.");
+            Report(new ApiResult(result.Ok, result.Message));
+            if (result.Ok && result.Value is not null) { current = result.Value; Reset(); }
+        }
+        finally { busy = false; }
+    }
+
+    private void Report(ApiResult result)
+    {
+        message = result.Message;
+        messageKind = result.Ok ? "success" : "error";
+    }
+
+    private static string Lines(PageFileTypeEntry[] types) => string.Join('\n', types.Select(type => type.Extension + " " + type.ContentType));
+
+    /// <summary>The text as typed, with line endings and stray blank space evened out, so that what was loaded
+    /// compares equal to itself.</summary>
+    private static string Normal(string text) =>
+        string.Join('\n', text.Replace("\r", "").Split('\n').Select(line => line.Trim()).Where(line => line.Length > 0));
+}
