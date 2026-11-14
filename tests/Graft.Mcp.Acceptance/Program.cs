@@ -7,6 +7,7 @@ using System.Text.Json;
 using Graft.Core;
 using Graft.Git;
 using Graft.Storage;
+using Graft.TestSupport;
 
 // Drives Graft's Model Context Protocol surface as a client would, against a real Graft: the endpoint the
 // forge hosts itself, and the separate Graft.Mcp launcher over both of its transports.
@@ -152,7 +153,7 @@ async Task CheckForge(string address, string token, string password)
     using (HttpResponseMessage listing = await Post(client, token, Request(3, "tools/list", "{}")))
     {
         using JsonDocument body = Parse(await listing.Content.ReadAsStringAsync());
-        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 58,
+        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 64,
             "the forge's endpoint advertises every tool");
     }
 
@@ -620,6 +621,8 @@ async Task CheckProjectSettings(HttpClient client, HttpClient browser, string ad
         Check(result.Contains("\"served_under\":\"a/", StringComparison.Ordinal) && result.Contains("\"name\":\"demo\"", StringComparison.Ordinal),
             "and lists a project's page artifacts with where they are served");
     }
+    await CheckReleaseDestinations(client, address, token);
+
     using (HttpResponseMessage refused = await Post(client, token, Call(74, "graft_delete_page_artifact", """{"project":"admin/shared","name":"demo"}""")))
     {
         using JsonDocument body = Parse(await refused.Content.ReadAsStringAsync());
@@ -631,6 +634,16 @@ async Task CheckProjectSettings(HttpClient client, HttpClient browser, string ad
     {
         using JsonDocument body = Parse(await removed.Content.ReadAsStringAsync());
         Check(Text(body).Contains("\"deleted\":true", StringComparison.Ordinal), "and deleted once it is");
+    }
+    using (HttpResponseMessage removed = await Post(client, token, Call(96, "graft_delete_release_destination", """{"project":"admin/shared","name":"store"}""")))
+    {
+        using JsonDocument body = Parse(await removed.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("\"deleted\":true", StringComparison.Ordinal), "a release destination is removed once deletion is allowed");
+    }
+    using (HttpResponseMessage listed = await Post(client, token, Call(97, "graft_list_release_destinations", """{"project":"admin/shared"}""")))
+    {
+        using JsonDocument body = Parse(await listed.Content.ReadAsStringAsync());
+        Check(Text(body).Contains("\"destinations\":[]", StringComparison.Ordinal), "and is gone from the list");
     }
     using (HttpResponseMessage who = await Post(client, token, Call(58, "graft_whoami", "{}")))
     {
@@ -674,6 +687,139 @@ async Task CheckProjectSettings(HttpClient client, HttpClient browser, string ad
         using JsonDocument body = Parse(await closed.Content.ReadAsStringAsync());
         Check(Text(body).Contains("delete or transfer", StringComparison.Ordinal), "turning the switch off refuses the next transfer without a restart");
     }
+}
+
+/// <summary>
+/// Release destinations and publishing (ADR 0052), through the tools alone, against a stand-in store: an agent
+/// configures a destination, checks a release against it, publishes, and follows the publication to its end. Runs
+/// with writes allowed and the destructive switch off, and leaves the destination for the caller to remove.
+/// </summary>
+async Task CheckReleaseDestinations(HttpClient client, string address, string token)
+{
+    using FakeAppStore fake = new() { ChunkSize = 2048 };
+    StringBuilder said = new();
+    async Task<string> Tool(int id, string tool, string arguments)
+    {
+        using HttpResponseMessage response = await Post(client, token, Call(id, tool, arguments));
+        using JsonDocument body = Parse(await response.Content.ReadAsStringAsync());
+        string text = Text(body);
+        said.AppendLine(text);
+        return text;
+    }
+    async Task<JsonDocument> Finished(int id, long publication)
+    {
+        for (int attempt = 0; attempt < 150; attempt++)
+        {
+            JsonDocument read = JsonDocument.Parse(await Tool(id, "graft_get_release_publication",
+                $$"""{"project":"admin/shared","id":{{publication}}}"""));
+            if (read.RootElement.GetProperty("state").GetString() is "succeeded" or "failed") return read;
+            read.Dispose();
+            await Task.Delay(200);
+        }
+        throw new InvalidOperationException("The publication did not finish.");
+    }
+
+    // A release with a file on it. Making a release is still a person's act, so this half is the HTTP API.
+    Check((await Tool(80, "graft_create_tag", """{"project":"admin/shared","tag":"v2.0.0","reference":"main"}""")).Contains("\"tag\":\"v2.0.0\"", StringComparison.Ordinal),
+        "a tag to release");
+    byte[] package = System.Security.Cryptography.RandomNumberGenerator.GetBytes(5000);
+    using (HttpRequestMessage make = new(HttpMethod.Post, "/api/v4/projects/admin%2Fshared/releases"))
+    {
+        make.Headers.Add("PRIVATE-TOKEN", token);
+        make.Content = JsonContent.Create(new { tag_name = "v2.0.0", name = "Two", description = "Notes for two." });
+        using HttpResponseMessage made = await client.SendAsync(make);
+        Check(made.StatusCode == HttpStatusCode.Created, "a release on it");
+    }
+    using (HttpRequestMessage attach = new(HttpMethod.Put, "/api/v4/projects/admin%2Fshared/releases/v2.0.0/assets/files/example-linux-x64.tar.gz"))
+    {
+        attach.Headers.Add("PRIVATE-TOKEN", token);
+        attach.Content = new ByteArrayContent(package);
+        attach.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+        using HttpResponseMessage attached = await client.SendAsync(attach);
+        Check(attached.StatusCode == HttpStatusCode.Created, "and a file on the release");
+    }
+
+    string empty = await Tool(81, "graft_list_release_destinations", """{"project":"admin/shared"}""");
+    Check(empty.Contains("\"publishing_turned_on\":true", StringComparison.Ordinal) && empty.Contains("\"destinations\":[]", StringComparison.Ordinal),
+        "an agent reads a project's release destinations, and whether the operator turned publishing on");
+
+    string incomplete = await Tool(82, "graft_set_release_destination",
+        $$"""{"project":"admin/shared","name":"store","endpoint":"","apiKey":"","applicationId":"{{fake.ApplicationId}}","channel":"none","allowProductionPromotion":false,"packageName":"","rules":""}""");
+    Check(incomplete.Contains("\"error\":true", StringComparison.Ordinal), "a new destination with no endpoint or key is refused");
+
+    string unpromoted = await Tool(99, "graft_set_release_destination",
+        $$"""{"project":"admin/shared","name":"store","endpoint":"{{fake.Endpoint}}","apiKey":"{{fake.ApiKey}}","applicationId":"{{fake.ApplicationId}}","channel":"beta","allowProductionPromotion":false,"packageName":"","rules":""}""");
+    Check(unpromoted.Contains("needs production promotion", StringComparison.Ordinal), "a channel is refused unless promotion is allowed for the destination, with the server's reason");
+
+    string added = await Tool(83, "graft_set_release_destination",
+        $$"""{"project":"admin/shared","name":"store","endpoint":"{{fake.Endpoint}}","apiKey":"{{fake.ApiKey}}","applicationId":"{{fake.ApplicationId}}","channel":"beta","allowProductionPromotion":true,"packageName":"","rules":"*.tar.gz Linux x64 main"}""");
+    Check(added.Contains("\"name\":\"store\"", StringComparison.Ordinal) && added.Contains("\"channel\":\"beta\"", StringComparison.Ordinal) &&
+          added.Contains("\"endpoint_host\":\"127.0.0.1:" + fake.Port.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\"", StringComparison.Ordinal) &&
+          added.Contains("\"allow_production_promotion\":true", StringComparison.Ordinal),
+        "an agent adds a release destination and is told its host and channel");
+
+    string bad = await Tool(84, "graft_set_release_destination",
+        $$"""{"project":"admin/shared","name":"store","endpoint":"","apiKey":"","applicationId":"{{fake.ApplicationId}}","channel":"beta","allowProductionPromotion":true,"packageName":"","rules":"*.tar.gz"}""");
+    Check(bad.Contains("Graft refused", StringComparison.Ordinal), "a rule that does not parse is refused with the server's reason");
+
+    string dry = await Tool(85, "graft_publish_release", """{"project":"admin/shared","tag":"v2.0.0","destination":"store","dryRun":true}""");
+    using (JsonDocument queued = JsonDocument.Parse(dry))
+    {
+        Check(queued.RootElement.GetProperty("dry_run").GetBoolean() && queued.RootElement.GetProperty("id").GetInt64() > 0,
+            "an agent asks for a dry run and is given a publication to follow");
+        using JsonDocument done = await Finished(86, queued.RootElement.GetProperty("id").GetInt64());
+        JsonElement file = done.RootElement.GetProperty("files")[0];
+        Check(done.RootElement.GetProperty("state").GetString() == "succeeded" && file.GetProperty("platform").GetString() == "Linux" &&
+              file.GetProperty("architecture").GetString() == "x64", "the dry run succeeds and says what each file would be declared as");
+        Check(fake.UploadSessionsOpened == 0 && fake.Builds.Count == 0, "and nothing was uploaded for it");
+    }
+
+    string real = await Tool(87, "graft_publish_release", """{"project":"admin/shared","tag":"v2.0.0","destination":"store","dryRun":false}""");
+    long publicationId;
+    using (JsonDocument queued = JsonDocument.Parse(real))
+    {
+        publicationId = queued.RootElement.GetProperty("id").GetInt64();
+        using JsonDocument done = await Finished(88, publicationId);
+        JsonElement file = done.RootElement.GetProperty("files")[0];
+        Check(done.RootElement.GetProperty("state").GetString() == "succeeded" && file.GetProperty("build_id").GetString() is { Length: > 0 } &&
+              file.GetProperty("uploaded_sha256").GetString() == Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(package)),
+            "an agent publishes a release and follows it to the store's build");
+        Check(fake.Builds.Count == 1 && fake.Builds[0].Published && fake.Builds[0].Channel == "beta" && fake.Channel("beta")?.Version == "2.0.0",
+            "the store holds the build, published on the destination's channel");
+        Check(fake.Violations.IsEmpty, "and saw nothing the contract forbids");
+    }
+
+    string again = await Tool(89, "graft_publish_release", """{"project":"admin/shared","tag":"v2.0.0","destination":"store","dryRun":false}""");
+    using (JsonDocument queued = JsonDocument.Parse(again))
+    using (JsonDocument done = await Finished(90, queued.RootElement.GetProperty("id").GetInt64()))
+        Check(done.RootElement.GetProperty("state").GetString() == "succeeded" && fake.Builds.Count == 1 && fake.ReleaseRequests == 1,
+            "asking again uploads nothing and publishes nothing a second time");
+
+    string history = await Tool(91, "graft_list_release_publications", """{"project":"admin/shared","tag":"v2.0.0"}""");
+    using (JsonDocument listed = JsonDocument.Parse(history))
+        Check(listed.RootElement.GetProperty("publications").GetArrayLength() == 3 &&
+              listed.RootElement.GetProperty("publications").EnumerateArray().Any(entry => entry.GetProperty("id").GetInt64() == publicationId),
+            "an agent lists a release's publications");
+
+    string nowhere = await Tool(92, "graft_publish_release", """{"project":"admin/shared","tag":"v2.0.0","destination":"elsewhere","dryRun":true}""");
+    Check(nowhere.Contains("\"error\":true", StringComparison.Ordinal), "publishing to a destination the project does not have is refused");
+
+    // A change that names no endpoint or key keeps what is stored, so an agent can retune one a person entered.
+    string changed = await Tool(93, "graft_set_release_destination",
+        $$"""{"project":"admin/shared","name":"store","endpoint":"","apiKey":"","applicationId":"{{fake.ApplicationId}}","channel":"none","allowProductionPromotion":false,"packageName":"","rules":""}""");
+    Check(changed.Contains("\"channel\":\"none\"", StringComparison.Ordinal) && changed.Contains("\"endpoint_host\":\"127.0.0.1:", StringComparison.Ordinal),
+        "a change with no endpoint or key keeps the stored ones");
+    string kept = await Tool(94, "graft_publish_release", """{"project":"admin/shared","tag":"v2.0.0","destination":"store","dryRun":true}""");
+    using (JsonDocument queued = JsonDocument.Parse(kept))
+    using (JsonDocument done = await Finished(95, queued.RootElement.GetProperty("id").GetInt64()))
+        Check(done.RootElement.GetProperty("state").GetString() == "succeeded", "and the stored key still opens the store");
+
+    string refused = await Tool(98, "graft_delete_release_destination", """{"project":"admin/shared","name":"store"}""");
+    Check(refused.Contains("refused", StringComparison.Ordinal), "removing a release destination is refused until deletion is allowed");
+
+    string everything = said.ToString();
+    Check(!everything.Contains(fake.ApiKey, StringComparison.Ordinal) && !everything.Contains(fake.Opaque, StringComparison.Ordinal),
+        "nothing any of these tools answered carries the key or the endpoint's path");
 }
 
 async Task SetSettings(HttpClient browser, string address, bool enabled, bool allowWrites, bool allowAnonymous, bool allowDestructive = false)
@@ -758,7 +904,7 @@ async Task CheckStdio(string address, bool readOnly)
 
         using JsonDocument tools = await Exchange(client, Request(2, "tools/list", "{}"));
         int count = tools.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength();
-        Check(count == 58, label + " advertises every tool");
+        Check(count == 64, label + " advertises every tool");
 
         using JsonDocument read = await Exchange(client, Call(3, "graft_browse", """{"search":""}"""));
         Check(Text(read).Contains("admin/shared", StringComparison.Ordinal), label + " reads the public listing");
@@ -817,7 +963,7 @@ async Task CheckHttp(string address, string token)
     using (HttpResponseMessage listing = await Post(client, token, Request(3, "tools/list", "{}")))
     {
         using JsonDocument body = Parse(await listing.Content.ReadAsStringAsync());
-        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 58,
+        Check(body.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength() == 64,
             "the launcher's HTTP endpoint advertises every tool");
     }
 
@@ -956,7 +1102,7 @@ async Task<string> StartServer(bool mcp)
     serverLines = [];
     List<string> lines = serverLines;
     server = Process.Start(Launch(serverPath,
-        ["--database", databasePath, "--repositories", repositoriesRoot, "--public-browsing", "true", "--mcp", mcp ? "true" : "false"]))!;
+        ["--database", databasePath, "--repositories", repositoriesRoot, "--public-browsing", "true", "--release-publishing", "any", "--mcp", mcp ? "true" : "false"]))!;
     Process active = server;
     _ = Task.Run(async () =>
     {

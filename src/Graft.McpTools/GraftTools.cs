@@ -1463,6 +1463,171 @@ public sealed class GraftTools
         }.ToJsonString();
     }
 
+    [McpServerTool(Name = "graft_list_release_destinations")]
+    [Description("Lists a project's release destinations: the application stores its releases can be published to (ADR 0052). Shows each one's host, application, channel, whether it may put builds on a channel, and its file rules; never the endpoint's path or the key. Also says whether this server's operator has turned publishing on. Needs the Maintainer role.")]
+    public static async Task<string> ListReleaseDestinations(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        CancellationToken cancellationToken)
+    {
+        (ReleaseDestinationListResponse? list, string? error) = await graft.GetAsync(
+            "api/graft/projects/" + Encode(project) + "/release-destinations", ApiJson.Default.ReleaseDestinationListResponse, cancellationToken);
+        if (error is not null) return Failure(error);
+        return new JsonObject
+        {
+            ["project"] = project,
+            ["publishing_turned_on"] = list!.PublishingAvailable,
+            ["destinations"] = Array(list.Destinations, ReleaseDestinationJson)
+        }.ToJsonString();
+    }
+
+    [McpServerTool(Name = "graft_set_release_destination")]
+    [Description("Adds a release destination, or changes the one of that name. The endpoint and the key are required for a new destination and are write-only: pass them empty on a change to keep what is stored. Every other setting is replaced by what is given here, so repeat the ones to keep. Rules are one per line, '<file pattern> <platform> [architecture] [main]' or '<file pattern> skip'; a file no rule matches is guessed from its name, and a dry run with graft_publish_release shows the guess. Needs the Maintainer role, and the operator's --release-publishing switch. Refused unless writes are allowed on this server.")]
+    public static async Task<string> SetReleaseDestination(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("The destination's name within the project: lower-case letters, digits, '-' and '_'.")] string name,
+        [Description("The store's API address, as its operator gave it. Empty keeps the stored one.")] string endpoint,
+        [Description("The store's API key. Empty keeps the stored one. It is never shown again.")] string apiKey,
+        [Description("The application's id in the store, a UUID.")] string applicationId,
+        [Description("The channel a publication puts builds on: stable or beta, or none to upload without publishing. Empty means none.")] string channel,
+        [Description("Whether a publication may put builds on a channel, where the store's users receive them. The stable and beta channels are refused without it; false with the channel none.")] bool allowProductionPromotion,
+        [Description("Optional: the package name the store should expect, for an Android package. Empty for none.")] string packageName,
+        [Description("Optional: the file rules, one per line. Empty guesses every file from its name.")] string rules,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowWrites) return Refused(graft, "changing a release destination");
+        JsonObject body = new()
+        {
+            ["application_id"] = (applicationId ?? "").Trim(),
+            ["channel"] = string.IsNullOrWhiteSpace(channel) ? "none" : channel.Trim(),
+            ["allow_production_promotion"] = allowProductionPromotion
+        };
+        if (!string.IsNullOrWhiteSpace(endpoint)) body["endpoint"] = endpoint.Trim();
+        if (!string.IsNullOrEmpty(apiKey)) body["api_key"] = apiKey;
+        if (!string.IsNullOrWhiteSpace(packageName)) body["package_name"] = packageName.Trim();
+        if (!string.IsNullOrWhiteSpace(rules)) body["rules"] = rules;
+
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Put,
+            "api/graft/projects/" + Encode(project) + "/release-destinations/" + Uri.EscapeDataString((name ?? "").Trim()), body, cancellationToken);
+        if (!ok) return Failure(Explain(status, response));
+        return Created(response, ApiJson.Default.ReleaseDestinationResponse, ReleaseDestinationJson);
+    }
+
+    [McpServerTool(Name = "graft_delete_release_destination")]
+    [Description("Removes a release destination with the endpoint and key stored for it. They cannot be read back, so adding it again needs them from the store's operator. What was already published stays in the store. Needs the Maintainer role. Refused unless deleting is allowed on this server.")]
+    public static async Task<string> DeleteReleaseDestination(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("The destination's name.")] string name,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowDestructive) return RefusedDestructive(graft, "removing a release destination");
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Delete,
+            "api/graft/projects/" + Encode(project) + "/release-destinations/" + Uri.EscapeDataString((name ?? "").Trim()), null, cancellationToken);
+        return ok
+            ? new JsonObject { ["project"] = project, ["name"] = name, ["deleted"] = true }.ToJsonString()
+            : Failure(ExplainPublishing(status, response));
+    }
+
+    [McpServerTool(Name = "graft_publish_release")]
+    [Description("Queues a release's files for publication to one of the project's release destinations and answers at once; the server uploads in the background, so follow it with graft_get_release_publication until its state is succeeded or failed. With dryRun true the store is only asked what it accepts and each file's platform is reported: nothing is uploaded or published, so start there. A real publication uploads every file, and only when the store accepted them all puts the builds on the destination's channel. Asking again is safe: nothing is uploaded or published twice. A failure caused by a revision conflict means somebody else changed the application; report it rather than retrying. Needs the Maintainer role. Refused unless writes are allowed on this server.")]
+    public static async Task<string> PublishRelease(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("The release's tag, such as v1.2.0.")] string tag,
+        [Description("The destination's name, as graft_list_release_destinations reports it.")] string destination,
+        [Description("True to check the release against the store without uploading anything.")] bool dryRun,
+        CancellationToken cancellationToken)
+    {
+        if (!graft.AllowWrites) return Refused(graft, dryRun ? "checking a release against a destination" : "publishing a release");
+        if (string.IsNullOrWhiteSpace(tag)) return Failure("Name the release's tag.");
+        if (string.IsNullOrWhiteSpace(destination)) return Failure("Name the destination.");
+
+        (bool ok, string response, int status) = await graft.SendAsync(HttpMethod.Post,
+            "api/graft/projects/" + Encode(project) + "/releases/" + Uri.EscapeDataString(tag.Trim()) + "/publications",
+            new JsonObject { ["destination"] = destination.Trim(), ["dry_run"] = dryRun }, cancellationToken);
+        if (!ok) return Failure(ExplainPublishing(status, response));
+        return Created(response, ApiJson.Default.ReleasePublicationResponse, ReleasePublicationJson);
+    }
+
+    [McpServerTool(Name = "graft_list_release_publications")]
+    [Description("Lists the attempts to publish one release, newest first: each one's destination, whether it was a dry run, its state and what became of every file. Needs the Maintainer role.")]
+    public static async Task<string> ListReleasePublications(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("The release's tag, such as v1.2.0.")] string tag,
+        CancellationToken cancellationToken)
+    {
+        (ReleasePublicationResponse[]? publications, string? error) = await graft.GetAsync(
+            "api/graft/projects/" + Encode(project) + "/releases/" + Uri.EscapeDataString((tag ?? "").Trim()) + "/publications",
+            ApiJson.Default.ReleasePublicationResponseArray, cancellationToken);
+        if (error is not null) return Failure(error);
+        return new JsonObject { ["project"] = project, ["tag"] = tag, ["publications"] = Array(publications!, ReleasePublicationJson) }.ToJsonString();
+    }
+
+    [McpServerTool(Name = "graft_get_release_publication")]
+    [Description("Reads one publication by the id graft_publish_release returned: queued, running, succeeded or failed, a summary in words, and each file's state, platform, the store's build id and both hashes. An Android package's hash in the store may differ from the one sent, because a store that signs a package changes it. Needs the Maintainer role.")]
+    public static async Task<string> GetReleasePublication(
+        GraftClient graft,
+        [Description("The project path like alice/widgets, its instance-wide slug, or its numeric id.")] string project,
+        [Description("The publication's id.")] long id,
+        CancellationToken cancellationToken)
+    {
+        (ReleasePublicationResponse? publication, string? error) = await graft.GetAsync(
+            "api/graft/projects/" + Encode(project) + "/release-publications/" + Number(id), ApiJson.Default.ReleasePublicationResponse, cancellationToken);
+        if (error is not null) return Failure(error);
+        return ReleasePublicationJson(publication!).ToJsonString();
+    }
+
+    /// <summary>A 404 from these routes is as often a release or a destination that is not there as a project, and
+    /// the route says which.</summary>
+    private static string ExplainPublishing(int status, string body) =>
+        status == 404 && Field(body, "message") is string reason && reason.Length > 0
+            ? "Not found: " + reason + " (A project the token's owner may not see answers the same way.)"
+            : Explain(status, body);
+
+    private static JsonObject ReleaseDestinationJson(ReleaseDestinationResponse destination) => new()
+    {
+        ["name"] = destination.Name,
+        ["kind"] = destination.Kind,
+        ["endpoint_host"] = destination.EndpointHost,
+        ["application_id"] = destination.ApplicationId,
+        ["channel"] = destination.Channel,
+        ["allow_production_promotion"] = destination.AllowProductionPromotion,
+        ["package_name"] = destination.PackageName,
+        ["rules"] = destination.Rules,
+        ["updated_at"] = destination.UpdatedAt.ToString("O", CultureInfo.InvariantCulture),
+        ["updated_by"] = destination.UpdatedBy
+    };
+
+    private static JsonObject ReleasePublicationJson(ReleasePublicationResponse publication) => new()
+    {
+        ["id"] = publication.Id,
+        ["destination"] = publication.Destination,
+        ["tag"] = publication.TagName,
+        ["state"] = publication.State,
+        ["dry_run"] = publication.DryRun,
+        ["channel"] = publication.Channel,
+        ["summary"] = publication.Summary,
+        ["channel_verified"] = publication.ChannelVerified,
+        ["requested_by"] = publication.RequestedBy,
+        ["created_at"] = publication.CreatedAt.ToString("O", CultureInfo.InvariantCulture),
+        ["finished_at"] = publication.FinishedAt?.ToString("O", CultureInfo.InvariantCulture),
+        ["files"] = Array(publication.Files, file => new JsonObject
+        {
+            ["name"] = file.FileName,
+            ["format"] = file.Format,
+            ["platform"] = file.Platform,
+            ["architecture"] = file.Architecture,
+            ["state"] = file.State,
+            ["build_id"] = file.BuildId,
+            ["uploaded_sha256"] = file.UploadedSha256,
+            ["store_sha256"] = file.StoreSha256,
+            ["problem"] = file.Problem
+        })
+    };
+
     [McpServerTool(Name = "graft_read_wiki")]
     [Description("Reads a project's wiki: with no page, lists the pages; with a page's slug, returns that page's markdown source and its history.")]
     public static async Task<string> ReadWiki(

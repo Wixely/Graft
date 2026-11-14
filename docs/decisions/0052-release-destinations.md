@@ -6,7 +6,8 @@
   a written HTTP contract supplied with the request and nothing else: "Do not access [its] database, filesystem or
   MCP server." Settled in the same conversation: the store is not named in this repository; a publication is
   started by "maintainer or automated action from a runner"; and the 32 MiB bound on a release file is raised "in
-  this work"
+  this work". Amended the same day by the project owner, who asked for all of it to be configurable by an
+  agent over MCP, which reverses the first answer in decision 6 and is recorded there
 - Builds on: [ADR 0022](0022-releases.md) (releases, and who may publish one),
   [ADR 0027](0027-packages-and-registry.md) (files beside the repository),
   [ADR 0042](0042-import-by-address-and-mirrors.md) (an operator's policy for addresses the server calls),
@@ -14,7 +15,8 @@
 - Supersedes: the decision in ADR 0022 that a release file's bytes live in the database, bounded at 32 MiB
 - Review trigger: a second kind of destination; a request to publish automatically when a release is created; a
   runner job that needs a credential of its own instead of a person's token; a release file that has to pass a
-  proxy that caps a request's size; a request for an agent to publish; a store whose expired upload sessions block
+  proxy that caps a request's size; an agent publishing somewhere a person did not
+  intend, which would argue for a switch of its own beside writes; a store whose expired upload sessions block
   a retry
 
 ## What was asked for, and what was there
@@ -29,7 +31,8 @@ be reported before anything was built. They were:
 - **A release has no version, platform, architecture or package name.** Decision 4.
 - **A release file was at most 32 MiB**, in a database row. Decision 7.
 - **Graft has no secret references.** A secret is either never stored or stored under the key ring. Decision 3.
-- **ADR 0022 withholds publishing a release from agents.** Kept: decision 6.
+- **ADR 0022 withholds publishing a release from agents.** Kept at first, then reversed for destinations and
+  publications by the project owner: decision 6. Creating a release and attaching a file are still withheld.
 - **Tests are acceptance programs, not a unit-test framework.** The fake store lives in them: see the end.
 
 ## Decision 1: a destination is a project's, and a publisher is an interface with one implementation
@@ -127,8 +130,23 @@ A publication is started from the release's page, or by `POST` to the token rout
 job calls. Graft's jobs have no credential of their own for the HTTP API and no stored secret variables, so the
 job uses a token its runner's environment provides; giving jobs their own is a review trigger.
 
-There is no MCP tool for any of this. ADR 0022 said a release speaks for the project and is for a person to
-publish, and sending it to a store is the same act, further.
+As first built there was no MCP tool for any of this, on ADR 0022's reasoning that a release speaks for the
+project and is for a person to publish. The project owner reversed that the same day, and an agent now has all of
+it, through the token routes and so with exactly what its token's owner may do:
+
+| Tool | Needs |
+|---|---|
+| `graft_list_release_destinations` | Maintainer. |
+| `graft_set_release_destination` | Maintainer, and writes allowed. The endpoint and key go in and never come back; empty keeps the stored ones. |
+| `graft_delete_release_destination` | Maintainer, and the destructive switch, as deleting a page artifact does: the stored key cannot be read back. |
+| `graft_publish_release` | Maintainer, and writes allowed, for a dry run as well: it queues work and makes the server call out. |
+| `graft_list_release_publications`, `graft_get_release_publication` | Maintainer. |
+
+What stands between an agent and a store's users is therefore what stands between a script and them: the
+operator's switch, the Maintainer role, the administrator's write switch for agents, and the destination's own
+promotion setting, which an agent with those may also change. No separate switch was added; that is a review
+trigger. ADR 0022's decision is otherwise as it was: no tool creates a release or attaches a file, so an agent
+publishes a release a person made.
 
 ## Decision 7: a release file is on disk, up to 2 GiB
 
@@ -183,6 +201,12 @@ chunk address, with a client that does and does not follow them; an upload addre
 idempotency conflict; a revision conflict stopping after one attempt; a wrong key, a missing scope, an unknown
 application and an unreachable store; and every message produced across all of it searched for the key, a
 transfer token, the endpoint's path and an upload address.
+
+`tests/Graft.Mcp.Acceptance` (`CheckReleaseDestinations`), with the same fake store, through the forge's own
+`/mcp` endpoint: listing, adding, the refusals for a missing endpoint, a channel without promotion and a rule
+that does not parse; a dry run that uploads nothing; a publication followed to the store's build on its channel;
+a repeat that uploads and publishes nothing; a change that keeps the stored endpoint and key; removal refused
+until the destructive switch is on; and every answer searched for the key and the endpoint's path.
 
 Writing that suite found that a client which follows a redirect rewrites the request it was given, so comparing
 the answer's address with the request's own detected nothing. The address asked for is now kept apart.

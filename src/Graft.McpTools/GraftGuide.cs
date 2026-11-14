@@ -61,6 +61,11 @@ public static class GraftGuide
         save keeps the previous text as a version. graft_list_releases shows what a project has shipped and
         where to download it.
 
+        Publishing. A Maintainer can send a release's files to an application store the project names as a
+        release destination: graft_list_release_destinations, graft_set_release_destination, then
+        graft_publish_release with dryRun true before the real one, and graft_get_release_publication until
+        it has succeeded or failed. A destination's endpoint and key go in and are never shown again.
+
         Ask graft_help for detail on: addressing, permissions, visibility, pages, writing, collaboration,
         limits.
         """;

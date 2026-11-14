@@ -113,6 +113,16 @@ when the store signs it.
 A job needs a token that belongs to a Maintainer and has the `api` scope. Graft does not hold secrets for jobs,
 so the token comes from the runner's own environment.
 
+### From an agent
+
+Where the forge's MCP endpoint is on and an administrator has allowed writes, an agent whose token belongs to a
+Maintainer can do all of the above: `graft_list_release_destinations`, `graft_set_release_destination`,
+`graft_publish_release` (with `dryRun` first), then `graft_get_release_publication` until the state is `succeeded`
+or `failed`, and `graft_list_release_publications` for a release's history. `graft_delete_release_destination`
+also needs the administrator's switch for deleting. The endpoint and the key can be given to the agent to enter,
+or entered by a person in the browser and left empty by the agent, which keeps them. No tool ever returns them.
+An agent cannot create a release or attach a file to one; it publishes a release a person made.
+
 ## When it fails
 
 Nothing is published unless every file of the release was accepted. The summary says what stopped it.

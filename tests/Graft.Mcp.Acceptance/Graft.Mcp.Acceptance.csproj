@@ -8,6 +8,9 @@
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="../Graft.TestSupport/FakeAppStore.cs" Link="FakeAppStore.cs" />
+  </ItemGroup>
+  <ItemGroup>
     <!-- The binaries under test are launched as child processes, exactly as an MCP client would launch
          them, so neither is referenced for its types. -->
     <ProjectReference Include="../../src/Graft.Server/Graft.Server.csproj" ReferenceOutputAssembly="false" />

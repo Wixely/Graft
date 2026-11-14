@@ -26,7 +26,11 @@ store is not named in this repository, by the project owner's decision. [ADR 005
   `ReleasePublishingChecks` in `tests/Graft.Acceptance`; `CheckReleasePublishing` in `tests/Graft.Git.Acceptance`.
 - **Not verified.** Any real store: the contract was all there was, and the fake is this repository's reading of
   it. The NativeAOT publish of this change.
-- **Not done.** No agent tool, by ADR 0022's reasoning. No automatic publication on release. A runner job has no
+- **Agents.** Six tools, added the same day at the project owner's request, reversing the first decision: list,
+  set and delete a destination, publish (or dry run), list and get publications. In `GraftTools.cs` after
+  `graft_list_releases`. The tool count is 64 and three assertions in `tests/Graft.Mcp.Acceptance` say so;
+  `CheckReleaseDestinations` there drives them against the fake store. No tool creates a release or attaches a file.
+- **Not done.** No automatic publication on release. A runner job has no
   credential of its own, so a job publishes with a Maintainer's token from its runner's environment.
 - **Next action (project owner).** Get the endpoint, application UUID and a scoped key from the store's operator,
   redeploy with `GRAFT_RELEASE_PUBLISHING=public`, add a destination with the channel `none`, and run a dry run
