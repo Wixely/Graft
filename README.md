@@ -136,6 +136,7 @@ All are off or at their default unless given. The [deployment runbook](docs/depl
 | `--runner-downloads <directory>` | Serve the runner and `git-remote-graft` executables from this directory to the install scripts. Put the release's `graft-runner-*` and `git-remote-graft-*` files there under their release names. |
 | `--transfer-part-size <MiB>` | Largest part `git-remote-graft` sends; 16 by default, under Cloudflare's 100 MB. |
 | `--url-import public\|any` | Allow importing and mirroring repositories by address. |
+| `--release-publishing public\|any` | Allow publishing releases to an application store ([how](docs/release-destinations.md)). |
 | `--public-browsing true` | Let public projects be read without signing in. |
 | `--mcp true` | Serve the Model Context Protocol endpoint at `/mcp`. |
 | `--webhooks true`, `--mail-smtp <url>` | Outbound webhooks; email. |

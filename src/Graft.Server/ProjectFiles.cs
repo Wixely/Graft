@@ -20,6 +20,18 @@ public sealed class ProjectFiles(string repositoryRoot)
     public string PackagePath(string packageType, string name, string version, string fileName) =>
         Path.Combine(root, "packages", packageType, name.ToLowerInvariant().Replace('/', Path.DirectorySeparatorChar), version.ToLowerInvariant(), fileName);
 
+    /// <summary>A release file's path (ADR 0052). The name is one the server generated, which the store checks before it keeps it.</summary>
+    public string ReleaseFilePath(string stored) => Path.Combine(root, "release-files", stored);
+
+    /// <summary>Removes a release file whose row is gone. A file somebody is still downloading is left for the project's deletion.</summary>
+    public void DeleteReleaseFile(string? stored)
+    {
+        if (stored is null) return;
+        try { File.Delete(ReleaseFilePath(stored)); }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+
     public string BlobPath(string digestHex) => Path.Combine(root, "registry", "blobs", "sha256", digestHex[..2], digestHex);
     public string ManifestPath(string digestHex) => Path.Combine(root, "registry", "manifests", "sha256", digestHex[..2], digestHex);
     public string UploadPath(string uploadId) => Path.Combine(root, "registry", "uploads", uploadId);

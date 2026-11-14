@@ -4,7 +4,7 @@ namespace Graft.Storage;
 
 public static class GraftSchema
 {
-    public static DnaXMigrationManifest Manifest { get; } = new(30,
+    public static DnaXMigrationManifest Manifest { get; } = new(31,
     [
         DnaXMigration.Sql(1, "initial-identity-project-schema", "Create identity and private project schema", """
             CREATE TABLE Users (
@@ -951,6 +951,58 @@ public static class GraftSchema
                 UpdatedAtUtc TEXT NOT NULL,
                 UNIQUE (ProjectId, Name)
             );
+            """),
+        // Larger release files, and publishing a release somewhere else (ADR 0052).
+        //
+        // A release file's bytes now live on disk beside the repository, under the name in Stored, as a package's
+        // do. A row written before this keeps its bytes in Bytes and has no Stored; both are read, and nothing is
+        // moved, because a migration that copied every blob out of the database could fail halfway.
+        //
+        // A destination is somewhere a release can be published to. Its endpoint and its key are protected by the
+        // server's key ring before they reach these columns, and neither is ever read back out to a caller; the
+        // host is kept beside them so a list can say where a destination points without unprotecting anything.
+        // A publication is one attempt, kept so its outcome can be read after the request that started it.
+        DnaXMigration.Sql(31, "release-destinations", "Release files on disk, and publishing a release to a destination", """
+            ALTER TABLE ReleaseAssets ADD COLUMN Stored TEXT NULL;
+
+            CREATE TABLE ReleaseDestinations (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                Name TEXT NOT NULL,
+                Kind TEXT NOT NULL,
+                EndpointHost TEXT NOT NULL,
+                ProtectedEndpoint TEXT NOT NULL,
+                ProtectedKey TEXT NOT NULL,
+                ApplicationId TEXT NOT NULL,
+                Channel TEXT NOT NULL CHECK (Channel IN ('none', 'stable', 'beta')),
+                AllowProductionPromotion INTEGER NOT NULL DEFAULT 0 CHECK (AllowProductionPromotion IN (0, 1)),
+                PackageName TEXT NULL,
+                Rules TEXT NOT NULL DEFAULT '',
+                UpdatedByUserId INTEGER NOT NULL REFERENCES Users(Id),
+                CreatedAtUtc TEXT NOT NULL,
+                UpdatedAtUtc TEXT NOT NULL,
+                UNIQUE (ProjectId, Name)
+            );
+
+            CREATE TABLE ReleasePublications (
+                Id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                DestinationId INTEGER NOT NULL REFERENCES ReleaseDestinations(Id) ON DELETE CASCADE,
+                ReleaseId INTEGER NOT NULL REFERENCES Releases(Id) ON DELETE CASCADE,
+                TagName TEXT NOT NULL,
+                State TEXT NOT NULL CHECK (State IN ('queued', 'running', 'succeeded', 'failed')),
+                DryRun INTEGER NOT NULL DEFAULT 0 CHECK (DryRun IN (0, 1)),
+                Channel TEXT NOT NULL,
+                Summary TEXT NOT NULL DEFAULT '',
+                Artifacts TEXT NOT NULL DEFAULT '[]',
+                ChannelVerified INTEGER NULL,
+                RequestedByUserId INTEGER NOT NULL REFERENCES Users(Id),
+                CreatedAtUtc TEXT NOT NULL,
+                FinishedAtUtc TEXT NULL
+            );
+
+            CREATE INDEX IX_ReleasePublications_Release ON ReleasePublications(ReleaseId, Id);
+            CREATE INDEX IX_ReleasePublications_State ON ReleasePublications(State, Id);
             """)
     ]);
 }

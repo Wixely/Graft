@@ -580,6 +580,67 @@ public sealed record PageServingSettingsResponse(
 
 public sealed record PageServingSettingsRequest(string ArtifactPrefix, int ArtifactMaximumMebibytes, PageFileTypeEntry[]? FileTypes);
 
+/// <summary>
+/// Somewhere a project's releases can be published to (ADR 0052). The endpoint is never returned, only its
+/// host; the key is never returned at all.
+/// </summary>
+public sealed record ReleaseDestinationResponse(
+    string Name,
+    string Kind,
+    string EndpointHost,
+    string ApplicationId,
+    string Channel,
+    bool AllowProductionPromotion,
+    string? PackageName,
+    string Rules,
+    string UpdatedBy,
+    DateTimeOffset UpdatedAt);
+
+/// <summary>A project's release destinations, and whether this server publishes anywhere at all.</summary>
+public sealed record ReleaseDestinationListResponse(ReleaseDestinationResponse[] Destinations, bool PublishingAvailable);
+
+/// <summary>
+/// Creates or changes a destination. The endpoint and the key are required for a new one; left out of a
+/// change, what is stored is kept.
+/// </summary>
+public sealed record ReleaseDestinationRequest(
+    string? Endpoint,
+    string? ApiKey,
+    string? ApplicationId,
+    string? Channel,
+    bool AllowProductionPromotion = false,
+    string? PackageName = null,
+    string? Rules = null);
+
+/// <summary>Asks for a release to be published to a destination, or with <c>dry_run</c> only checked against it.</summary>
+public sealed record ReleasePublicationRequest(string? Destination, bool DryRun = false);
+
+public sealed record ReleasePublicationFileResponse(
+    string FileName,
+    string Format,
+    string Platform,
+    string Architecture,
+    string State,
+    string? BuildId,
+    string UploadedSha256,
+    string? StoreSha256,
+    string? Problem);
+
+/// <summary>One attempt to publish a release: queued, running, succeeded or failed, and what became of each file.</summary>
+public sealed record ReleasePublicationResponse(
+    long Id,
+    string Destination,
+    string TagName,
+    string State,
+    bool DryRun,
+    string Channel,
+    string Summary,
+    ReleasePublicationFileResponse[] Files,
+    bool? ChannelVerified,
+    string RequestedBy,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset? FinishedAt);
+
 /// <summary>Where a project's banner is served, or null when it has none (ADR 0046). Graft's own shape for the
 /// same reason as <see cref="PageStateResponse"/>: GitLab has no banner.</summary>
 public sealed record BannerStateResponse(long ProjectId, [property: JsonPropertyName("banner_url")] string? BannerUrl);
@@ -1601,6 +1662,12 @@ public sealed record ProjectUploadResponse(
 [JsonSerializable(typeof(PageArtifactPromotionRequest))]
 [JsonSerializable(typeof(PageServingSettingsResponse))]
 [JsonSerializable(typeof(PageServingSettingsRequest))]
+[JsonSerializable(typeof(ReleaseDestinationResponse))]
+[JsonSerializable(typeof(ReleaseDestinationListResponse))]
+[JsonSerializable(typeof(ReleaseDestinationRequest))]
+[JsonSerializable(typeof(ReleasePublicationRequest))]
+[JsonSerializable(typeof(ReleasePublicationResponse))]
+[JsonSerializable(typeof(ReleasePublicationResponse[]))]
 [JsonSerializable(typeof(BannerStateResponse))]
 [JsonSerializable(typeof(ProjectApprovalsResponse))]
 [JsonSerializable(typeof(ProjectTransferRequest))]

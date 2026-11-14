@@ -1,6 +1,36 @@
 # Next-agent handoff
 
-Updated: 2026-11-13. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the project owner.
+Updated: 2026-11-14. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the project owner.
+
+## Added on 2026-11-14: release destinations, and release files on disk
+
+A request to publish releases to an application store whose code is private, against a written HTTP contract. The
+store is not named in this repository, by the project owner's decision. [ADR 0052](decisions/0052-release-destinations.md),
+[the guide](release-destinations.md). Migration 31.
+
+- **The publisher.** `IReleasePublisher` and `AppStorePublisher` in `Graft.Core/AppStorePublisher.cs`: capabilities,
+  one upload session per file, hashed chunks to the store's own origin, finalize, poll, then publish and read back.
+  The rules for a destination's settings and for declaring a file are in `Graft.Core/ReleasePublishing.cs`. Every
+  message leaves through `Redactor`; do not add a message path that goes round it.
+- **Storage.** `GraftStoreReleaseDestinations.cs`: `ReleaseDestinations` and `ReleasePublications`. The endpoint
+  and key columns hold what the server's key ring protected (purpose `graft.release-destinations.v1`).
+- **Server.** `--release-publishing off|public|any`, off by default. `ReleasePublishingWorker` in
+  `ReleasePublishing.cs` takes queued publications one at a time; the queue is the table. Routes are in the
+  page-artifacts loop in `Program.cs`, in both families. Everything needs Maintainer.
+- **Release files.** On disk under `release-files/` in the repository directory, up to 2 GiB, streamed and hashed
+  by `ProjectFiles.WriteAsync`. Rows from before keep their bytes in the database and are still read; nothing is
+  migrated.
+- **Browser.** `ReleaseDestinationsPanel.razor` in project settings; a Publish panel on a release in
+  `Releases.razor`, which polls while a publication is under way.
+- **Tests.** `tests/Graft.TestSupport/FakeAppStore.cs` is compiled into both suites that use it.
+  `ReleasePublishingChecks` in `tests/Graft.Acceptance`; `CheckReleasePublishing` in `tests/Graft.Git.Acceptance`.
+- **Not verified.** Any real store: the contract was all there was, and the fake is this repository's reading of
+  it. The NativeAOT publish of this change.
+- **Not done.** No agent tool, by ADR 0022's reasoning. No automatic publication on release. A runner job has no
+  credential of its own, so a job publishes with a Maintainer's token from its runner's environment.
+- **Next action (project owner).** Get the endpoint, application UUID and a scoped key from the store's operator,
+  redeploy with `GRAFT_RELEASE_PUBLISHING=public`, add a destination with the channel `none`, and run a dry run
+  and then an upload against the real store. Report anything the store does that the contract did not say.
 
 ## Added on 2026-11-13: page artifacts
 

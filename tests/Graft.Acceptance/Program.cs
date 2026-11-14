@@ -464,6 +464,9 @@ try
             "the private ranges end where they end");
     }
 
+    // Publishing a release to a destination (ADR 0052): the settings' rules, and the publisher against a store of our own.
+    assertions += await ReleasePublishingChecks.RunAsync();
+
     Console.WriteLine($"RESULT: PASS; assertions: {assertions}");
     Console.WriteLine("BOUNDARY: shared authorization decisions are exercised for REST, browse, fetch and push capabilities; actual HTTP/Git transport is MVP-05.");
     return 0;

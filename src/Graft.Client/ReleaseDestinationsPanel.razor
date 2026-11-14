@@ -1,0 +1,205 @@
+@* A project's release destinations (ADR 0052), in its settings: where a release can be published outside the
+   forge. Shown to whoever can manage the project. The endpoint and the key are entered here and never shown
+   again; what a destination shows of its endpoint is the host. *@
+@inject GraftApi Api
+
+<div class="panel">
+    <div class="panel-header">
+        <Icon Name="upload" /><h2>Release destinations</h2><span class="spacer"></span>
+        @if (list is not null) { <span class="label">@list.Destinations.Length</span> }
+    </div>
+    <div class="panel-body">
+        <p class="secondary-text">
+            A release destination is an application store this project's releases can be published to. A
+            release's files are uploaded as builds, and then, if the destination names a channel, published on
+            it. Publishing is started from a release, by a Maintainer or by a script with a Maintainer's token.
+        </p>
+        <Banner Message="@message" Kind="@messageKind" />
+        @if (list is { PublishingAvailable: false })
+        {
+            <div class="banner warning">
+                <Icon Name="alert" />
+                <span>This server does not publish releases anywhere. An operator turns it on with <code>--release-publishing</code>. A destination can still be removed.</span>
+            </div>
+        }
+    </div>
+    @if (list is null)
+    {
+        <p role="status" class="panel-empty">@(loading ? "Loading…" : "The release destinations could not be read.")</p>
+    }
+    else if (list.Destinations.Length == 0)
+    {
+        <p class="panel-empty">No destinations.</p>
+    }
+    else
+    {
+        <div class="list">
+            @foreach (ReleaseDestinationResponse destination in list.Destinations)
+            {
+                <div class="list-item">
+                    <Icon Name="upload" />
+                    <span class="list-item-main">
+                        <strong>
+                            @destination.Name
+                            <span class="label @(destination.Channel == "none" ? "" : "accent")">@(destination.Channel == "none" ? "upload only" : destination.Channel)</span>
+                        </strong>
+                        <small>
+                            @destination.EndpointHost &middot; application <code>@destination.ApplicationId</code>
+                            @if (destination.PackageName is not null) { <span> &middot; <code>@destination.PackageName</code></span> }
+                        </small>
+                        <small>@destination.UpdatedBy &middot; @destination.UpdatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")</small>
+                    </span>
+                    <button type="button" class="link" @onclick="() => Edit(destination)" disabled="@busy">Edit</button>
+                    <button type="button" class="link danger-text" @onclick="() => Delete(destination)" disabled="@busy">
+                        @(confirming == destination.Name ? "Confirm remove" : "Remove")
+                    </button>
+                </div>
+            }
+        </div>
+    }
+    @if (list is { PublishingAvailable: true })
+    {
+        <div class="panel-body">
+            <form class="form" @onsubmit="Save" @onsubmit:preventDefault>
+                <label for="destination-name">@(editing ? "Change the destination named" : "Add a destination named")</label>
+                <input id="destination-name" @bind="name" maxlength="40" pattern="[a-z0-9][a-z0-9_\-]*" placeholder="store" autocomplete="off" spellcheck="false" readonly="@editing" required />
+                <label for="destination-endpoint">Endpoint</label>
+                <input id="destination-endpoint" type="url" @bind="endpoint" maxlength="2048" placeholder="@(editing ? "Unchanged unless you enter one" : "https://<host>/<path>/api/v1")" autocomplete="off" spellcheck="false" required="@(!editing)" />
+                <p class="field-hint">The complete address of the store's API, ending in <code>/api/v1</code>. It is stored protected and only its host is shown afterwards.</p>
+                <label for="destination-key">API key</label>
+                <input id="destination-key" type="password" @bind="apiKey" maxlength="512" placeholder="@(editing ? "Unchanged unless you enter one" : "")" autocomplete="new-password" required="@(!editing)" />
+                <p class="field-hint">Needs the <code>read</code> and <code>upload:test</code> scopes, and <code>promote:production</code> to publish to a channel. It is stored protected and never shown again.</p>
+                <label for="destination-application">Application</label>
+                <input id="destination-application" @bind="applicationId" maxlength="36" placeholder="00000000-0000-0000-0000-000000000000" autocomplete="off" spellcheck="false" required />
+                <label for="destination-channel">After upload</label>
+                <select id="destination-channel" @bind="channel">
+                    <option value="none">Leave the builds unpublished</option>
+                    <option value="beta">Publish to the beta channel</option>
+                    <option value="stable">Publish to the stable channel</option>
+                </select>
+                <label class="checkbox"><input type="checkbox" @bind="allowPromotion" /> Allow production promotion. Without this, the destination cannot publish to a channel.</label>
+                <label for="destination-package">Android package name</label>
+                <input id="destination-package" @bind="packageName" maxlength="255" placeholder="com.example.application" autocomplete="off" spellcheck="false" />
+                <p class="field-hint">Only needed when a release carries an <code>.apk</code>.</p>
+                <label for="destination-rules">File rules</label>
+                <textarea id="destination-rules" @bind="rules" rows="4" spellcheck="false" placeholder="*-win-x64.zip Windows x64 main&#10;*.sig skip"></textarea>
+                <p class="field-hint">
+                    One to a line: a file name pattern, then <code>skip</code>, or a platform (Android, Windows, Linux,
+                    MacOS, iOS, Unknown), an architecture, and <code>main</code> for the file the channel should
+                    report. A file no rule names is declared from its own name. A dry run shows what each file
+                    would be sent as.
+                </p>
+                <div class="form-actions">
+                    <button type="submit" disabled="@busy">@(busy ? "Saving…" : editing ? "Save destination" : "Add destination")</button>
+                    @if (editing) { <button type="button" class="secondary" @onclick="Reset" disabled="@busy">Cancel</button> }
+                </div>
+            </form>
+        </div>
+    }
+</div>
+
+@code {
+    [Parameter, EditorRequired] public long ProjectId { get; set; }
+
+    private ReleaseDestinationListResponse? list;
+    private string name = "";
+    private string endpoint = "";
+    private string apiKey = "";
+    private string applicationId = "";
+    private string channel = "none";
+    private bool allowPromotion;
+    private string packageName = "";
+    private string rules = "";
+    private bool editing;
+    private string message = "";
+    private string messageKind = "info";
+    private string? confirming;
+    private bool loading = true;
+    private bool busy;
+    private long loadedFor;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        if (loadedFor == ProjectId) return;
+        loadedFor = ProjectId;
+        await Load();
+    }
+
+    private async Task Load()
+    {
+        try
+        {
+            (bool reached, ReleaseDestinationListResponse? loaded) =
+                await Api.GetOptionalAsync($"api/projects/{ProjectId}/release-destinations", ApiJson.Default.ReleaseDestinationListResponse);
+            if (reached) list = loaded;
+        }
+        finally { loading = false; }
+    }
+
+    private void Edit(ReleaseDestinationResponse destination)
+    {
+        editing = true;
+        confirming = null;
+        name = destination.Name;
+        endpoint = "";
+        apiKey = "";
+        applicationId = destination.ApplicationId;
+        channel = destination.Channel;
+        allowPromotion = destination.AllowProductionPromotion;
+        packageName = destination.PackageName ?? "";
+        rules = destination.Rules;
+    }
+
+    private void Reset()
+    {
+        editing = false;
+        name = endpoint = apiKey = applicationId = packageName = rules = "";
+        channel = "none";
+        allowPromotion = false;
+    }
+
+    private async Task Save()
+    {
+        if (busy) return;
+        busy = true;
+        confirming = null;
+        try
+        {
+            string target = name.Trim();
+            ApiResult result = await Api.PostAsync($"api/projects/{ProjectId}/release-destinations/{Uri.EscapeDataString(target)}",
+                new ReleaseDestinationRequest(endpoint.Length == 0 ? null : endpoint, apiKey.Length == 0 ? null : apiKey, applicationId, channel,
+                    allowPromotion, packageName.Length == 0 ? null : packageName, rules),
+                ApiJson.Default.ReleaseDestinationRequest, $"Saved {target}. Try a dry run from a release to check it.");
+            Report(result);
+            // The key leaves the form whether or not it was accepted: a refused one is typed again, not left in the page.
+            apiKey = "";
+            if (!result.Ok) return;
+            Reset();
+            await Load();
+        }
+        finally { busy = false; }
+    }
+
+    /// <summary>The second click is the confirmation, as it is for deleting a file.</summary>
+    private async Task Delete(ReleaseDestinationResponse destination)
+    {
+        if (busy) return;
+        if (confirming != destination.Name) { confirming = destination.Name; return; }
+        busy = true;
+        confirming = null;
+        try
+        {
+            ApiResult result = await Api.DeleteAsync($"api/projects/{ProjectId}/release-destinations/{destination.Name}",
+                $"{destination.Name} is removed, with its stored endpoint and key.");
+            Report(result);
+            if (result.Ok) { if (editing && name == destination.Name) Reset(); await Load(); }
+        }
+        finally { busy = false; }
+    }
+
+    private void Report(ApiResult result)
+    {
+        message = result.Message;
+        messageKind = result.Ok ? "success" : "error";
+    }
+}

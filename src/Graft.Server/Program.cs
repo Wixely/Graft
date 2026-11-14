@@ -42,7 +42,7 @@ if (args.Length == 1 && args[0] == "--licences")
 
 if (!Arguments.TryParse(args, out Arguments? parsedSettings))
 {
-    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>] [--mcp true|false] [--pages-origin <https origin>] [--pages-root-redirect true|false] [--recoverable-tokens true|false] [--webhooks true|false] [--ssh-port <0-65535>] [--ssh-host <name>] [--mail-smtp <smtp|smtp+starttls|smtps URL>] [--mail-from <address>] [--mail-password-file <UTF-8 path>] [--runner-port <0-65535>] [--runner-host <name>] [--runner-downloads <directory>] [--runner-chunk-threshold <MiB|off>] [--runner-chunk-size <1-64 MiB>] [--push-delete true|false] [--url-import off|public|any] [--mirror-interval <15-10080 minutes>] [--transfer-part-size <1-95 MiB>] [--mail-digest-minutes <minutes, default 1440>].");
+    Console.Error.WriteLine("Usage: Graft.Server --database <path> --repositories <directory> [--listen <https URI>] [--origin <https origin>] [--certificate <PKCS#12 path>] [--certificate-password-file <UTF-8 path>] [--public-browsing true|false] [--push-to-create true|false] [--session-minutes <5-43200>] [--mcp true|false] [--pages-origin <https origin>] [--pages-root-redirect true|false] [--recoverable-tokens true|false] [--webhooks true|false] [--ssh-port <0-65535>] [--ssh-host <name>] [--mail-smtp <smtp|smtp+starttls|smtps URL>] [--mail-from <address>] [--mail-password-file <UTF-8 path>] [--runner-port <0-65535>] [--runner-host <name>] [--runner-downloads <directory>] [--runner-chunk-threshold <MiB|off>] [--runner-chunk-size <1-64 MiB>] [--push-delete true|false] [--url-import off|public|any] [--mirror-interval <15-10080 minutes>] [--transfer-part-size <1-95 MiB>] [--mail-digest-minutes <minutes, default 1440>] [--release-publishing off|public|any].");
     Console.Error.WriteLine("       Graft.Server --licences  prints the third-party notices this build redistributes.");
     Console.Error.WriteLine("       Graft.Server --version   prints the release this is.");
     return 2;
@@ -125,6 +125,7 @@ const string GlobalNamespace = "projects";
 const string McpSettingsItem = "graft.mcp.settings";
 const string McpWriteRemedy = "An administrator can allow writes under Administration, Agent access.";
 const string McpDestructiveRemedy = "An administrator can allow deleting and transferring projects under Administration, Agent access.";
+const string ReleasePublishingOff = "This server does not publish releases anywhere. An operator turns it on with --release-publishing.";
 McpEndpoint mcpEndpoint = new();
 
 // Browser uploads are mounted under Graft's own API namespace, never GitLab's. GitLab owns "/uploads/..."
@@ -237,6 +238,12 @@ await using WebhookSender? webhooks = settings.Webhooks ? new WebhookSender(stor
 using HttpClient? importClient = settings.UrlImport == UrlImportPolicy.Off ? null : ImportClient(settings.UrlImport);
 // Started once the server is listening; null when import is off, and then nothing schedules an update.
 MirrorWorker? mirrors = null;
+// Publishing releases to a destination, when the operator has allowed it (ADR 0052). A destination's endpoint and key
+// are kept under the key ring that already exists, with a purpose of their own, and unprotected only by the worker.
+// The client never follows a redirect: a key goes to the address it was given for, or nowhere.
+IDataProtector destinationProtector = app.Services.GetRequiredService<IDataProtectionProvider>().CreateProtector("graft.release-destinations.v1");
+using HttpClient? publishingClient = settings.ReleasePublishing == ReleasePublishingPolicy.Off ? null : PublishingClient(settings.ReleasePublishing);
+ReleasePublishingWorker? publishing = null;
 // Pushes, fetches and large files sent in parts by git-remote-graft, for a proxy that caps a request's size (ADR 0043).
 using TransferSessions transfers = new(settings.TransferPartBytes);
 // Mail, when the operator named a server. Off, the forge sends nothing and says so where it matters.
@@ -316,7 +323,11 @@ app.Use(async (context, next) =>
         context.Request.Path.StartsWithSegments("/v2") ||
         (context.Request.Path.Value?.Contains("/packages/", StringComparison.Ordinal) == true && context.Request.Method is "PUT" or "POST") ||
         // A page artifact arrives as one archive. The route bounds it by the administrator's own limit as it reads.
-        (context.Request.Path.Value?.Contains("/page-artifacts/", StringComparison.Ordinal) == true && context.Request.Method is "PUT");
+        (context.Request.Path.Value?.Contains("/page-artifacts/", StringComparison.Ordinal) == true && context.Request.Method is "PUT") ||
+        // A release file, sent as the request body or fetched back, is as large as a package (ADR 0052).
+        // The browser's receipt for one carries no bytes, but copying and hashing what was staged takes as long.
+        (context.Request.Path.StartsWithSegments("/api") && context.Request.Path.Value!.Contains("/releases/", StringComparison.Ordinal) &&
+            (context.Request.Path.Value.Contains("/assets/files/", StringComparison.Ordinal) || context.Request.Path.Value.EndsWith("/assets", StringComparison.Ordinal)));
     if (context.Request.Path.Value?.EndsWith(".git/git-receive-pack", StringComparison.Ordinal) == true || largeFile)
     {
         IHttpMaxRequestBodySizeFeature? bodySize = context.Features.Get<IHttpMaxRequestBodySizeFeature>();
@@ -2703,11 +2714,10 @@ app.MapGet("/api/graft/pages/{globalSlug}/releases/{tag}/assets/files/{fileName}
     { await ApiError(context, 404, "page"); return; }
     try
     {
-        (ReleaseAsset Asset, byte[] Bytes)? asset = await store.ReadReleaseAssetAsync(identity, found.Id, TagOf(context), FileNameOf(context),
+        StoredReleaseAsset? asset = await store.ReadReleaseAssetAsync(identity, found.Id, TagOf(context), FileNameOf(context),
             context.RequestAborted, page: page.Reach);
         if (asset is null) { await ApiError(context, 404, "file"); return; }
-        context.Response.Headers.ETag = "\"" + asset.Value.Asset.Sha256 + "\"";
-        await WriteDownload(context, asset.Value.Bytes, asset.Value.Asset.FileName, "application/octet-stream");
+        await WriteReleaseAsset(context, found, asset);
     }
     catch (UnauthorizedAccessException) { await ApiError(context, 404, "page"); }
 });
@@ -4354,7 +4364,138 @@ foreach ((string root, bool browserFamily) in new[] { ("/api/projects/{projectId
         catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Page Artifact Not Found"); }
         catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
     });
+
+    // Release destinations and publications (ADR 0052): where a project's releases can be published outside the
+    // forge, and each attempt. All of it is a Maintainer's, reading included, because a destination holds a
+    // credential and a publication spends it. The endpoint and the key go in and never come back out.
+    async Task<(ProjectDetails Details, AuthenticatedIdentity Identity)?> DestinationReader(HttpContext context)
+    {
+        var scope = await Reader(context);
+        if (scope is null) return null;
+        if (scope.Value.Identity is null) { await ApiError(context, 401, "authentication is required"); return null; }
+        PermissionDecision decision = await DecideFor(context, scope.Value.Identity, scope.Value.Details.Project.Id, ProjectAction.ManageProject);
+        if (!decision.Allowed) { await ApiError(context, 403, "Release destinations and publishing to them need the Maintainer role."); return null; }
+        return (scope.Value.Details, scope.Value.Identity);
+    }
+
+    app.MapGet(root + "/release-destinations", async context =>
+    {
+        var scope = await DestinationReader(context);
+        if (scope is null) return;
+        if (!await OnlyQuery(context)) return;
+        IReadOnlyList<ReleaseDestination> destinations = await store.ListReleaseDestinationsAsync(scope.Value.Identity, scope.Value.Details.Project.Id, context.RequestAborted);
+        await context.Response.WriteAsJsonAsync(new ReleaseDestinationListResponse([.. destinations.Select(ReleaseDestinationResponseFor)], publishingClient is not null),
+            ApiJson.Default.ReleaseDestinationListResponse, null, context.RequestAborted);
+    });
+
+    app.MapMethods(root + "/release-destinations/{name}", [browserFamily ? "POST" : "PUT"], async context =>
+    {
+        var scope = await Writer(context, ProjectAction.ManageProject);
+        if (scope is null) return;
+        if (publishingClient is null) { await ApiError(context, 400, ReleasePublishingOff); return; }
+        if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+        ReleaseDestinationRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.ReleaseDestinationRequest, context.RequestAborted);
+        if (request is null) { await ApiError(context, 400, "destination"); return; }
+        string name = context.Request.RouteValues["name"]?.ToString() ?? "";
+        string? host = null, protectedEndpoint = null, protectedKey = null;
+        if (!string.IsNullOrWhiteSpace(request.Endpoint))
+        {
+            Uri? endpoint = ReleaseDestinations.ParseEndpoint(request.Endpoint, settings.ReleasePublishing == ReleasePublishingPolicy.Any, out string endpointProblem);
+            if (endpoint is null) { await ApiError(context, 400, endpointProblem); return; }
+            host = endpoint.Authority;
+            protectedEndpoint = destinationProtector.Protect(endpoint.AbsoluteUri.TrimEnd('/'));
+        }
+        if (!string.IsNullOrEmpty(request.ApiKey))
+        {
+            if (request.ApiKey.Length is < 8 or > 512 || request.ApiKey.Any(character => char.IsWhiteSpace(character) || char.IsControl(character)))
+            { await ApiError(context, 400, "An API key is 8 to 512 characters with no spaces."); return; }
+            protectedKey = destinationProtector.Protect(request.ApiKey);
+        }
+        IReadOnlyList<ArtifactRule>? rules = ReleaseDestinations.ParseRules(request.Rules, out string rulesProblem);
+        if (rules is null) { await ApiError(context, 400, rulesProblem); return; }
+        try
+        {
+            (ReleaseDestination destination, bool created) = await store.PutReleaseDestinationAsync(scope.Value.Identity, scope.Value.Details.Project.Id, name,
+                host, protectedEndpoint, protectedKey, (request.ApplicationId ?? "").Trim(), (request.Channel ?? "none").Trim(), request.AllowProductionPromotion,
+                request.PackageName?.Trim(), rules, context.RequestAborted);
+            context.Response.StatusCode = created ? StatusCodes.Status201Created : StatusCodes.Status200OK;
+            await context.Response.WriteAsJsonAsync(ReleaseDestinationResponseFor(destination), ApiJson.Default.ReleaseDestinationResponse, null, context.RequestAborted);
+        }
+        catch (CollaborationConflictException error) { await ApiError(context, 409, error.Message); }
+        catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+        catch (ArgumentException error) { await ApiError(context, 400, error.Message.Split(" (Parameter", 2)[0]); }
+    });
+
+    // Removing a destination stays possible on a server that no longer publishes: it is how a stored key is got rid of.
+    app.MapDelete(root + "/release-destinations/{name}", async context =>
+    {
+        var scope = await Writer(context, ProjectAction.ManageProject);
+        if (scope is null) return;
+        if (!await OnlyQuery(context)) return;
+        try
+        {
+            await store.DeleteReleaseDestinationAsync(scope.Value.Identity, scope.Value.Details.Project.Id, context.Request.RouteValues["name"]?.ToString() ?? "", context.RequestAborted);
+            context.Response.StatusCode = StatusCodes.Status204NoContent;
+        }
+        catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Release Destination Not Found"); }
+        catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    });
+
+    app.MapGet(root + "/releases/{tag}/publications", async context =>
+    {
+        var scope = await DestinationReader(context);
+        if (scope is null) return;
+        if (!await OnlyQuery(context)) return;
+        IReadOnlyList<ReleasePublication> publications = await store.ListReleasePublicationsAsync(scope.Value.Identity, scope.Value.Details.Project.Id, TagOf(context), context.RequestAborted);
+        await context.Response.WriteAsJsonAsync([.. publications.Select(ReleasePublicationResponseFor)], ApiJson.Default.ReleasePublicationResponseArray, null, context.RequestAborted);
+    });
+
+    // Asking is all a request does: the publication is queued and answered with 202, and its outcome is read back
+    // from the address in Location. With dry_run, the destination is asked what it accepts and nothing is uploaded.
+    app.MapPost(root + "/releases/{tag}/publications", async context =>
+    {
+        var scope = await Writer(context, ProjectAction.ManageProject);
+        if (scope is null) return;
+        if (publishing is null) { await ApiError(context, 400, ReleasePublishingOff); return; }
+        if (!context.Request.HasJsonContentType()) { await ApiError(context, 415, "content-type"); return; }
+        ReleasePublicationRequest? request = await context.Request.ReadFromJsonAsync(ApiJson.Default.ReleasePublicationRequest, context.RequestAborted);
+        if (request?.Destination is not { Length: > 0 }) { await ApiError(context, 400, "destination is required"); return; }
+        try
+        {
+            ReleasePublication publication = await store.QueueReleasePublicationAsync(scope.Value.Identity, scope.Value.Details.Project.Id, TagOf(context),
+                request.Destination, request.DryRun, context.RequestAborted);
+            publishing.Wake();
+            context.Response.StatusCode = StatusCodes.Status202Accepted;
+            context.Response.Headers.Location = context.Request.PathBase + context.Request.Path.Value![..context.Request.Path.Value!.IndexOf("/releases/", StringComparison.Ordinal)] +
+                "/release-publications/" + publication.Id.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            await context.Response.WriteAsJsonAsync(ReleasePublicationResponseFor(publication), ApiJson.Default.ReleasePublicationResponse, null, context.RequestAborted);
+        }
+        catch (CollaborationNotFoundException error) { await ApiError(context, 404, error.Message); }
+        catch (CollaborationConflictException error) { await ApiError(context, 409, error.Message); }
+        catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
+    });
+
+    app.MapGet(root + "/release-publications/{publicationId:long}", async context =>
+    {
+        var scope = await DestinationReader(context);
+        if (scope is null) return;
+        if (!await OnlyQuery(context)) return;
+        ReleasePublication? publication = await store.FindReleasePublicationAsync(scope.Value.Identity, scope.Value.Details.Project.Id,
+            RouteId(context, "publicationId"), context.RequestAborted);
+        if (publication is null) { await ApiError(context, 404, "404 Publication Not Found"); return; }
+        await context.Response.WriteAsJsonAsync(ReleasePublicationResponseFor(publication), ApiJson.Default.ReleasePublicationResponse, null, context.RequestAborted);
+    });
 }
+
+static ReleaseDestinationResponse ReleaseDestinationResponseFor(ReleaseDestination destination) =>
+    new(destination.Name, destination.Kind, destination.EndpointHost, destination.ApplicationId, destination.Channel, destination.AllowProductionPromotion,
+        destination.PackageName, ReleaseDestinations.FormatRules(destination.Rules), destination.UpdatedByUsername, destination.UpdatedAtUtc);
+
+static ReleasePublicationResponse ReleasePublicationResponseFor(ReleasePublication publication) =>
+    new(publication.Id, publication.DestinationName, publication.TagName, publication.State, publication.DryRun, publication.Channel, publication.Summary,
+        [.. publication.Artifacts.Select(file => new ReleasePublicationFileResponse(file.FileName, file.Format, file.Platform, file.Architecture, file.State,
+            file.BuildId, file.UploadedSha256, file.StoreSha256, file.Problem))],
+        publication.ChannelVerified, publication.RequestedByUsername, publication.CreatedAtUtc, publication.FinishedAtUtc);
 
 PageArtifactFiles PageArtifactFilesOf(ProjectInfo project) => new(Path.Combine(settings.Repositories, project.StorageId));
 
@@ -6512,7 +6653,10 @@ async Task DeleteRelease(HttpContext context, ProjectDetails project, Authentica
     if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
     try
     {
-        await store.DeleteReleaseAsync(identity, project.Project.Id, TagOf(context), context.RequestAborted);
+        // The rows first: once they are gone nothing can be downloaded, whatever happens to the files.
+        IReadOnlyList<string> stored = await store.DeleteReleaseAsync(identity, project.Project.Id, TagOf(context), context.RequestAborted);
+        ProjectFiles files = FilesOf(project.Project);
+        foreach (string name in stored) files.DeleteReleaseFile(name);
         context.Response.StatusCode = StatusCodes.Status204NoContent;
     }
     catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Release Not Found"); }
@@ -6562,29 +6706,34 @@ string FileNameOf(HttpContext context)
 async Task PutReleaseAssetBytes(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
 {
     if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
-    if (context.Request.ContentLength > GraftStore.MaximumAssetBytes) { await ApiError(context, 413, "the file exceeds the 32 MiB asset limit"); return; }
-    byte[] bytes;
-    using (MemoryStream buffer = new())
-    {
-        await context.Request.Body.CopyToAsync(buffer, context.RequestAborted);
-        if (buffer.Length > GraftStore.MaximumAssetBytes) { await ApiError(context, 413, "the file exceeds the 32 MiB asset limit"); return; }
-        bytes = buffer.ToArray();
-    }
-    await StoreReleaseAsset(context, project, identity, FileNameOf(context), bytes);
+    if (context.Request.ContentLength > GraftStore.MaximumAssetBytes) { await ApiError(context, 413, "the file exceeds the 2 GiB asset limit"); return; }
+    await StoreReleaseAsset(context, project, identity, FileNameOf(context), context.Request.Body);
 }
 
-async Task StoreReleaseAsset(HttpContext context, ProjectDetails project, AuthenticatedIdentity identity, string fileName, byte[] bytes)
+// A release file goes to disk beside the repository as it is read, hashed on the way, and becomes a file of the
+// release only when the store has the row (ADR 0052). Whoever may not push is refused before a byte is written.
+async Task StoreReleaseAsset(HttpContext context, ProjectDetails project, AuthenticatedIdentity identity, string fileName, Stream content)
 {
+    PermissionDecision decision = await DecideFor(context, identity, project.Project.Id, ProjectAction.PushRepository);
+    if (!decision.Allowed) { await ApiError(context, 403, "Publishing a release needs the permission to push."); return; }
+    ProjectFiles files = FilesOf(project.Project);
+    string? stored = Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(16));
     try
     {
-        Release release = await store.PutReleaseAssetAsync(identity, project.Project.Id, TagOf(context), fileName, bytes, context.RequestAborted);
+        (string sha, long size) = await files.WriteAsync(files.ReleaseFilePath(stored), content, GraftStore.MaximumAssetBytes, context.RequestAborted);
+        (Release release, string? replaced) = await store.PutReleaseAssetAsync(identity, project.Project.Id, TagOf(context), fileName, size, sha, stored, context.RequestAborted);
+        stored = null;
+        // After the row has moved: a download that began on the earlier file keeps the handle it opened.
+        files.DeleteReleaseFile(replaced);
         context.Response.StatusCode = StatusCodes.Status201Created;
         await context.Response.WriteAsJsonAsync(await ReleaseResponseFor(context, project, release), ApiJson.Default.ReleaseResponse, null, context.RequestAborted);
     }
+    catch (InvalidDataException) { await ApiError(context, 413, "the file exceeds the 2 GiB asset limit"); }
     catch (CollaborationNotFoundException) { await ApiError(context, 404, "404 Release Not Found"); }
     catch (CollaborationConflictException error) { await ApiError(context, 409, error.Message); }
     catch (UnauthorizedAccessException error) { await ApiError(context, 403, error.Message); }
     catch (ArgumentException error) { await ApiError(context, 400, error.Message); }
+    finally { files.DeleteReleaseFile(stored); }
 }
 
 // Served exactly as a raw repository file is: an attachment of unknown type, with nosniff. An uploaded
@@ -6595,12 +6744,22 @@ async Task DownloadReleaseAsset(HttpContext context, ProjectDetails project, Aut
     if (!await OnlyQuery(context)) return;
     try
     {
-        (ReleaseAsset Asset, byte[] Bytes)? found = await store.ReadReleaseAssetAsync(identity, project.Project.Id, TagOf(context), FileNameOf(context), context.RequestAborted);
+        StoredReleaseAsset? found = await store.ReadReleaseAssetAsync(identity, project.Project.Id, TagOf(context), FileNameOf(context), context.RequestAborted);
         if (found is null) { await ApiError(context, 404, "404 File Not Found"); return; }
-        context.Response.Headers.ETag = "\"" + found.Value.Asset.Sha256 + "\"";
-        await WriteDownload(context, found.Value.Bytes, found.Value.Asset.FileName, "application/octet-stream");
+        await WriteReleaseAsset(context, project.Project, found);
     }
     catch (UnauthorizedAccessException) { await ApiError(context, 404, "project"); }
+}
+
+// From disk, or from the row for a file stored before files moved out of the database.
+async Task WriteReleaseAsset(HttpContext context, ProjectInfo project, StoredReleaseAsset found)
+{
+    context.Response.Headers.ETag = "\"" + found.Asset.Sha256 + "\"";
+    if (found.Stored is null) { await WriteDownload(context, found.Bytes ?? [], found.Asset.FileName, "application/octet-stream"); return; }
+    string path = FilesOf(project).ReleaseFilePath(found.Stored);
+    if (!File.Exists(path)) { context.Response.Headers.Remove("ETag"); await ApiError(context, 404, "404 File Not Found"); return; }
+    using FileStream content = new(path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete, 64 * 1024, FileOptions.Asynchronous);
+    await WriteDownloadStream(context, content, found.Asset.FileName, "application/octet-stream");
 }
 
 async Task DeleteReleaseAsset(HttpContext context, ProjectDetails project, AuthenticatedIdentity? identity)
@@ -6608,7 +6767,8 @@ async Task DeleteReleaseAsset(HttpContext context, ProjectDetails project, Authe
     if (identity is null) { await ApiError(context, 401, "authentication is required"); return; }
     try
     {
-        Release release = await store.DeleteReleaseAssetAsync(identity, project.Project.Id, TagOf(context), FileNameOf(context), context.RequestAborted);
+        (Release release, string? stored) = await store.DeleteReleaseAssetAsync(identity, project.Project.Id, TagOf(context), FileNameOf(context), context.RequestAborted);
+        FilesOf(project.Project).DeleteReleaseFile(stored);
         await context.Response.WriteAsJsonAsync(await ReleaseResponseFor(context, project, release), ApiJson.Default.ReleaseResponse, null, context.RequestAborted);
     }
     catch (CollaborationNotFoundException error) { await ApiError(context, 404, error.Message); }
@@ -8349,24 +8509,18 @@ app.MapPost("/api/graft/projects/{projectId:long}/releases/{tag}/assets", async 
     if (request is null || !Guid.TryParse(request.UploadId, out Guid uploadId)) { await ApiError(context, 400, "upload-id"); return; }
     DiskUploadStore uploads = context.RequestServices.GetRequiredService<DiskUploadStore>();
     string owner = GraftSessionAuthenticationHandler.Owner(scope.Value.Identity);
-    byte[] bytes = [];
-    string fileName;
     try
     {
         UploadStatus status = uploads.Get(owner, uploadId);
         if (!string.Equals(status.Profile, UploadLimits.ReleaseAssetProfile, StringComparison.Ordinal))
         { await ApiError(context, 400, "upload was not created for release files"); return; }
-        if (status.Length > GraftStore.MaximumAssetBytes) { await ApiError(context, 413, "the file exceeds the 32 MiB asset limit"); return; }
-        fileName = Path.GetFileName(status.FileName);
-        await uploads.ReadCompletedAsync(owner, uploadId, async (source, cancellationToken) =>
-        {
-            using MemoryStream buffer = new();
-            await source.CopyToAsync(buffer, cancellationToken);
-            bytes = buffer.ToArray();
-        }, context.RequestAborted);
+        if (status.Length > GraftStore.MaximumAssetBytes) { await ApiError(context, 413, "the file exceeds the 2 GiB asset limit"); return; }
+        string fileName = Path.GetFileName(status.FileName);
+        await uploads.ReadCompletedAsync(owner, uploadId,
+            async (source, cancellationToken) => await StoreReleaseAsset(context, scope.Value.Details, scope.Value.Identity, fileName, source),
+            context.RequestAborted);
     }
-    catch (UploadException error) { await ApiError(context, error.StatusCode, error.Message); return; }
-    await StoreReleaseAsset(context, scope.Value.Details, scope.Value.Identity, fileName, bytes);
+    catch (UploadException error) { await ApiError(context, error.StatusCode, error.Message); }
 });
 
 foreach ((string segment, CommentSubject noteSubject) in new[] { ("issues", CommentSubject.Issue), ("merge_requests", CommentSubject.MergeRequest) })
@@ -10186,6 +10340,21 @@ Console.WriteLine("URL IMPORT: " + settings.UrlImport switch
     UrlImportPolicy.Any => "any address, including this server's own network; mirrors updated every " + settings.MirrorIntervalMinutes.ToString(System.Globalization.CultureInfo.InvariantCulture) + " minutes",
     _ => "off"
 });
+if (publishingClient is not null)
+{
+    ReleasePublishingWorker worker = new(store, new AppStorePublisher(publishingClient), destinationProtector.Unprotect,
+        async (projectId, cancellationToken) => await store.GetReadyProjectAsync(projectId, cancellationToken) is { } details
+            ? Path.Combine(settings.Repositories, details.Project.StorageId) : null,
+        settings.ReleasePublishing == ReleasePublishingPolicy.Any, text => Console.WriteLine("PUBLISH: " + text));
+    publishing = worker;
+    app.Lifetime.ApplicationStopping.Register(() => worker.DisposeAsync().AsTask().GetAwaiter().GetResult());
+}
+Console.WriteLine("RELEASE PUBLISHING: " + settings.ReleasePublishing switch
+{
+    ReleasePublishingPolicy.Public => "https destinations on the public internet only",
+    ReleasePublishingPolicy.Any => "any address, including this server's own network and plain http",
+    _ => "off"
+});
 Console.WriteLine("TRANSFERS: in parts of " + (settings.TransferPartBytes / (1024 * 1024)).ToString(System.Globalization.CultureInfo.InvariantCulture) + " MiB, for git-remote-graft");
 Console.WriteLine("VERSION: " + graftVersion);
 Console.WriteLine("READY: " + address);
@@ -10527,6 +10696,43 @@ static HttpClient ImportClient(UrlImportPolicy policy)
     };
     HttpClient client = new(handler) { Timeout = Timeout.InfiniteTimeSpan };
     return client;
+}
+
+// Every connection a publication makes goes through here, checked as an import's is: the host is resolved, each address
+// is held to the operator's policy, and the connection is made to what was checked. No proxy, and no redirects at all.
+static HttpClient PublishingClient(ReleasePublishingPolicy policy)
+{
+    SocketsHttpHandler handler = new()
+    {
+        UseProxy = false,
+        AllowAutoRedirect = false,
+        UseCookies = false,
+        ConnectTimeout = TimeSpan.FromSeconds(30),
+        PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+        ConnectCallback = async (connection, cancellationToken) =>
+        {
+            string host = connection.DnsEndPoint.Host;
+            IPAddress[] addresses = IPAddress.TryParse(host, out IPAddress? literal)
+                ? [literal]
+                : await Dns.GetHostAddressesAsync(host, cancellationToken);
+            if (addresses.Length == 0) throw new HttpRequestException("the host does not resolve");
+            if (policy != ReleasePublishingPolicy.Any && addresses.Any(candidate => !OutboundAddresses.IsPublic(candidate)))
+                throw new HttpRequestException("refused: the host is not on the public internet, and this server publishes to public addresses only");
+            Socket socket = new(SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+            try
+            {
+                await socket.ConnectAsync(addresses, connection.DnsEndPoint.Port, cancellationToken);
+                return new NetworkStream(socket, ownsSocket: true);
+            }
+            catch
+            {
+                socket.Dispose();
+                throw;
+            }
+        }
+    };
+    // One request is at most one chunk of a file; ten minutes is a slow link, not a hung one.
+    return new HttpClient(handler) { Timeout = TimeSpan.FromMinutes(10) };
 }
 
 static bool ValidProjectPath(string path)
@@ -11365,12 +11571,13 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
     string? Certificate, string? CertificatePasswordFile, bool PublicBrowsing, bool PushToCreate, int SessionMinutes, bool Mcp,
     string? PagesOrigin, bool RecoverableTokens, bool Webhooks, int SshPort, string? SshHost, MailSettings? Mail,
     int RunnerPort, string? RunnerHost, string? RunnerDownloads, long RunnerChunkThreshold, long RunnerChunkBytes, bool PushDelete,
-    UrlImportPolicy UrlImport, int MirrorIntervalMinutes, long TransferPartBytes, TimeSpan DigestPeriod, bool PagesRootRedirect)
+    UrlImportPolicy UrlImport, int MirrorIntervalMinutes, long TransferPartBytes, TimeSpan DigestPeriod, bool PagesRootRedirect,
+    ReleasePublishingPolicy ReleasePublishing)
 {
     public static bool TryParse(string[] values, out Arguments? result)
     {
         result = null;
-        if (values.Length is < 4 or > 58 || values.Length % 2 != 0) return false;
+        if (values.Length is < 4 or > 60 || values.Length % 2 != 0) return false;
         string? database = null;
         string? repositories = null;
         string? listen = null;
@@ -11400,6 +11607,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         string? mirrorInterval = null;
         string? transferPartSize = null;
         string? mailDigestMinutes = null;
+        string? releasePublishing = null;
         HashSet<string> seen = new(StringComparer.Ordinal);
         for (int index = 0; index < values.Length; index += 2)
         {
@@ -11433,6 +11641,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             else if (values[index] == "--mirror-interval") mirrorInterval = values[index + 1];
             else if (values[index] == "--transfer-part-size") transferPartSize = values[index + 1];
             else if (values[index] == "--mail-digest-minutes") mailDigestMinutes = values[index + 1];
+            else if (values[index] == "--release-publishing") releasePublishing = values[index + 1];
             else return false;
         }
         if (string.IsNullOrWhiteSpace(database) || string.IsNullOrWhiteSpace(repositories)) return false;
@@ -11582,6 +11791,18 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
         if (mailDigestMinutes is not null && (!double.TryParse(mailDigestMinutes, System.Globalization.NumberStyles.AllowDecimalPoint, System.Globalization.CultureInfo.InvariantCulture, out digestMinutes) ||
             digestMinutes is <= 0 or > 10080))
             return false;
+        // Whether a project's releases may be published to a destination outside the forge (ADR 0052). Off by default, as
+        // importing by address is and for the same reason: a Maintainer names an address and the server calls it. "public"
+        // reaches only https endpoints on the public internet, "any" also the server's own network and plain http.
+        if (string.IsNullOrWhiteSpace(releasePublishing)) releasePublishing = null;
+        ReleasePublishingPolicy publishingPolicy = releasePublishing switch
+        {
+            null or "off" => ReleasePublishingPolicy.Off,
+            "public" => ReleasePublishingPolicy.Public,
+            "any" => ReleasePublishingPolicy.Any,
+            _ => (ReleasePublishingPolicy)(-1)
+        };
+        if (publishingPolicy < 0) return false;
         if (certificatePasswordFile is not null && certificate is null) return false;
         if (!IPAddress.IsLoopback(address) && certificate is null) return false;
         if (!IPAddress.IsLoopback(address) && origin is null) return false;
@@ -11594,7 +11815,7 @@ sealed record Arguments(string Database, string Repositories, IPAddress ListenAd
             publicBrowsing == "true", pushToCreate == "true", window, mcp == "true",
             pagesOrigin, recoverableTokens == "true", webhooks == "true", sshPortNumber, sshHost, mail,
             runnerPortNumber, runnerHost, runnerDownloads is null ? null : Path.GetFullPath(runnerDownloads), chunkThreshold, chunkBytes, pushDelete != "false",
-            importPolicy, intervalMinutes, partMebibytes * 1024 * 1024, TimeSpan.FromMinutes(digestMinutes), pagesRootRedirect != "false");
+            importPolicy, intervalMinutes, partMebibytes * 1024 * 1024, TimeSpan.FromMinutes(digestMinutes), pagesRootRedirect != "false", publishingPolicy);
         return true;
     }
 }

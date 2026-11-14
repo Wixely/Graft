@@ -60,6 +60,10 @@ services:
       - ${GRAFT_URL_IMPORT:-}
       - --mirror-interval
       - ${GRAFT_MIRROR_INTERVAL:-}
+      # Publishing releases to a destination outside the forge: off, public or any. Empty means off. See
+      # docs/decisions/0052-release-destinations.md.
+      - --release-publishing
+      - ${GRAFT_RELEASE_PUBLISHING:-}
       # The largest part git-remote-graft sends a push, fetch or large file in, in MiB; 16 when empty. See
       # docs/decisions/0043-chunked-transfers-git-remote-graft.md.
       - --transfer-part-size

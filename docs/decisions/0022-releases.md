@@ -1,7 +1,7 @@
 # 0022: Releases
 
 - Date: 2026-10-29
-- Status: Accepted, implemented
+- Status: Accepted, implemented. The decision that asset bytes live in the database, bounded at 32 MiB, is superseded by [ADR 0052](0052-release-destinations.md) as of 2026-11-14: a release file is on disk beside the repository, up to 2 GiB
 - Source: Releases with notes and assets from the collaboration depth list
 - Review trigger: Any proposal to store asset bytes outside the database, to raise the per-asset bound, to delete a tag with its release, or to serve an asset with a content type
 

@@ -11,6 +11,7 @@ using System.Text.RegularExpressions;
 using Graft.Core;
 using Graft.Git;
 using Graft.Storage;
+using Graft.TestSupport;
 
 if (args.Length != 1 || !File.Exists(args[0]))
 {
@@ -43,6 +44,8 @@ bool pushDelete = true;
 bool pagesRootRedirect = true;
 // Which addresses a restart lets the forge import from (--url-import), or null for a forge that imports from nowhere.
 string? urlImport = null;
+// Which addresses a restart lets the forge publish releases to (--release-publishing), or null for a forge that publishes nowhere.
+string? releasePublishing = null;
 // The part size a restart gives chunked transfers (--transfer-part-size, in MiB), or null for the default.
 string? transferPartSize = null;
 Process? server = null;
@@ -255,6 +258,7 @@ try
     address = await CheckWebhooks(address, aliceIdentity);
     address = await CheckRunners(address, aliceIdentity, bob.Username);
     address = await CheckUrlImport(address, aliceIdentity, bob.Username);
+    address = await CheckReleasePublishing(address, aliceIdentity, bob.Username);
     address = await CheckRemoteHelper(address, aliceIdentity, bob.Username);
     await CheckProjectAudit(address, aliceIdentity, bob.Username, "carol", alicePassword);
     await CheckGroups(address, aliceIdentity, bob.Username, "carol", adminPassword);
@@ -387,6 +391,11 @@ ProcessStartInfo ServerStart()
     {
         start.ArgumentList.Add("--url-import");
         start.ArgumentList.Add(urlImport);
+    }
+    if (releasePublishing is not null)
+    {
+        start.ArgumentList.Add("--release-publishing");
+        start.ArgumentList.Add(releasePublishing);
     }
     if (transferPartSize is not null)
     {
@@ -6708,6 +6717,266 @@ string RemoteHelperPath()
         if (File.Exists(Path.Combine(directory.FullName, "Graft.slnx")))
             return Path.Combine(directory.FullName, "src", "Graft.Remote", "bin", "Debug", "net10.0", name);
     return name;
+}
+
+/// <summary>
+/// Larger release files, and publishing a release to a destination (ADR 0052), through the server and against an
+/// application store this suite runs. Proves a release file lives on disk and may exceed the old bound; that a
+/// destination is a Maintainer's, keeps its endpoint and key to itself, and exists only where the operator allowed
+/// publishing; and that a publication is queued, carried out, read back and recorded.
+/// </summary>
+async Task<string> CheckReleasePublishing(string address, AuthenticatedIdentity alice, string bobUsername)
+{
+    long projectId;
+    string storageId;
+    string aliceApi;
+    string bobApi;
+    await using (GraftStore fixture = await GraftStore.OpenAsync(databasePath))
+    {
+        ProjectInfo created = await fixture.CreateProjectWithRepositoryAsync(alice, "storesample", "Store sample",
+            (project, token) => { token.ThrowIfCancellationRequested(); _ = new DurableRepositoryStorage(Path.Combine(repositoriesRoot, project.StorageId)); return Task.CompletedTask; });
+        projectId = created.Id;
+        storageId = created.StorageId;
+        UserAccount bob = Required(await fixture.FindActiveUserAsync(bobUsername), "bob account");
+        await fixture.SetMembershipAsync(alice, projectId, bob.Id, ProjectRole.Developer);
+        aliceApi = (await fixture.CreateTokenAsync(alice, "store", TokenScope.Api | TokenScope.WriteRepository, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+        bobApi = (await fixture.CreateTokenAsync(new(bob.Id, bob.Username, false, IdentityKind.BrowserSession), "store-developer", TokenScope.Api, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+    }
+    string v4 = "/api/v4/projects/" + projectId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    string own = "/api/graft/projects/" + projectId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    string release = v4 + "/releases/v1.4.0";
+    string filesOnDisk = Path.Combine(repositoriesRoot, storageId, "release-files");
+
+    string clone = Path.Combine(root, "store-clone");
+    Directory.CreateDirectory(clone);
+    await Git(clone, ["init", "--initial-branch=main"]);
+    File.WriteAllText(Path.Combine(clone, "app.txt"), "an application\n");
+    await Git(clone, ["add", "."]);
+    await Git(clone, ["commit", "-m", "An application"]);
+    await Git(clone, ["push", AuthenticatedUrl(address, "alice", aliceApi, "alice/storesample.git"), "main"]);
+    using (HttpResponseMessage tagged = await ApiPost(address, v4 + "/repository/tags", aliceApi, new { tag_name = "v1.4.0", @ref = "main" }))
+        Check(tagged.StatusCode == HttpStatusCode.Created, "a tag is created to release");
+    using (HttpResponseMessage made = await ApiPost(address, v4 + "/releases", aliceApi, new { tag_name = "v1.4.0", name = "One point four", description = "Release notes for this version." }))
+        Check(made.StatusCode == HttpStatusCode.Created, "and a release on it");
+
+    // Release files live on disk beside the repository now, and may be larger than a database row was allowed to be.
+    byte[] windows = RandomNumberGenerator.GetBytes(70 * 1024);
+    byte[] android = RandomNumberGenerator.GetBytes(40 * 1024);
+    byte[] sums = Encoding.UTF8.GetBytes("checksums\n");
+    foreach ((string name, byte[] bytes) in new[] { ("example-win-x64.zip", windows), ("example.apk", android), ("checksums.txt", sums) })
+        using (HttpResponseMessage stored = await ApiPutBytes(address, release + "/assets/files/" + name, aliceApi, bytes, "application/octet-stream"))
+            Check(stored.StatusCode == HttpStatusCode.Created, "a release file is attached: " + name);
+    Check(Directory.GetFiles(filesOnDisk).Length == 3 && Directory.GetFiles(filesOnDisk).All(path => Path.GetFileName(path).Length == 32),
+        "each release file is on disk beside the repository, under a name the server generated");
+    using (HttpResponseMessage download = await ApiGet(address, release + "/assets/files/example-win-x64.zip", aliceApi))
+        Check(download.IsSuccessStatusCode && (await download.Content.ReadAsByteArrayAsync()).AsSpan().SequenceEqual(windows) &&
+            download.Headers.ETag?.Tag == "\"" + Convert.ToHexStringLower(SHA256.HashData(windows)) + "\"" &&
+            download.Content.Headers.ContentDisposition?.DispositionType == "attachment", "and downloads from there byte for byte, as an attachment, with its hash as the validator");
+    using (HttpResponseMessage replaced = await ApiPutBytes(address, release + "/assets/files/checksums.txt", aliceApi, Encoding.UTF8.GetBytes("newer checksums\n"), "application/octet-stream"))
+        Check(replaced.StatusCode == HttpStatusCode.Created && Directory.GetFiles(filesOnDisk).Length == 3, "replacing a file leaves one file on disk for it, not two");
+    using (HttpResponseMessage refused = await ApiPutBytes(address, release + "/assets/files/build.bin", bobApi.Replace("graft_pat_", "graft_pat_x", StringComparison.Ordinal), windows, "application/octet-stream"))
+        Check(refused.StatusCode == HttpStatusCode.Unauthorized && Directory.GetFiles(filesOnDisk).Length == 3, "a refused upload leaves nothing on disk");
+    byte[] large = new byte[40 * 1024 * 1024];
+    RandomNumberGenerator.Fill(large.AsSpan(0, 4096));
+    RandomNumberGenerator.Fill(large.AsSpan(large.Length - 4096));
+    using (HttpResponseMessage stored = await ApiPutBytes(address, release + "/assets/files/large.bin", aliceApi, large, "application/octet-stream"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await stored.Content.ReadAsStringAsync());
+        JsonElement file = json.RootElement.GetProperty("assets").GetProperty("files").EnumerateArray().Single(entry => entry.GetProperty("file_name").GetString() == "large.bin");
+        Check(stored.StatusCode == HttpStatusCode.Created && file.GetProperty("size").GetInt64() == large.Length &&
+            file.GetProperty("sha256").GetString() == Convert.ToHexStringLower(SHA256.HashData(large)), "a 40 MiB file, larger than a release file could be before, is stored and hashed");
+    }
+    using (HttpResponseMessage download = await ApiGet(address, release + "/assets/files/large.bin", aliceApi))
+        Check(download.IsSuccessStatusCode && download.Content.Headers.ContentLength == large.Length &&
+            (await download.Content.ReadAsByteArrayAsync()).AsSpan().SequenceEqual(large), "and downloads whole");
+    using (HttpResponseMessage removed = await ApiDelete(address, release + "/assets/files/large.bin", aliceApi))
+        Check(removed.IsSuccessStatusCode && Directory.GetFiles(filesOnDisk).Length == 3, "removing a file removes it from disk");
+
+    using FakeAppStore fake = new() { ChunkSize = 16 * 1024 };
+    object Destination(string? endpoint, string? key, string channel = "none", bool promote = false, string? application = null, string rules = "*.apk Android any main\nchecksums.txt skip") =>
+        new { endpoint, api_key = key, application_id = application ?? fake.ApplicationId, channel, allow_production_promotion = promote, package_name = "com.example.application", rules };
+
+    // With the operator's switch off, as everywhere else in this suite, nothing is published anywhere.
+    using (HttpResponseMessage refused = await ApiPut(address, own + "/release-destinations/store", aliceApi, Destination(fake.Endpoint, fake.ApiKey)))
+        Check(refused.StatusCode == HttpStatusCode.BadRequest && (await refused.Content.ReadAsStringAsync()).Contains("does not publish", StringComparison.Ordinal),
+            "a server started without the switch refuses a destination");
+    using (HttpResponseMessage listed = await ApiGet(address, own + "/release-destinations", aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await listed.Content.ReadAsStringAsync());
+        Check(listed.IsSuccessStatusCode && !json.RootElement.GetProperty("publishing_available").GetBoolean() && json.RootElement.GetProperty("destinations").GetArrayLength() == 0,
+            "and says publishing is not available");
+    }
+    using (HttpResponseMessage refused = await ApiPost(address, own + "/releases/v1.4.0/publications", aliceApi, new { destination = "store" }))
+        Check(refused.StatusCode == HttpStatusCode.BadRequest, "and refuses a publication");
+
+    await StopServer();
+    releasePublishing = "any";
+    address = await StartServer();
+    Check(serverLines.Any(line => line.StartsWith("RELEASE PUBLISHING: any address", StringComparison.Ordinal)), "a server that publishes releases says so at startup");
+
+    foreach ((string label, object body, HttpStatusCode expected) in new (string, object, HttpStatusCode)[]
+    {
+        ("an endpoint that does not end in /api/v1 is refused", Destination(fake.Origin + "/" + fake.Opaque + "/api", fake.ApiKey), HttpStatusCode.BadRequest),
+        ("an endpoint carrying credentials is refused", Destination(fake.Endpoint.Replace("http://", "http://user:secret@", StringComparison.Ordinal), fake.ApiKey), HttpStatusCode.BadRequest),
+        ("a new destination without a key is refused", Destination(fake.Endpoint, null), HttpStatusCode.BadRequest),
+        ("a new destination without an endpoint is refused", Destination(null, fake.ApiKey), HttpStatusCode.BadRequest),
+        ("an application that is not a UUID is refused", Destination(fake.Endpoint, fake.ApiKey, application: "example"), HttpStatusCode.BadRequest),
+        ("a channel without production promotion allowed is refused", Destination(fake.Endpoint, fake.ApiKey, channel: "stable"), HttpStatusCode.BadRequest),
+        ("an unknown channel is refused", Destination(fake.Endpoint, fake.ApiKey, channel: "nightly", promote: true), HttpStatusCode.BadRequest),
+        ("a file rule that cannot be read is refused", Destination(fake.Endpoint, fake.ApiKey, rules: "*.zip Plan9"), HttpStatusCode.BadRequest)
+    })
+        using (HttpResponseMessage refused = await ApiPut(address, own + "/release-destinations/store", aliceApi, body))
+            Check(refused.StatusCode == expected, label + " (got " + (int)refused.StatusCode + ")");
+    using (HttpResponseMessage refused = await ApiPut(address, own + "/release-destinations/Store%20One", aliceApi, Destination(fake.Endpoint, fake.ApiKey)))
+        Check(refused.StatusCode == HttpStatusCode.BadRequest, "a name that is not one lower-case word is refused");
+    using (HttpResponseMessage refused = await ApiPut(address, own + "/release-destinations/store", bobApi, Destination(fake.Endpoint, fake.ApiKey)))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden, "a Developer cannot add a destination");
+    using (HttpResponseMessage refused = await ApiPut(address, own + "/release-destinations/store", null, Destination(fake.Endpoint, fake.ApiKey)))
+        Check(refused.StatusCode == HttpStatusCode.Unauthorized, "nor can nobody");
+
+    using (HttpResponseMessage added = await ApiPut(address, own + "/release-destinations/store", aliceApi, Destination(fake.Endpoint, fake.ApiKey)))
+    {
+        string text = await added.Content.ReadAsStringAsync();
+        using JsonDocument json = JsonDocument.Parse(text);
+        Check(added.StatusCode == HttpStatusCode.Created && json.RootElement.GetProperty("endpoint_host").GetString() == "127.0.0.1:" + fake.Port &&
+            json.RootElement.GetProperty("channel").GetString() == "none" && json.RootElement.GetProperty("kind").GetString() == "app-store-v1",
+            "a Maintainer adds a destination, and is shown its host");
+        Check(!text.Contains(fake.ApiKey, StringComparison.Ordinal) && !text.Contains(fake.Opaque, StringComparison.Ordinal), "and is not shown its key or the path of its endpoint again");
+    }
+    using (HttpResponseMessage listed = await ApiGet(address, own + "/release-destinations", aliceApi))
+    {
+        string text = await listed.Content.ReadAsStringAsync();
+        Check(listed.IsSuccessStatusCode && text.Contains("\"store\"", StringComparison.Ordinal) && text.Contains("\"publishing_available\":true", StringComparison.Ordinal) &&
+            !text.Contains(fake.ApiKey, StringComparison.Ordinal) && !text.Contains(fake.Opaque, StringComparison.Ordinal), "the list names it and carries neither secret");
+    }
+    using (HttpResponseMessage listed = await ApiGet(address, own + "/release-destinations", bobApi))
+        Check(listed.StatusCode == HttpStatusCode.Forbidden, "a Developer cannot list destinations");
+    foreach (string file in new[] { databasePath, databasePath + "-wal" }.Where(File.Exists))
+    {
+        using FileStream stream = new(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        byte[] bytes = new byte[stream.Length];
+        stream.ReadExactly(bytes);
+        string stored = Encoding.Latin1.GetString(bytes);
+        Check(!stored.Contains(fake.ApiKey, StringComparison.Ordinal) && !stored.Contains(fake.Opaque, StringComparison.Ordinal),
+            "neither the key nor the endpoint's path is in the database in the clear: " + Path.GetFileName(file));
+    }
+
+    async Task<JsonElement> Settled(HttpResponseMessage accepted)
+    {
+        string location = accepted.Headers.Location?.OriginalString ?? "";
+        for (int attempt = 0; attempt < 300; attempt++)
+        {
+            using HttpResponseMessage read = await ApiGet(address, location, aliceApi);
+            using JsonDocument json = JsonDocument.Parse(await read.Content.ReadAsStringAsync());
+            if (json.RootElement.GetProperty("state").GetString() is "succeeded" or "failed") return json.RootElement.Clone();
+            await Task.Delay(100);
+        }
+        throw new InvalidOperationException("A publication did not finish.");
+    }
+
+    using (HttpResponseMessage refused = await ApiPost(address, own + "/releases/v1.4.0/publications", bobApi, new { destination = "store", dry_run = true }))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden, "a Developer cannot publish, or dry-run");
+    using (HttpResponseMessage missing = await ApiPost(address, own + "/releases/v1.4.0/publications", aliceApi, new { destination = "elsewhere" }))
+        Check(missing.StatusCode == HttpStatusCode.NotFound, "a destination that does not exist is not published to");
+    using (HttpResponseMessage missing = await ApiPost(address, own + "/releases/v9.9/publications", aliceApi, new { destination = "store" }))
+        Check(missing.StatusCode == HttpStatusCode.NotFound, "nor is a release that does not exist");
+
+    using (HttpResponseMessage accepted = await ApiPost(address, own + "/releases/v1.4.0/publications", aliceApi, new { destination = "store", dry_run = true }))
+    {
+        Check(accepted.StatusCode == HttpStatusCode.Accepted && accepted.Headers.Location is not null, "a dry run is queued and answered with where to read it");
+        JsonElement outcome = await Settled(accepted);
+        JsonElement[] files = [.. outcome.GetProperty("files").EnumerateArray()];
+        Check(outcome.GetProperty("state").GetString() == "succeeded" && outcome.GetProperty("dry_run").GetBoolean() && files.Length == 2 &&
+            files.All(file => file.GetProperty("state").GetString() == "planned") &&
+            files.Single(file => file.GetProperty("file_name").GetString() == "example.apk").GetProperty("platform").GetString() == "Android" &&
+            files.Single(file => file.GetProperty("file_name").GetString() == "example-win-x64.zip").GetProperty("architecture").GetString() == "x64",
+            "the dry run reports what each file would be sent as, and leaves out the one a rule skips: " + outcome.GetProperty("summary").GetString());
+        Check(fake.UploadSessionsOpened == 0, "and started no upload");
+    }
+
+    string androidBuild;
+    using (HttpResponseMessage accepted = await ApiPost(address, own + "/releases/v1.4.0/publications", aliceApi, new { destination = "store" }))
+    {
+        JsonElement outcome = await Settled(accepted);
+        Check(accepted.StatusCode == HttpStatusCode.Accepted && outcome.GetProperty("state").GetString() == "succeeded" &&
+            outcome.GetProperty("files").EnumerateArray().All(file => file.GetProperty("state").GetString() == "accepted" && file.GetProperty("build_id").GetString()!.Length == 36),
+            "a release is published to an upload-only destination: " + outcome.GetProperty("summary").GetString());
+        var builds = fake.Builds;
+        Check(builds.Count == 2 && builds.All(build => build is { Published: false, Version: "1.4.0" }) &&
+            builds.Single(build => build.FileName == "example-win-x64.zip") is { Platform: "Windows", Architecture: "x64", Format: "file" } zip &&
+            zip.Sha256 == Convert.ToHexStringLower(SHA256.HashData(windows)) &&
+            builds.Single(build => build.FileName == "example.apk") is { Platform: "Android", Format: "apk", PackageName: "com.example.application" },
+            "the store holds one unpublished build for each file, whole, declared and versioned from the tag");
+        Check(fake.Arrivals("example-win-x64.zip", 4) == 1 && fake.Arrivals("example-win-x64.zip", 5) == 0 && fake.Violations.IsEmpty, "sent in the store's chunks, with nothing the contract forbids");
+        androidBuild = builds.Single(build => build.FileName == "example.apk").Id;
+    }
+
+    // The settings change without the endpoint or the key being entered again, and what is stored is kept.
+    using (HttpResponseMessage changed = await ApiPut(address, own + "/release-destinations/store", aliceApi, Destination(null, null, channel: "stable", promote: true)))
+        Check(changed.StatusCode == HttpStatusCode.OK, "a destination is changed without its endpoint or key being entered again");
+    using (HttpResponseMessage accepted = await ApiPost(address, own + "/releases/v1.4.0/publications", aliceApi, new { destination = "store" }))
+    {
+        JsonElement outcome = await Settled(accepted);
+        Check(outcome.GetProperty("state").GetString() == "succeeded" && outcome.GetProperty("channel_verified").GetBoolean() &&
+            outcome.GetProperty("files").EnumerateArray().All(file => file.GetProperty("state").GetString() == "published"),
+            "the same release is then published to the stable channel and read back: " + outcome.GetProperty("summary").GetString());
+        Check(fake.UploadSessionsOpened == 2 && fake.Builds.All(build => build is { Published: true, Channel: "stable" }) && fake.Channel("stable") == (androidBuild, "1.4.0"),
+            "without uploading anything twice, and the channel is left on the file marked main");
+        JsonElement apk = outcome.GetProperty("files").EnumerateArray().Single(file => file.GetProperty("file_name").GetString() == "example.apk");
+        Check(apk.GetProperty("uploaded_sha256").GetString() == Convert.ToHexStringLower(SHA256.HashData(android)) &&
+            apk.GetProperty("store_sha256").GetString() is { Length: 64 } signed && signed != apk.GetProperty("uploaded_sha256").GetString(),
+            "the hash the store gave a signed package is recorded beside the one that was sent");
+    }
+
+    // A file the store rejects: the publication fails, says so in the store's words, and publishes nothing further.
+    fake.Reject.Add("extra-linux-x64.tar.gz");
+    using (HttpResponseMessage stored = await ApiPutBytes(address, release + "/assets/files/extra-linux-x64.tar.gz", aliceApi, RandomNumberGenerator.GetBytes(20 * 1024), "application/octet-stream"))
+        Check(stored.StatusCode == HttpStatusCode.Created, "another file is attached");
+    int releasesBefore = fake.ReleaseRequests;
+    using (HttpResponseMessage accepted = await ApiPost(address, own + "/releases/v1.4.0/publications", aliceApi, new { destination = "store" }))
+    {
+        JsonElement outcome = await Settled(accepted);
+        Check(outcome.GetProperty("state").GetString() == "failed" && outcome.GetProperty("summary").GetString()!.Contains("malware_scan", StringComparison.Ordinal) &&
+            outcome.GetProperty("files").EnumerateArray().Any(file => file.GetProperty("state").GetString() == "rejected") && fake.ReleaseRequests == releasesBefore,
+            "a file the store rejects fails the publication with the store's own code, and nothing more is published");
+    }
+
+    using (HttpResponseMessage history = await ApiGet(address, own + "/releases/v1.4.0/publications", aliceApi))
+    {
+        string text = await history.Content.ReadAsStringAsync();
+        using JsonDocument json = JsonDocument.Parse(text);
+        Check(history.IsSuccessStatusCode && json.RootElement.GetArrayLength() == 4 && json.RootElement[0].GetProperty("state").GetString() == "failed",
+            "the release lists its publications, newest first");
+        Check(!text.Contains(fake.ApiKey, StringComparison.Ordinal) && !text.Contains(fake.Opaque, StringComparison.Ordinal) && !text.Contains("transfer-", StringComparison.Ordinal),
+            "and none of them carries the key, the endpoint's path or a transfer token");
+    }
+    using (HttpResponseMessage history = await ApiGet(address, own + "/releases/v1.4.0/publications", bobApi))
+        Check(history.StatusCode == HttpStatusCode.Forbidden, "a Developer cannot read them");
+    string log = string.Join('\n', serverLines);
+    Check(log.Contains("PUBLISH: publication", StringComparison.Ordinal) && !log.Contains(fake.ApiKey, StringComparison.Ordinal) && !log.Contains(fake.Opaque, StringComparison.Ordinal) &&
+        !log.Contains("transfer-", StringComparison.Ordinal), "the server's log says a publication ran and carries no secret");
+    using (HttpResponseMessage audit = await ApiGet(address, v4 + "/audit_events", aliceApi))
+    {
+        string text = await audit.Content.ReadAsStringAsync();
+        Check(audit.IsSuccessStatusCode && text.Contains("create-release-destination", StringComparison.Ordinal) && text.Contains("update-release-destination", StringComparison.Ordinal) &&
+            text.Contains("publish-release", StringComparison.Ordinal) && text.Contains("release-published", StringComparison.Ordinal) &&
+            text.Contains("release-publication-failed", StringComparison.Ordinal) && !text.Contains(fake.ApiKey, StringComparison.Ordinal) && !text.Contains(fake.Opaque, StringComparison.Ordinal),
+            "the project's audit trail records the destination and each publication, without the key or the endpoint's path");
+    }
+
+    // The same through the browser's family is the same store calls; what differs is the session, covered elsewhere.
+    using (HttpResponseMessage refused = await ApiDelete(address, own + "/release-destinations/store", bobApi))
+        Check(refused.StatusCode == HttpStatusCode.Forbidden, "a Developer cannot remove a destination");
+    using (HttpResponseMessage gone = await ApiDelete(address, v4 + "/releases/v1.4.0", aliceApi))
+        Check(gone.StatusCode == HttpStatusCode.NoContent && Directory.GetFiles(filesOnDisk).Length == 0, "deleting the release removes its files from disk");
+    using (HttpResponseMessage removed = await ApiDelete(address, own + "/release-destinations/store", aliceApi))
+        Check(removed.StatusCode == HttpStatusCode.NoContent, "a Maintainer removes the destination");
+    using (HttpResponseMessage again = await ApiDelete(address, own + "/release-destinations/store", aliceApi))
+        Check(again.StatusCode == HttpStatusCode.NotFound, "removing one that is not there says so");
+
+    await StopServer();
+    releasePublishing = null;
+    return await StartServer();
 }
 
 async Task<string> CheckUrlImport(string address, AuthenticatedIdentity alice, string bobUsername)

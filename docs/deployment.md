@@ -130,6 +130,18 @@ forge prints which on startup as `URL IMPORT:`. Outbound requests go directly, n
 address check is made on the connection itself. Only repositories anybody may clone can be imported. See
 [ADR 0042](decisions/0042-import-by-address-and-mirrors.md).
 
+### Publishing releases to an application store
+
+A project can publish its releases to an application store a Maintainer names, uploading the release's files as
+builds. This too makes the server call an address somebody chose, so it is off unless the operator says
+`--release-publishing public` (`GRAFT_RELEASE_PUBLISHING=public`), which reaches only https endpoints on the public
+internet, or `--release-publishing any`, which also reaches the server's own network and accepts plain http. The
+forge prints which on startup as `RELEASE PUBLISHING:`. Requests go directly, never through a proxy, and a redirect
+is refused. A destination's endpoint and key are stored under the `data-protection-keys` directory's key ring, so
+that directory has to survive a move with the database. Release files are in the repositories directory, under
+each repository's `release-files/`, and are backed up with it. See [the guide](release-destinations.md) and
+[ADR 0052](decisions/0052-release-destinations.md).
+
 ### Large pushes behind a proxy that limits requests
 
 A proxy may refuse a request over a size: Cloudflare's free plan stops at 100 MB, and IIS at about 28.6 MiB unless

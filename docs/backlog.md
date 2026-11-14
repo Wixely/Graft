@@ -137,6 +137,14 @@ Then the first of the four large items, in the order given:
   trail, transfer and deletion, with token routes for the banner, approvals and transfer.
   [ADR 0047](decisions/0047-agent-project-settings.md).
 
+## Closed on 2026-11-14
+
+- **Publishing a release to an application store.** Destinations per project, a dry run, resumable chunked uploads,
+  publication to a channel only when every file was accepted, and a read-back; behind `--release-publishing`.
+  Release files moved to disk and may be 2 GiB. [ADR 0052](decisions/0052-release-destinations.md). Left open there:
+  a real store has not been published to, publishing automatically on release, a credential for runner jobs, a
+  release file above a proxy's request cap by token, and moving old release files out of the database.
+
 ## Closed on 2026-11-13
 
 - **Page artifacts.** A build that is not in the repository, uploaded as one zip, private until promoted, then part

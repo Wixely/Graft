@@ -4,6 +4,7 @@
 @page "/projects/{Slug}/-/releases/{Tag}"
 @inject GraftApi Api
 @inject NavigationManager Navigation
+@implements IDisposable
 
 <PageTitle>@(Tag is null ? "Releases" : "Release " + Tag) &middot; Graft</PageTitle>
 
@@ -154,7 +155,7 @@ else
         @if (canPush)
         {
             <div class="panel-body">
-                <p class="secondary-text">Attach files to this release. Each is capped at 32 MiB, and a file of the same name replaces the earlier one.</p>
+                <p class="secondary-text">Attach files to this release. Each may be up to 2 GiB, and a file of the same name replaces the earlier one.</p>
                 <UploadField Profile="release-asset" Id="release-files" OnCompleted="Attach" />
             </div>
         }
@@ -203,6 +204,70 @@ else
         }
     </div>
 
+    @if (canManage && destinations is { Destinations.Length: > 0 })
+    {
+        <div class="panel">
+            <div class="panel-header"><Icon Name="upload" /><h2>Publish</h2></div>
+            <div class="panel-body">
+                <p class="secondary-text">
+                    Publishing sends the files of this release to a destination as builds and, if the destination names a
+                    channel, publishes them on it. A dry run asks the destination what it accepts and uploads nothing.
+                </p>
+                @if (!destinations.PublishingAvailable)
+                {
+                    <div class="banner warning"><Icon Name="alert" /><span>This server does not publish releases anywhere. An operator turns it on with <code>--release-publishing</code>.</span></div>
+                }
+            </div>
+            <div class="list">
+                @foreach (ReleaseDestinationResponse destination in destinations.Destinations)
+                {
+                    <div class="list-item">
+                        <Icon Name="upload" />
+                        <span class="list-item-main">
+                            <strong>@destination.Name <span class="label @(destination.Channel == "none" ? "" : "accent")">@(destination.Channel == "none" ? "upload only" : destination.Channel)</span></strong>
+                            <small>@destination.EndpointHost</small>
+                        </span>
+                        @if (destinations.PublishingAvailable)
+                        {
+                            <button type="button" class="link" @onclick="() => Publish(destination, dryRun: true)" disabled="@(busy || Underway(destination))">Dry run</button>
+                            <button type="button" class="link" @onclick="() => Publish(destination, dryRun: false)" disabled="@(busy || Underway(destination))">
+                                @(confirmingPublish == destination.Name ? (destination.Channel == "none" ? "Confirm upload" : "Confirm publish to " + destination.Channel) : "Publish")
+                            </button>
+                        }
+                    </div>
+                }
+            </div>
+            @if (publications.Length > 0)
+            {
+                <div class="list">
+                    @foreach (ReleasePublicationResponse publication in publications)
+                    {
+                        <div class="list-item">
+                            <span class="list-item-main">
+                                <strong>
+                                    @publication.Destination
+                                    <span class="label @StateClass(publication.State)">@(publication.DryRun ? "dry run " : "")@publication.State</span>
+                                    @if (publication.ChannelVerified == true) { <span class="label accent">@publication.Channel verified</span> }
+                                </strong>
+                                <small>@publication.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm") by @publication.RequestedBy</small>
+                                <small>@publication.Summary</small>
+                                @foreach (ReleasePublicationFileResponse file in publication.Files)
+                                {
+                                    <small>
+                                        <code>@file.FileName</code> &middot; @file.Platform @file.Architecture &middot; @file.State
+                                        @if (file.BuildId is not null) { <span> &middot; build <code>@file.BuildId</code></span> }
+                                        @if (file.StoreSha256 is not null && file.StoreSha256 != file.UploadedSha256) { <span> &middot; stored as sha256 <code>@file.StoreSha256[..12]</code></span> }
+                                        @if (file.Problem is not null) { <span> &middot; @file.Problem</span> }
+                                    </small>
+                                }
+                            </span>
+                        </div>
+                    }
+                </div>
+            }
+        </div>
+    }
+
     @if (canPush)
     {
         <div class="panel danger-zone">
@@ -223,6 +288,12 @@ else
     private ProjectResponse? project;
     private long projectId;
     private bool canPush;
+    private bool canManage;
+    private ReleaseDestinationListResponse? destinations;
+    private ReleasePublicationResponse[] publications = [];
+    private string? confirmingPublish;
+    private bool watching;
+    private bool left;
     private ReleaseResponse[] releases = [];
     private ReleaseResponse? release;
     private TagResponse[] tags = [];
@@ -266,6 +337,8 @@ else
             project = page.Project;
             projectId = page.Project.Id;
             canPush = page.CanPush;
+            canManage = page.CanManage;
+            destinations = null;
             if (Tag is null) await LoadList(); else await LoadOne();
         }
         finally { loading = false; }
@@ -282,6 +355,7 @@ else
     {
         release = await Api.GetAsync($"api/projects/{projectId}/releases/{TagPath}", ApiJson.Default.ReleaseResponse);
         if (release is null) message = "That release could not be found.";
+        else if (destinations is null) await LoadPublishing();
     }
 
     private async Task Create()
@@ -368,6 +442,72 @@ else
         }
         finally { busy = false; }
     }
+
+    private bool Underway(ReleaseDestinationResponse destination) =>
+        publications.Any(publication => publication.Destination == destination.Name && publication.State is "queued" or "running");
+
+    private static string StateClass(string state) => state switch { "succeeded" => "accent", "failed" => "danger", _ => "" };
+
+    private async Task LoadPublishing()
+    {
+        destinations = null;
+        publications = [];
+        if (!canManage) return;
+        (_, destinations) = await Api.GetOptionalAsync($"api/projects/{projectId}/release-destinations", ApiJson.Default.ReleaseDestinationListResponse);
+        if (destinations is { Destinations.Length: > 0 }) await LoadPublications();
+    }
+
+    private async Task LoadPublications()
+    {
+        (bool reached, ReleasePublicationResponse[]? loaded) =
+            await Api.GetOptionalAsync($"api/projects/{projectId}/releases/{TagPath}/publications", ApiJson.Default.ReleasePublicationResponseArray);
+        if (reached && loaded is not null) publications = loaded;
+        if (publications.Any(publication => publication.State is "queued" or "running")) Watch();
+    }
+
+    /// <summary>Looks again every few seconds while a publication is under way, and stops when none is or the page is left.</summary>
+    private void Watch()
+    {
+        if (watching) return;
+        watching = true;
+        string watched = TagPath;
+        _ = InvokeAsync(async () =>
+        {
+            try
+            {
+                while (!left && watched == TagPath && publications.Any(publication => publication.State is "queued" or "running"))
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(3));
+                    if (left || watched != TagPath) break;
+                    (bool reached, ReleasePublicationResponse[]? loaded) =
+                        await Api.GetOptionalAsync($"api/projects/{projectId}/releases/{watched}/publications", ApiJson.Default.ReleasePublicationResponseArray);
+                    if (reached && loaded is not null) publications = loaded;
+                    StateHasChanged();
+                }
+            }
+            finally { watching = false; }
+        });
+    }
+
+    /// <summary>A dry run starts at once. A publication takes a second click, which names what it will do.</summary>
+    private async Task Publish(ReleaseDestinationResponse destination, bool dryRun)
+    {
+        if (busy) return;
+        if (!dryRun && confirmingPublish != destination.Name) { confirmingPublish = destination.Name; return; }
+        busy = true;
+        confirmingPublish = null;
+        try
+        {
+            ApiResult result = await Api.PostAsync($"api/projects/{projectId}/releases/{TagPath}/publications",
+                new ReleasePublicationRequest(destination.Name, dryRun), ApiJson.Default.ReleasePublicationRequest,
+                dryRun ? $"Checking {destination.Name}." : $"Publishing to {destination.Name}. This page follows it.");
+            Report(result.Ok, result.Message);
+            if (result.Ok) await LoadPublications();
+        }
+        finally { busy = false; }
+    }
+
+    public void Dispose() => left = true;
 
     private void Report(bool ok, string text)
     {
