@@ -1875,9 +1875,8 @@ app.MapGet("/api/projects", async context =>
     if (browser is null) return;
     if (!await OnlyQuery(context)) return;
     ProjectPage projects = await store.ListAccessibleProjectsAsync(browser.Value.Identity, 0, 100, context.RequestAborted);
-    List<ProjectResponse> response = [];
-    foreach (ProjectDetails project in projects.Projects) response.Add(await ProjectResponseFor(context, project));
-    await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.ProjectResponseArray, null, context.RequestAborted);
+    ProjectResponse[] response = await ProjectResponsesFor(context, projects.Projects);
+    await context.Response.WriteAsJsonAsync(response, ApiJson.Default.ProjectResponseArray, null, context.RequestAborted);
 });
 
 app.MapPost("/api/projects", async context =>
@@ -3073,9 +3072,7 @@ app.MapGet("/api/v4/groups", async context =>
     if (identity is null) return;
     if (!await OnlyQuery(context)) return;
     IReadOnlyList<Group> groups = await store.ListGroupsAsync(identity, context.RequestAborted);
-    List<GroupResponse> response = [];
-    foreach (Group group in groups) response.Add(await GroupResponseFor(context, identity, group));
-    await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.GroupResponseArray, null, context.RequestAborted);
+    await context.Response.WriteAsJsonAsync(await GroupResponsesFor(context, identity, groups), ApiJson.Default.GroupResponseArray, null, context.RequestAborted);
 });
 
 app.MapPost("/api/v4/groups", async context =>
@@ -3116,10 +3113,9 @@ app.MapGet("/api/v4/groups/{groupId}/projects", async context =>
     Group? group = await ResolveGroup(context, identity);
     if (group is null) return;
     ProjectPage page = await store.ListGroupProjectsAsync(identity, group.Id, (pagination.Value.Page - 1) * pagination.Value.PerPage, pagination.Value.PerPage, context.RequestAborted);
-    List<ProjectResponse> response = [];
-    foreach (ProjectDetails details in page.Projects) response.Add(await ProjectResponseFor(context, details));
+    ProjectResponse[] response = await ProjectResponsesFor(context, page.Projects);
     context.Response.Headers["X-Total"] = page.Total.ToString(System.Globalization.CultureInfo.InvariantCulture);
-    await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.ProjectResponseArray, null, context.RequestAborted);
+    await context.Response.WriteAsJsonAsync(response, ApiJson.Default.ProjectResponseArray, null, context.RequestAborted);
 });
 
 app.MapGet("/api/v4/groups/{groupId}/subgroups", async context =>
@@ -3129,9 +3125,8 @@ app.MapGet("/api/v4/groups/{groupId}/subgroups", async context =>
     if (!await OnlyQuery(context)) return;
     Group? group = await ResolveGroup(context, identity);
     if (group is null) return;
-    List<GroupResponse> response = [];
-    foreach (Group child in await store.ListSubgroupsAsync(identity, group.Id, context.RequestAborted)) response.Add(await GroupResponseFor(context, identity, child));
-    await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.GroupResponseArray, null, context.RequestAborted);
+    IReadOnlyList<Group> children = await store.ListSubgroupsAsync(identity, group.Id, context.RequestAborted);
+    await context.Response.WriteAsJsonAsync(await GroupResponsesFor(context, identity, children), ApiJson.Default.GroupResponseArray, null, context.RequestAborted);
 });
 
 app.MapGet("/api/v4/groups/{groupId}/members", async context =>
@@ -3181,10 +3176,8 @@ app.MapGet("/api/groups", async context =>
     (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: true);
     if (browser is null) return;
     if (!await OnlyQuery(context)) return;
-    List<GroupResponse> response = [];
-    foreach (Group group in await store.ListGroupsAsync(browser.Value.Identity, context.RequestAborted))
-        response.Add(await GroupResponseFor(context, browser.Value.Identity, group));
-    await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.GroupResponseArray, null, context.RequestAborted);
+    IReadOnlyList<Group> groups = await store.ListGroupsAsync(browser.Value.Identity, context.RequestAborted);
+    await context.Response.WriteAsJsonAsync(await GroupResponsesFor(context, browser.Value.Identity, groups), ApiJson.Default.GroupResponseArray, null, context.RequestAborted);
 });
 
 app.MapPost("/api/groups", async context =>
@@ -3221,9 +3214,8 @@ app.MapGet("/api/groups/{groupId}/projects", async context =>
     Group? group = await ResolveGroup(context, browser.Value.Identity);
     if (group is null) return;
     ProjectPage page = await store.ListGroupProjectsAsync(browser.Value.Identity, group.Id, 0, 100, context.RequestAborted);
-    List<ProjectResponse> response = [];
-    foreach (ProjectDetails details in page.Projects) response.Add(await ProjectResponseFor(context, details));
-    await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.ProjectResponseArray, null, context.RequestAborted);
+    ProjectResponse[] response = await ProjectResponsesFor(context, page.Projects);
+    await context.Response.WriteAsJsonAsync(response, ApiJson.Default.ProjectResponseArray, null, context.RequestAborted);
 });
 
 app.MapGet("/api/groups/{groupId}/subgroups", async context =>
@@ -3233,10 +3225,8 @@ app.MapGet("/api/groups/{groupId}/subgroups", async context =>
     if (!await OnlyQuery(context)) return;
     Group? group = await ResolveGroup(context, browser.Value.Identity);
     if (group is null) return;
-    List<GroupResponse> response = [];
-    foreach (Group child in await store.ListSubgroupsAsync(browser.Value.Identity, group.Id, context.RequestAborted))
-        response.Add(await GroupResponseFor(context, browser.Value.Identity, child));
-    await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.GroupResponseArray, null, context.RequestAborted);
+    IReadOnlyList<Group> children = await store.ListSubgroupsAsync(browser.Value.Identity, group.Id, context.RequestAborted);
+    await context.Response.WriteAsJsonAsync(await GroupResponsesFor(context, browser.Value.Identity, children), ApiJson.Default.GroupResponseArray, null, context.RequestAborted);
 });
 
 app.MapGet("/api/groups/{groupId}/members", async context =>
@@ -3366,13 +3356,20 @@ async Task RemoveGroupMember(HttpContext context, AuthenticatedIdentity identity
     catch (GroupNotFoundException) { await ApiError(context, 404, "404 Group Not Found"); }
 }
 
-async Task<GroupResponse> GroupResponseFor(HttpContext context, AuthenticatedIdentity identity, Group group)
+async Task<GroupResponse> GroupResponseFor(HttpContext context, AuthenticatedIdentity identity, Group group) =>
+    GroupResponseWith(context, group, await store.GetGroupRoleAsync(identity, group.Id, context.RequestAborted));
+
+// Many groups at once, with the caller's roles in them from one store call rather than one each.
+async Task<GroupResponse[]> GroupResponsesFor(HttpContext context, AuthenticatedIdentity identity, IReadOnlyList<Group> groups)
 {
-    GroupRole? role = await store.GetGroupRoleAsync(identity, group.Id, context.RequestAborted);
-    return new(group.Id, group.Name, group.Path, group.Description, "private", group.FullPath.Replace("/", " / ", StringComparison.Ordinal), group.FullPath,
+    IReadOnlyDictionary<long, GroupRole?> roles = await store.GetGroupRolesAsync(identity, [.. groups.Select(group => group.Id).Distinct()], context.RequestAborted);
+    return [.. groups.Select(group => GroupResponseWith(context, group, roles.GetValueOrDefault(group.Id)))];
+}
+
+GroupResponse GroupResponseWith(HttpContext context, Group group, GroupRole? role) =>
+    new(group.Id, group.Name, group.Path, group.Description, "private", group.FullPath.Replace("/", " / ", StringComparison.Ordinal), group.FullPath,
         group.ParentId, Origin(context) + "/-/groups/" + group.FullPath, group.CreatedAtUtc, group.ProjectCount, group.SubgroupCount,
         role is null ? null : AccessLevelOf(role.Value));
-}
 
 static GroupMemberResponse GroupMemberResponseFor(GroupMember member) =>
     new(member.UserId, member.Username, member.Username, AccessLevelOf(member.Role), "active", member.Inherited);
@@ -3434,11 +3431,9 @@ app.MapGet("/api/v4/projects", async context =>
         return;
     }
     ProjectPage projects = await store.ListAccessibleProjectsAsync(identity, (page - 1) * perPage, perPage, context.RequestAborted);
-    List<ProjectResponse> response = [];
-    foreach (ProjectDetails project in projects.Projects)
-        response.Add(await ProjectResponseFor(context, project));
+    ProjectResponse[] response = await ProjectResponsesFor(context, projects.Projects);
     SetPagination(context, page, perPage, projects.Total);
-    await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.ProjectResponseArray, null, context.RequestAborted);
+    await context.Response.WriteAsJsonAsync(response, ApiJson.Default.ProjectResponseArray, null, context.RequestAborted);
 });
 
 app.MapPost("/api/v4/projects", async context =>
@@ -4673,14 +4668,12 @@ async Task<(ProjectDetails Details, AuthenticatedIdentity? Identity)?> ApiCollab
 long Number(HttpContext context) =>
     Convert.ToInt64(context.Request.RouteValues["iid"], System.Globalization.CultureInfo.InvariantCulture);
 
-async Task<UserResponse> AuthorFor(HttpContext context, long userId, string username)
-{
-    string? avatarUrl = await store.HasAvatarAsync(AvatarOwner.User, userId, context.RequestAborted)
-        ? AvatarUrl(context, AvatarOwner.User, userId)
-        : null;
-    return new(userId, username, username, "active", false,
-        Origin(context) + "/" + Uri.EscapeDataString(username), avatarUrl);
-}
+async Task<UserResponse> AuthorFor(HttpContext context, long userId, string username) =>
+    AuthorWith(context, userId, username, await store.HasAvatarAsync(AvatarOwner.User, userId, context.RequestAborted));
+
+UserResponse AuthorWith(HttpContext context, long userId, string username, bool hasAvatar) =>
+    new(userId, username, username, "active", false,
+        Origin(context) + "/" + Uri.EscapeDataString(username), hasAvatar ? AvatarUrl(context, AvatarOwner.User, userId) : null);
 
 async Task<IssueResponse> IssueResponseFor(HttpContext context, ProjectDetails project, Issue issue) => new(
     issue.Id, issue.Iid, issue.ProjectId, issue.Title, issue.Description, StateText(issue.State),
@@ -4998,9 +4991,8 @@ async Task ListForks(HttpContext context, ProjectDetails project, AuthenticatedI
     try
     {
         IReadOnlyList<ProjectDetails> forks = await store.ListForksAsync(identity, project.Project.Id, settings.PublicBrowsing, context.RequestAborted);
-        List<ProjectResponse> response = [];
-        foreach (ProjectDetails fork in forks) response.Add(await ProjectResponseFor(context, fork));
-        await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.ProjectResponseArray, null, context.RequestAborted);
+        ProjectResponse[] response = await ProjectResponsesFor(context, forks);
+        await context.Response.WriteAsJsonAsync(response, ApiJson.Default.ProjectResponseArray, null, context.RequestAborted);
     }
     catch (UnauthorizedAccessException) { await ApiError(context, 404, "404 Project Not Found"); }
 }
@@ -6891,8 +6883,7 @@ async Task GlobalSearch(HttpContext context, AuthenticatedIdentity? identity, bo
     switch (scope)
     {
         case "projects":
-            foreach (ProjectDetails project in await store.SearchProjectsAsync(identity, search, includePublic, SearchLimit, context.RequestAborted))
-                projects.Add(await ProjectResponseFor(context, project));
+            projects.AddRange(await ProjectResponsesFor(context, [.. await store.SearchProjectsAsync(identity, search, includePublic, SearchLimit, context.RequestAborted)]));
             break;
         case "issues":
             foreach (IssueHit hit in await store.SearchIssuesAsync(identity, search, includePublic, SearchLimit, context.RequestAborted))
@@ -10383,9 +10374,14 @@ return 0;
 async Task<PermissionDecision> DecideFor(HttpContext context, AuthenticatedIdentity? identity, long projectId, ProjectAction action, PageReach? page = null)
 {
     PermissionDecision decision = await store.GetPermissionAsync(identity, projectId, action, page, context.RequestAborted);
-    if (settings.PublicBrowsing || decision.Grant is AccessGrant.Member or AccessGrant.None) return decision;
-    return new(false, null, "Public browsing disabled", "This server does not serve projects to anonymous callers.");
+    return Served(decision);
 }
+
+// The store's decision as this server serves it: a grant that rests on publishing is withdrawn while the operator has it off.
+PermissionDecision Served(PermissionDecision decision) =>
+    settings.PublicBrowsing || decision.Grant is AccessGrant.Member or AccessGrant.None
+        ? decision
+        : new(false, null, "Public browsing disabled", "This server does not serve projects to anonymous callers.");
 
 async Task<AuthorizedRepository?> Authorize(HttpContext context, ProjectAction action)
 {
@@ -10893,12 +10889,18 @@ async Task DeleteProject(HttpContext context, AuthenticatedIdentity identity, lo
     context.Response.StatusCode = StatusCodes.Status204NoContent;
 }
 
-RepositoryEndpoint EndpointFor(ProjectInfo project)
+string StoragePathFor(ProjectInfo project)
 {
     if (project.StorageId.Length != 32 || project.StorageId.Any(character => character is not (>= '0' and <= '9' or >= 'a' and <= 'f')))
         throw new InvalidOperationException("Invalid project storage identifier.");
-    RepositoryEndpoint endpoint = repositories.GetOrAdd(project.StorageId, storageId =>
-        new(() => new(new Repository(new DurableRepositoryStorage(Path.Combine(settings.Repositories, storageId)))),
+    return Path.Combine(settings.Repositories, project.StorageId);
+}
+
+RepositoryEndpoint EndpointFor(ProjectInfo project)
+{
+    string storagePath = StoragePathFor(project);
+    RepositoryEndpoint endpoint = repositories.GetOrAdd(project.StorageId, _ =>
+        new(() => new(new Repository(new DurableRepositoryStorage(storagePath))),
             LazyThreadSafetyMode.ExecutionAndPublication)).Value;
     // Repositories are cached for the process lifetime while the project row is read per request, so the
     // stored preference is reapplied on every use rather than only when the repository is first opened.
@@ -10921,29 +10923,54 @@ async Task<bool> WithRepository(RepositoryEndpoint endpoint, HttpContext context
     return true;
 }
 
-async Task<ProjectResponse> ProjectResponseFor(HttpContext context, ProjectDetails details)
+// The default branch is the only thing a project's description needs from its repository, so it is found
+// without the repository's lock and without opening it. An open repository's references are replaced whole,
+// never edited in place, so reading them while a push runs sees the state before it or after it. One nobody
+// has opened yet is read from its reference file alone: opening it means reading every object it holds, and
+// a listing would otherwise open every project it lists, one after another.
+async Task<ProjectResponse> ProjectResponseFor(HttpContext context, ProjectDetails details) =>
+    ProjectResponseWith(context, details, DefaultBranchFor(details.Project), await ListingFactsFor(context, [details]));
+
+async Task<ProjectResponse> ProjectResponseForLocked(HttpContext context, ProjectDetails details, Repository repository) =>
+    ProjectResponseWith(context, details, repository.DefaultBranch, await ListingFactsFor(context, [details]));
+
+// Many projects described at once: the facts about all of them come from one store call rather than several
+// queries each, which is what a listing of a hundred projects spent most of its time on.
+async Task<ProjectResponse[]> ProjectResponsesFor(HttpContext context, IReadOnlyList<ProjectDetails> projects)
 {
-    RepositoryEndpoint endpoint = EndpointFor(details.Project);
-    await endpoint.Gate.WaitAsync(context.RequestAborted);
-    try { return await ProjectResponseForLocked(context, details, endpoint.Repository); }
-    finally { endpoint.Gate.Release(); }
+    IReadOnlyDictionary<long, ProjectListingFacts> facts = await ListingFactsFor(context, projects);
+    return [.. projects.Select(details => ProjectResponseWith(context, details, DefaultBranchFor(details.Project), facts))];
 }
 
-async Task<ProjectResponse> ProjectResponseForLocked(HttpContext context, ProjectDetails details, Repository repository)
+Task<IReadOnlyDictionary<long, ProjectListingFacts>> ListingFactsFor(HttpContext context, IReadOnlyList<ProjectDetails> projects) =>
+    store.GetProjectListingFactsAsync(context.Items[ApiIdentityKey] as AuthenticatedIdentity,
+        [.. projects.Select(details => details.Project.Id).Distinct()],
+        [ProjectAction.ManageProject, ProjectAction.PushRepository, ProjectAction.WriteCollaboration], context.RequestAborted);
+
+string? DefaultBranchFor(ProjectInfo project)
 {
-    string? defaultBranch = repository.DefaultBranch;
+    if (repositories.TryGetValue(project.StorageId, out Lazy<RepositoryEndpoint>? opened) && opened.IsValueCreated)
+        return Repository.HeadOf(opened.Value.Repository.Refs, project.DefaultBranch);
+    return DurableRepositoryStorage.ReadDefaultBranch(StoragePathFor(project), project.DefaultBranch);
+}
+
+ProjectResponse ProjectResponseWith(HttpContext context, ProjectDetails details, string? defaultBranch,
+    IReadOnlyDictionary<long, ProjectListingFacts> allFacts)
+{
     string origin = Origin(context);
     string path = details.Project.Namespace + "/" + details.Project.Slug;
     string webUrl = origin + "/" + path;
+    ProjectListingFacts facts = allFacts.GetValueOrDefault(details.Project.Id)
+        ?? new(false, false, new(null, null, 0), 0, null, new Dictionary<ProjectAction, PermissionDecision>());
     // GitLab reports a null avatar_url when none is set, so the field is only populated once one exists.
-    string? avatarUrl = await store.HasAvatarAsync(AvatarOwner.Project, details.Project.Id, context.RequestAborted)
-        ? AvatarUrl(context, AvatarOwner.Project, details.Project.Id)
+    string? avatarUrl = facts.HasAvatar ? AvatarUrl(context, AvatarOwner.Project, details.Project.Id) : null;
+    ForkInfo forks = facts.Forks;
+    long stars = facts.Stars;
+    ProjectPermissionsResponse? permissions = PermissionsFor(context, details, facts);
+    UserResponse? owner = details.Project.GroupId is null
+        ? AuthorWith(context, details.Project.OwnerUserId, details.Project.Namespace, facts.OwnerHasAvatar)
         : null;
-    ForkInfo forks = await store.GetForkInfoAsync(details.Project.Id, context.RequestAborted);
-    long stars = await store.CountStarsAsync(details.Project.Id, context.RequestAborted);
-    ProjectPermissionsResponse? permissions = await PermissionsFor(context, details);
-    UserResponse? owner = details.Project.GroupId is null ? await AuthorFor(context, details.Project.OwnerUserId, details.Project.Namespace) : null;
-    ProjectMirror? mirror = await store.GetMirrorAsync(details.Project.Id, context.RequestAborted);
+    ProjectMirror? mirror = facts.Mirror;
     return new(details.Project.Id, details.Description, details.Project.Name,
         details.Project.Namespace + " / " + details.Project.Name, details.Project.Slug, path, details.CreatedAtUtc,
         defaultBranch, VisibilityName(details.Project.Visibility),
@@ -10975,21 +11002,21 @@ async Task<List<ProjectDetails>> ReadableProjects(HttpContext context, Authentic
 // One page of an in-memory project list, in GitLab's shape with its paging headers.
 async Task WriteProjectPage(HttpContext context, IReadOnlyList<ProjectDetails> projects, int page, int perPage)
 {
-    List<ProjectResponse> response = [];
-    foreach (ProjectDetails project in projects.Skip((page - 1) * perPage).Take(perPage)) response.Add(await ProjectResponseFor(context, project));
+    ProjectResponse[] response = await ProjectResponsesFor(context, [.. projects.Skip((page - 1) * perPage).Take(perPage)]);
     SetPagination(context, page, perPage, projects.Count);
-    await context.Response.WriteAsJsonAsync(response.ToArray(), ApiJson.Default.ProjectResponseArray, null, context.RequestAborted);
+    await context.Response.WriteAsJsonAsync(response, ApiJson.Default.ProjectResponseArray, null, context.RequestAborted);
 }
 
 // GitLab's access level for whoever is asking, read from the identity the API authentication left on the request: 50 for
 // the owner or an administrator, then 40, 30 and 20 for what the caller may do, and nothing for a caller with no role.
-async Task<ProjectPermissionsResponse?> PermissionsFor(HttpContext context, ProjectDetails details)
+ProjectPermissionsResponse? PermissionsFor(HttpContext context, ProjectDetails details, ProjectListingFacts facts)
 {
     if (context.Items[ApiIdentityKey] is not AuthenticatedIdentity identity) return null;
+    bool May(ProjectAction action) => facts.Decisions.TryGetValue(action, out PermissionDecision? decision) && Served(decision).Allowed;
     int level = identity.IsAdministrator || identity.UserId == details.Project.OwnerUserId ? 50
-        : (await DecideFor(context, identity, details.Project.Id, ProjectAction.ManageProject)).Allowed ? 40
-        : (await DecideFor(context, identity, details.Project.Id, ProjectAction.PushRepository)).Allowed ? 30
-        : (await DecideFor(context, identity, details.Project.Id, ProjectAction.WriteCollaboration)).Allowed ? 20
+        : May(ProjectAction.ManageProject) ? 40
+        : May(ProjectAction.PushRepository) ? 30
+        : May(ProjectAction.WriteCollaboration) ? 20
         : 0;
     return level == 0 ? null : new(new(level, 3), null);
 }

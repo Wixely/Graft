@@ -13,6 +13,8 @@ public sealed record GitObject
     private bool rawPayload;
     private PackFile? pack;
     private long packOffset;
+    // The name a stored loose file was found under, until its content has been read once and found to match.
+    private string? unverifiedId;
     internal string? StoredPath => rawPayload ? null : path;
     internal PackFile? PackSource => pack;
     public int Type { get; }
@@ -20,6 +22,12 @@ public sealed record GitObject
     public GitObject(int type, byte[] data) { Type = type; this.data = data; Size = data.Length; }
     /// <summary>An object kept as a loose file in Git's format, staged or stored.</summary>
     internal GitObject(int type, int size, string path) { Type = type; Size = size; this.path = path; }
+    /// <summary>
+    /// A stored loose file found under <paramref name="expectedId"/>. Opening a repository reads only its
+    /// header; the content is checked against the name the first time it is read, so a repository opens
+    /// without hashing every loose object in it and a damaged file still never passes for the real one.
+    /// </summary>
+    internal GitObject(int type, int size, string path, string expectedId) : this(type, size, path) => unverifiedId = expectedId;
     /// <summary>An object kept in a pack, read on demand.</summary>
     internal GitObject(int type, int size, PackFile pack, long offset) { Type = type; Size = size; this.pack = pack; packOffset = offset; }
     public byte[] Data
@@ -40,8 +48,22 @@ public sealed record GitObject
                 raw.ReadExactly(content);
                 return content;
             }
-            return LooseObject.ReadData(path!, Type, Size);
+            byte[] loose = LooseObject.ReadData(path!, Type, Size);
+            if (unverifiedId is { } expected)
+            {
+                Limits.Require(HashOf(Type, loose) == expected, "stored-object-hash");
+                unverifiedId = null;
+            }
+            return loose;
         }
+    }
+
+    private static string HashOf(int type, byte[] content)
+    {
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
+        hash.AppendData(Encoding.ASCII.GetBytes(LooseObject.TypeName(type) + " " + content.Length.ToString(CultureInfo.InvariantCulture) + "\0"));
+        hash.AppendData(content);
+        return Convert.ToHexStringLower(hash.GetHashAndReset());
     }
     /// <summary>
     /// The content as a seekable stream. A loose object is inflated into memory first, because the archive
@@ -65,8 +87,8 @@ public sealed record GitObject
         if (path is not null && !rawPayload) return LooseObject.OpenContent(path, out _, out _);
         return OpenRead();
     }
-    internal void StoredAt(string destination) { path = destination; data = null; pack = null; rawPayload = false; }
-    internal void StoredIn(PackFile source, long offset) { pack = source; packOffset = offset; path = null; data = null; rawPayload = false; }
+    internal void StoredAt(string destination) { path = destination; data = null; pack = null; rawPayload = false; unverifiedId = null; }
+    internal void StoredIn(PackFile source, long offset) { pack = source; packOffset = offset; path = null; data = null; rawPayload = false; unverifiedId = null; }
 
     /// <summary>A new object with the same bytes, staged as a loose file of its own in <paramref name="directory"/>,
     /// so a later durable commit moves the copy and never this object's own file.</summary>
@@ -112,7 +134,13 @@ public sealed record GitObject
             byte[] buffer = new byte[64 * 1024];
             int count;
             while ((count = source.Read(buffer)) != 0) hash.AppendData(buffer.AsSpan(0, count));
-            return Convert.ToHexStringLower(hash.GetHashAndReset());
+            string id = Convert.ToHexStringLower(hash.GetHashAndReset());
+            if (unverifiedId is { } expected)
+            {
+                Limits.Require(id == expected, "stored-object-hash");
+                unverifiedId = null;
+            }
+            return id;
         }
     }
 }

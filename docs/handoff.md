@@ -1,6 +1,22 @@
 # Next-agent handoff
 
-Updated: 2026-11-14. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the project owner.
+Updated: 2026-11-16. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the project owner.
+
+## Added on 2026-11-16: the project list, and the cost of opening a repository
+
+The project list loaded so slowly that the page claimed the server was unreachable. [ADR 0053](decisions/0053-listing-and-repository-open-cost.md).
+
+- **Describing a project** (`ProjectResponseFor`, `ProjectResponsesFor` in `Graft.Server/Program.cs`) no longer takes the
+  repository's lock or opens it: `DefaultBranchFor` reads an open repository's references, or the reference file of
+  one not yet opened. The rest comes from `GraftStore.GetProjectListingFactsAsync` in one call. Use `ProjectResponsesFor`
+  for any new list of projects, and `GroupResponsesFor` for groups; do not add a per-item store call to either.
+- **The engine.** `PackFile`'s cache is now O(1) per hit (it was a linear search, which made reading histories
+  quadratic); `Describe` takes an optional type memo; loose objects are checked when first read, not at open. A
+  155,061-object repository opens in about 4 s, down from about 130.
+- **The client.** `GraftApi.GetAsync` no longer marks the server unreachable on an error status; `ReadAsync` returns
+  the message. The home page shows it, and loads groups only when the new-project form opens.
+- **Next action (implementation agent):** check the live deployment's project list after the next release; if a
+  first open after restart is still reported slow, see "Not done" in the ADR.
 
 ## Added on 2026-11-14: release destinations, and release files on disk
 

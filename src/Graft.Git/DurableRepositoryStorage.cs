@@ -122,10 +122,11 @@ public sealed class DurableRepositoryStorage : IRepositoryPersistence, IDisposab
             if (!File.Exists(Path.ChangeExtension(packPath, ".idx"))) continue;
             PackFile pack = PackFile.Open(packPath);
             packs.Add(pack);
+            Dictionary<long, int> types = new(pack.Count);
             foreach ((string id, long offset) in pack.Entries().OrderBy(entry => entry.Offset))
             {
                 if (objects.ContainsKey(id)) continue;
-                (int type, int size) = pack.Describe(offset);
+                (int type, int size) = pack.Describe(offset, types);
                 Count(size);
                 objects.Add(id, new GitObject(type, size, pack, offset));
             }
@@ -143,9 +144,9 @@ public sealed class DurableRepositoryStorage : IRepositoryPersistence, IDisposab
             if (objects.ContainsKey(id)) continue;
             (int type, int size) = LooseObject.ReadHeader(path);
             Count(size);
-            GitObject value = new(type, size, path);
-            Limits.Require(value.Id == id, "stored-object-hash");
-            objects.Add(id, value);
+            // Checked against its name when first read rather than here: hashing every loose object made
+            // opening a repository cost as much as reading all of it.
+            objects.Add(id, new GitObject(type, size, path, id));
         }
 
         known = objects;
@@ -405,10 +406,32 @@ public sealed class DurableRepositoryStorage : IRepositoryPersistence, IDisposab
         return value is { Type: not 4 } ? current : null;
     }
 
-    private static Dictionary<string, string> ReadRefs(string root)
+    /// <summary>
+    /// The default branch of the repository in a directory, from its references alone: no object is read and
+    /// nothing is written, so a listing can name the branch of a repository nobody has opened yet without
+    /// paying for opening it. A reference file being replaced at that moment is read from the copy the
+    /// replacement keeps, and a layout from before the current one is read where it lies.
+    /// </summary>
+    public static string? ReadDefaultBranch(string repositoryRoot, string? preferred)
+    {
+        string root = Path.GetFullPath(repositoryRoot);
+        if (!Directory.Exists(root)) return null;
+        for (int attempt = 0; ; attempt++)
+        {
+            try { return Repository.HeadOf(ReadRefs(root, settled: false), preferred); }
+            // A replacement landed between finding the file and opening it; the next attempt sees it whole.
+            catch (IOException) when (attempt < 2) { }
+        }
+    }
+
+    private static Dictionary<string, string> ReadRefs(string root, bool settled = true)
     {
         Dictionary<string, string> refs = new(StringComparer.Ordinal);
         string packed = Path.Combine(root, PackedRefsName);
+        // An open storage has already recovered and converted these, so only a reader that has not opened it
+        // needs to look past the current file.
+        if (!settled && !File.Exists(packed))
+            packed = File.Exists(Path.Combine(root, PackedRefsBackupName)) ? Path.Combine(root, PackedRefsBackupName) : Path.Combine(root, LegacyRefsName);
         if (File.Exists(packed))
         {
             foreach (string line in File.ReadAllLines(packed, Encoding.ASCII))

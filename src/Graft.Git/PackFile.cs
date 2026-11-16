@@ -20,8 +20,10 @@ public sealed class PackFile : IDisposable
     private readonly int count;
     private readonly long packLength;
     private readonly object cacheLock = new();
-    private readonly Dictionary<long, byte[]> cache = new();
-    private readonly LinkedList<long> cacheOrder = new();
+    // Each entry holds its own node in the recency list, so a hit is moved to the end without searching the
+    // list for it. The cache holds many small bases at once, and a search per hit made reading quadratic.
+    private readonly Dictionary<long, LinkedListNode<(long Offset, byte[] Value)>> cache = new();
+    private readonly LinkedList<(long Offset, byte[] Value)> cacheOrder = new();
     private long cacheSize;
 
     public string PackPath { get; }
@@ -132,12 +134,20 @@ public sealed class PackFile : IDisposable
     }
 
     /// <summary>The type and content size of the object at an offset, resolving a delta's type through its base.</summary>
-    public (int Type, int Size) Describe(long offset)
+    public (int Type, int Size) Describe(long offset) => Describe(offset, null);
+
+    /// <summary>
+    /// The same, remembering each resolved type by offset in <paramref name="types"/>. Describing a whole pack
+    /// in offset order then resolves a delta's type in one step, because its base, which comes earlier in the
+    /// pack, has already been described; without it every object walks its chain to the end again.
+    /// </summary>
+    public (int Type, int Size) Describe(long offset, Dictionary<long, int>? types)
     {
         Header header = ReadHeader(offset);
         if (header.Type <= 4)
         {
             Limits.Require(header.Size <= Limits.ObjectBytes, "object-size");
+            types?.TryAdd(offset, header.Type);
             return (header.Type, (int)header.Size);
         }
         // A delta's own header says how long the delta is; the result size is the second number inside it,
@@ -152,10 +162,12 @@ public sealed class PackFile : IDisposable
         for (int depth = 0; type > 4; depth++)
         {
             Limits.Require(depth < Limits.DeltaDepth, "delta-depth");
-            Header current = ReadHeader(at);
+            if (depth > 0 && types is not null && types.TryGetValue(at, out int known)) { type = known; break; }
+            Header current = depth == 0 ? header : ReadHeader(at);
             if (current.Type <= 4) { type = current.Type; break; }
             at = BaseOffset(at, current);
         }
+        types?.TryAdd(offset, type);
         return (type, (int)resultSize);
     }
 
@@ -285,10 +297,10 @@ public sealed class PackFile : IDisposable
     {
         lock (cacheLock)
         {
-            if (!cache.TryGetValue(offset, out byte[]? value)) return null;
-            cacheOrder.Remove(offset);
-            cacheOrder.AddLast(offset);
-            return value;
+            if (!cache.TryGetValue(offset, out LinkedListNode<(long Offset, byte[] Value)>? node)) return null;
+            cacheOrder.Remove(node);
+            cacheOrder.AddLast(node);
+            return node.Value.Value;
         }
     }
 
@@ -297,15 +309,15 @@ public sealed class PackFile : IDisposable
         if (value.Length > CacheBytes / 4) return;
         lock (cacheLock)
         {
-            if (cache.TryAdd(offset, value))
+            if (!cache.ContainsKey(offset))
             {
-                cacheOrder.AddLast(offset);
+                cache.Add(offset, cacheOrder.AddLast((offset, value)));
                 cacheSize += value.Length;
             }
             while (cacheSize > CacheBytes && cacheOrder.First is { } oldest)
             {
-                cacheSize -= cache[oldest.Value].Length;
-                cache.Remove(oldest.Value);
+                cacheSize -= oldest.Value.Value.Length;
+                cache.Remove(oldest.Value.Offset);
                 cacheOrder.RemoveFirst();
             }
         }

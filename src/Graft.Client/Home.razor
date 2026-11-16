@@ -18,7 +18,7 @@ else
     <div class="page-header">
         <div><h1>Projects</h1></div>
         <div class="page-header-actions">
-            <button type="button" class="@(creating ? "secondary" : "")" @onclick="() => creating = !creating">
+            <button type="button" class="@(creating ? "secondary" : "")" @onclick="ToggleCreating">
                 <Icon Name="plus" />New project
             </button>
         </div>
@@ -74,7 +74,11 @@ else
 
     <div class="panel">
         <div class="panel-header"><h2>Your projects</h2><span class="spacer"></span><span class="label">@projects.Length</span></div>
-        @if (projects.Length == 0)
+        @if (loadFailed)
+        {
+            <p class="panel-empty">The projects could not be loaded.</p>
+        }
+        else if (projects.Length == 0)
         {
             <p class="panel-empty">No accessible projects yet.</p>
         }
@@ -126,18 +130,34 @@ else
                 return;
             }
             await LoadProjects();
-            await LoadGroups();
         }
         finally { loading = false; }
     }
 
-    private async Task LoadProjects() =>
-        projects = await Api.GetAsync("api/projects", ApiJson.Default.ProjectResponseArray) ?? [];
+    private bool loadFailed;
+
+    // A failure here is reported as what it was. The server answering slowly or with an error is not the
+    // server being unreachable, and an empty list would claim there is nothing to show.
+    private async Task LoadProjects()
+    {
+        ApiResult<ProjectResponse[]> result = await Api.ReadAsync("api/projects", ApiJson.Default.ProjectResponseArray);
+        loadFailed = !result.Ok;
+        if (result.Ok) projects = result.Value ?? [];
+        else if (Api.Reachable) { message = result.Message; messageKind = "error"; }
+    }
 
     private GroupResponse[] groups = [];
+    private bool groupsLoaded;
     private string namespaceId = "";
 
-    private async Task LoadGroups() => groups = await Api.GetAsync("api/groups", ApiJson.Default.GroupResponseArray) ?? [];
+    // Groups only matter to the form, so they are fetched when it first opens rather than holding up the list.
+    private async Task ToggleCreating()
+    {
+        creating = !creating;
+        if (!creating || groupsLoaded) return;
+        groupsLoaded = true;
+        groups = await Api.GetAsync("api/groups", ApiJson.Default.GroupResponseArray) ?? [];
+    }
 
     private async Task CreateProject()
     {

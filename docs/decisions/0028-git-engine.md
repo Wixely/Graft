@@ -59,7 +59,9 @@ deleted. It needs the `api` scope and Maintainer-equivalent access, the same sta
 settings need. GitLab schedules it and answers `201` with nothing; Graft does it before answering and says
 what it did. It also runs by itself at the end of a push that leaves more than a thousand loose objects,
 as Git runs `gc --auto` at the end of a receive; Git's own threshold is 6,700, and Graft's is lower because
-every loose object is hashed when a repository opens and a pack is not.
+every loose object is hashed when a repository opens and a pack is not. (Amended 2026-11-16 by
+[ADR 0053](0053-listing-and-repository-open-cost.md): a loose object is now checked when first read, not at
+open; the threshold stays because opening still reads each loose file's header.)
 
 Nothing is pruned. An object nothing points at is kept, because a line comment or a proposal may still
 name the commit it belongs to, and because deciding when an object is safe to lose is a decision of its

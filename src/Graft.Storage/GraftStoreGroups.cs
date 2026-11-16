@@ -260,6 +260,22 @@ public sealed partial class GraftStore
         return liveActor.IsAdministrator ? GroupRole.Owner : await GroupRoleForAsync(db, null, liveActor.UserId, groupId);
     }
 
+    /// <summary>The same for many groups on one connection, for a listing; a group the caller holds no role in maps to null.</summary>
+    public async Task<IReadOnlyDictionary<long, GroupRole?>> GetGroupRolesAsync(AuthenticatedIdentity actor, IReadOnlyCollection<long> groupIds,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(actor);
+        ArgumentNullException.ThrowIfNull(groupIds);
+        Dictionary<long, GroupRole?> roles = [];
+        if (groupIds.Count == 0) return roles;
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        await using SqliteTransaction transaction = db.BeginTransaction(deferred: true);
+        AuthenticatedIdentity liveActor = await RequireLiveIdentityAsync(db, transaction, actor, cancellationToken);
+        foreach (long groupId in groupIds)
+            roles[groupId] = liveActor.IsAdministrator ? GroupRole.Owner : await GroupRoleForAsync(db, transaction, liveActor.UserId, groupId);
+        return roles;
+    }
+
     private static async Task<GroupRole?> GroupRoleForAsync(SqliteConnection db, SqliteTransaction? transaction, long userId, long groupId)
     {
         long? role = await db.ExecuteScalarAsync<long?>("""

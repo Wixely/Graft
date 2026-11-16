@@ -26,6 +26,7 @@ public readonly record struct SignInOutcome(bool Ok, string Message, string? Cha
 public sealed class GraftApi(HttpClient http)
 {
     private const string Unreachable = "Graft could not be reached.";
+    private const string TooSlow = "Graft took too long to answer. Try again.";
     private Task<bool>? load;
 
     public SessionResponse? Session { get; private set; }
@@ -59,10 +60,26 @@ public sealed class GraftApi(HttpClient http)
         return Authenticated;
     }
 
-    public async Task<T?> GetAsync<T>(string uri, JsonTypeInfo<T> type, CancellationToken cancellationToken = default)
+    public async Task<T?> GetAsync<T>(string uri, JsonTypeInfo<T> type, CancellationToken cancellationToken = default) =>
+        (await ReadAsync(uri, type, cancellationToken)).Value;
+
+    /// <summary>
+    /// A GET that says why it failed. Only a request that never got an answer makes the server unreachable;
+    /// an error status, including a proxy's answer that the server was too slow, is an answer, and saying the
+    /// server could not be reached when it could is what this exists to avoid.
+    /// </summary>
+    public async Task<ApiResult<T>> ReadAsync<T>(string uri, JsonTypeInfo<T> type, CancellationToken cancellationToken = default)
     {
-        try { return await http.GetFromJsonAsync(uri, type, cancellationToken); }
-        catch (HttpRequestException) { Reachable = false; return default; }
+        try
+        {
+            using HttpResponseMessage response = await http.GetAsync(uri, cancellationToken);
+            Reachable = true;
+            return response.IsSuccessStatusCode
+                ? new(true, "", await response.Content.ReadFromJsonAsync(type, cancellationToken))
+                : new(false, await ReadMessageAsync(response, cancellationToken), default);
+        }
+        catch (HttpRequestException) { Reachable = false; return new(false, Unreachable, default); }
+        catch (TaskCanceledException) when (!cancellationToken.IsCancellationRequested) { return new(false, TooSlow, default); }
     }
 
     /// <summary>
@@ -277,6 +294,9 @@ public sealed class GraftApi(HttpClient http)
             HttpStatusCode.Forbidden => "That action is not permitted.",
             HttpStatusCode.NotFound => "That resource no longer exists.",
             HttpStatusCode.TooManyRequests => "Too many attempts. Wait and try again.",
+            // 524 is what a proxy in front, Cloudflare in particular, answers when Graft has not replied in time.
+            HttpStatusCode.GatewayTimeout or (HttpStatusCode)524 => TooSlow,
+            HttpStatusCode.BadGateway or HttpStatusCode.ServiceUnavailable => "Graft is not answering at the moment. Try again shortly.",
             _ => "The request was refused."
         };
     }

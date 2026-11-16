@@ -26,7 +26,8 @@ public sealed class Repository
     /// <summary>
     /// How many loose objects a push may leave behind before the repository is repacked on the spot, the
     /// way Git runs <c>gc --auto</c> at the end of a receive. Git's own default is 6,700; this is lower
-    /// because every loose object is hashed when the repository is opened, and a pack is not.
+    /// because opening a repository reads the header of every loose object, one file each, and a pack's
+    /// objects come from one index.
     /// </summary>
     public const int AutoRepackLooseObjects = 1000;
     private const string Agent = "agent=graft";
