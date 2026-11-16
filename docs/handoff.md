@@ -11,7 +11,8 @@ Updated: 2026-11-16. Review: at the start and end of the next work session. Owne
 - **Verified under WSL:** the install script end to end, its refusal without systemd, and a pipeline routed by tags
   to a Linux and a Windows runner. [Evidence](validation/2026-11-16-runners-linux-wsl-systemd.md).
 - **The full solution build passes again:** `experiments/storage` moved to DnaX alpha.13.
-- **Next action (project owner):** cut a release so the fixed static Linux runner exists. Then, from an elevated
+- **Released as v0.1.4**, whose static Linux runner was verified as a systemd service the same day.
+- **Next action (project owner):** from an elevated
   PowerShell, run a runner install script without `-NoService` to try the Windows service.
 
 ## Added on 2026-11-16, last: backups keep the server's keys, and the documents were reviewed

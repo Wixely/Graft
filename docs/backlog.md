@@ -236,8 +236,8 @@ the Windows runner is tested.
 3. Exercise the install scripts' service paths: the `graft-runner` systemd unit and the `GraftRunner` Windows
    service. (2026-11-16: the systemd path was run under WSL and found broken; the runner never started as a
    service. Fixed, with the refusal without systemd and the WSL advice verified:
-   [evidence](validation/2026-11-16-runners-linux-wsl-systemd.md). Still to do: the fix in a static build, which
-   comes with the next release; the Windows service, which needs an elevated session; whether WSL stops an idle
+   [evidence](validation/2026-11-16-runners-linux-wsl-systemd.md). Still to do (the static build was verified in v0.1.4):
+   the Windows service, which needs an elevated session; whether WSL stops an idle
    distribution with the service running.)
 4. A runner container image in `deploy/container`, and a test of a runner against a forge running in a
    container with its runner port published.

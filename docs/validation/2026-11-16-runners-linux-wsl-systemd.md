@@ -61,3 +61,12 @@ affected; the next release carries the fix. The Windows service path was not aff
   asked for.
 - **The Linux 3.10.108 host, and a runner container image.** No access to the host from here, and no Docker or
   Podman on this machine.
+
+## Release v0.1.4 (same day)
+
+The fix was released as v0.1.4 (commit `bc5e9be`). All three Linux executables were checked against the release's
+`SHA256SUMS` and run under WSL: the static forge, the admin tool's bootstrap, and the static runner. The release
+forge's install script installed the static runner as a `Type=notify` systemd service. It reached `active` with no
+restarts and status "Graft runner is asking for work", and the forge listed it online. It ran a `tags: [linux]` job
+to success, and `systemctl restart` brought it back. This closes "the fix in a static NativeAOT build" above; the
+other items under "Not verified" stand.
