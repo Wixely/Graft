@@ -7963,6 +7963,93 @@ async Task<string> CheckRunners(string address, AuthenticatedIdentity alice, str
     File.WriteAllText(config, Regex.Replace(File.ReadAllText(config), "\"port\": *\\d+", "\"port\": " + newPort));
     runnerChunkThreshold = null;
 
+    // Tags route a job to the runners that have them (ADR 0054). The suite's runner has no tags and runs untagged jobs.
+    async Task<Dictionary<string, JsonElement>> NewestJobs()
+    {
+        Dictionary<string, JsonElement> found = [];
+        using HttpResponseMessage pipelines = await ApiGet(address, prefix + "/pipelines", aliceApi);
+        using JsonDocument list = JsonDocument.Parse(await pipelines.Content.ReadAsStringAsync());
+        using HttpResponseMessage listed = await ApiGet(address, prefix + "/pipelines/" + list.RootElement[0].GetProperty("id").GetInt64() + "/jobs", aliceApi);
+        using JsonDocument json = JsonDocument.Parse(await listed.Content.ReadAsStringAsync());
+        foreach (JsonElement job in json.RootElement.EnumerateArray()) found[job.GetProperty("name").GetString()!] = job.Clone();
+        return found;
+    }
+    File.WriteAllText(Path.Combine(work, ".gitlab-ci.yml"), "tagged:\n  tags: [Special]\n  script: echo tagged\nplain:\n  script: echo plain\n");
+    await Git(work, ["commit", "-am", "A tagged job"]);
+    await Git(work, ["push", AuthenticatedUrl(address, "alice", aliceApi, "alice/citest.git"), "main"]);
+    Dictionary<string, JsonElement> tagJobs = await NewestJobs();
+    Check(tagJobs["tagged"].GetProperty("tag_list").EnumerateArray().Select(tag => tag.GetString()).SequenceEqual(["special"]) &&
+        tagJobs["plain"].GetProperty("tag_list").GetArrayLength() == 0, "a job's tags are read from the file, lower-cased as GitLab compares them");
+    Check(tagJobs["tagged"].GetProperty("stuck").GetBoolean() && !tagJobs["plain"].GetProperty("stuck").GetBoolean(),
+        "a job no registered runner has the tags for says it is stuck; an untagged one does not");
+    (int tagRunExit, _, string tagRunErrors) = await RunTool(runnerExe, scripts, ["run", "--config", config, "--once"]);
+    tagJobs = await NewestJobs();
+    Check(tagRunExit == 0 && tagJobs["plain"].GetProperty("status").GetString() == "success" && tagJobs["tagged"].GetProperty("status").GetString() == "pending",
+        "a runner without the tag runs the untagged job and leaves the tagged one waiting (" + tagRunErrors.Trim() + ")");
+
+    using (HttpResponseMessage paused = await ApiPutJson(address, "/api/v4/runners/" + runnerId, adminApi, """{"paused":true}"""))
+        Check(paused.StatusCode == HttpStatusCode.BadRequest, "pausing a runner is refused rather than pretended");
+    using (HttpResponseMessage comma = await ApiPutJson(address, "/api/v4/runners/" + runnerId, adminApi, """{"tag_list":["a,b"]}"""))
+        Check(comma.StatusCode == HttpStatusCode.BadRequest, "a tag with a comma in it is refused");
+    using (HttpResponseMessage notAdmin = await ApiPutJson(address, "/api/v4/runners/" + runnerId, aliceApi, """{"tag_list":["special"]}"""))
+        Check(notAdmin.StatusCode == HttpStatusCode.Forbidden, "only an administrator changes a runner's tags");
+    using (HttpResponseMessage tagged = await ApiPutJson(address, "/api/v4/runners/" + runnerId, adminApi,
+        """{"tag_list":["special"," Other "],"run_untagged":false}"""))
+    {
+        using JsonDocument json = JsonDocument.Parse(await tagged.Content.ReadAsStringAsync());
+        Check(tagged.IsSuccessStatusCode && json.RootElement.GetProperty("tag_list").EnumerateArray().Select(tag => tag.GetString()).SequenceEqual(["special", "other"]) &&
+            !json.RootElement.GetProperty("run_untagged").GetBoolean() && json.RootElement.GetProperty("description").GetString() == "suite runner",
+            "an administrator gives the runner tags through GitLab's runner route, leaving what was not sent as it was");
+    }
+    using (HttpResponseMessage one = await ApiGet(address, "/api/v4/runners/" + runnerId, adminApi))
+        Check((await one.Content.ReadAsStringAsync()).Contains("\"tag_list\":[\"special\",\"other\"]", StringComparison.Ordinal), "and the runner reads back with them");
+    using (HttpResponseMessage filtered = await ApiGet(address, "/api/v4/runners/all?tag_list=special,other", adminApi))
+    using (HttpResponseMessage unmatched = await ApiGet(address, "/api/v4/runners/all?tag_list=special,nowhere", adminApi))
+        Check((await filtered.Content.ReadAsStringAsync()).Contains("\"id\":" + runnerId, StringComparison.Ordinal) &&
+            (await unmatched.Content.ReadAsStringAsync()).Trim() == "[]", "the runner list filters by tag_list as GitLab's does");
+    tagJobs = await NewestJobs();
+    Check(!tagJobs["tagged"].GetProperty("stuck").GetBoolean(), "the waiting job is no longer stuck once a runner has its tag");
+    (tagRunExit, _, tagRunErrors) = await RunTool(runnerExe, scripts, ["run", "--config", config, "--once"]);
+    tagJobs = await NewestJobs();
+    Check(tagRunExit == 0 && tagJobs["tagged"].GetProperty("status").GetString() == "success" &&
+        tagJobs["tagged"].GetProperty("runner").GetProperty("id").GetInt64() == runnerId, "and the tagged runner runs it (" + tagRunErrors.Trim() + ")");
+
+    File.WriteAllText(Path.Combine(work, ".gitlab-ci.yml"), "untagged:\n  script: echo untagged\n");
+    await Git(work, ["commit", "-am", "An untagged job"]);
+    await Git(work, ["push", AuthenticatedUrl(address, "alice", aliceApi, "alice/citest.git"), "main"]);
+    (tagRunExit, _, tagRunErrors) = await RunTool(runnerExe, scripts, ["run", "--config", config, "--once"]);
+    tagJobs = await NewestJobs();
+    Check(tagRunExit == 0 && tagJobs["untagged"].GetProperty("status").GetString() == "pending" && tagJobs["untagged"].GetProperty("stuck").GetBoolean(),
+        "a runner that takes tagged jobs only leaves an untagged one alone, and the job says it is stuck");
+    using (HttpResponseMessage untaggedAgain = await ApiPutJson(address, "/api/v4/runners/" + runnerId, adminApi, """{"run_untagged":true}"""))
+        Check(untaggedAgain.IsSuccessStatusCode && (await untaggedAgain.Content.ReadAsStringAsync()).Contains("\"tag_list\":[\"special\",\"other\"]", StringComparison.Ordinal),
+            "run_untagged changes alone, keeping the tags");
+    (tagRunExit, _, tagRunErrors) = await RunTool(runnerExe, scripts, ["run", "--config", config, "--once"]);
+    tagJobs = await NewestJobs();
+    Check(tagRunExit == 0 && tagJobs["untagged"].GetProperty("status").GetString() == "success", "and the runner then takes it (" + tagRunErrors.Trim() + ")");
+
+    using (HttpResponseMessage second = await ApiPostJson(address, "/api/v4/user/runners", adminApi,
+        """{"description":"tagged at birth","tag_list":["Windows","android"],"run_untagged":false}"""))
+    {
+        using JsonDocument json = JsonDocument.Parse(await second.Content.ReadAsStringAsync());
+        long secondId = json.RootElement.GetProperty("id").GetInt64();
+        using HttpResponseMessage read = await ApiGet(address, "/api/v4/runners/" + secondId, adminApi);
+        string body = await read.Content.ReadAsStringAsync();
+        Check(second.StatusCode == HttpStatusCode.Created && body.Contains("\"tag_list\":[\"windows\",\"android\"]", StringComparison.Ordinal) &&
+            body.Contains("\"run_untagged\":false", StringComparison.Ordinal), "a runner is created with tags");
+        using HttpResponseMessage removed = await ApiDelete(address, "/api/v4/runners/" + secondId, adminApi);
+    }
+    File.WriteAllText(Path.Combine(work, ".gitlab-ci.yml"), "build:\n  tags: [$RUNNER]\n  script: echo hi\n");
+    await Git(work, ["commit", "-am", "A tag from a variable"]);
+    await Git(work, ["push", AuthenticatedUrl(address, "alice", aliceApi, "alice/citest.git"), "main"]);
+    using (HttpResponseMessage listed = await ApiGet(address, prefix + "/pipelines", aliceApi))
+    {
+        using JsonDocument json = JsonDocument.Parse(await listed.Content.ReadAsStringAsync());
+        Check(json.RootElement[0].GetProperty("status").GetString() == "failed" &&
+            json.RootElement[0].GetProperty("error").GetString()!.Contains("variable", StringComparison.Ordinal),
+            "a tag that would need a variable expanded fails the pipeline, saying so");
+    }
+
     // A file Graft does not run is a failed pipeline that says why, not silence.
     File.WriteAllText(Path.Combine(work, ".gitlab-ci.yml"), "build:\n  image: alpine\n  script: echo hi\n");
     await Git(work, ["commit", "-am", "Ask for an image"]);

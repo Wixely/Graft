@@ -2,6 +2,21 @@
 
 Updated: 2026-11-16. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the project owner.
 
+## Added on 2026-11-16, later: runner tags
+
+Jobs can now say which runner they need. [ADR 0054](decisions/0054-runner-tags.md). Migration 32.
+
+- **Matching** is SQL in `GraftStoreCi.cs`: `RunnerTakesJob` is used both by `LeaseJobAsync` and by the `Stuck`
+  column of `JobSelect`. Keep the two the same, and keep them the same as `RunnerTags.Satisfies` in
+  `Graft.Core/Ci.cs`. The runner joined in `JobSelect` is now aliased `jr`; `r` is the candidate runner.
+- **The pipeline reader** accepts `tags:` and refuses tags that use variables.
+- **Routes**: `PUT` and `GET /api/v4/runners/:id`, `tag_list` on create and as a filter, and `PUT
+  /api/admin/runners/:id` for the page.
+- **The shell install script** checks for systemd before registering, and under WSL says how to turn systemd on
+  and how to keep the distribution running. The WSL path has not been run on a real WSL distribution.
+- **Next action (project owner):** on the Windows build machine, install a second runner inside WSL 2 tagged
+  `linux`, tag the Windows one `windows`, and report whether the script's WSL advice holds.
+
 ## Added on 2026-11-16: the project list, and the cost of opening a repository
 
 The project list loaded so slowly that the page claimed the server was unreachable. [ADR 0053](decisions/0053-listing-and-repository-open-cost.md).

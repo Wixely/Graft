@@ -35,11 +35,18 @@ public sealed partial class GraftStore
     // Runners
     // ------------------------------------------------------------------------------------------------
 
-    public async Task<RunnerRegistration> CreateRunnerAsync(AuthenticatedIdentity actor, string description, CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Creates a runner registration with the tags jobs are routed by. Tags are normalised by
+    /// <see cref="RunnerTags"/>; a list it refuses is an <see cref="ArgumentException"/> saying why.
+    /// </summary>
+    public async Task<RunnerRegistration> CreateRunnerAsync(AuthenticatedIdentity actor, string description, IReadOnlyList<string> tags, bool runUntagged,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(actor);
         description = (description ?? "").Trim();
         if (description.Length > 200) throw new ArgumentException("A runner description is at most 200 characters.", nameof(description));
+        if (!RunnerTags.TryNormalise(tags ?? [], out IReadOnlyList<string> normalTags, out string tagError))
+            throw new ArgumentException("Runner tags: " + tagError, nameof(tags));
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
         await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
         AuthenticatedIdentity liveActor = await RequireLiveIdentityAsync(db, transaction, actor, cancellationToken);
@@ -48,15 +55,51 @@ public sealed partial class GraftStore
         string now = Now();
         DateTimeOffset expires = DateTimeOffset.UtcNow + RunnerRegistrationLifetime;
         long id = await db.QuerySingleAsync<long>("""
-            INSERT INTO Runners (Description, RegistrationDigest, RegistrationExpiresAtUtc, CreatedByUserId, CreatedAtUtc)
-            VALUES (@Description, @RegistrationDigest, @RegistrationExpiresAtUtc, @CreatedByUserId, @CreatedAtUtc)
+            INSERT INTO Runners (Description, RegistrationDigest, RegistrationExpiresAtUtc, CreatedByUserId, CreatedAtUtc, Tags, RunUntagged)
+            VALUES (@Description, @RegistrationDigest, @RegistrationExpiresAtUtc, @CreatedByUserId, @CreatedAtUtc, @Tags, @RunUntagged)
             RETURNING Id;
-            """, new RunnerInsertParameters(description, Digest(token), expires.ToString("O", CultureInfo.InvariantCulture), liveActor.UserId, now), transaction);
+            """, new RunnerInsertParameters(description, Digest(token), expires.ToString("O", CultureInfo.InvariantCulture), liveActor.UserId, now,
+                EncodeLines(normalTags), runUntagged ? 1 : 0), transaction);
         await AuditAsync(db, transaction, liveActor.UserId, "create-runner", "runner", id.ToString(CultureInfo.InvariantCulture),
-            "Runner registration created" + (description.Length == 0 ? "." : ": " + description + "."), now);
+            "Runner registration created" + (description.Length == 0 ? "" : ": " + description) + TagSummary(normalTags, runUntagged) + ".", now);
         await transaction.CommitAsync(cancellationToken);
-        return new(new(id, description, null, null, null, Instant(now), null, null, expires), token);
+        return new(new(id, description, null, null, null, Instant(now), null, null, expires, normalTags, runUntagged), token);
     }
+
+    /// <summary>
+    /// Changes what an administrator says about a runner: its description, its tags, and whether it takes untagged
+    /// jobs. A null leaves that setting as it is. A job already running keeps its runner; the change routes the jobs
+    /// leased after it. Returns null for an unknown runner.
+    /// </summary>
+    public async Task<RunnerInfo?> UpdateRunnerAsync(AuthenticatedIdentity actor, long runnerId, string? description, IReadOnlyList<string>? tags,
+        bool? runUntagged, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(actor);
+        description = description?.Trim();
+        if (description?.Length > 200) throw new ArgumentException("A runner description is at most 200 characters.", nameof(description));
+        IReadOnlyList<string>? normalTags = null;
+        if (tags is not null && !RunnerTags.TryNormalise(tags, out normalTags, out string tagError))
+            throw new ArgumentException("Runner tags: " + tagError, nameof(tags));
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
+        AuthenticatedIdentity liveActor = await RequireLiveIdentityAsync(db, transaction, actor, cancellationToken);
+        if (!liveActor.IsAdministrator) throw new UnauthorizedAccessException("Administrator access is required.");
+        RunnerInfo? current = await RunnerByIdAsync(db, transaction, runnerId);
+        if (current is null) return null;
+        string newDescription = description ?? current.Description;
+        IReadOnlyList<string> newTags = normalTags ?? current.Tags ?? [];
+        bool newRunUntagged = runUntagged ?? current.RunUntagged;
+        string now = Now();
+        await db.ExecuteAsync("UPDATE Runners SET Description = @Description, Tags = @Tags, RunUntagged = @RunUntagged WHERE Id = @Id;",
+            new RunnerUpdateParameters(runnerId, newDescription, EncodeLines(newTags), newRunUntagged ? 1 : 0), transaction);
+        await AuditAsync(db, transaction, liveActor.UserId, "update-runner", "runner", runnerId.ToString(CultureInfo.InvariantCulture),
+            "Runner settings changed" + (newDescription.Length == 0 ? "" : ": " + newDescription) + TagSummary(newTags, newRunUntagged) + ".", now);
+        await transaction.CommitAsync(cancellationToken);
+        return await RunnerByIdAsync(db, null, runnerId);
+    }
+
+    private static string TagSummary(IReadOnlyList<string> tags, bool runUntagged) =>
+        (tags.Count == 0 ? "; no tags" : "; tags " + string.Join(", ", tags)) + (runUntagged ? ", runs untagged jobs" : ", tagged jobs only");
 
     /// <summary>
     /// The runner side of registration: the one-time token for a credential. Returns null for a token that is
@@ -160,10 +203,10 @@ public sealed partial class GraftStore
         if (parsed.Plan is CiPlan plan)
             foreach (CiJobDefinition job in plan.Jobs)
                 await db.ExecuteAsync("""
-                    INSERT INTO Jobs (PipelineId, ProjectId, Name, Stage, StageIndex, Script, Variables, AllowFailure, Status, CreatedAtUtc, ArtifactPaths)
-                    VALUES (@PipelineId, @ProjectId, @Name, @Stage, @StageIndex, @Script, @Variables, @AllowFailure, 'pending', @CreatedAtUtc, @ArtifactPaths);
+                    INSERT INTO Jobs (PipelineId, ProjectId, Name, Stage, StageIndex, Script, Variables, AllowFailure, Status, CreatedAtUtc, ArtifactPaths, Tags)
+                    VALUES (@PipelineId, @ProjectId, @Name, @Stage, @StageIndex, @Script, @Variables, @AllowFailure, 'pending', @CreatedAtUtc, @ArtifactPaths, @Tags);
                     """, new JobInsertParameters(id, projectId, job.Name, job.Stage, job.StageIndex, EncodeLines(job.Script),
-                        EncodeVariables(job.Variables), job.AllowFailure ? 1 : 0, now, EncodeLines(job.ArtifactPaths ?? [])), transaction);
+                        EncodeVariables(job.Variables), job.AllowFailure ? 1 : 0, now, EncodeLines(job.ArtifactPaths ?? []), EncodeLines(job.Tags ?? [])), transaction);
         await transaction.CommitAsync(cancellationToken);
         return (await PipelineByIdAsync(db, null, id))!;
     }
@@ -225,9 +268,9 @@ public sealed partial class GraftStore
     // ------------------------------------------------------------------------------------------------
 
     /// <summary>
-    /// The next job this runner may take, or null when there is none: the oldest pending job whose earlier stages
-    /// have all succeeded or failed where that was allowed. Marks it running for this runner and returns a fresh
-    /// token for it.
+    /// The next job this runner may take, or null when there is none: the oldest pending job whose tags the runner
+    /// has and whose earlier stages have all succeeded or failed where that was allowed. Marks it running for this
+    /// runner and returns a fresh token for it.
     /// </summary>
     public async Task<CiLease?> LeaseJobAsync(long runnerId, CancellationToken cancellationToken = default)
     {
@@ -236,14 +279,18 @@ public sealed partial class GraftStore
         long? jobId = await db.ExecuteScalarAsync<long?>("""
             SELECT j.Id FROM Jobs j
             JOIN Pipelines p ON p.Id = j.PipelineId
+            JOIN Runners r ON r.Id = @Id
             WHERE j.Status = 'pending' AND p.Status IN ('pending', 'running')
               AND NOT EXISTS (
                   SELECT 1 FROM Jobs e
                   WHERE e.PipelineId = j.PipelineId AND e.StageIndex < j.StageIndex AND e.Retried = 0
                     AND NOT (e.Status = 'success' OR (e.Status = 'failed' AND e.AllowFailure = 1)))
+              AND
+            """ + RunnerTakesJob + """
+
             ORDER BY j.Id
             LIMIT 1;
-            """, transaction: transaction);
+            """, new IdParameters(runnerId), transaction);
         if (jobId is null) return null;
         string token = NewSecret("graft_job_");
         string now = Now();
@@ -402,17 +449,31 @@ public sealed partial class GraftStore
     // ------------------------------------------------------------------------------------------------
 
     private const string RunnerSelect = """
-        SELECT Id, Description, Name, Platform, Version, CreatedAtUtc, ClaimedAtUtc, ContactedAtUtc, RegistrationExpiresAtUtc FROM Runners
+        SELECT Id, Description, Name, Platform, Version, CreatedAtUtc, ClaimedAtUtc, ContactedAtUtc, RegistrationExpiresAtUtc, Tags, RunUntagged FROM Runners
+        """;
+
+    /// <summary>
+    /// Whether runner <c>r</c> may take job <c>j</c>: a job with no tags goes to a runner that runs untagged jobs,
+    /// and a job with tags to a runner that has every one of them. The same test as <see cref="RunnerTags.Satisfies"/>.
+    /// </summary>
+    private const string RunnerTakesJob = """
+        (CASE WHEN json_array_length(j.Tags) = 0 THEN r.RunUntagged = 1
+              ELSE NOT EXISTS (SELECT 1 FROM json_each(j.Tags) jt WHERE jt.value NOT IN (SELECT rt.value FROM json_each(r.Tags) rt)) END)
         """;
     private const string PipelineSelect = """
         SELECT Id, ProjectId, Iid, Ref, Sha, Status, Source, Error, CreatedAtUtc, UpdatedAtUtc, FinishedAtUtc FROM Pipelines
         """;
+    // A pending job is stuck when no claimed runner could take it. A runner that is registered but offline still
+    // counts, because it takes the job when it returns; one whose script has not been run yet does not.
     private const string JobSelect = """
         SELECT j.Id, j.PipelineId, j.ProjectId, j.Name, j.Stage, j.StageIndex, j.Script, j.Variables, j.AllowFailure, j.Status, j.RunnerId,
-               r.Description AS RunnerDescription, j.ExitCode, j.Failure, j.CreatedAtUtc, j.StartedAtUtc, j.FinishedAtUtc,
-               j.ArtifactPaths, j.ArtifactsBytes, j.ArtifactsSha256
+               jr.Description AS RunnerDescription, j.ExitCode, j.Failure, j.CreatedAtUtc, j.StartedAtUtc, j.FinishedAtUtc,
+               j.ArtifactPaths, j.ArtifactsBytes, j.ArtifactsSha256, j.Tags,
+               CASE WHEN j.Status = 'pending' AND NOT EXISTS (SELECT 1 FROM Runners r WHERE r.CredentialDigest IS NOT NULL AND
+        """ + RunnerTakesJob + """
+               ) THEN 1 ELSE 0 END AS Stuck
         FROM Jobs j
-        LEFT JOIN Runners r ON r.Id = j.RunnerId
+        LEFT JOIN Runners jr ON jr.Id = j.RunnerId
         """;
 
     private static async Task<RunnerInfo?> RunnerByIdAsync(SqliteConnection db, SqliteTransaction? transaction, long id)
@@ -429,7 +490,7 @@ public sealed partial class GraftStore
 
     private static RunnerInfo ToRunner(RunnerRow row) => new(row.Id, row.Description, row.Name, row.Platform, row.Version, Instant(row.CreatedAtUtc),
         row.ClaimedAtUtc is null ? null : Instant(row.ClaimedAtUtc), row.ContactedAtUtc is null ? null : Instant(row.ContactedAtUtc),
-        Instant(row.RegistrationExpiresAtUtc));
+        Instant(row.RegistrationExpiresAtUtc), DecodeLines(row.Tags), row.RunUntagged != 0);
 
     private static PipelineInfo ToPipeline(PipelineRow row) => new(row.Id, row.ProjectId, row.Iid, row.Ref, row.Sha, row.Status, row.Source, row.Error,
         Instant(row.CreatedAtUtc), Instant(row.UpdatedAtUtc), row.FinishedAtUtc is null ? null : Instant(row.FinishedAtUtc));
@@ -437,7 +498,7 @@ public sealed partial class GraftStore
     private static CiJobInfo ToJob(JobRow row) => new(row.Id, row.PipelineId, row.ProjectId, row.Name, row.Stage, (int)row.StageIndex, row.Status,
         row.AllowFailure != 0, row.RunnerId, row.RunnerDescription, row.ExitCode is null ? null : (int)row.ExitCode.Value, row.Failure,
         Instant(row.CreatedAtUtc), row.StartedAtUtc is null ? null : Instant(row.StartedAtUtc), row.FinishedAtUtc is null ? null : Instant(row.FinishedAtUtc),
-        row.ArtifactsBytes, row.ArtifactsSha256);
+        row.ArtifactsBytes, row.ArtifactsSha256, DecodeLines(row.Tags), row.Stuck != 0);
 
     private static string? Bounded(string? value, int maximum)
     {
@@ -485,12 +546,14 @@ public sealed partial class GraftStore
     }
 }
 
-internal sealed record RunnerInsertParameters(string Description, string RegistrationDigest, string RegistrationExpiresAtUtc, long CreatedByUserId, string CreatedAtUtc);
+internal sealed record RunnerInsertParameters(string Description, string RegistrationDigest, string RegistrationExpiresAtUtc, long CreatedByUserId, string CreatedAtUtc,
+    string Tags, int RunUntagged);
+internal sealed record RunnerUpdateParameters(long Id, string Description, string Tags, int RunUntagged);
 internal sealed record RunnerClaimParameters(long Id, string CredentialDigest, string? Name, string? Platform, string? Version, string NowUtc);
 internal sealed record PipelineInsertParameters(long ProjectId, long Iid, string Ref, string Sha, string Status, string Source, string? Error, long? CreatedByUserId,
     string NowUtc, string? FinishedAtUtc);
 internal sealed record JobInsertParameters(long PipelineId, long ProjectId, string Name, string Stage, int StageIndex, string Script, string Variables,
-    int AllowFailure, string CreatedAtUtc, string ArtifactPaths);
+    int AllowFailure, string CreatedAtUtc, string ArtifactPaths, string Tags);
 internal sealed record ScopedPageParameters(long Id, int Take, int Skip);
 internal sealed record PipelineJobsParameters(long PipelineId, long ProjectId);
 internal sealed record JobLeaseParameters(long Id, long RunnerId, string TokenDigest, string NowUtc);
@@ -501,11 +564,11 @@ internal sealed record JobFinishParameters(long Id, string Status, int? ExitCode
 internal sealed record SkipLaterParameters(long PipelineId, long StageIndex, string NowUtc);
 internal sealed record PipelineSettleParameters(long Id, string Status, string NowUtc);
 internal sealed record RunnerRow(long Id, string Description, string? Name, string? Platform, string? Version, string CreatedAtUtc, string? ClaimedAtUtc,
-    string? ContactedAtUtc, string RegistrationExpiresAtUtc);
+    string? ContactedAtUtc, string RegistrationExpiresAtUtc, string Tags, long RunUntagged);
 internal sealed record PipelineRow(long Id, long ProjectId, long Iid, string Ref, string Sha, string Status, string Source, string? Error, string CreatedAtUtc,
     string UpdatedAtUtc, string? FinishedAtUtc);
 internal sealed record JobRow(long Id, long PipelineId, long ProjectId, string Name, string Stage, long StageIndex, string Script, string Variables, long AllowFailure,
     string Status, long? RunnerId, string? RunnerDescription, long? ExitCode, string? Failure, string CreatedAtUtc, string? StartedAtUtc, string? FinishedAtUtc,
-    string ArtifactPaths, long? ArtifactsBytes, string? ArtifactsSha256);
+    string ArtifactPaths, long? ArtifactsBytes, string? ArtifactsSha256, string Tags, long Stuck);
 internal sealed record JobTokenRow(long Id, long TraceLength);
 internal sealed record ArtifactRecordParameters(long Id, long Bytes, string Sha256);

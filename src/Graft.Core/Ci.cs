@@ -14,7 +14,49 @@ public sealed record RunnerInfo(
     DateTimeOffset CreatedAtUtc,
     DateTimeOffset? ClaimedAtUtc,
     DateTimeOffset? ContactedAtUtc,
-    DateTimeOffset RegistrationExpiresAtUtc);
+    DateTimeOffset RegistrationExpiresAtUtc,
+    /// <summary>The tags an administrator gave the runner; a job is routed by them.</summary>
+    IReadOnlyList<string>? Tags = null,
+    /// <summary>Whether the runner also takes jobs that ask for no tags.</summary>
+    bool RunUntagged = true);
+
+/// <summary>
+/// The rule for runner and job tags, shared by the pipeline reader and the runner settings so a tag a job asks for
+/// is spelled the way a runner's is. A tag is trimmed and lower-cased, as GitLab compares tags without regard to
+/// case; it is at most 64 characters with no comma, because GitLab's API sends a runner's tags as one
+/// comma-separated string; a list holds at most 20 distinct tags.
+/// </summary>
+public static class RunnerTags
+{
+    public const int MaximumTags = 20;
+    public const int MaximumLength = 64;
+
+    public static bool TryNormalise(IEnumerable<string> tags, out IReadOnlyList<string> normal, out string error)
+    {
+        ArgumentNullException.ThrowIfNull(tags);
+        List<string> result = [];
+        normal = result;
+        error = "";
+        foreach (string written in tags)
+        {
+            string tag = (written ?? "").Trim().ToLowerInvariant();
+            if (tag.Length == 0) { error = "a tag is empty."; return false; }
+            if (tag.Length > MaximumLength) { error = "'" + tag[..20] + "…' is longer than 64 characters."; return false; }
+            if (tag.Contains(',') || tag.Any(char.IsControl)) { error = "'" + tag + "' contains a comma or a control character."; return false; }
+            if (!result.Contains(tag, StringComparer.Ordinal)) result.Add(tag);
+        }
+        if (result.Count > MaximumTags) { error = "more than 20 tags."; return false; }
+        return true;
+    }
+
+    /// <summary>GitLab's <c>tag_list</c> as a string: tags separated by commas.</summary>
+    public static bool TryParseList(string? list, out IReadOnlyList<string> normal, out string error) =>
+        TryNormalise((list ?? "").Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries), out normal, out error);
+
+    /// <summary>Whether a runner with these tags may take a job asking for <paramref name="jobTags"/>.</summary>
+    public static bool Satisfies(IReadOnlyCollection<string> runnerTags, bool runUntagged, IReadOnlyCollection<string> jobTags) =>
+        jobTags.Count == 0 ? runUntagged : jobTags.All(runnerTags.Contains);
+}
 
 /// <summary>A runner just created: its row, and the one-time registration token the install script carries.</summary>
 public sealed record RunnerRegistration(RunnerInfo Runner, string RegistrationToken);
@@ -66,7 +108,11 @@ public sealed record CiJobInfo(
     DateTimeOffset? FinishedAtUtc,
     /// <summary>The size of the job's kept artifacts archive, or null when it kept none.</summary>
     long? ArtifactsBytes = null,
-    string? ArtifactsSha256 = null);
+    string? ArtifactsSha256 = null,
+    /// <summary>The tags a runner needs to take the job.</summary>
+    IReadOnlyList<string>? Tags = null,
+    /// <summary>Pending, and no registered runner has the tags to take it, so it waits until one does.</summary>
+    bool Stuck = false);
 
 /// <summary>
 /// A job handed to a runner: what to run, against which commit of which project, and the token that lets the

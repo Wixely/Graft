@@ -4,7 +4,7 @@ namespace Graft.Storage;
 
 public static class GraftSchema
 {
-    public static DnaXMigrationManifest Manifest { get; } = new(31,
+    public static DnaXMigrationManifest Manifest { get; } = new(32,
     [
         DnaXMigration.Sql(1, "initial-identity-project-schema", "Create identity and private project schema", """
             CREATE TABLE Users (
@@ -1003,6 +1003,15 @@ public static class GraftSchema
 
             CREATE INDEX IX_ReleasePublications_Release ON ReleasePublications(ReleaseId, Id);
             CREATE INDEX IX_ReleasePublications_State ON ReleasePublications(State, Id);
+            """),
+        // Runner tags (ADR 0054). A job lists the tags a runner must have to take it, and a runner the tags it has
+        // and whether it also takes jobs that list none. Both lists are JSON arrays of lower-case names, so the
+        // lease can match them with json_each. A runner from before this has no tags and takes untagged jobs,
+        // which is what every runner did before tags existed.
+        DnaXMigration.Sql(32, "runner-tags", "Tags that route a job to the runners that can run it", """
+            ALTER TABLE Runners ADD COLUMN Tags TEXT NOT NULL DEFAULT '[]';
+            ALTER TABLE Runners ADD COLUMN RunUntagged INTEGER NOT NULL DEFAULT 1 CHECK (RunUntagged IN (0, 1));
+            ALTER TABLE Jobs ADD COLUMN Tags TEXT NOT NULL DEFAULT '[]';
             """)
     ]);
 }

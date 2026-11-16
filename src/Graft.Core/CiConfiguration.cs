@@ -12,7 +12,9 @@ public sealed record CiJobDefinition(
     IReadOnlyDictionary<string, string> Variables,
     bool AllowFailure,
     /// <summary>What the job keeps after a successful run, as paths relative to the source; empty for nothing.</summary>
-    IReadOnlyList<string>? ArtifactPaths = null);
+    IReadOnlyList<string>? ArtifactPaths = null,
+    /// <summary>The tags a runner must have to take the job, normalised by <see cref="RunnerTags"/>; empty for any runner.</summary>
+    IReadOnlyList<string>? Tags = null);
 
 /// <summary>A pipeline file read into the jobs it asks for, in stage order.</summary>
 public sealed record CiPlan(IReadOnlyList<string> Stages, IReadOnlyList<CiJobDefinition> Jobs);
@@ -28,7 +30,7 @@ public sealed record CiParseResult(CiPlan? Plan, string? Error)
 ///
 /// <para>
 /// Supported: <c>stages</c>; top-level <c>variables</c>; jobs with <c>stage</c>, <c>script</c>,
-/// <c>before_script</c>, <c>variables</c> and <c>allow_failure</c>; hidden jobs (a name starting with a dot),
+/// <c>before_script</c>, <c>variables</c>, <c>allow_failure</c>, <c>artifacts: paths</c> and <c>tags</c>; hidden jobs (a name starting with a dot),
 /// which GitLab never runs and neither does Graft. Anything else, a key Graft does not run or a YAML feature
 /// this reader does not parse, is an error naming the key or the line, so a file that asks for something is
 /// never run as though it had asked for less.
@@ -55,7 +57,7 @@ public static class CiConfiguration
     private static readonly HashSet<string> TopLevelRefused = new(StringComparer.Ordinal)
         { "default", "include", "workflow", "image", "services", "cache", "before_script", "after_script", "pages", "spec" };
     private static readonly HashSet<string> JobKeys = new(StringComparer.Ordinal)
-        { "stage", "script", "before_script", "variables", "allow_failure", "artifacts" };
+        { "stage", "script", "before_script", "variables", "allow_failure", "artifacts", "tags" };
 
     public static CiParseResult Parse(string text)
     {
@@ -91,7 +93,7 @@ public static class CiConfiguration
             if (value is not YamlMap job) throw new CiYamlException("Job '" + name + "' must be a mapping with at least a script.");
             foreach ((string key, _) in job.Entries)
                 if (!JobKeys.Contains(key))
-                    throw new CiYamlException("Job '" + name + "' uses '" + key + "', which Graft does not run yet. Supported: stage, script, before_script, variables, allow_failure, artifacts.");
+                    throw new CiYamlException("Job '" + name + "' uses '" + key + "', which Graft does not run yet. Supported: stage, script, before_script, variables, allow_failure, artifacts, tags.");
             if (!job.TryGet("script", out YamlNode? scriptNode)) throw new CiYamlException("Job '" + name + "' has no script.");
             List<string> script = [];
             if (job.TryGet("before_script", out YamlNode? before)) script.AddRange(Lines(before, name, "before_script"));
@@ -117,7 +119,19 @@ public static class CiConfiguration
                 foreach ((string key, string val) in Variables(jobVariables, "Job '" + name + "' variables"))
                     variables[key] = val;
             List<string> artifactPaths = job.TryGet("artifacts", out YamlNode? artifactsNode) ? ArtifactPaths(artifactsNode, name) : [];
-            jobs.Add(new(name, stage, stageIndex, script, variables, allowFailure, artifactPaths));
+            List<string> tags = [];
+            if (job.TryGet("tags", out YamlNode? tagsNode))
+            {
+                // GitLab expands variables in tags; Graft matches them as written, so a tag that would expand is
+                // refused rather than routed to a runner tagged with the literal text.
+                List<string> written = Strings(tagsNode, "Job '" + name + "' tags");
+                if (written.Any(tag => tag.Contains('$')))
+                    throw new CiYamlException("Job '" + name + "' tags use a variable, which Graft does not expand in tags yet.");
+                if (!RunnerTags.TryNormalise(written, out IReadOnlyList<string> normal, out string tagError))
+                    throw new CiYamlException("Job '" + name + "' tags: " + tagError);
+                tags.AddRange(normal);
+            }
+            jobs.Add(new(name, stage, stageIndex, script, variables, allowFailure, artifactPaths, tags));
             if (jobs.Count > MaximumJobs) throw new CiYamlException("The pipeline has more than 50 jobs.");
         }
         if (jobs.Count == 0) throw new CiYamlException("The pipeline file defines no jobs.");

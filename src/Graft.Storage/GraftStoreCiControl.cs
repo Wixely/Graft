@@ -169,8 +169,8 @@ public sealed partial class GraftStore
     {
         await db.ExecuteAsync("UPDATE Jobs SET Retried = 1 WHERE Id = @Id;", new IdParameters(jobId), transaction);
         return await db.QuerySingleAsync<long>("""
-            INSERT INTO Jobs (PipelineId, ProjectId, Name, Stage, StageIndex, Script, Variables, AllowFailure, Status, CreatedAtUtc, ArtifactPaths)
-            SELECT PipelineId, ProjectId, Name, Stage, StageIndex, Script, Variables, AllowFailure, 'pending', @NowUtc, ArtifactPaths
+            INSERT INTO Jobs (PipelineId, ProjectId, Name, Stage, StageIndex, Script, Variables, AllowFailure, Status, CreatedAtUtc, ArtifactPaths, Tags)
+            SELECT PipelineId, ProjectId, Name, Stage, StageIndex, Script, Variables, AllowFailure, 'pending', @NowUtc, ArtifactPaths, Tags
             FROM Jobs WHERE Id = @Id
             RETURNING Id;
             """, new TouchKeyParameters(jobId, now), transaction);

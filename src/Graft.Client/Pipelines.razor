@@ -101,7 +101,14 @@ else
                                     @(job.ExitCode is int code ? " · exit " + code : "")
                                     @(job.AllowFailure ? " · allowed to fail" : "")
                                     @(job.ArtifactsFile is not null ? " · artifacts" : "")
+                                    @(job.TagList is { Length: > 0 } tags ? " · tags " + string.Join(", ", tags) : "")
                                 </small>
+                                @if (job.Stuck)
+                                {
+                                    <small class="danger-text">
+                                        @(job.TagList is { Length: > 0 } ? "Waiting: no registered runner has all of these tags." : "Waiting: no registered runner takes untagged jobs.")
+                                    </small>
+                                }
                             </span>
                         </button>
                     }

@@ -78,8 +78,22 @@ public sealed record RunnerFinishRequest(string Status, [property: JsonPropertyN
 // The administrator's and the projects' side, in GitLab's shapes as far as Graft has them.
 // ----------------------------------------------------------------------------------------------------
 
-/// <summary>GitLab's request to create a runner; Graft creates instance runners only.</summary>
-public sealed record RunnerCreateRequest(string? Description, [property: JsonPropertyName("runner_type")] string? RunnerType);
+/// <summary>
+/// GitLab's request to create a runner; Graft creates instance runners only. <c>tag_list</c> routes jobs that ask for
+/// those tags to it; <c>run_untagged</c>, true when left out, lets it also take jobs that ask for none.
+/// </summary>
+public sealed record RunnerCreateRequest(
+    string? Description,
+    [property: JsonPropertyName("runner_type")] string? RunnerType,
+    [property: JsonPropertyName("tag_list")] string[]? TagList = null,
+    [property: JsonPropertyName("run_untagged")] bool? RunUntagged = null);
+
+/// <summary>GitLab's request to change a runner. A field left out is left as it is; Graft has no paused runners.</summary>
+public sealed record RunnerUpdateRequest(
+    string? Description,
+    [property: JsonPropertyName("tag_list")] string[]? TagList,
+    [property: JsonPropertyName("run_untagged")] bool? RunUntagged,
+    bool? Paused = null);
 
 /// <summary>
 /// A runner just created: GitLab's <c>id</c>, <c>token</c> and <c>token_expires_at</c>, and Graft's additions, the
@@ -108,7 +122,9 @@ public sealed record RunnerResponse(
     bool Online,
     string Status,
     [property: JsonPropertyName("contacted_at")] DateTimeOffset? ContactedAt,
-    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt);
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt,
+    [property: JsonPropertyName("tag_list")] string[]? TagList = null,
+    [property: JsonPropertyName("run_untagged")] bool RunUntagged = true);
 
 /// <summary>A pipeline in GitLab's shape, with Graft's <c>error</c> for a file that could not be run.</summary>
 public sealed record PipelineResponse(
@@ -149,7 +165,10 @@ public sealed record JobResponse(
     [property: JsonPropertyName("web_url")] string WebUrl,
     [property: JsonPropertyName("exit_code")] int? ExitCode,
     string? Failure,
-    [property: JsonPropertyName("artifacts_file")] JobArtifactsFileResponse? ArtifactsFile = null);
+    [property: JsonPropertyName("artifacts_file")] JobArtifactsFileResponse? ArtifactsFile = null,
+    [property: JsonPropertyName("tag_list")] string[]? TagList = null,
+    /// <summary>Graft's: pending, and no registered runner has the tags to take it.</summary>
+    bool Stuck = false);
 
 /// <summary>GitLab's request to run a pipeline for a ref.</summary>
 public sealed record PipelineCreateRequest(string? Ref);

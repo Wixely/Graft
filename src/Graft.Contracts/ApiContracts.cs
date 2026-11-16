@@ -1616,6 +1616,7 @@ public sealed record ProjectUploadResponse(
 [JsonSerializable(typeof(RunnerTraceRequest))]
 [JsonSerializable(typeof(RunnerFinishRequest))]
 [JsonSerializable(typeof(RunnerCreateRequest))]
+[JsonSerializable(typeof(RunnerUpdateRequest))]
 [JsonSerializable(typeof(RunnerCreatedResponse))]
 [JsonSerializable(typeof(RunnerResponse))]
 [JsonSerializable(typeof(RunnerResponse[]))]

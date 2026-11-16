@@ -1068,7 +1068,7 @@ app.MapGet("/api/graft/admin/audit", async context =>
 // ---------------------------------------------------------------------------------------------------
 // Runners and pipelines (ADR 0037). An administrator creates a runner and is handed, once, the registration
 // token and the two install scripts that carry it with the forge's Intonation. Pipelines are read by whoever
-// may browse the repository, and run by any registered runner.
+// may browse the repository, and run by a registered runner whose tags cover the job's (ADR 0054).
 // ---------------------------------------------------------------------------------------------------
 
 app.MapPost("/api/v4/user/runners", async context =>
@@ -1084,10 +1084,34 @@ app.MapGet("/api/v4/runners/all", async context =>
 {
     AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
     if (identity is null) return;
+    if (!await OnlyQuery(context, "tag_list")) return;
+    if (!identity.IsAdministrator) { await ApiError(context, 403, "403 Forbidden"); return; }
+    // GitLab's filter: runners that have every tag listed.
+    if (!RunnerTags.TryParseList(context.Request.Query["tag_list"].ToString(), out IReadOnlyList<string> wanted, out string tagError))
+    { await ApiError(context, 400, "400 Bad Request: tag_list: " + tagError); return; }
+    IReadOnlyList<RunnerInfo> list = await store.ListRunnersAsync(identity, context.RequestAborted);
+    await context.Response.WriteAsJsonAsync(list.Where(runner => wanted.All((runner.Tags ?? []).Contains)).Select(RunnerResponseFor).ToArray(),
+        ApiJson.Default.RunnerResponseArray, null, context.RequestAborted);
+});
+
+app.MapGet("/api/v4/runners/{runnerId:long}", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
     if (!await OnlyQuery(context)) return;
     if (!identity.IsAdministrator) { await ApiError(context, 403, "403 Forbidden"); return; }
-    IReadOnlyList<RunnerInfo> list = await store.ListRunnersAsync(identity, context.RequestAborted);
-    await context.Response.WriteAsJsonAsync(list.Select(RunnerResponseFor).ToArray(), ApiJson.Default.RunnerResponseArray, null, context.RequestAborted);
+    long runnerId = Convert.ToInt64(context.Request.RouteValues["runnerId"], System.Globalization.CultureInfo.InvariantCulture);
+    RunnerInfo? runner = (await store.ListRunnersAsync(identity, context.RequestAborted)).FirstOrDefault(candidate => candidate.Id == runnerId);
+    if (runner is null) { await ApiError(context, 404, "404 Runner Not Found"); return; }
+    await context.Response.WriteAsJsonAsync(RunnerResponseFor(runner), ApiJson.Default.RunnerResponse, null, context.RequestAborted);
+});
+
+app.MapPut("/api/v4/runners/{runnerId:long}", async context =>
+{
+    AuthenticatedIdentity? identity = await AuthenticateApi(context, requireApiScope: true);
+    if (identity is null) return;
+    if (!identity.TokenScopes.HasFlag(TokenScope.Api) || !identity.IsAdministrator) { await ApiError(context, 403, "403 Forbidden"); return; }
+    await UpdateRunner(context, identity, "404 Runner Not Found");
 });
 
 app.MapDelete("/api/v4/runners/{runnerId:long}", async context =>
@@ -1116,6 +1140,14 @@ app.MapPost("/api/admin/runners", async context =>
     if (browser is null) return;
     if (!browser.Value.Identity.IsAdministrator) { await ApiError(context, 403, "administrator"); return; }
     await CreateRunner(context, browser.Value.Identity);
+});
+
+app.MapPut("/api/admin/runners/{runnerId:long}", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await BrowserWriter(context);
+    if (browser is null) return;
+    if (!browser.Value.Identity.IsAdministrator) { await ApiError(context, 403, "administrator"); return; }
+    await UpdateRunner(context, browser.Value.Identity, "runner");
 });
 
 app.MapDelete("/api/admin/runners/{runnerId:long}", async context =>
@@ -1469,7 +1501,9 @@ async Task CreateRunner(HttpContext context, AuthenticatedIdentity identity)
     { await ApiError(context, 400, "400 Bad Request: Graft creates instance runners only; group and project runners are not implemented"); return; }
     string description = request?.Description?.Trim() ?? "";
     if (description.Length > 200) { await ApiError(context, 400, "400 Bad Request: description must be at most 200 characters"); return; }
-    RunnerRegistration registration = await store.CreateRunnerAsync(identity, description, context.RequestAborted);
+    if (!RunnerTags.TryNormalise(request?.TagList ?? [], out IReadOnlyList<string> tags, out string tagError))
+    { await ApiError(context, 400, "400 Bad Request: tag_list: " + tagError); return; }
+    RunnerRegistration registration = await store.CreateRunnerAsync(identity, description, tags, request?.RunUntagged ?? true, context.RequestAborted);
     // The Intonation lives as long as the token it travels with; after that the script is spent either way.
     string intonation = runners.Intone(registration.Runner.RegistrationExpiresAtUtc - DateTimeOffset.UtcNow);
     string origin = serverOrigin ?? Origin(context);
@@ -1492,7 +1526,27 @@ static RunnerResponse RunnerResponseFor(RunnerInfo runner)
         ? (runner.RegistrationExpiresAtUtc <= DateTimeOffset.UtcNow ? "registration_expired" : "never_contacted")
         : online ? "online" : "offline";
     return new(runner.Id, runner.Description, runner.Name, runner.Platform, runner.Version, "instance_type", true, true, false, online, status,
-        runner.ContactedAtUtc, runner.CreatedAtUtc);
+        runner.ContactedAtUtc, runner.CreatedAtUtc, [.. runner.Tags ?? []], runner.RunUntagged);
+}
+
+// GitLab's PUT on a runner, for what Graft keeps: the description, the tags and run_untagged. Graft has no paused
+// runners, so asking to pause one is refused rather than answered as though it had been.
+async Task UpdateRunner(HttpContext context, AuthenticatedIdentity identity, string notFound)
+{
+    long runnerId = Convert.ToInt64(context.Request.RouteValues["runnerId"], System.Globalization.CultureInfo.InvariantCulture);
+    RunnerUpdateRequest? request;
+    try { request = await context.Request.ReadFromJsonAsync(ApiJson.Default.RunnerUpdateRequest, context.RequestAborted); }
+    catch (Exception error) when (error is JsonException or InvalidOperationException)
+    { await ApiError(context, 400, "400 Bad Request: body must be JSON"); return; }
+    if (request is null) { await ApiError(context, 400, "400 Bad Request: body must be JSON"); return; }
+    if (request.Paused == true) { await ApiError(context, 400, "400 Bad Request: Graft does not pause runners; remove it instead"); return; }
+    RunnerInfo? runner;
+    try { runner = await store.UpdateRunnerAsync(identity, runnerId, request.Description, request.TagList, request.RunUntagged, context.RequestAborted); }
+    catch (ArgumentException error) { await ApiError(context, 400, "400 Bad Request: " + error.Message.Split(" (Parameter", 2)[0]); return; }
+    if (runner is null) { await ApiError(context, 404, notFound); return; }
+    // A runner given new tags may now take a job that was waiting for them.
+    runners?.Notify();
+    await context.Response.WriteAsJsonAsync(RunnerResponseFor(runner), ApiJson.Default.RunnerResponse, null, context.RequestAborted);
 }
 
 PipelineResponse PipelineResponseFor(HttpContext context, ProjectInfo project, PipelineInfo pipeline) =>
@@ -1507,7 +1561,8 @@ JobResponse JobResponseFor(HttpContext context, ProjectInfo project, PipelineInf
         job.RunnerId is long runnerId ? new(runnerId, job.RunnerDescription ?? "") : null,
         ProjectUrlFor(context, project) + "/-/jobs/" + job.Id.ToString(System.Globalization.CultureInfo.InvariantCulture),
         job.ExitCode, job.Failure,
-        job.ArtifactsBytes is long artifactsBytes ? new JobArtifactsFileResponse("artifacts.zip", artifactsBytes) : null);
+        job.ArtifactsBytes is long artifactsBytes ? new JobArtifactsFileResponse("artifacts.zip", artifactsBytes) : null,
+        [.. job.Tags ?? []], job.Stuck);
 
 // A project's own view of the trail, for whoever may manage the project. The scoping rule lives in the store.
 app.MapGet("/api/projects/{projectId:long}/audit", async context =>

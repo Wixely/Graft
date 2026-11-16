@@ -95,6 +95,20 @@ internal static class RunnerInstallScripts
         script.Append("        *) echo \"Unknown option: $1\" >&2; exit 2 ;;\n");
         script.Append("    esac\n");
         script.Append("done\n");
+        // Checked before registering, because registering spends the token: a script that registered and then found
+        // no systemd could not be run again. WSL is the usual case of a Linux without systemd running.
+        script.Append("WSL=0\n");
+        script.Append("if grep -qi microsoft /proc/version 2>/dev/null; then WSL=1; fi\n");
+        script.Append("if [ \"$SERVICE\" = 1 ] && [ ! -d /run/systemd/system ]; then\n");
+        script.Append("    echo 'systemd is not running here, so the runner cannot be installed as a service. Nothing was registered.' >&2\n");
+        script.Append("    if [ \"$WSL\" = 1 ]; then\n");
+        script.Append("        echo 'Under WSL, add these lines to /etc/wsl.conf, run \"wsl --shutdown\" from Windows, and run this script again:' >&2\n");
+        script.Append("        echo '    [boot]' >&2\n");
+        script.Append("        echo '    systemd=true' >&2\n");
+        script.Append("    fi\n");
+        script.Append("    echo 'Or run it with --no-service and start the runner yourself.' >&2\n");
+        script.Append("    exit 1\n");
+        script.Append("fi\n");
         script.Append("mkdir -p \"$DIR\"\n");
         script.Append("if [ -z \"$BINARY\" ]; then\n");
         if (downloads)
@@ -141,6 +155,13 @@ internal static class RunnerInstallScripts
         script.Append("systemctl daemon-reload\n");
         script.Append("systemctl enable --now graft-runner\n");
         script.Append("echo 'The Graft runner is installed and running as the graft-runner service.'\n");
+        // WSL stops a distribution once no Windows program is using it, and a systemd service does not count, so
+        // the runner would stop with it. Starting a process that never exits from Windows at sign-in keeps it up.
+        script.Append("if [ \"$WSL\" = 1 ]; then\n");
+        script.Append("    echo 'Under WSL this distribution stops when nothing on Windows is using it, and the runner stops with it.' >&2\n");
+        script.Append("    echo \"To keep it running, have Windows run this at startup, for example from Task Scheduler:\" >&2\n");
+        script.Append("    echo \"    wsl.exe -d ${WSL_DISTRO_NAME:-<distribution>} --exec sleep infinity\" >&2\n");
+        script.Append("fi\n");
         return script.ToString();
     }
 

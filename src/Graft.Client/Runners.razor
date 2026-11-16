@@ -34,6 +34,12 @@ else
             <form class="form" @onsubmit="Create" @onsubmit:preventDefault>
                 <label for="runner-description">Description</label>
                 <input id="runner-description" @bind="description" maxlength="200" placeholder="build box in the office" />
+                <label for="runner-tags">Tags</label>
+                <input id="runner-tags" @bind="tags" maxlength="1300" placeholder="windows, android" />
+                <p class="field-hint">
+                    Optional, separated by commas. A job that lists <span class="mono">tags:</span> runs only on a runner that has every one of them.
+                </p>
+                <label class="checkbox"><input type="checkbox" @bind="runUntagged" /> Also run jobs that list no tags</label>
                 <div class="form-actions">
                     <button type="submit" disabled="@busy">@(busy ? "Creating…" : "Create runner and install scripts")</button>
                 </div>
@@ -100,14 +106,31 @@ else
                                 @(runner.Description.Length > 0 ? runner.Description + " · " : "")@(runner.Platform ?? "not registered yet")
                                 @(runner.ContactedAt is DateTimeOffset contacted ? " · last seen " + contacted.ToLocalTime().ToString("yyyy-MM-dd HH:mm") : "")
                             </small>
+                            <small>
+                                @(runner.TagList is { Length: > 0 } runnerTags ? "Tags " + string.Join(", ", runnerTags) : "No tags")
+                                @(runner.RunUntagged ? " · runs untagged jobs" : " · tagged jobs only")
+                            </small>
                         </span>
                         <span class="label @(runner.Online ? "success" : "")">@StatusText(runner.Status)</span>
                         <span class="list-item-actions">
+                            <button type="button" class="secondary" @onclick="() => StartEdit(runner)" disabled="@busy">Edit tags</button>
                             <button type="button" class="@(pendingDelete == runner.Id ? "danger" : "secondary")" @onclick="() => Delete(runner)" disabled="@busy">
                                 @(pendingDelete == runner.Id ? "Confirm remove" : "Remove")
                             </button>
                         </span>
                     </div>
+                    @if (editing == runner.Id)
+                    {
+                        <form class="form panel-body" @onsubmit="() => SaveEdit(runner)" @onsubmit:preventDefault>
+                            <label for="edit-tags-@runner.Id">Tags of runner #@runner.Id</label>
+                            <input id="edit-tags-@runner.Id" @bind="editTags" maxlength="1300" />
+                            <label class="checkbox"><input type="checkbox" @bind="editRunUntagged" /> Also run jobs that list no tags</label>
+                            <div class="form-actions">
+                                <button type="submit" disabled="@busy">Save</button>
+                                <button type="button" class="secondary" @onclick="() => editing = null" disabled="@busy">Cancel</button>
+                            </div>
+                        </form>
+                    }
                 }
             </div>
         }
@@ -153,11 +176,42 @@ else
         try
         {
             ApiResult<RunnerCreatedResponse> result = await Api.SendAsync(HttpMethod.Post, "api/admin/runners",
-                new RunnerCreateRequest(description.Trim(), "instance_type"), ApiJson.Default.RunnerCreateRequest, ApiJson.Default.RunnerCreatedResponse,
-                "Runner created. Copy its install script now; it is not shown again.");
+                new RunnerCreateRequest(description.Trim(), "instance_type", SplitTags(tags), runUntagged), ApiJson.Default.RunnerCreateRequest,
+                ApiJson.Default.RunnerCreatedResponse, "Runner created. Copy its install script now; it is not shown again.");
             message = result.Message;
             messageKind = result.Ok ? "success" : "error";
-            if (result.Ok) { created = result.Value; description = ""; await Load(); }
+            if (result.Ok) { created = result.Value; description = ""; tags = ""; runUntagged = true; await Load(); }
+        }
+        finally { busy = false; }
+    }
+
+    private string tags = "";
+    private bool runUntagged = true;
+    private long? editing;
+    private string editTags = "";
+    private bool editRunUntagged = true;
+
+    private static string[] SplitTags(string text) => text.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+
+    private void StartEdit(RunnerResponse runner)
+    {
+        editing = editing == runner.Id ? null : runner.Id;
+        editTags = string.Join(", ", runner.TagList ?? []);
+        editRunUntagged = runner.RunUntagged;
+    }
+
+    private async Task SaveEdit(RunnerResponse runner)
+    {
+        if (busy) return;
+        busy = true;
+        try
+        {
+            ApiResult<RunnerResponse> result = await Api.SendAsync(HttpMethod.Put, $"api/admin/runners/{runner.Id}",
+                new RunnerUpdateRequest(null, SplitTags(editTags), editRunUntagged), ApiJson.Default.RunnerUpdateRequest, ApiJson.Default.RunnerResponse,
+                $"Runner #{runner.Id} saved. Jobs it takes from now on are matched against its new tags.");
+            message = result.Message;
+            messageKind = result.Ok ? "success" : "error";
+            if (result.Ok) { editing = null; await Load(); }
         }
         finally { busy = false; }
     }
