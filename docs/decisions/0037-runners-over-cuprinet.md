@@ -102,7 +102,8 @@ merge; webhooks and notifications for pipelines; CupriNet traversal, relay or To
 reach directly. The Linux build of the runner has not been published; the systemd path of the shell script and
 the Windows service path of the PowerShell script have not been run by a test.
 
-(Amended 2026-11-16: runner tags are built by [ADR 0054](0054-runner-tags.md), and the Linux runner has been
+(Amended 2026-11-16: runner tags are built by [ADR 0054](0054-runner-tags.md), cancelling and retrying a job by
+[ADR 0041](0041-labcoat-routes-retry-cancel-directory.md), and the Linux runner has been
 published with each release since [ADR 0044](0044-releases.md). The rest of this list stands.)
 
 ## What was verified

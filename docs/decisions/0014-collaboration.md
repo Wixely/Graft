@@ -119,6 +119,8 @@ No cross-references between issues and commits. No reactions. No editing a comme
 can be deleted by its author or a Maintainer. No line-level comments on a diff, which is the one of these
 that would most change how review feels and is the largest single item in [the backlog](../backlog.md).
 
+(Amended 2026-11-16: most of this has since been built: approvals and line comments in [ADR 0015](0015-review-journey.md), editing a comment in [ADR 0019](0019-conversation.md), labels, milestones, assignees and due dates in [ADR 0020](0020-planning.md), code owners that may be required in [ADR 0021](0021-review-options.md), a draft flag on merge requests, and reactions on comments in [ADR 0041](0041-labcoat-routes-retry-cancel-directory.md). Cross-references between issues and commits are still absent.)
+
 ## What was verified
 
 The Git suite went from 483 to 556. Against a running server: issues number from one and independently from

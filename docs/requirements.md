@@ -9,13 +9,13 @@ Recorded: 2026-09-18. Source: explicit requests and corrections during Graft dis
   bound. See [ADR 0018](decisions/0018-repository-capacity.md) for related limits and validation.
 
 - **Graft** is a locally hosted GitLab alternative written in managed C#/.NET 10.
-- On 2026-09-18 MVP preparation was requested, entirely in C#. The [MVP plan](mvp-plan.md) uses C# application logic and proposes managed C# Git; the precise native dependency boundary remains an explicit open interpretation.
+- On 2026-09-18 MVP preparation was requested, entirely in C#. The [MVP plan](mvp-plan.md) uses C# application logic and proposes managed C# Git. (2026-11-16: Git is served by Graft's own managed engine with no `git` executable on the server, [ADR 0028](decisions/0028-git-engine.md); SQLite, TLS, ICU and libc remain native.)
 - Target GitLab-style applications, API operations and URL conventions. Include most GitLab functionality. GitHub compatibility is not required; all initial references to GitHub were corrected.
 - Support importing GitLab data.
 - Reduce memory use and latency. Performance improvements must be measured; no numeric budget is chosen yet.
 - Make permissions substantially easier to understand and manage.
 - Make upgrades predictable and easy, avoiding manual day-long chains and late discovery of host incompatibility.
-- Simplify runner setup/networking; investigate CupriNet integration.
+- Simplify runner setup/networking; investigate CupriNet integration. (2026-11-16: Graft's own runner over CupriNet, [ADR 0037](decisions/0037-runners-over-cuprinet.md).)
 - Use Dapper.AOT and attempt NativeAOT application publishing. Preserve the now-demonstrated standalone-executable path on the required old-kernel host.
 - Use .NET 10's platforms as the general support baseline, while including the required Linux 3.10.108 x86_64 host without upgrading its kernel. See [acceptance](validation/2026-09-18-nativeaot.md).
 
@@ -45,11 +45,11 @@ Propose dry runs, resumable checkpoints, identity mapping, permission previews, 
 
 | Question | Owner | Needed by |
 | --- | --- | --- |
-| Exact GitLab version/edition baseline and first existing clients | Project owner; agent can prepare inventory | Conformance scope approval |
-| UI approach consistent with NativeAOT and inherited Blazor preference | Agent proposal; user for material change | Application architecture |
+| Exact GitLab version/edition baseline (first clients known since 2026-11-01: LabCoat and Comeet, [ADR 0040](decisions/0040-gitlab-request-and-list-shapes.md)) | Project owner; agent can prepare inventory | Conformance scope approval |
+| ~~UI approach~~ Resolved: standalone Blazor WebAssembly in the NativeAOT host ([ADR 0004](decisions/0004-csharp-mvp-proposal.md)) | — | — |
 | First-release feature boundary and memory/latency targets | Agent proposal; user priorities | First-slice review |
-| Git backend choice and acceptable native Git dependency | Agent investigation; user if material tradeoff | Repository hosting implementation |
-| Remote host, visibility, license | Project owner | Any remote creation/publication |
+| ~~Git backend~~ Resolved: managed engine, no native Git ([ADR 0028](decisions/0028-git-engine.md)) | — | — |
+| Licence (the GitHub remote and published releases exist since [ADR 0044](decisions/0044-releases.md)) | Project owner | Choosing a licence |
 | Name/domain/package availability | Agent | Branding investment/public release |
 
 No license or hosting choice is implied by the name, GitLab compatibility, or the creation of this local repository.

@@ -43,6 +43,7 @@ Every field is optional, and so is the file. What is absent is absent.
 | --- | --- |
 | `title`, `description` | What the page is called and how it is described. Falls back to the project's own. |
 | `readme` | One file to render on the page. It must also be matched by `files`. |
+| `image` | Accepted and checked against `files`; not currently shown anywhere. |
 | `files` | The patterns that decide which files the page offers. |
 | `site.root` | The folder served as a website. |
 | `site.index` | The file that answers for a directory. Defaults to `index.html`. |

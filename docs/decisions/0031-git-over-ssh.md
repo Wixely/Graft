@@ -89,6 +89,8 @@ signing keys, an administrator listing or removing another account's keys, and `
 fingerprint. Protocol version 0 fetches, refused by name. The Linux 3.10.108 host has not run this; the
 static-musl build has not been published with it.
 
+(Amended 2026-11-16: LFS over SSH, deploy keys, administrator-managed keys and `GET /api/v4/keys` by fingerprint are built by [ADR 0049](0049-ssh-large-files-deploy-keys-administered-keys.md), and the static-musl build is published with each release since [ADR 0044](0044-releases.md). Signing keys are still absent, and the 3.10.108 host has still not run it.)
+
 ## What was verified
 
 By the Git acceptance suite with OpenSSH 10.5 as the client. Registration: `read_api` cannot add, `api` can,

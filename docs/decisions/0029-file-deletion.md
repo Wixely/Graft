@@ -43,7 +43,7 @@ present and the body names them.
 `last_commit_id`, which lets a client refuse its own deletion if someone else changed the file first; the
 write routes do not have it either, and a reader of the file today gets the selected commit rather than the
 last one that touched it, so there is nothing to compare against yet. `start_branch`, `author_email` and
-`author_name`: a Graft account has no email and a deletion is attributed to the account that made it.
+`author_name`: a deletion is attributed to the account that made it.
 Deleting a directory: refused by name, because a directory is not a file and the route says file.
 
 ## Surfaces

@@ -65,6 +65,8 @@ address verification; an administrator testing the mail settings from the browse
 not set addresses or make reset links, for the reason [ADR 0011](0011-agent-parity.md) withholds account
 administration. The browser pages compile against the routes the suite drove and were not driven by a browser.
 
+(Amended 2026-11-16: notifications are built by [ADR 0033](0033-notifications.md) and a second factor by [ADR 0034](0034-second-factor.md).)
+
 ## What was verified
 
 By the Git acceptance suite, against a server with no mail server and then against an SMTP server of the

@@ -45,7 +45,9 @@ The revised container/systemd settings have not been exercised on Linux for this
 
 ### Publish and run
 
-Publish a self-contained NativeAOT server, then run it interactively:
+Download `graft-server-win-x64.exe` and `graft-admin-win-x64.exe` from a release, or build them with
+`eng\build-windows.ps1` ([ADR 0044](decisions/0044-releases.md)). From source without that script, publish a
+self-contained NativeAOT server, then run it interactively:
 
 ```powershell
 dotnet publish src\Graft.Server\Graft.Server.csproj -c Release -r win-x64 --self-contained true -p:PublishAot=true -o artifacts\mvp08\server-win-x64
@@ -64,13 +66,11 @@ Stop Graft before backup, restore or upgrade. Validate a new binary interactivel
 
 ## Linux interactive and systemd
 
-`deploy/linux/build-static-native.ps1` builds and inspects independent static-musl server and admin executables in an isolated Alpine chroot under an existing WSL distribution. It verifies that neither ELF contains an interpreter nor a `NEEDED` library entry. It does not install WSL or deploy to another host.
+Use a release's `graft-server-linux-x64` and `graft-admin-linux-x64`: static executables built by
+`eng/build-linux.sh` in Alpine, which run on any x64 Linux ([ADR 0044](decisions/0044-releases.md)).
+`deploy/linux/build-static-native.ps1`, the older WSL chroot build, predates the package feed and is not maintained.
 
-```powershell
-.\deploy\linux\build-static-native.ps1 -Distribution <existing-wsl-distribution>
-```
-
-Copy the executable to `/opt/graft/Graft.Server`, create a dedicated unprivileged account and `/var/lib/graft`, then replace every `@...@` placeholder in `deploy/systemd/graft.service`, including the listen URI, public origin and certificate paths readable only by that account. Install the rendered file as `/etc/systemd/system/graft.service` and run:
+Copy the forge to `/opt/graft/Graft.Server`, create a dedicated unprivileged account and `/var/lib/graft`, then replace every `@...@` placeholder in `deploy/systemd/graft.service`, including the listen URI, public origin and certificate paths readable only by that account. Install the rendered file as `/etc/systemd/system/graft.service` and run:
 
 ```text
 systemctl daemon-reload
@@ -174,20 +174,21 @@ GRAFT_MCP=true
 
 in `.env`, then `up --detach` again. Turning it on is a restart rather than a rebuild, and nothing else about the deployment changes: no second port, no second service, no second certificate. With it off, a request for `/mcp` is answered with a 404 that names the flag.
 
-Once on, what agents may do is decided in the browser, by an administrator, under **Administration, Agent access**. Three switches live there and each change applies to the next request with nothing restarted:
+Once on, what agents may do is decided in the browser, by an administrator, under **Administration, Agent access**. Four switches live there and each change applies to the next request with nothing restarted:
 
 | Switch | Default | What it does |
 | --- | --- | --- |
 | Serve agents | on | Pauses or resumes the endpoint. Off, callers get a 404 until it is turned back on. |
 | Allow writes | off | Lets agents create projects, change visibility, and publish or withdraw pages, within what each caller's token permits. Off, those tools are refused and the refusal names this page. |
 | Serve callers with no token | off | Serves requests that carry no credential, as strangers who see only public projects and published pages. Anyone who can reach the port can then talk to it. |
+| Allow deleting and transferring projects | off | Lets agents delete or transfer a project, only while writes are allowed; deletion names the path again. [ADR 0047](decisions/0047-agent-project-settings.md). |
 
 The endpoint holds no credential. Every caller sends their own Graft personal access token as `PRIVATE-TOKEN` or `Authorization: Bearer`, so two callers get exactly the access their own tokens carry, and a request without one is refused `401` before the protocol is spoken unless the third switch is on. Tokens are created under Profile and tokens; reading needs `read_api`, the mutating tools need `api`.
 
 The forge prints its agent posture on startup beside its other lines, so what a deployment is actually doing is visible in its logs; the switches can change afterwards, which is their point:
 
 ```text
-MCP: https://graft.example.internal:8443/mcp; enabled=true; credentials=required; writes=refused
+MCP: https://graft.example.internal:8443/mcp; enabled=true; credentials=required; writes=refused; destructive=refused
 ```
 
 For a client that launches its MCP server locally over stdio, `Graft.Mcp` remains a separate executable; see [build-and-test](build-and-test.md). It is not in the container image. See [ADR 0009](decisions/0009-mcp-in-the-forge.md) for why the endpoint moved into the forge and what it keeps from [ADR 0008](decisions/0008-mcp-layer.md).
@@ -278,13 +279,25 @@ forge prints it at startup:
 RUNNERS: cupri port 7443 advertised as graft.example.com; shrine cupri1…; runner downloads from /srv/graft/runner-binaries; transfers chunked above 80 MiB in 8 MiB chunks
 ```
 
-To add a runner, an administrator opens **Runners**, creates one, and copies the Windows or Linux install
-script to the machine that will run jobs. Each script carries the forge's Intonation, a signed link naming its
+To add a runner, an administrator opens **Runners**, creates one, optionally with tags and whether it also runs
+untagged jobs, and copies the Windows or Linux install script to the machine that will run jobs. Each script carries the forge's Intonation, a signed link naming its
 key and address, and a one-time token, and both expire after a day. Run it as an administrator on Windows or as
 root on Linux and it installs the `GraftRunner` service or the `graft-runner` systemd unit; add `-NoService` or
 `--no-service` to register only. The script downloads the runner from `/-/runner/download/` when the downloads
 directory holds `graft-runner-win-x64.exe` or `graft-runner-linux-x64`; otherwise pass the binary with `-Binary`
 or `--binary`.
+
+The Linux script checks that systemd is running *before* it registers, because registering spends the one-time
+token; if it is not, nothing is registered and the script says why. A Windows machine runs Linux jobs through a
+second runner installed inside WSL 2 with the Linux script and tagged for Linux. Under WSL the script prints the
+`/etc/wsl.conf` lines that turn systemd on, and after installing, a `wsl.exe -d <distribution> --exec sleep
+infinity` command for Windows to run at startup, because WSL stops an idle distribution and the runner with it.
+Under WSL's default NAT networking, a runner reaches a forge on the same machine by the host's address, not
+`localhost`. WSL runs Microsoft's kernel, so a job passing there says nothing about the 3.10 host. See
+[ADR 0054](decisions/0054-runner-tags.md); the WSL path has not yet been run on a real distribution.
+
+In a container deployment, publish the runner port as well as the HTTPS port; the compose file lists only the
+latter by default.
 
 Files between the forge and its runners, a job's source and its artifacts, go whole up to 80 MiB and in
 verified, resumable chunks of 8 MiB above it. `--runner-chunk-threshold <MiB>` (`GRAFT_RUNNER_CHUNK_THRESHOLD`)
@@ -294,7 +307,9 @@ database, and a job's artifacts are kept as `artifacts/<job id>.zip` in the proj
 they are backed up with it. See [ADR 0038](decisions/0038-chunked-runner-transfers-and-artifacts.md).
 
 A push that carries a `.gitlab-ci.yml` then makes a pipeline. Graft reads a strict subset of the format, and a
-file asking for anything else, such as `image` or `rules`, fails its pipeline naming the key. See
+file asking for anything else, such as `image` or `rules`, fails its pipeline naming the key. A job's `tags:`
+route it to a runner holding every one of them; a job no registered runner can take is shown as stuck, and a tag
+that uses a variable fails the pipeline ([ADR 0054](decisions/0054-runner-tags.md)). See
 [ADR 0037](decisions/0037-runners-over-cuprinet.md) for what runs and what does not.
 
 ### Optional email
@@ -351,8 +366,8 @@ GRAFT_SSH_HOST=git.example.com
 
 or `--ssh-host git.example.com`.
 
-The host key is created on first start as `ssh_host_ecdsa_key` beside the database, in the directory your
-backups already cover; keep it with the database when you move the server, or every client will be told the
+The host key is created on first start as `ssh_host_ecdsa_key` beside the database. `graft-admin backup` does not
+copy it ([operations](operations.md)); keep it with the database when you back up or move the server, or every client will be told the
 host has changed. The forge prints where it listens and the key's fingerprint at startup:
 
 ```text
@@ -395,7 +410,7 @@ On that hostname there is no API, no session, no upload route and no browser she
 The forge prints which it is using at startup:
 
 ```text
-PAGES: https://pages.example.com/<project-slug>/
+PAGES: https://pages.example.com/<project-slug>/; the root redirects to the forge
 ```
 
 The root of that hostname belongs to no project, so it redirects to the forge. That is on by default;

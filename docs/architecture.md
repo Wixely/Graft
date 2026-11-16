@@ -1,14 +1,14 @@
 # Architecture investigation
 
-Status: proposals/open questions, except where tied to a confirmed decision. Recorded: 2026-09-18. Owner: Next agent. Review: GRAFT-001.
+Status: the investigation of 2026-09-18, kept as a record. Most of what it left open is now decided in the [decision records](decisions/README.md); the table at the end says which (updated 2026-11-16).
 
 The current concrete recommendation is [ADR 0004](decisions/0004-csharp-mvp-proposal.md): a NativeAOT API/static-file host, standalone Blazor WebAssembly client, DnaX trial and managed C# Git feasibility gate. See [the MVP plan](mvp-plan.md) for scope and [research/build evidence](validation/2026-09-18-mvp-preparation.md) for what is verified. This is a proposal, including an explicit review of the inherited Blazor-host deployment rule; no full-stack compatibility is claimed.
 
-MVP-02 [demonstrates the browser/API boundary on Windows](validation/2026-09-18-ui-nativeaot.md): standalone Blazor client assets embedded in a NativeAOT executable, with opaque revocable sessions, HTTPS and source-generated JSON. MVP-03 [demonstrates DnaX migrations with Dapper.AOT](validation/2026-09-19-storage-migrations.md) in Windows and local static-musl NativeAOT. DnaX package distribution and required-host execution remain gates before product adoption.
+MVP-02 [demonstrates the browser/API boundary on Windows](validation/2026-09-18-ui-nativeaot.md): standalone Blazor client assets embedded in a NativeAOT executable, with opaque revocable sessions, HTTPS and source-generated JSON. MVP-03 [demonstrates DnaX migrations with Dapper.AOT](validation/2026-09-19-storage-migrations.md) in Windows and local static-musl NativeAOT. DnaX is restored from the GitHub Packages feed since 2026-11-03 ([ADR 0044](decisions/0044-releases.md)); execution on the required host remains a gate.
 
 MVP-07 adds an offline operations boundary: the server holds exclusive database and repository maintenance leases for its lifetime; the NativeAOT `Graft.Admin` tool must acquire both before backup or restore. Backups contain a SQLite snapshot plus the repository tree and a SHA-256 manifest. Restore verifies before publishing into fresh targets and removes a partially published database on failure. This is a single-process quiesced design; online backup and clustered writers remain outside the demonstrated boundary.
 
-MVP-08 keeps one host implementation across console, Windows Service and systemd lifetimes. Explicit HTTPS listener/origin arguments make service and container bindings deterministic. `/healthz` reports process readiness. Linux systemd uses `Type=notify`; the server sends its readiness/stopping datagrams directly from C# so both CoreCLR and static NativeAOT publications reach the expected service state. The optional container runs the self-contained CoreCLR publication as a non-root user with a read-only root filesystem. The legacy-host path is a separate static-musl NativeAOT server/admin pair. Local lifecycle and static functional tests pass, while Linux 3.10.108 execution remains an acceptance gate.
+MVP-08 keeps one host implementation across console, Windows Service and systemd lifetimes. Explicit HTTPS listener/origin arguments make service and container bindings deterministic. `/healthz` reports process readiness. Linux systemd uses `Type=notify`; the server sends its readiness/stopping datagrams directly from C# so both CoreCLR and static NativeAOT publications reach the expected service state. The optional container runs the same static NativeAOT Linux executables as the release, as a non-root user with a read-only root filesystem; that one static-musl build is also the legacy-host artifact ([ADR 0044](decisions/0044-releases.md)). Local lifecycle and static functional tests pass, while Linux 3.10.108 execution remains an acceptance gate.
 
 TLS configuration uses an operator PKCS#12 file and a separate password file. The password is not accepted on the command line. Non-loopback binding requires the operator certificate, and startup validates the private key, validity interval, server-authentication EKU when present, and subject alternative name against the public origin. Certificates load at startup, so renewal uses a coordinated file replacement and service restart. systemd paths, container secrets and the static-musl import pass locally; CA/DNS trust remains an environment acceptance concern.
 
@@ -29,12 +29,12 @@ Use C#/.NET 10 and Dapper.AOT. Preserve the demonstrated static-musl NativeAOT p
 
 | Boundary | Investigation |
 | --- | --- |
-| Browser UI and NativeAOT | Check current .NET 10 support. Blazor default remains relevant; server-side rendering/hosting must not be assumed compatible because minimal HTTP endpoints passed. Compare options and document tradeoffs. |
+| Browser UI and NativeAOT | **Decided:** a standalone Blazor WebAssembly client embedded in the NativeAOT host ([ADR 0004](decisions/0004-csharp-mvp-proposal.md), MVP-02); server-side Blazor is not used. |
 | Static native libraries | Keep full globalization; audit OpenSSL providers, certificate trust, DNS and library updates. The probe's embedded ICU fix is essential. |
 | Database manifests | DnaX 10.0.0-alpha.13 (pinned 2026-10-29; alpha.7 passed the original migration/AOT experiment) carries the NativeAOT generator fixes and is published by DnaX's CI to GitHub Packages. Graft restores it from that feed since 2026-11-03 (ADR 0044); target-host execution is still unproven. The application owns ordered migrations, preservation fixtures and restore policy. |
-| Git backend | Compare correctness, licenses, footprint, old-kernel compatibility and standalone packaging; external Git is not yet authorized as a product dependency. |
+| Git backend | **Decided:** Graft's own managed engine, keeping repositories as bare Git repositories, with no `git` executable on the server ([ADR 0028](decisions/0028-git-engine.md)). |
 | HTTP/API serialization | Confirm source-generated serializers and endpoint patterns work in a published binary. Do not disable warnings globally. |
 | Authentication and permissions | Map GitLab token/membership semantics into a simple explainable model without broadening access. Avoid separate inconsistent auth implementations. |
-| Windows build | Primary developer platform; the static-musl Linux approach does not specify Windows NativeAOT linking/packaging. |
+| Windows build | **Decided:** Windows NativeAOT single-file executables are built and released ([ADR 0044](decisions/0044-releases.md)). |
 
 A successful prototype is evidence for its exercised operations only. UI, Git, service hosting, real certificates, backup/recovery and actual clients must be tested independently.

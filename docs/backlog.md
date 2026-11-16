@@ -48,8 +48,8 @@ The collaboration depth list from the 2026-10-28 review, taken on as one piece o
   replays each commit and refuses by name; code owners come from the target branch and may be required.
   [ADR 0021](decisions/0021-review-options.md).
 
-- **Releases.** Notes, links and files on a tag; a release outlives its tag; asset bytes in the database,
-  bounded. [ADR 0022](decisions/0022-releases.md).
+- **Releases.** Notes, links and files on a tag; a release outlives its tag; asset bytes in the database
+  (on disk up to 2 GiB since [ADR 0052](decisions/0052-release-destinations.md)). [ADR 0022](decisions/0022-releases.md).
 - **Wiki, snippets, time tracking.** Wiki pages in the database with every save kept; snippets as a
   comment with a file; time as an estimate and an attributed ledger.
   [ADR 0023](decisions/0023-wiki-snippets-time.md).
@@ -102,13 +102,13 @@ Then the first of the four large items, in the order given:
   and one command per connection. Keys are registered to accounts through GitLab's `user/keys` routes and a
   profile tab, audited, unique across the instance. Fetches in protocol version 2 only; pushes as always.
   Off until `--ssh-port` names a port. Not done: LFS over an SSH remote, deploy keys, administrator-managed
-  keys. [ADR 0031](decisions/0031-git-over-ssh.md).
+  keys (all three built 2026-11-11, [ADR 0049](decisions/0049-ssh-large-files-deploy-keys-administered-keys.md)). [ADR 0031](decisions/0031-git-over-ssh.md).
 - **Email, optional.** `--mail-smtp` turns it on; nothing is sent without it. An optional unique address per
   account, an in-process SMTP client, and a password reset by one-time link that an administrator hands over
   or, with mail, the account asks for itself. [ADR 0032](decisions/0032-email-is-optional.md).
 - **Notifications.** An inbox row per person per event, written in the event's transaction: assignment,
   review requests, comments, approvals, merges, closes. The bell, `/-/notifications`, GitLab's `/todos`. A
-  message per entry is an opt-in copy. Not done: mentions, muting, digests. [ADR 0033](decisions/0033-notifications.md).
+  message per entry is an opt-in copy. Not done: mentions, muting, digests (built 2026-11-11, [ADR 0050](decisions/0050-mentions-muting-digests.md)). [ADR 0033](decisions/0033-notifications.md).
 - **A second factor.** Time-based codes from an authenticator app, enrolled in two steps, with recovery codes;
   off with the password and a code; removed by an administrator for the person who lost both. No email, no
   phone number; tokens and SSH keys unaffected. Not done: WebAuthn, requiring it of everyone, a QR picture.
@@ -136,6 +136,16 @@ Then the first of the four large items, in the order given:
 - **Every project setting through the agent tools** (2026-11-09). Banner, tags, review rules, webhooks, the audit
   trail, transfer and deletion, with token routes for the banner, approvals and transfer.
   [ADR 0047](decisions/0047-agent-project-settings.md).
+
+## Closed on 2026-11-16
+
+- **Runner tags.** A job's `tags:` send it only to a runner holding every tag; a job with no tags goes only to a
+  runner that runs untagged jobs. An administrator sets the tags (Runners page, `tag_list`/`run_untagged`,
+  `PUT /api/v4/runners/:id`), and a job no runner can take is marked stuck. The Linux install script checks for
+  systemd before registering and advises on WSL. [ADR 0054](decisions/0054-runner-tags.md). Left open: variables
+  in tags, paused runners, and the WSL path on a real distribution.
+- **The project list no longer opens repositories,** and opening a large one takes seconds, not minutes.
+  [ADR 0053](decisions/0053-listing-and-repository-open-cost.md).
 
 ## Closed on 2026-11-14
 
@@ -220,10 +230,12 @@ Added on 2026-11-01, first in line: the GitLab clients in use, LabCoat and Comee
 Added on 2026-10-31: making "the runner works on Windows, Linux and in Docker" true. Today only
 the Windows runner is tested.
 
-1. Publish the linux-x64 runner, NativeAOT, static musl like the forge.
+1. ~~Publish the linux-x64 runner, NativeAOT, static musl like the forge.~~ Done: published static with each release since [ADR 0044](decisions/0044-releases.md).
 2. Run the acceptance suite with the Linux runner, then run the runner on the Linux 3.10.108 host.
 3. Exercise the install scripts' service paths: the `graft-runner` systemd unit and the `GraftRunner` Windows
-   service. The suite runs the runner directly, so neither has been run.
+   service. The suite runs the runner directly, so neither has been run. Since ADR 0054 the shell script refuses
+   before registering when systemd is not running and advises on WSL; that path, including the keep-alive
+   command, has not been run on a real WSL distribution.
 4. A runner container image in `deploy/container`, and a test of a runner against a forge running in a
    container with its runner port published.
 
@@ -234,7 +246,7 @@ Jobs inside containers (`image:`) is not on this list; it is in the section belo
 **The rest of continuous integration.** The first slice exists ([ADR 0037](decisions/0037-runners-over-cuprinet.md)):
 Graft's own runner over CupriNet, install scripts, a strict subset of `.gitlab-ci.yml`, and artifacts with
 chunked, resumable transfers ([ADR 0038](decisions/0038-chunked-runner-transfers-and-artifacts.md)). Still absent:
-containers, artifact expiry and passing artifacts between stages, caches, `rules` and the rest of the format, group and project runners (retry and cancel exist since ADR 0041),
+containers, artifact expiry and passing artifacts between stages, caches, `rules` and the rest of the format, group and project runners (retry and cancel exist since ADR 0041, runner tags since [ADR 0054](decisions/0054-runner-tags.md)),
 detecting a runner that dropped mid-job, and GitLab's runner API for the official `gitlab-runner`.
 
 **More from an import.** [ADR 0042](decisions/0042-import-by-address-and-mirrors.md) imports and mirrors public

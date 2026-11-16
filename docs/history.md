@@ -31,6 +31,8 @@ project Maintainer make the server call an address of their choosing, which is w
 See [ADR 0015](decisions/0015-review-journey.md), [ADR 0016](decisions/0016-webhooks.md) and
 [the evidence](validation/2026-10-22-review.md).
 
+Status as of **2026-10-30 to 2026-10-31** (recorded under the entry above; dates added 2026-11-16):
+
 Email is optional. Graft sends nothing unless `--mail-smtp` names a server, and it works without one: a
 forgotten password is reset with a one-time link an administrator makes and hands over, so the administrator
 never knows the password the person chooses. With a mail server, the sign-in page lets people ask for that

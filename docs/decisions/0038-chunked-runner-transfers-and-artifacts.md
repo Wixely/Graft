@@ -79,6 +79,8 @@ archive; the by-ref artifact routes. A deleted project's directory takes its art
 pipeline is not built. Resumption across a forge restart is designed in through the journal, but the suite drops
 the runner's connection, not the forge.
 
+(Amended 2026-11-16: deleting a job's artifacts, deleting a project's artifacts and erasing a job are built by [ADR 0041](0041-labcoat-routes-retry-cancel-directory.md); expiry is not.)
+
 ## What was verified
 
 The acceptance suite drives the real runner against the real forge.

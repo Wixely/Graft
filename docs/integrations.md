@@ -1,12 +1,12 @@
 # Product-line integration candidates
 
-Recorded: 2026-09-18 from existing PLAN product records. Owner: Next agent. Review package/source maturity and licensing before adoption; these are fit proposals, not installed dependencies.
+Recorded: 2026-09-18 from existing PLAN product records. Owner: Next agent. Review package/source maturity and licensing before adoption; these were fit proposals. Updated 2026-11-16: CupriNet and CupriMark (runner transport, [ADR 0037](decisions/0037-runners-over-cuprinet.md)) and DnaX (migrations and browser uploads, [ADR 0044](decisions/0044-releases.md)) are adopted dependencies; the rest remain proposals.
 
 | Product | Intended fit | Decision boundary |
 | --- | --- | --- |
 | CupriNet / CupriMark | Runner connectivity and capability negotiation | Evaluation was explicitly suggested. Verify traversal/relay behavior, authorization, resource use and NativeAOT. Keep optional transports optional. |
 | DnaX | Host paths, diagnostics, migration manifests, uploads, optional admin/MCP support | Evaluate migrations first per shared preference. Confirm AOT; no randomized replacement of GitLab-compatible routes. |
-| GitlabMCPSharp / MCPHub | Existing compatibility client and task-oriented automation | Verify configurable endpoints and actual workflow fidelity. Do not configure connectors without approval. |
+| GitlabMCPSharp / MCPHub | Existing compatibility client and task-oriented automation | Verify configurable endpoints and actual workflow fidelity. Do not configure connectors without approval. Graft's own `/mcp` endpoint ([ADR 0009](decisions/0009-mcp-in-the-forge.md)) supersedes the agent-automation part of this row. |
 | CoLibra | Worker leases/fencing/failover | Introduce only when distributed coordination is justified; avoid overlapping transport responsibilities. |
 | RepoDetox | Optional import assessment and privacy/history tools | Never silently rewrite imported Git history. |
 | Banter / DaggerAgent | Notifications, repository rooms, opt-in agent workflows | Later scoped API/webhook integration; core forge remains independent. |

@@ -16,6 +16,11 @@ dotnet build Graft.slnx
 dotnet run --project experiments/compatibility/Graft.Compatibility.csproj --no-build
 ```
 
+Known failure since DnaX alpha.13 (2026-10-29): the full solution build, and the VS Code `build` task, stop with
+NU1601 in `experiments/storage`, which pins alpha.7 and treats warnings as errors. Build the product and suite
+projects individually (for example `dotnet build src\Graft.Server\Graft.Server.csproj`) until that experiment's pin
+is moved.
+
 VS Code: **Debug compatibility probe** builds its project then launches the Debug DLL. See [VS Code debugging](vscode-debugging.md) for the UI, Git, self-check and attach options. Running it on Windows validates only this developer baseline. `dotnet test` is not an application conformance suite here; the probe executable is the current functional oracle.
 
 Checkout setup validation on 2026-09-18: solution build passed with zero warnings/errors; all six probe checks passed on Windows x64 with the installed .NET 10.0.8 runtime. The first Windows run exposed Schannel's inability to use the generated ephemeral RSA key. The maintained source now imports that test certificate with default key storage on Windows only and disposes it after the test; no certificate/trust store is installed. Linux retains the original key path. Exception reporting now includes inner exception type/HResult without paths. The accepted Linux archive was not rebuilt or altered by these developer-baseline fixes.
@@ -54,11 +59,11 @@ The package-preparation script verifies the exact public source tag and commit b
 MVP-06 extends the ordinary Git client workflow with GitLab-style REST reads, browser-session APIs, embedded Blazor assets and repository browsing against the same disposable database/repository root. Git must be on `PATH`; the harness isolates Git configuration and disables certificate verification only for its ephemeral loopback certificate. Since 2026-10-30 the suite also drives Git over SSH, so `ssh`, `ssh-keygen` and `ssh-keyscan` must be on `PATH` too; Git for Windows and Windows OpenSSH both provide them. Since 2026-10-31 it also drives the runner: build `src/Graft.Runner` first, or point `GRAFT_RUNNER` at a runner binary, such as a NativeAOT one published with `-p:GraftRunnerAot=true`. Since 2026-11-03 it also drives `git-remote-graft` (ADR 0043): building the suite builds `src/Graft.Remote` too, and `GRAFT_REMOTE_HELPER` points it at another build, such as a NativeAOT one. The helper's binaries for the forge's download directory are published per platform; on Windows under `vcvars64` with `Platform` cleared, as for the server:
 
 ```powershell
-dotnet publish srcGraft.RemoteGraft.Remote.csproj -c Release -r win-x64 -p:GraftRemoteAot=true -p:IlcUseEnvironmentalTools=true -o artifactshelperwin-x64
-# then copy artifactshelperwin-x64git-remote-graft.exe to <runner downloads>git-remote-graft-win-x64.exe
+dotnet publish src\Graft.Remote\Graft.Remote.csproj -c Release -r win-x64 -p:GraftRemoteAot=true -p:IlcUseEnvironmentalTools=true -o artifacts\helper\win-x64
+# then copy artifacts\helper\win-x64\git-remote-graft.exe to <runner downloads>\git-remote-graft-win-x64.exe
 ```
 
-The Linux binary, `git-remote-graft-linux-x64`, is published the same way with `-r linux-x64` on a Linux machine or in WSL.
+The Linux binary, `git-remote-graft-linux-x64`, is built static by `eng/build-linux.sh` and ships with each release and in the image's `/app/downloads`.
 
 ```powershell
 dotnet build tests\Graft.Git.Acceptance\Graft.Git.Acceptance.csproj -c Debug
@@ -69,7 +74,7 @@ dotnet tests\Graft.Git.Acceptance\bin\Debug\net10.0\Graft.Git.Acceptance.dll art
 
 See [MVP-06 evidence](validation/2026-09-19-mvp06-repository-api-ui.md) for covered behavior, exact compatibility boundaries and remaining operational gates. The published server embeds a trimmed Blazor WebAssembly client; WebAssembly AOT is not enabled and the optional `wasm-tools` workload is not required for this slice.
 
-The current extension adds administrator user creation and account lifecycle, owner-managed project roles, and user-managed personal access tokens while retaining this harness. It passes 135 assertions against both managed and Windows NativeAOT servers; see [user/membership evidence](validation/2026-09-19-user-membership.md), [token evidence](validation/2026-09-19-personal-access-tokens.md), and [account credential evidence](validation/2026-09-20-account-credentials.md).
+The current extension adds administrator user creation and account lifecycle, owner-managed project roles, and user-managed personal access tokens while retaining this harness. On 2026-09-19 it passed 135 assertions against both managed and Windows NativeAOT servers (1,665 on 2026-11-16, after runner tags); see [user/membership evidence](validation/2026-09-19-user-membership.md), [token evidence](validation/2026-09-19-personal-access-tokens.md), and [account credential evidence](validation/2026-09-20-account-credentials.md).
 
 The same harness now also covers README rendering, which is the one place repository content becomes markup. Its corpus is pushed as real repository content on a branch of its own and read back through the browser endpoint, so the assertions run against the whole path rather than against the renderer in isolation. Half the corpus is hostile and must not survive; the other half is ordinary markdown and must not be flattened, because a renderer that escaped everything would satisfy every attack case and still be useless. See [README rendering evidence](validation/2026-10-04-readme-rendering.md).
 
@@ -229,9 +234,9 @@ dotnet build tests\Graft.Diff.Fuzz\Graft.Diff.Fuzz.csproj -c Debug
 dotnet tests\Graft.Diff.Fuzz\bin\Debug\net10.0\Graft.Diff.Fuzz.dll <seed> <cases> [show]
 ```
 
-It exits non-zero when any case disagrees and `show` prints the first one. Agreement currently sits around
-91% on seeds not used while developing the sliding passes; the rest are cases where Git picks a different
-script of the same length rather than a different position. This is a measuring instrument, not a gate: the
+It exits non-zero when any case disagrees and `show` prints the first one. Agreement with `git diff` at its
+defaults is 99.3% over 1,758 fresh pairs since the port of Git's `xdl_change_compact` (2026-10-30); the rest are
+cases where Git's search picks a different script of the same length rather than a different position. This is a measuring instrument, not a gate: the
 acceptance suite is what pins specific shapes. Git must be on `PATH`. See
 [commit diff evidence](validation/2026-10-09-commit-diff.md) for the measurements and what they exclude.
 
@@ -297,7 +302,7 @@ See [the operations runbook](operations.md) for backup, verification, fresh-targ
 
 The administration tool also provides the one-use offline administrator bootstrap. Its current 41-assertion operations workflow verifies live-server exclusion, successful login, administrator status, hashed-at-rest storage and reuse refusal under both managed and `win-x64` NativeAOT administration binaries. See [bootstrap evidence](validation/2026-09-19-operator-bootstrap.md).
 
-MVP-08 adds service lifetimes, deployment definitions, a static-musl product build and resource/lifecycle acceptance. The ordinary Windows NativeAOT baseline is:
+MVP-08 adds service lifetimes, deployment definitions, a static-musl product build and resource/lifecycle acceptance. The ordinary Windows NativeAOT baseline is below; for the release-equivalent single files with SQLite compiled in, use `eng\build-windows.ps1` ([ADR 0044](decisions/0044-releases.md)):
 
 ```powershell
 dotnet publish src\Graft.Server\Graft.Server.csproj -c Release -r win-x64 --self-contained true -p:PublishAot=true -o artifacts\mvp08\server-win-x64
@@ -348,13 +353,12 @@ Seen on 2026-10-29; the cause was not run down. That run is recorded in
 the managed suites could not have: a route mapped through a delegate variable, which the compile-time
 endpoint generator cannot see. Map routes through lambdas or method groups.
 
-Build the integrated static Linux server and admin tool with the existing isolated WSL toolchain:
+Build the static Linux executables (forge, admin tool, runner and helper) with `eng/build-linux.sh` in an Alpine
+3.21 root, as its header describes; the release workflow runs the same script.
+`deploy/linux/build-static-native.ps1` predates the package feed ([ADR 0044](decisions/0044-releases.md)) and is
+not maintained.
 
-```powershell
-.\deploy\linux\build-static-native.ps1 -Distribution <existing-wsl-distribution>
-```
-
-The systemd acceptance requires root in a systemd Linux environment. It passes with the static NativeAOT server as recorded in [static systemd evidence](validation/2026-09-19-static-systemd.md). The container acceptance requires rootless Podman and the self-contained `linux-x64` publication expected by the Containerfile. `.dockerignore` and `.containerignore` restrict the build context to source/deployment files and that publication. Both tests generate disposable certificate/password files and clean their temporary service/container state. See [the deployment runbook](deployment.md), [MVP-08 evidence](validation/2026-09-19-mvp08-packaging-resources.md) and [TLS evidence](validation/2026-09-19-operator-tls.md) for commands, results and boundaries.
+The systemd acceptance requires root in a systemd Linux environment. It passes with the static NativeAOT server as recorded in [static systemd evidence](validation/2026-09-19-static-systemd.md). The container acceptance requires rootless Podman and the static Linux executables laid out under `artifacts/container`, as the [deployment runbook](deployment.md) describes. `.dockerignore` and `.containerignore` restrict the build context to those files. Both tests generate disposable certificate/password files and clean their temporary service/container state. See [the deployment runbook](deployment.md), [MVP-08 evidence](validation/2026-09-19-mvp08-packaging-resources.md) and [TLS evidence](validation/2026-09-19-operator-tls.md) for commands, results and boundaries.
 
 `experiments/compatibility/Graft.Compatibility.csproj` has separate `NativeProbe` and `StaticProbe` switches. Plain `NativeProbe` enables AOT only; **StaticProbe** also sets static-musl executable linking, OpenSSL, ICU plus embedded data, and direct SQLite imports. Use `linux-musl-x64`, not the earlier CoreCLR `linux-x64` path, for the accepted standalone technique.
 

@@ -1,12 +1,12 @@
 # VS Code debugging
 
-Updated: 2026-09-19. Owner: Implementation agent. Review when projects or debug output paths change.
+Updated: 2026-11-16. Owner: Implementation agent. Review when projects or debug output paths change.
 
 Open the repository folder in VS Code with the Microsoft C# extension (`ms-dotnettools.csharp`). The workspace recommends it; no extension is installed automatically. Use the .NET SDK selected by `global.json`.
 
-In **Run and Debug**, select **Debug production browser fixture**, then press **F5**. Enter a temporary 16-256 character password at the masked prompt. The fixture builds the current server and embedded Blazor client, creates a seeded repository, starts on a random loopback HTTPS port and opens `/projects` in your default browser. Sign in as `fixture` using that password. The disposable server uses an untrusted localhost certificate; the browser may require a local certificate exception. No trust root is installed by the fixture. Stop debugging to discard all fixture state.
+In **Run and Debug**, select **Debug production browser fixture**, then press **F5**. The fixture builds the current server and embedded Blazor client, creates a seeded repository, starts on a random loopback HTTPS port and opens `/projects` in your default browser. Sign in as `admin` with the password `admin` (Debug builds only; `GRAFT_BROWSER_FIXTURE_USERNAME` and `GRAFT_BROWSER_FIXTURE_PASSWORD` override them). The disposable server uses an untrusted localhost certificate; the browser may require a local certificate exception. No trust root is installed by the fixture. Stop debugging to discard all fixture state.
 
-Set server breakpoints in `experiments/ui-server`. The browser client is published in Release mode and embedded; browser-side Razor/C# debugging and hot reload are not configured. Restart debugging after client changes to rebuild embedded assets.
+The server is `src/Graft.Server`, started by the fixture as a child process; to hit server breakpoints, attach to it with **Attach to .NET process**. The browser client is published in Release mode and embedded; browser-side Razor/C# debugging and hot reload are not configured. Restart debugging after client changes to rebuild embedded assets.
 
 ## Project pages
 
@@ -34,6 +34,7 @@ else when the request arrives on the pages host.
 
 | Launch option | Behavior |
 | --- | --- |
+| Debug Git scale checks (96 MiB) | Runs the repository-capacity checks in `tests/Graft.Git.Scale`. |
 | Debug production browser fixture | Runs the current Graft server with a disposable account and seeded text, hostile HTML and binary repository content, then opens the rendered UI. |
 | Debug project pages | Runs the same fixture with a pages origin configured and the sample page repository pushed, then opens the published project page. |
 | Debug MVP-04 accounts and permissions | Runs the disposable SQLite acceptance flow for accounts, projects, sessions, tokens, roles and revocation. |
@@ -55,7 +56,7 @@ Each launch builds its required projects in Debug mode. **Ctrl+Shift+B** still b
 
 The **run pinned glab acceptance in WSL** task prompts for an existing WSL distribution and runs the version-pinned client workflow. The official image must already be present; use the documented PowerShell runner with `-PullImage` only after approving that pull. A Windows `coreclr` launch is not provided for this harness because its behavior depends on the Linux host network namespace and rootless Podman. Debug it from a VS Code WSL window when step debugging is needed.
 
-Acceptance harnesses start child server processes. Their launch options debug the harness; server breakpoints require attaching to the child process, which may exit quickly. For ordinary server debugging, select the interactive server launch instead.
+Acceptance harnesses start child server processes. Their launch options debug the harness; server breakpoints require attaching to the child process, which may exit quickly. For ordinary server debugging, start a fixture launch and attach to its `Graft.Server` child process.
 
 These `coreclr` options debug managed DLLs, not published NativeAOT executables. NativeAOT acceptance remains a separate runbook step. Automatic browser opening follows the [official C# debugger configuration](https://code.visualstudio.com/docs/csharp/debugger-settings), using the host's `READY` output in the Debug Console.
 
