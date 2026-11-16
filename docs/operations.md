@@ -6,15 +6,16 @@ Updated: 2026-11-16. Owner: Operator. Review when storage layout, schema, import
 
 `Graft.Server` holds exclusive maintenance leases beside both the database and repository root for its lifetime. Stop the server before backup or restore. `Graft.Admin` refuses maintenance while either lease is held. Restore accepts only paths that do not exist; it never overwrites active data.
 
-Backups are directories containing `database.sqlite`, `repositories/` and `manifest.json`. The manifest inventories all repository directories and records every file's length and SHA-256. Verification rejects missing, extra, changed or linked content and runs SQLite `integrity_check`.
+Backups are directories containing `database.sqlite`, `repositories/`, `state/` and `manifest.json`. The manifest inventories all repository and state directories and records every file's length and SHA-256. Verification rejects missing, extra, changed or linked content and runs SQLite `integrity_check`.
 
-A backup does **not** hold what the server keeps beside the database: the key ring in `data-protection-keys/`, the
-runner Shrine's key in `runner-shrine/`, and the SSH host key `ssh_host_ecdsa_key`. Copy them with every backup and
-put them beside the restored database. Without the key ring, recoverable tokens and release destinations cannot be
-read; without the Shrine key, every runner must be installed again; without the host key, SSH clients are told the
-host has changed.
+Since 2026-11-16 (format 2, [ADR 0055](decisions/0055-backups-keep-the-server-keys.md)) `state/` holds what the server keeps beside the
+database and cannot do without: the key ring in `data-protection-keys/`, the runner Shrine's key in `runner-shrine/`,
+and the SSH host key `ssh_host_ecdsa_key`. Restore puts them beside the restored database and refuses if any is
+already there. **The key ring is stored unencrypted, so a backup now holds keys:** whoever has it can read recoverable
+tokens and release destinations. A format 1 backup, made before this, has no `state/`; it still restores, and those
+three must then be copied by hand.
 
-Keep backups on storage with access controls appropriate for password hashes, token/session digests, audit data and private repository content. The backup is not encrypted by Graft.
+Keep backups on storage with access controls appropriate for the server's keys, password hashes, token/session digests, audit data and private repository content. The backup is not encrypted by Graft.
 
 ## First administrator
 

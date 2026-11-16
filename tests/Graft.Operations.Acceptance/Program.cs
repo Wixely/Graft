@@ -128,8 +128,13 @@ try
     string backup = Path.Combine(root, "backup");
     await Admin(["backup", "--database", activeDatabase, "--repositories", activeRepositories, "--output", backup]);
     BackupManifest manifest = await BackupManager.VerifyAsync(backup);
-    Check(manifest.FormatVersion == 1 && manifest.Files.Any(file => file.Path == "database.sqlite"),
+    Check(manifest.FormatVersion == 2 && manifest.Files.Any(file => file.Path == "database.sqlite"),
         "backup manifest inventories database");
+    string activeKeyRing = Path.Combine(Path.GetDirectoryName(activeDatabase)!, "data-protection-keys");
+    string[] keyFiles = Directory.GetFiles(activeKeyRing).Select(Path.GetFileName).ToArray()!;
+    Check(keyFiles.Length > 0 && keyFiles.All(name => manifest.Files.Any(file => file.Path == "state/data-protection-keys/" + name)) &&
+        BackupManager.StateKept(manifest).Contains("data-protection-keys", StringComparison.Ordinal),
+        "backup keeps the key ring the server wrote beside the database");
     Check(manifest.Files.Any(file => file.Path.StartsWith("repositories/", StringComparison.Ordinal)),
         "backup manifest inventories repository content");
     await Admin(["verify", "--input", backup]);
@@ -141,6 +146,37 @@ try
     Directory.CreateDirectory(Path.Combine(undeclared, "unexpected-empty-directory"));
     await Throws<InvalidDataException>(() => BackupManager.VerifyAsync(undeclared), "undeclared backup path is rejected");
 
+    string strayState = Path.Combine(root, "stray-state-backup");
+    CopyTree(backup, strayState);
+    File.WriteAllText(Path.Combine(strayState, "state", "planted.txt"), "not a key");
+    await Throws<InvalidDataException>(() => BackupManager.VerifyAsync(strayState), "a backup's state holds only the server's keys");
+
+    // A format 1 backup, from before the state was kept, still verifies and restores.
+    string formatOne = Path.Combine(root, "format-one-backup");
+    CopyTree(backup, formatOne);
+    Directory.Delete(Path.Combine(formatOne, "state"), recursive: true);
+    System.Text.Json.Nodes.JsonObject oldManifest = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(Path.Combine(formatOne, "manifest.json")))!.AsObject();
+    oldManifest["format_version"] = 1;
+    oldManifest.Remove("state_directories");
+    System.Text.Json.Nodes.JsonArray oldFiles = oldManifest["files"]!.AsArray();
+    foreach (System.Text.Json.Nodes.JsonNode? file in oldFiles.ToArray())
+        if (file!["path"]!.GetValue<string>().StartsWith("state/", StringComparison.Ordinal)) oldFiles.Remove(file);
+    File.WriteAllText(Path.Combine(formatOne, "manifest.json"), oldManifest.ToJsonString());
+    BackupManifest oldVerified = await BackupManager.VerifyAsync(formatOne);
+    string oldDatabase = Path.Combine(root, "format-one", "graft.db");
+    await BackupManager.RestoreAsync(formatOne, oldDatabase, Path.Combine(root, "format-one", "repositories"));
+    Check(oldVerified.FormatVersion == 1 && BackupManager.StateKept(oldVerified) == "not kept (format 1)" &&
+        File.Exists(oldDatabase) && !Directory.Exists(Path.Combine(root, "format-one", "data-protection-keys")),
+        "a format 1 backup still verifies and restores, without state");
+
+    // State is never restored over state that is already there, and nothing is published when it would be.
+    string occupied = Path.Combine(root, "occupied");
+    Directory.CreateDirectory(Path.Combine(occupied, "data-protection-keys"));
+    await Throws<IOException>(() => BackupManager.RestoreAsync(backup, Path.Combine(occupied, "graft.db"), Path.Combine(occupied, "repositories")),
+        "restore refuses to put the key ring over one already beside the target database");
+    Check(!File.Exists(Path.Combine(occupied, "graft.db")) && !Directory.Exists(Path.Combine(occupied, "repositories")),
+        "and publishes nothing");
+
     string tampered = Path.Combine(root, "tampered-backup");
     CopyTree(backup, tampered);
     string tamperedFile = Directory.EnumerateFiles(Path.Combine(tampered, "repositories"), "*", SearchOption.AllDirectories).First();
@@ -151,6 +187,11 @@ try
     string candidateRepositories = Path.Combine(root, "candidate", "repositories");
     await Admin(["restore", "--input", backup, "--database", candidateDatabase, "--repositories", candidateRepositories]);
     await VerifyRestored(candidateDatabase, candidateRepositories, importToken.Secret, project, firstImport, "restored candidate");
+    string restoredKeyRing = Path.Combine(Path.GetDirectoryName(candidateDatabase)!, "data-protection-keys");
+    Check(keyFiles.All(name => File.Exists(Path.Combine(restoredKeyRing, name)) &&
+            File.ReadAllBytes(Path.Combine(restoredKeyRing, name)).SequenceEqual(File.ReadAllBytes(Path.Combine(activeKeyRing, name)))) &&
+        !Directory.EnumerateDirectories(Path.GetDirectoryName(candidateDatabase)!, ".graft-restore-state-*").Any(),
+        "restore puts the same key ring beside the restored database, leaving no staging behind");
     await Throws<IOException>(() => BackupManager.RestoreAsync(backup, candidateDatabase, candidateRepositories),
         "restore refuses to overwrite existing data");
 

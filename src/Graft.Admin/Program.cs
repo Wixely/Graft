@@ -38,7 +38,7 @@ try
             RequireOnly(options, "database", "repositories", "output");
             BackupManifest manifest = await BackupManager.CreateAsync(
                 Required(options, "database"), Required(options, "repositories"), Required(options, "output"));
-            Console.WriteLine($"BACKUP: PASS; files={manifest.Files.Length}; directories={manifest.Directories.Length}");
+            Console.WriteLine($"BACKUP: PASS; files={manifest.Files.Length}; directories={manifest.Directories.Length}; state={BackupManager.StateKept(manifest)}");
             break;
         }
         case "verify":
@@ -53,7 +53,7 @@ try
             RequireOnly(options, "input", "database", "repositories");
             BackupManifest manifest = await BackupManager.RestoreAsync(
                 Required(options, "input"), Required(options, "database"), Required(options, "repositories"));
-            Console.WriteLine($"RESTORE: PASS; files={manifest.Files.Length}; directories={manifest.Directories.Length}");
+            Console.WriteLine($"RESTORE: PASS; files={manifest.Files.Length}; directories={manifest.Directories.Length}; state={BackupManager.StateKept(manifest)}");
             break;
         }
         case "inspect-bundle":

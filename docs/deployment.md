@@ -366,8 +366,8 @@ GRAFT_SSH_HOST=git.example.com
 
 or `--ssh-host git.example.com`.
 
-The host key is created on first start as `ssh_host_ecdsa_key` beside the database. `graft-admin backup` does not
-copy it ([operations](operations.md)); keep it with the database when you back up or move the server, or every client will be told the
+The host key is created on first start as `ssh_host_ecdsa_key` beside the database. `graft-admin backup` keeps it
+since 2026-11-16 ([operations](operations.md)); keep it with the database when you move the server by hand, or every client will be told the
 host has changed. The forge prints where it listens and the key's fingerprint at startup:
 
 ```text

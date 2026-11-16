@@ -2,6 +2,16 @@
 
 Updated: 2026-11-16. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the project owner.
 
+## Added on 2026-11-16, last: backups keep the server's keys, and the documents were reviewed
+
+- **Backups.** `BackupManager` writes format 2, with `state/` holding the key ring, the runner Shrine key and the
+  SSH host key; restore puts them back beside the database. [ADR 0055](decisions/0055-backups-keep-the-server-keys.md).
+  A new file the server keeps beside the database that a restore needs must be added to `BackupManager.StateItems`.
+- **Documents.** Every document was checked against the code and the decision records the same day. The full
+  solution build's NU1601 in `experiments/storage` is now written down in build-and-test; fixing that pin is open.
+- **Next action (project owner):** make a backup of the live deployment with the new admin tool and keep it where
+  keys may be kept.
+
 ## Added on 2026-11-16, later: runner tags
 
 Jobs can now say which runner they need. [ADR 0054](decisions/0054-runner-tags.md). Migration 32.

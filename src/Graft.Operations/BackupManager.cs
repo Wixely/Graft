@@ -13,13 +13,42 @@ public sealed record BackupManifest(
     string DatabasePath,
     string RepositoriesPath,
     string[] Directories,
-    BackupFile[] Files);
+    BackupFile[] Files,
+    /// <summary>
+    /// Format 2: the directories under <c>state/</c>, relative to it. Null in a format 1 backup, which has no state.
+    /// </summary>
+    string[]? StateDirectories = null);
 
+/// <summary>
+/// Offline backup, verification and restore of a quiesced forge.
+///
+/// <para>
+/// Format 2 also keeps the server's state beside the database under <c>state/</c>: the key ring, without which
+/// recoverable tokens and release destinations cannot be read; the runner Shrine's key, without which every runner
+/// must be installed again; and the SSH host key, without which clients are told the host has changed. Only those
+/// named items are kept; transient directories beside the database are not. The key ring is stored unencrypted,
+/// so a backup now holds keys and must be protected as such. A format 1 backup still verifies and restores.
+/// </para>
+/// </summary>
 public static class BackupManager
 {
     private const string ManifestName = "manifest.json";
     private const string DatabaseName = "database.sqlite";
     private const string RepositoriesName = "repositories";
+    private const string StateName = "state";
+
+    /// <summary>What the server keeps beside the database that a restore cannot do without.</summary>
+    public static IReadOnlyList<string> StateItems { get; } = ["data-protection-keys", "runner-shrine", "ssh_host_ecdsa_key"];
+
+    /// <summary>Which state items a backup holds, for the operator's output: comma-separated, "none", or "not kept (format 1)".</summary>
+    public static string StateKept(BackupManifest manifest)
+    {
+        ArgumentNullException.ThrowIfNull(manifest);
+        if (manifest.StateDirectories is null) return "not kept (format 1)";
+        string[] kept = StateItems.Where(item => manifest.Files.Any(file =>
+            file.Path == StateName + "/" + item || file.Path.StartsWith(StateName + "/" + item + "/", StringComparison.Ordinal))).ToArray();
+        return kept.Length == 0 ? "none" : string.Join(",", kept);
+    }
 
     public static async Task<BackupManifest> CreateAsync(
         string databasePath,
@@ -42,6 +71,23 @@ public static class BackupManager
             string repositoriesCopy = Path.Combine(staging, RepositoriesName);
             Directory.CreateDirectory(repositoriesCopy);
             CopyTree(repositories, repositoriesCopy, cancellationToken);
+            string stateCopy = Path.Combine(staging, StateName);
+            CreatePrivateDirectory(stateCopy);
+            string stateSource = Path.GetDirectoryName(database)!;
+            foreach (string item in StateItems)
+            {
+                string source = Path.Combine(stateSource, item);
+                if (Directory.Exists(source))
+                {
+                    Directory.CreateDirectory(Path.Combine(stateCopy, item));
+                    CopyTree(source, Path.Combine(stateCopy, item), cancellationToken);
+                }
+                else if (File.Exists(source))
+                {
+                    RejectLink(File.GetAttributes(source));
+                    CopyFile(source, Path.Combine(stateCopy, item), cancellationToken);
+                }
+            }
 
             BackupManifest manifest = BuildManifest(staging);
             await using (FileStream destination = new(Path.Combine(staging, ManifestName), FileMode.CreateNew,
@@ -71,10 +117,26 @@ public static class BackupManager
         ValidateManifest(manifest);
 
         (string[] actualDirectories, string[] actualFiles) = InventoryTree(backup);
+        bool hasState = manifest.StateDirectories is not null;
         if (!actualDirectories.Contains(RepositoriesName, StringComparer.Ordinal) ||
-            actualDirectories.Any(path => path != RepositoriesName &&
-                !path.StartsWith(RepositoriesName + "/", StringComparison.Ordinal)))
+            hasState != actualDirectories.Contains(StateName, StringComparer.Ordinal) ||
+            actualDirectories.Any(path => path != RepositoriesName && path != StateName &&
+                !path.StartsWith(RepositoriesName + "/", StringComparison.Ordinal) &&
+                !(hasState && path.StartsWith(StateName + "/", StringComparison.Ordinal))))
             throw new InvalidDataException("Backup contains an undeclared directory outside the repository tree.");
+        if (hasState)
+        {
+            string[] stateDirectories = actualDirectories
+                .Where(path => path.StartsWith(StateName + "/", StringComparison.Ordinal))
+                .Select(path => path[(StateName.Length + 1)..]).ToArray();
+            if (!manifest.StateDirectories!.ToHashSet(StringComparer.Ordinal).SetEquals(stateDirectories))
+                throw new InvalidDataException("Backup state inventory does not match its manifest.");
+            // Only the named items, so a backup cannot carry something else into the database's directory.
+            if (stateDirectories.Concat(actualFiles.Where(path => path.StartsWith(StateName + "/", StringComparison.Ordinal))
+                    .Select(path => path[(StateName.Length + 1)..]))
+                .Any(path => !StateItems.Contains(path.Split('/')[0], StringComparer.Ordinal)))
+                throw new InvalidDataException("Backup state holds something other than the server's keys.");
+        }
         HashSet<string> declared = manifest.Files.Select(file => NormalizeRelative(file.Path)).ToHashSet(StringComparer.Ordinal);
         string[] actual = actualFiles.Where(path => path != ManifestName).ToArray();
         if (!declared.SetEquals(actual)) throw new InvalidDataException("Backup file inventory does not match its manifest.");
@@ -110,26 +172,63 @@ public static class BackupManager
         if (File.Exists(repositories) || Directory.Exists(repositories)) throw new IOException("Restore repository target already exists.");
         BackupManifest manifest = await VerifyAsync(backup, cancellationToken);
 
-        Directory.CreateDirectory(Path.GetDirectoryName(database)!);
+        // The state goes beside the restored database, where the server looks for it, and never over anything.
+        string stateTarget = Path.GetDirectoryName(database)!;
+        string[] stateItems = manifest.StateDirectories is null ? [] :
+            StateItems.Where(item => Path.Exists(Path.Combine(backup, StateName, item))).ToArray();
+        foreach (string item in stateItems)
+            if (Path.Exists(Path.Combine(stateTarget, item)))
+                throw new IOException("Restore state target already exists: " + item + " beside the database.");
+
+        Directory.CreateDirectory(stateTarget);
         Directory.CreateDirectory(Path.GetDirectoryName(repositories)!);
         string databaseStage = database + ".restore-" + Guid.NewGuid().ToString("N");
         string repositoriesStage = repositories + ".restore-" + Guid.NewGuid().ToString("N");
+        string stateStage = Path.Combine(stateTarget, ".graft-restore-state-" + Guid.NewGuid().ToString("N"));
         bool databasePublished = false;
+        bool repositoriesPublished = false;
+        List<string> statePublished = [];
         try
         {
             CopyFile(Path.Combine(backup, DatabaseName), databaseStage, cancellationToken);
             Directory.CreateDirectory(repositoriesStage);
             CopyTree(Path.Combine(backup, RepositoriesName), repositoriesStage, cancellationToken);
+            if (stateItems.Length > 0)
+            {
+                CreatePrivateDirectory(stateStage);
+                CopyTree(Path.Combine(backup, StateName), stateStage, cancellationToken);
+            }
             await CheckDatabase(databaseStage, cancellationToken);
             File.Move(databaseStage, database);
             databasePublished = true;
             Directory.Move(repositoriesStage, repositories);
+            repositoriesPublished = true;
+            foreach (string item in stateItems)
+            {
+                string staged = Path.Combine(stateStage, item);
+                string published = Path.Combine(stateTarget, item);
+                if (Directory.Exists(staged)) Directory.Move(staged, published);
+                else File.Move(staged, published);
+                if (!OperatingSystem.IsWindows())
+                    File.SetUnixFileMode(published, Directory.Exists(published)
+                        ? UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+                        : UnixFileMode.UserRead | UnixFileMode.UserWrite);
+                statePublished.Add(published);
+            }
+            if (Directory.Exists(stateStage)) Directory.Delete(stateStage, recursive: true);
             return manifest;
         }
         catch
         {
+            foreach (string published in statePublished)
+            {
+                if (Directory.Exists(published)) Directory.Delete(published, recursive: true);
+                else if (File.Exists(published)) File.Delete(published);
+            }
+            if (Directory.Exists(stateStage)) Directory.Delete(stateStage, recursive: true);
             if (File.Exists(databaseStage)) File.Delete(databaseStage);
             if (Directory.Exists(repositoriesStage)) Directory.Delete(repositoriesStage, recursive: true);
+            if (repositoriesPublished && Directory.Exists(repositories)) Directory.Delete(repositories, recursive: true);
             if (databasePublished && File.Exists(database)) File.Delete(database);
             throw;
         }
@@ -166,6 +265,8 @@ public static class BackupManager
         (string[] allDirectories, string[] allFiles) = InventoryTree(root);
         string[] directories = allDirectories.Where(path => path.StartsWith(RepositoriesName + "/", StringComparison.Ordinal))
             .Select(path => path[(RepositoriesName.Length + 1)..]).ToArray();
+        string[] stateDirectories = allDirectories.Where(path => path.StartsWith(StateName + "/", StringComparison.Ordinal))
+            .Select(path => path[(StateName.Length + 1)..]).ToArray();
         BackupFile[] files = allFiles
             .Select(relative =>
             {
@@ -173,12 +274,13 @@ public static class BackupManager
                 return new BackupFile(relative, new FileInfo(path).Length, Hash(path));
             })
             .OrderBy(file => file.Path, StringComparer.Ordinal).ToArray();
-        return new(1, "Graft", DateTimeOffset.UtcNow, DatabaseName, RepositoriesName, directories, files);
+        return new(2, "Graft", DateTimeOffset.UtcNow, DatabaseName, RepositoriesName, directories, files, stateDirectories);
     }
 
     private static void ValidateManifest(BackupManifest manifest)
     {
-        if (manifest.FormatVersion != 1 || manifest.Application != "Graft" || manifest.DatabasePath != DatabaseName ||
+        if (manifest.FormatVersion is not (1 or 2) || (manifest.FormatVersion == 2) != (manifest.StateDirectories is not null) ||
+            manifest.Application != "Graft" || manifest.DatabasePath != DatabaseName ||
             manifest.RepositoriesPath != RepositoriesName || manifest.Files.Length == 0)
             throw new InvalidDataException("Unsupported backup manifest.");
         if (manifest.Files.Select(file => NormalizeRelative(file.Path)).Distinct(StringComparer.Ordinal).Count() != manifest.Files.Length ||
@@ -310,6 +412,14 @@ public static class BackupManager
 
     private static bool IsChild(string candidate, string parent) =>
         candidate.StartsWith(parent + Path.DirectorySeparatorChar, PathComparison);
+
+    // Keys pass through here, so on Linux the directory holding them is the owner's alone, as the server keeps it.
+    private static void CreatePrivateDirectory(string path)
+    {
+        Directory.CreateDirectory(path);
+        if (!OperatingSystem.IsWindows())
+            File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+    }
 
     private static void RejectLink(FileAttributes attributes)
     {
