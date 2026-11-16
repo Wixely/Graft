@@ -16,7 +16,11 @@
 
 <PageTitle>@(view?.Title ?? "Project page") &middot; Graft</PageTitle>
 
-@if (loading)
+@if (forwarding)
+{
+    <p role="status" class="secondary-text">Opening the project's site…</p>
+}
+else if (loading)
 {
     <p role="status" class="secondary-text">Loading…</p>
 }
@@ -425,6 +429,7 @@ else
     private string message = "";
     private string messageKind = "info";
     private bool loading = true;
+    private bool forwarding;
     private string? loadedSlug;
 
     // The formats the page's image route serves. Anything else opens as text or as "binary".
@@ -445,6 +450,7 @@ else
         }
 
         loading = true;
+        forwarding = false;
         loadedSlug = Slug;
         path = "";
         appliedLocation = null;
@@ -462,8 +468,11 @@ else
             if (view is null) { message = "No page is published at this address, or it was withdrawn."; return; }
 
             // The owner designed a site; that is the page. Replacing the entry keeps Back from bouncing here.
+            // The page is never drawn on the way: the browser is still on this origin until the site starts to
+            // load, and drawing the forge's page meanwhile flashed it in front of the site it was leaving for.
             if (view.SiteUrl is { Length: > 0 } site && TabQuery is null && FileQuery is null && PathQuery is null)
             {
+                forwarding = true;
                 Navigation.NavigateTo(site, forceLoad: true, replace: true);
                 return;
             }
