@@ -94,3 +94,8 @@ Not verified: the WSL path of the install script on a real WSL distribution, wit
 command; a forge on the same Windows machine reached from WSL's network. Under WSL's default NAT networking,
 Windows's `localhost` is not WSL's, so a runner in WSL reaches a forge on the same machine through the host's
 address or with mirrored networking.
+
+(Amended 2026-11-16, later: the WSL path was run on a real distribution, and the refusal without systemd and the
+keep-alive advice behaved as described. The same run found that the systemd service itself never started, which is
+fixed; see [the evidence](../validation/2026-11-16-runners-linux-wsl-systemd.md). Whether WSL stops an idle
+distribution with the service running is still unverified.)

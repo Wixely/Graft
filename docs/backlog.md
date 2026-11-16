@@ -231,11 +231,14 @@ Added on 2026-10-31: making "the runner works on Windows, Linux and in Docker" t
 the Windows runner is tested.
 
 1. ~~Publish the linux-x64 runner, NativeAOT, static musl like the forge.~~ Done: published static with each release since [ADR 0044](decisions/0044-releases.md).
-2. Run the acceptance suite with the Linux runner, then run the runner on the Linux 3.10.108 host.
+2. Run the acceptance suite with the Linux runner, then run the runner on the Linux 3.10.108 host. (2026-11-16:
+   the Linux runner ran tagged jobs beside a Windows runner under WSL; the suite itself has not been run on Linux.)
 3. Exercise the install scripts' service paths: the `graft-runner` systemd unit and the `GraftRunner` Windows
-   service. The suite runs the runner directly, so neither has been run. Since ADR 0054 the shell script refuses
-   before registering when systemd is not running and advises on WSL; that path, including the keep-alive
-   command, has not been run on a real WSL distribution.
+   service. (2026-11-16: the systemd path was run under WSL and found broken; the runner never started as a
+   service. Fixed, with the refusal without systemd and the WSL advice verified:
+   [evidence](validation/2026-11-16-runners-linux-wsl-systemd.md). Still to do: the fix in a static build, which
+   comes with the next release; the Windows service, which needs an elevated session; whether WSL stops an idle
+   distribution with the service running.)
 4. A runner container image in `deploy/container`, and a test of a runner against a forge running in a
    container with its runner port published.
 

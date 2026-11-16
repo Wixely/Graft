@@ -16,7 +16,7 @@
       },
       "DnaX.Data.Migrations.Sqlite": {
         "type": "Direct",
-        "requested": "[10.0.0-alpha.7, )",
+        "requested": "[10.0.0-alpha.13, )",
         "resolved": "10.0.0-alpha.13",
         "contentHash": "+3QMheoOwKowEJZZOHgjpYHlj7y5Jimh3SpIY8wS8d4Y7+6/xsfJmCMx1lJLLBJvfwtf6MsEAe3htcnYg+SGhg==",
         "dependencies": {

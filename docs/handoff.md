@@ -2,6 +2,18 @@
 
 Updated: 2026-11-16. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the project owner.
 
+## Added on 2026-11-16, after that: runners verified on Linux under systemd
+
+- **Bug fixed.** The Linux runner installed as a systemd service never started: rooted at `/` its host never
+  finished starting, and systemd never heard it was ready. The runner now roots its host at its config directory,
+  reloads no configuration, and sends `READY=1` itself (`src/Graft.Runner/SystemdNotify.cs`); the unit also sets
+  `WorkingDirectory=`. **v0.1.3's Linux runner cannot run as a service; the next release fixes it.**
+- **Verified under WSL:** the install script end to end, its refusal without systemd, and a pipeline routed by tags
+  to a Linux and a Windows runner. [Evidence](validation/2026-11-16-runners-linux-wsl-systemd.md).
+- **The full solution build passes again:** `experiments/storage` moved to DnaX alpha.13.
+- **Next action (project owner):** cut a release so the fixed static Linux runner exists. Then, from an elevated
+  PowerShell, run a runner install script without `-NoService` to try the Windows service.
+
 ## Added on 2026-11-16, last: backups keep the server's keys, and the documents were reviewed
 
 - **Backups.** `BackupManager` writes format 2, with `state/` holding the key ring, the runner Shrine key and the

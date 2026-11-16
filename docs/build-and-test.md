@@ -16,10 +16,9 @@ dotnet build Graft.slnx
 dotnet run --project experiments/compatibility/Graft.Compatibility.csproj --no-build
 ```
 
-Known failure since DnaX alpha.13 (2026-10-29): the full solution build, and the VS Code `build` task, stop with
-NU1601 in `experiments/storage`, which pins alpha.7 and treats warnings as errors. Build the product and suite
-projects individually (for example `dotnet build src\Graft.Server\Graft.Server.csproj`) until that experiment's pin
-is moved.
+From 2026-10-29 to 2026-11-16 the full solution build, and the VS Code `build` task, stopped with NU1601 in
+`experiments/storage`, which pinned DnaX alpha.7 from a local feed. The experiment now uses alpha.13 from the
+repository's feed, and `dotnet build Graft.slnx` passes with no warnings again (2026-11-16).
 
 VS Code: **Debug compatibility probe** builds its project then launches the Debug DLL. See [VS Code debugging](vscode-debugging.md) for the UI, Git, self-check and attach options. Running it on Windows validates only this developer baseline. `dotnet test` is not an application conformance suite here; the probe executable is the current functional oracle.
 

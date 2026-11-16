@@ -145,6 +145,7 @@ internal static class RunnerInstallScripts
         script.Append("\n");
         script.Append("[Service]\n");
         script.Append("Type=notify\n");
+        script.Append("WorkingDirectory=$DIR\n");
         script.Append("ExecStart=$BINARY run --config $CONFIG\n");
         script.Append("Restart=always\n");
         script.Append("RestartSec=5\n");

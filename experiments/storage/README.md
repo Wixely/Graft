@@ -28,6 +28,11 @@ The script creates a dedicated root filesystem, verifies the Alpine and SDK down
 
 ## Package availability boundary
 
+Updated 2026-11-16: the probe now references DnaX `10.0.0-alpha.13`, the version `src/` uses, restored from the
+repository's own NuGet configuration (the GitHub Packages feed, [ADR 0044](../../docs/decisions/0044-releases.md)),
+so the full solution builds again; it passed on Windows the same day. The text below records the alpha.7 trial.
+The static build script still uses `NuGet.static.config` and the alpha.7 local feed and has not been brought forward.
+
 The selected DnaX packages are built from public tag `v10.0.0-alpha.7` (commit `73826d731cef903083f2a4ae15ba6ac284e83ce3`) and locked by `packages.lock.json`. This tag includes platform-independent migration checksum normalization added after alpha.3. On 2026-09-19 the packages were not available from NuGet.org, and the corresponding GitHub release exposed no package assets. `prepare-dnax-packages.ps1` refuses any other or modified checkout and packs the tag into the ignored local feed at `artifacts/storage/dnax-feed`; normal and static restores consume those exact packages.
 
 This proves the package implementation works in the tested environments, but a clean checkout cannot restore it. Do not adopt DnaX in `src/` until the exact tested packages are published to an approved durable feed or an explicit vendoring/source-build policy is selected. The delivered application must not depend on the sibling DnaX checkout.
