@@ -2,6 +2,7 @@
 @inject GraftApi Api
 @inject NavigationManager Navigation
 @inject IJSRuntime JS
+@implements IAsyncDisposable
 
 @* A published project page: the curated surface an owner chose to show, which is not the repository and
    never becomes it. It wears the repository's own layout, the masthead, the tabs, the file table and the
@@ -486,12 +487,31 @@ else
     /// <summary>Renders mermaid diagrams in the readme or an open document once it is in the DOM, as the project page does.</summary>
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
+        // The page's own browser icon (ADR 0059), or Graft's again for a page that names none.
+        string? icon = forwarding ? appliedIcon : view?.IconUrl;
+        if (icon != appliedIcon)
+        {
+            appliedIcon = icon;
+            try { await JS.InvokeVoidAsync(icon is null ? "graftIcon.reset" : "graftIcon.set", icon); }
+            catch (JSException) { }
+        }
         if (tab != "code") return;
         bool readmeShown = view?.Readme?.HasDiagrams == true && openPath is null && path.Length == 0;
         bool documentShown = openMarkdown?.HasDiagrams == true && !showSource;
         if (!readmeShown && !documentShown) return;
         try { await JS.InvokeVoidAsync("graftMarkdown.render"); }
         catch (JSException) { }
+    }
+
+    private string? appliedIcon;
+
+    /// <summary>Leaving the page gives the tab Graft's icon back.</summary>
+    public async ValueTask DisposeAsync()
+    {
+        if (appliedIcon is null) return;
+        try { await JS.InvokeVoidAsync("graftIcon.reset"); }
+        catch (JSException) { }
+        catch (JSDisconnectedException) { }
     }
 
     /// <summary>Opens the folder or file the address names, once per distinct address.</summary>

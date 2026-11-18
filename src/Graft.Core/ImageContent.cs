@@ -45,6 +45,108 @@ public static class ImageContent
         return image.Width is > 0 and <= MaximumDimension && image.Height is > 0 and <= MaximumDimension ? image : null;
     }
 
+    /// <summary>
+    /// A favicon (ADR 0059), in any of the formats browsers take for one: a Windows icon file, PNG (animated
+    /// included), GIF, JPEG, WebP (extended included, as an icon with transparency is), AVIF, BMP or SVG. Null for
+    /// anything else.
+    ///
+    /// <para>
+    /// SVG is accepted here and nowhere else on the forge, because an icon is drawn as an image, where a browser runs
+    /// no script in it. It is still a document if somebody opens its address, so the routes that serve an icon
+    /// send it with a sandboxing content security policy, and a declaration of entities is refused so it cannot
+    /// expand without bound in a reader's browser.
+    /// </para>
+    /// </summary>
+    public static ValidatedImage? ValidateIcon(byte[] bytes)
+    {
+        if (bytes is null || bytes.Length is 0 or > MaximumBytes) return null;
+        return ReadIco(bytes) ?? ReadBmp(bytes) ?? ReadAvif(bytes) ?? ReadExtendedWebp(bytes) ?? ReadSvg(bytes) ?? Validate(bytes);
+    }
+
+    private static ValidatedImage? ReadBmp(byte[] bytes)
+    {
+        // "BM", then the DIB header, whose size says which: 12 bytes carries 16-bit dimensions, anything larger 32-bit.
+        if (bytes.Length < 26 || bytes[0] != (byte)'B' || bytes[1] != (byte)'M') return null;
+        uint header = BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(14, 4));
+        if (header == 12)
+            return new("image/bmp", BinaryPrimitives.ReadUInt16LittleEndian(bytes.AsSpan(18, 2)), BinaryPrimitives.ReadUInt16LittleEndian(bytes.AsSpan(20, 2)), bytes);
+        if (header < 40 || bytes.Length < 14 + 40) return null;
+        int width = BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(18, 4));
+        int height = Math.Abs(BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(22, 4)));
+        return width is > 0 and <= MaximumDimension && height is > 0 and <= MaximumDimension ? new("image/bmp", width, height, bytes) : null;
+    }
+
+    private static ValidatedImage? ReadAvif(byte[] bytes)
+    {
+        // An ISO media file whose first box is `ftyp` naming AVIF as its major or a compatible brand.
+        if (bytes.Length < 16 || !bytes.AsSpan(4, 4).SequenceEqual("ftyp"u8)) return null;
+        uint box = BinaryPrimitives.ReadUInt32BigEndian(bytes.AsSpan(0, 4));
+        if (box < 16 || box > bytes.Length || box % 4 != 0) return null;
+        for (int offset = 8; offset + 4 <= box; offset += 4)
+        {
+            if (offset == 12) continue;   // the minor version, not a brand
+            ReadOnlySpan<byte> brand = bytes.AsSpan(offset, 4);
+            if (brand.SequenceEqual("avif"u8) || brand.SequenceEqual("avis"u8)) return new("image/avif", 0, 0, bytes);
+        }
+        return null;
+    }
+
+    private static ValidatedImage? ReadExtendedWebp(byte[] bytes)
+    {
+        // RIFF/WEBP with a VP8X chunk, which carries the canvas size as two 24-bit values less one.
+        if (bytes.Length < 30 || !bytes.AsSpan(0, 4).SequenceEqual("RIFF"u8) || !bytes.AsSpan(8, 4).SequenceEqual("WEBP"u8) ||
+            !bytes.AsSpan(12, 4).SequenceEqual("VP8X"u8)) return null;
+        int width = (bytes[24] | bytes[25] << 8 | bytes[26] << 16) + 1;
+        int height = (bytes[27] | bytes[28] << 8 | bytes[29] << 16) + 1;
+        return width <= MaximumDimension && height <= MaximumDimension ? new("image/webp", width, height, bytes) : null;
+    }
+
+    private static ValidatedImage? ReadSvg(byte[] bytes)
+    {
+        // UTF-8 text whose first element, after an optional declaration, comments and white space, is <svg>.
+        if (Array.IndexOf(bytes, (byte)0) >= 0) return null;
+        string text;
+        try { text = new System.Text.UTF8Encoding(false, true).GetString(bytes); }
+        catch (ArgumentException) { return null; }
+        if (text.Length > 0 && text[0] == '﻿') text = text[1..];
+        if (text.Contains("<!DOCTYPE", StringComparison.OrdinalIgnoreCase) || text.Contains("<!ENTITY", StringComparison.OrdinalIgnoreCase)) return null;
+        int index = 0;
+        while (true)
+        {
+            while (index < text.Length && char.IsWhiteSpace(text[index])) index++;
+            if (string.CompareOrdinal(text, index, "<?xml", 0, 5) == 0 || string.CompareOrdinal(text, index, "<!--", 0, 4) == 0)
+            {
+                int end = text.IndexOf(text[index + 1] == '?' ? "?>" : "-->", index, StringComparison.Ordinal);
+                if (end < 0) return null;
+                index = end + (text[index + 1] == '?' ? 2 : 3);
+                continue;
+            }
+            break;
+        }
+        if (string.CompareOrdinal(text, index, "<svg", 0, 4) != 0 || index + 4 >= text.Length) return null;
+        char after = text[index + 4];
+        return char.IsWhiteSpace(after) || after is '>' or '/' ? new("image/svg+xml", 0, 0, bytes) : null;
+    }
+
+    private static ValidatedImage? ReadIco(byte[] bytes)
+    {
+        // ICONDIR: reserved 0, type 1 (an icon, not a cursor), then the number of entries, sixteen bytes each.
+        if (bytes.Length < 6 + 16 || BinaryPrimitives.ReadUInt16LittleEndian(bytes.AsSpan(0, 2)) != 0 ||
+            BinaryPrimitives.ReadUInt16LittleEndian(bytes.AsSpan(2, 2)) != 1) return null;
+        int count = BinaryPrimitives.ReadUInt16LittleEndian(bytes.AsSpan(4, 2));
+        if (count == 0 || bytes.Length < 6 + 16 * count) return null;
+        int largest = 0;
+        for (int index = 0; index < count; index++)
+        {
+            ReadOnlySpan<byte> entry = bytes.AsSpan(6 + 16 * index, 16);
+            uint size = BinaryPrimitives.ReadUInt32LittleEndian(entry[8..12]);
+            uint offset = BinaryPrimitives.ReadUInt32LittleEndian(entry[12..16]);
+            if (size == 0 || offset < 6 + 16 * (uint)count || offset + (ulong)size > (ulong)bytes.Length) return null;
+            largest = Math.Max(largest, entry[0] == 0 ? 256 : entry[0]);
+        }
+        return new("image/x-icon", largest, largest, bytes);
+    }
+
     private static ValidatedImage? ReadPng(byte[] bytes)
     {
         // Signature, then an IHDR chunk whose length is fixed at 13 bytes and which must come first.

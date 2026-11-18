@@ -2,6 +2,20 @@
 
 Updated: 2026-11-18. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the project owner.
 
+## Added on 2026-11-18, last: a page's own icon
+
+- **`page.icon`** in `.graft/project.json` names a file the page already serves (`files` or inside `site.root`).
+  It may be `.ico`, `.png`, `.apng`, `.gif`, `.jpg`, `.jpeg`, `.webp`, `.avif`, `.bmp` or `.svg`, and
+  `ImageContent.ValidateIcon` checks the bytes. SVG is allowed for icons only, served under `CSP: sandbox`.
+  [ADR 0059](decisions/0059-page-icons.md).
+- **The page on the forge** swaps the tab's icon (`graft-icon.js`) to `/api/graft/pages/<slug>/icon?v=<blob id>`. The
+  address differs per project and per change, and the response is `no-cache` with the blob id as entity tag.
+- **The pages origin** serves it at `/<slug>/-/icon`; its own `/favicon.ico` is a `no-store` 404, since every site
+  shares it.
+- **Not driven by a suite:** the tab swap in a real browser.
+- **Next action (project owner):** add `"icon"` to a site's config after the next release and open two pages one after
+  the other to see each keep its own icon.
+
 ## Added on 2026-11-18, later: runners update when asked
 
 - **Runner protocol 2** (migration 35): a runner reports its release and its executable's SHA-256 every time it asks

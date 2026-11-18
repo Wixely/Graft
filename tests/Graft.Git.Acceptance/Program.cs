@@ -537,7 +537,7 @@ async Task CheckProjectPages(string address, AuthenticatedIdentity alice, string
         {"version":1,"page":{"title":"Sample","description":"Curated.","readme":"README.md",
          "files":["README.md","docs/**/*.md","docs/**/*.png"],"features":["issues","wiki","issues"],
          "tree":true,"history":{"commits":10,"authors":"names"},"issues":true,"releases":true,
-         "site":{"root":"site","index":"index.html"}}}
+         "site":{"root":"site","index":"index.html"},"icon":"site/favicon.ico"}}
         """);
     // Three pictures: one the allowlist admits, one it does not, and one that climbs out of the repository.
     // And three links: one relative, one written as the page's own raw text address, and one to a file the
@@ -553,6 +553,7 @@ async Task CheckProjectPages(string address, AuthenticatedIdentity alice, string
     File.WriteAllText(Path.Combine(source, "src", "secret.cs"), "const string Key = \"must-never-be-served\";\n");
     File.WriteAllText(Path.Combine(source, "site", "index.html"), "<!doctype html><title>Sample site</title><h1>Sample site</h1>\n");
     File.WriteAllText(Path.Combine(source, "site", "style.css"), "body { color: #333; }\n");
+    File.WriteAllBytes(Path.Combine(source, "site", "favicon.ico"), OnePixelIcon());
     File.WriteAllText(Path.Combine(source, "site", "payload.exe"), "not a servable type\n");
     await Git(source, ["add", "."]);
     await Git(source, ["commit", "-m", "Page config, curated files and a site"]);
@@ -591,6 +592,7 @@ async Task CheckProjectPages(string address, AuthenticatedIdentity alice, string
         await fixture.SetPagePublishedAsync(alice, pageProjectId, true);
 
     // The curated page, to a reader with no credentials at all.
+    string pageIconUrl = "";
     using (HttpResponseMessage page = await PagesGet(address, null, "/api/graft/pages/" + slug))
     {
         Check(page.IsSuccessStatusCode, "a published page is readable without an account (got " +
@@ -650,7 +652,26 @@ async Task CheckProjectPages(string address, AuthenticatedIdentity alice, string
             Check(!commits[0].TryGetProperty(absent, out _), "a page's commit carries no " + absent);
         Check(json.RootElement.GetProperty("issues").GetBoolean() && json.RootElement.GetProperty("releases").GetBoolean(),
             "and the page says its issues and releases are open");
+        pageIconUrl = json.RootElement.GetProperty("icon_url").GetString() ?? "";
+        Check(pageIconUrl.StartsWith("/api/graft/pages/" + slug + "/icon?v=", StringComparison.Ordinal) && pageIconUrl.Length > ("/api/graft/pages/" + slug + "/icon?v=").Length,
+            "the page names its own icon at an address of its own, carrying the icon's version");
     }
+
+    // The page's icon (ADR 0059): the file the config named, from inside the site's folder, to a reader with no
+    // account, as the type its bytes prove and revalidated on every use.
+    using (HttpResponseMessage icon = await PagesGet(address, null, pageIconUrl))
+        Check(icon.IsSuccessStatusCode && icon.Content.Headers.ContentType?.MediaType == "image/x-icon" &&
+            (await icon.Content.ReadAsByteArrayAsync()).AsSpan().SequenceEqual(OnePixelIcon()) &&
+            icon.Headers.CacheControl?.NoCache == true && icon.Headers.ETag is not null &&
+            icon.Headers.TryGetValues("Content-Security-Policy", out IEnumerable<string>? iconPolicy) && iconPolicy.Single().StartsWith("sandbox;", StringComparison.Ordinal),
+            "the page serves its icon without an account, as an icon, not to be reused without asking, and sandboxed if opened as a document (got " +
+            (int)icon.StatusCode + ")");
+    using (HttpResponseMessage siteIcon = await PagesGet(address, PagesHost, "/" + slug + "/-/icon"))
+        Check(siteIcon.IsSuccessStatusCode && siteIcon.Content.Headers.ContentType?.MediaType == "image/x-icon" && siteIcon.Headers.CacheControl?.NoCache == true,
+            "the site can point at the same icon under its own path");
+    using (HttpResponseMessage hostIcon = await PagesGet(address, PagesHost, "/favicon.ico"))
+        Check(hostIcon.StatusCode == System.Net.HttpStatusCode.NotFound && hostIcon.Headers.CacheControl?.NoStore == true,
+            "and the pages origin's own /favicon.ico is nobody's, and not to be kept, so one site's icon never shows on another");
 
     // Issues through the page, read only, to a reader with no account. The confidential one is not there.
     using (HttpResponseMessage listing = await PagesGet(address, null, "/api/graft/pages/" + slug + "/issues?state=all"))
@@ -3189,6 +3210,21 @@ void ThrowsSync<TException>(Action action, string name) where TException : Excep
 // in a README resolves to repository content, and to contrast with a file that only claims to be one.
 static byte[] OnePixelPng() => Convert.FromBase64String(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==");
+
+// A Windows icon file holding that pixel as its one image, as browsers accept a favicon.
+static byte[] OnePixelIcon()
+{
+    byte[] png = OnePixelPng();
+    byte[] icon = new byte[6 + 16 + png.Length];
+    icon[2] = 1;                                             // type: icon
+    icon[4] = 1;                                             // one image
+    icon[6] = 1; icon[7] = 1;                                // 1 x 1
+    icon[10] = 1; icon[12] = 32;                             // one plane, 32 bits
+    BitConverter.TryWriteBytes(icon.AsSpan(14, 4), png.Length);
+    BitConverter.TryWriteBytes(icon.AsSpan(18, 4), 22);      // the image follows the directory
+    png.CopyTo(icon, 22);
+    return icon;
+}
 
 /// <summary>
 /// The README pushed into the repository for the rendering checks. The first half is hostile: every entry is

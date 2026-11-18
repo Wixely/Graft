@@ -356,6 +356,44 @@ try
         // A path named in one field but absent from the allowlist is a config error, not an implicit grant.
         Check(!PageConfiguration.Read(Encoding.UTF8.GetBytes("""{"page":{"files":["README.md"],"image":"logo.png"}}""")).Ok,
             "an image outside the allowlist is an error rather than an implicit grant");
+        // The icon (ADR 0059): a file the page already serves, from `files` or the site's folder, as a raster or icon file.
+        Check(!PageConfiguration.Read(Encoding.UTF8.GetBytes("""{"page":{"files":["README.md"],"icon":"icon.png"}}""")).Ok,
+            "an icon the page does not otherwise serve is an error");
+        Check(PageConfiguration.Read(Encoding.UTF8.GetBytes("""{"page":{"files":["icon.png"],"icon":"icon.png"}}""")).Settings?.Icon == "icon.png",
+            "an icon the allowlist admits is accepted");
+        Check(PageConfiguration.Read(Encoding.UTF8.GetBytes("""{"page":{"site":{"root":"site"},"icon":"site/favicon.ico"}}""")).Settings?.Icon == "site/favicon.ico",
+            "and so is one inside the site's folder");
+        Check(!PageConfiguration.Read(Encoding.UTF8.GetBytes("""{"page":{"files":["icon.txt"],"icon":"icon.txt"}}""")).Ok,
+            "an icon whose name is no icon format is refused");
+        foreach (string name in new[] { "icon.ico", "icon.png", "icon.apng", "icon.gif", "icon.jpg", "icon.jpeg", "icon.webp", "icon.avif", "icon.bmp", "icon.svg" })
+            Check(PageConfiguration.Read(Encoding.UTF8.GetBytes("{\"page\":{\"files\":[\"" + name + "\"],\"icon\":\"" + name + "\"}}")).Ok,
+                "an icon may be named " + name);
+
+        // And by content, each format a browser takes for an icon, as the type the bytes prove.
+        byte[] png = Convert.FromBase64String("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==");
+        byte[] ico = new byte[22 + png.Length];
+        ico[2] = 1; ico[4] = 1; ico[6] = 1; ico[7] = 1; ico[10] = 1; ico[12] = 32;
+        BitConverter.TryWriteBytes(ico.AsSpan(14, 4), png.Length);
+        BitConverter.TryWriteBytes(ico.AsSpan(18, 4), 22);
+        png.CopyTo(ico, 22);
+        byte[] bmp = new byte[14 + 40 + 4];
+        bmp[0] = (byte)'B'; bmp[1] = (byte)'M'; bmp[14] = 40; bmp[18] = 1; bmp[22] = 1;
+        byte[] avif = [0, 0, 0, 0x18, .. "ftypavif"u8, 0, 0, 0, 0, .. "mif1"u8, .. "miaf"u8];
+        byte[] webpExtended = [.. "RIFF"u8, 22, 0, 0, 0, .. "WEBPVP8X"u8, 10, 0, 0, 0, 0x10, 0, 0, 0, 31, 0, 0, 31, 0, 0];
+        foreach ((string label, byte[] bytes, string type) in new[]
+        {
+            ("an icon file", ico, "image/x-icon"), ("a PNG", png, "image/png"), ("a BMP", bmp, "image/bmp"),
+            ("an AVIF", avif, "image/avif"), ("a WebP with transparency", webpExtended, "image/webp"),
+            ("an SVG", Encoding.UTF8.GetBytes("<?xml version=\"1.0\"?>\n<!-- logo -->\n<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 16 16\"><circle r=\"8\"/></svg>"), "image/svg+xml"),
+        })
+            Check(ImageContent.ValidateIcon(bytes)?.ContentType == type, label + " is accepted as an icon, as " + type);
+        foreach ((string label, byte[] bytes) in new[]
+        {
+            ("an SVG declaring entities", Encoding.UTF8.GetBytes("<!DOCTYPE svg [<!ENTITY a \"aaaa\">]><svg>&a;</svg>")),
+            ("HTML", Encoding.UTF8.GetBytes("<html><svg></svg></html>")),
+            ("text", Encoding.UTF8.GetBytes("not an icon")),
+        })
+            Check(ImageContent.ValidateIcon(bytes) is null, label + " is refused as an icon");
 
         // A config that is absent is not an error: it is the empty page.
         PageConfigurationResult absent = PageConfiguration.Read(null);

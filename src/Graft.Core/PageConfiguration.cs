@@ -50,7 +50,9 @@ public sealed record PageSettings(
     /// and never a confidential issue.</summary>
     bool Issues = false,
     /// <summary>Whether the page's readers may read the project's releases and download their files.</summary>
-    bool Releases = false)
+    bool Releases = false,
+    /// <summary>The page's own browser icon (ADR 0059), a file the page already serves; null for Graft's.</summary>
+    string? Icon = null)
 {
     /// <summary>
     /// What a project with no config in its repository offers: nothing but the fact that it exists. Deny by
@@ -157,7 +159,7 @@ public static class PageConfiguration
     private static PageConfigurationResult ReadPage(JsonElement page)
     {
         foreach (JsonProperty property in page.EnumerateObject())
-            if (property.Name is not ("title" or "description" or "image" or "readme" or "files" or "features" or "site"
+            if (property.Name is not ("title" or "description" or "image" or "icon" or "readme" or "files" or "features" or "site"
                 or "tree" or "history" or "issues" or "releases"))
                 return new(null, "The page config has a field Graft does not understand: page." + property.Name);
 
@@ -325,8 +327,28 @@ public static class PageConfiguration
             site = new(root, index, artifact);
         }
 
-        return new(new PageSettings(title, description, image, readme, files, features, site, tree, history, issues, releases), null);
+        // The icon is a file the page already serves to the same readers: one `files` admits, or one inside the
+        // site's folder, which the pages origin serves to anybody the page is published to. Naming any other file
+        // would be an implicit grant, as for `image` and `readme`. The formats browsers take for an icon, by name here
+        // and by content where it is served (ImageContent.ValidateIcon).
+        string? icon = null;
+        if (page.TryGetProperty("icon", out JsonElement iconValue))
+        {
+            if (iconValue.ValueKind != JsonValueKind.String) return new(null, "page.icon must be a path.");
+            icon = PathMatcher.Normalize(iconValue.GetString());
+            if (icon.Length == 0) return new(null, "page.icon is not a path inside the repository.");
+            if (!IconExtensions.Contains(System.IO.Path.GetExtension(icon), StringComparer.OrdinalIgnoreCase))
+                return new(null, "page.icon must be an .ico, .png, .apng, .gif, .jpg, .jpeg, .webp, .avif, .bmp or .svg file: " + icon);
+            bool inSite = site is { Root.Length: > 0 } && PathMatcher.IsInside(site.Root, icon);
+            if (IsReserved(icon) || (!PathMatcher.IsAllowed(files, icon) && !inSite))
+                return new(null, "page.icon is not matched by page.files or inside page.site.root: " + icon);
+        }
+
+        return new(new PageSettings(title, description, image, readme, files, features, site, tree, history, issues, releases, icon), null);
     }
+
+    /// <summary>The file types a page's icon may be.</summary>
+    public static IReadOnlyList<string> IconExtensions { get; } = [".ico", ".png", ".apng", ".gif", ".jpg", ".jpeg", ".webp", ".avif", ".bmp", ".svg"];
 
     private static bool IsBoolean(JsonElement value) => value.ValueKind is JsonValueKind.True or JsonValueKind.False;
 

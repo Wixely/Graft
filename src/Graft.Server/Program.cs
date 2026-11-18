@@ -2720,6 +2720,11 @@ app.MapGet("/api/graft/pages/{globalSlug}", async context =>
                 features.Add(new(feature, projectBase + feature.Replace('_', '-')));
         }
 
+        // The icon's address names its blob, so it changes with the icon and differs between projects (ADR 0059).
+        string? iconUrl = PageIconFile(repository, page) is { } icon
+            ? "/api/graft/pages/" + Uri.EscapeDataString(details.Project.GlobalSlug) + "/icon?v=" + icon.BlobId[..16]
+            : null;
+
         ProjectPageResponse response = new(
             page.Title is { Length: > 0 } ? page.Title : details.Project.Name,
             page.Description is { Length: > 0 } ? page.Description : details.Description,
@@ -2739,7 +2744,8 @@ app.MapGet("/api/graft/pages/{globalSlug}", async context =>
             await store.HasAvatarAsync(AvatarOwner.Project, details.Project.Id, context.RequestAborted)
                 ? AvatarUrl(context, AvatarOwner.Project, details.Project.Id)
                 : null,
-            await BannerUrl(context, details.Project.Id));
+            await BannerUrl(context, details.Project.Id),
+            iconUrl);
         await context.Response.WriteAsJsonAsync(response, ApiJson.Default.ProjectPageResponse, null, context.RequestAborted);
     });
 });
@@ -2969,6 +2975,29 @@ app.MapMethods("/api/graft/pages/{globalSlug}/image", ["GET", "HEAD"], async con
     context.Response.ContentLength = image.Bytes.Length;
     if (HttpMethods.IsHead(context.Request.Method)) return;
     await context.Response.Body.WriteAsync(image.Bytes, context.RequestAborted);
+});
+
+// A page's own browser icon (ADR 0059): the file `page.icon` names, to anybody the page is published to. `v` is the
+// blob id the page response put in the address; it is ignored here and exists so that every project's icon, and
+// every version of one, has an address of its own. A browser keeps icons by address, so a shared address is how one
+// page's icon would turn up on another. The response is also revalidated on every use, by its blob id.
+app.MapMethods("/api/graft/pages/{globalSlug}/icon", ["GET", "HEAD"], async context =>
+{
+    if (!await OnlyQuery(context, "v")) return;
+    ProjectInfo? found = await store.FindReadyProjectByGlobalSlugAsync(
+        context.Request.RouteValues["globalSlug"]?.ToString() ?? "", context.RequestAborted);
+    (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: false);
+    if (found is null || !(await DecideFor(context, browser?.Identity, found.Id, ProjectAction.ReadPage)).Allowed)
+    { await ApiError(context, 404, "page"); return; }
+    GitFile? file = null;
+    if (!await WithRepository(EndpointFor(found), context, repository =>
+    {
+        PageConfigurationResult config = PageConfiguration.Read(ReadRepositoryFile(repository, PageConfiguration.Path));
+        if (config.Ok) file = PageIconFile(repository, config.Settings!);
+        return Task.CompletedTask;
+    })) return;
+    if (file is null) { await ApiError(context, 404, "icon"); return; }
+    await WritePageIcon(context, file, "no-cache, private");
 });
 
 // The same page, reached by the project's instance-wide slug. It lives under Graft's own prefix rather than
@@ -10310,6 +10339,16 @@ if (settings.PagesOrigin is not null)
             return;
         }
 
+        // The host's own icon, which a browser asks for on every site that does not name one. It belongs to no site,
+        // and anything served or remembered here would show on all of them, so it is none, and not to be kept
+        // (ADR 0059). A site names its icon in its HTML, or points at `-/icon` below.
+        if (segments.Length == 1 && segments[0] == "favicon.ico")
+        {
+            context.Response.Headers.CacheControl = "no-store";
+            await PagesMiss(context, "The pages origin has no icon of its own; a site names its own.");
+            return;
+        }
+
         ProjectInfo? project = await store.FindReadyProjectByGlobalSlugAsync(segments[0], context.RequestAborted);
         // Anonymous, always: there is no session on this host to resolve. A site is therefore reachable
         // only through a published page, and a project that published nothing is simply not here.
@@ -10356,6 +10395,27 @@ if (settings.PagesOrigin is not null)
             // followed the link. The page links onward to the source for anyone allowed to see it.
             context.Response.StatusCode = StatusCodes.Status302Found;
             context.Response.Headers.Location = pageUrl;
+            return;
+        }
+
+        // The icon the config names (ADR 0059), for a site to point at with `<link rel="icon" href="/<slug>/-/icon">`,
+        // so the page and its site share one setting. Under the project's own path, so it is never another site's.
+        if (requested == "-/icon")
+        {
+            GitFile? icon = null;
+            if (!await WithRepository(EndpointFor(project), context, repository =>
+            {
+                PageConfigurationResult config = PageConfiguration.Read(ReadRepositoryFile(repository, PageConfiguration.Path));
+                if (config.Ok) icon = PageIconFile(repository, config.Settings!);
+                return Task.CompletedTask;
+            })) return;
+            if (icon is null)
+            {
+                context.Response.Headers.CacheControl = "no-store";
+                await PagesMiss(context, "This site names no icon.");
+                return;
+            }
+            await WritePageIcon(context, icon, "no-cache");
             return;
         }
 
@@ -11587,6 +11647,41 @@ static string Origin(HttpContext context) => context.Request.Scheme + "://" + co
 /// project that published nothing, and a file outside the configured root must be indistinguishable, or
 /// the pages host becomes a way to enumerate what an instance holds.
 /// </summary>
+// The file a page's `icon` names, when it is there; null for no icon or a missing file. The config parser already
+// held it to what the page serves.
+static GitFile? PageIconFile(Repository repository, PageSettings page)
+{
+    if (page.Icon is null) return null;
+    try { return RepositoryView.File(repository, "HEAD", page.Icon); }
+    catch (GitInputException) { return null; }
+}
+
+// Sends a page's icon as the type its bytes prove, revalidated by its blob id; a file that is not an icon or a
+// raster image is refused, whatever it is called.
+static async Task WritePageIcon(HttpContext context, GitFile file, string cacheControl)
+{
+    ValidatedImage? image = ImageContent.ValidateIcon(file.Content);
+    if (image is null)
+    {
+        context.Response.StatusCode = StatusCodes.Status415UnsupportedMediaType;
+        context.Response.Headers.CacheControl = "no-store";
+        return;
+    }
+    string etag = '"' + file.BlobId + '"';
+    context.Response.Headers.CacheControl = cacheControl;
+    context.Response.Headers.ETag = etag;
+    context.Response.Headers.XContentTypeOptions = "nosniff";
+    // An SVG icon is drawn as an image, where no script runs; opened by its address it is a document, and this
+    // keeps it one with no script, no requests and an origin of its own. Harmless for every other format.
+    context.Response.Headers.ContentSecurityPolicy = "sandbox; default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'";
+    if (context.Request.GetTypedHeaders().IfNoneMatch?.Any(value => value.Tag.Value == etag || value.Tag.Value == "*") == true)
+    { context.Response.StatusCode = StatusCodes.Status304NotModified; return; }
+    context.Response.ContentType = image.ContentType;
+    context.Response.ContentLength = image.Bytes.Length;
+    if (HttpMethods.IsHead(context.Request.Method)) return;
+    await context.Response.Body.WriteAsync(image.Bytes, context.RequestAborted);
+}
+
 static async Task PagesMiss(HttpContext context, string message)
 {
     context.Response.StatusCode = StatusCodes.Status404NotFound;

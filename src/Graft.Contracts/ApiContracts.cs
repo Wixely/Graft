@@ -687,7 +687,13 @@ public sealed record ProjectPageResponse(
     /// <summary>The project's avatar, or null when it has none.</summary>
     [property: JsonPropertyName("avatar_url")] string? AvatarUrl = null,
     /// <summary>The project's banner (ADR 0046), or null when it has none.</summary>
-    [property: JsonPropertyName("banner_url")] string? BannerUrl = null);
+    [property: JsonPropertyName("banner_url")] string? BannerUrl = null,
+    /// <summary>
+    /// The page's own browser icon (ADR 0059), or null for Graft's. The address carries the icon's blob id, so it
+    /// is a different address for every project and every change, and a browser never shows one page's cached
+    /// icon on another.
+    /// </summary>
+    [property: JsonPropertyName("icon_url")] string? IconUrl = null);
 
 /// <summary>One surface a page links onward to, by GitLab's name and at the project's shareable address.</summary>
 public sealed record PageFeatureResponse(string Name, string Url);

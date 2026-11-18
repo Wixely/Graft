@@ -167,6 +167,10 @@ public static class GraftGuide
             or `emails`; `"issues": true` opens the issues read only, never a confidential one; `"releases":
             true` opens releases with their files. Each is a JSON boolean or object and nothing else.
 
+            `"icon": "site/favicon.ico"` gives the page its own browser icon: a file `files` admits or one
+            inside `site.root`, as .ico, .png, .apng, .gif, .jpg, .jpeg, .webp, .avif, .bmp or .svg. A site points at the
+            same icon with `<link rel="icon" href="/<slug>/-/icon">`.
+
             A page can never clone, show a diff or a changed-file list, or list branches, whatever the
             config says. Those walk the object graph, and no path allowlist can constrain a graph walk.
 

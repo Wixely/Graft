@@ -147,6 +147,8 @@ Then the first of the four large items, in the order given:
 - **Updating runners meant registering them again.** An administrator now asks from **Runners**, and runners from
   v0.1.4 and earlier have an update script. [ADR 0058](decisions/0058-runner-updates.md). Left open: checking the
   restart under a real Windows service and systemd unit.
+- **Every page wore Graft's icon.** `page.icon` gives a page its own, at an address no other page shares.
+  [ADR 0059](decisions/0059-page-icons.md).
 
 ## Closed on 2026-11-16
 

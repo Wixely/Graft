@@ -44,6 +44,7 @@ Every field is optional, and so is the file. What is absent is absent.
 | `title`, `description` | What the page is called and how it is described. Falls back to the project's own. |
 | `readme` | One file to render on the page. It must also be matched by `files`. |
 | `image` | Accepted and checked against `files`; not currently shown anywhere. |
+| `icon` | The page's own browser icon, in place of Graft's. It must be matched by `files` or be inside `site.root`. It may be `.ico`, `.png`, `.apng`, `.gif`, `.jpg`, `.jpeg`, `.webp`, `.avif`, `.bmp` or `.svg`. See [Icons](#icons). |
 | `files` | The patterns that decide which files the page offers. |
 | `site.root` | The folder served as a website. |
 | `site.index` | The file that answers for a directory. Defaults to `index.html`. |
@@ -66,7 +67,8 @@ Nothing else is a metacharacter, and there is no "everything except" form. Patte
 - **An invalid config unpublishes the page.** A parse failure is never a page with default settings.
 - **`.graft/` is never servable**, at any visibility, and a config cannot name it.
 - **`readme` and `image` must themselves match `files`.** A path named in one field but absent from the
-  allowlist is an error, not an implicit grant.
+  allowlist is an error, not an implicit grant. `icon` may instead be inside `site.root`, which the pages origin
+  already serves to the same readers.
 
 ## Beyond files: a semi-public project
 
@@ -129,6 +131,32 @@ how a site links to its own files, issues or releases. The forge records where e
 default branch moves or the page is published, so the bare address answers with a redirect before the browser
 application loads, and an Explore card for a page-only project links to the site itself
 ([ADR 0056](decisions/0056-page-site-recorded.md)).
+
+## Icons
+
+A page shows Graft's icon in the browser tab unless its config names one of its own
+([ADR 0059](decisions/0059-page-icons.md)):
+
+```json
+{ "version": 1, "page": { "site": { "root": "site" }, "icon": "site/favicon.ico" } }
+```
+
+- **On the forge,** the page at `/-/p/<slug>` puts the icon in the tab, and gives the tab Graft's icon back when
+  the reader moves on.
+- **Every icon has an address of its own.** The address is `/api/graft/pages/<slug>/icon?v=<version>`, where the
+  version comes from the file's content. A browser keeps icons by address, so no page can show another's, and a
+  changed icon is a new address. The icon is also sent `no-cache`, so a browser checks it is still current before
+  using it again.
+- **On the pages origin,** the same icon is at `/<slug>/-/icon`. A site uses it with
+  `<link rel="icon" href="/<slug>/-/icon">`, or names any icon file of its own the usual way. The pages origin's own
+  `/favicon.ico`, which a browser asks for when a site names no icon, is answered as missing with `no-store`. It
+  is shared by every site on the host, so it serves none of them.
+- **Formats:** ICO, PNG (animated too), GIF, JPEG, WebP (with transparency too), AVIF, BMP and SVG. The file is
+  served as the type its bytes prove; a file that is none of these is refused, whatever it is called.
+- **SVG is allowed for icons only.** A browser draws an icon as an image and runs no script in it. Opened by its
+  address it would be a document, so icons are served with `Content-Security-Policy: sandbox`, which blocks script
+  and gives the file an origin of its own. An SVG that declares entities is refused. Readme pictures still exclude
+  SVG.
 
 ## Pictures in the readme
 
@@ -270,6 +298,7 @@ request time to wherever the forge is now.
 | --- | --- |
 | `/<slug>/-/repo` | Redirects to the project's page on the forge, on its Code tab (`?tab=code`), so the page does not send the reader straight back to the site. |
 | `/<slug>/-/graft.json` | Returns the forge's origin and the project's URLs, for a site that would rather render its own link. |
+| `/<slug>/-/icon` | The icon the config's `icon` names, for `<link rel="icon">`. See [Icons](#icons). |
 
 From a page at the site's root, that is an ordinary relative link with no host in it:
 
