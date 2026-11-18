@@ -136,6 +136,8 @@ internal sealed class GitBridge(string remote, Uri address, Stream input, Stream
             // Buffered, because the walk reads a byte at a time and a pipe read per byte is slow. Reading ahead cannot block:
             // Git sends nothing after the pack until it has the answer, and the walk asks only for bytes the pack still owes.
             try { Pack.Capture(new BufferedStream(input, 64 * 1024), request, cancellationToken); }
+            catch (GitInputException error) when (error.Message == "object-too-large")
+            { throw new HelperException(await TooLargeAsync(commands, cancellationToken)); }
             catch (GitInputException error) { throw new HelperException("the pack Git wrote is beyond what Graft accepts (" + error.Message + ")"); }
         }
         await request.FlushAsync(cancellationToken);
@@ -264,6 +266,52 @@ internal sealed class GitBridge(string remote, Uri address, Stream input, Stream
     }
 
     private static string? FirstPacket(byte[] section) => Packets(section).FirstOrDefault()?.TrimEnd('\n');
+
+    /// <summary>
+    /// Which files made a push too large, found by asking Git: the pack names no paths, but this program runs in the
+    /// repository being pushed, so the objects the push adds can be listed with their paths and sizes. Anything already
+    /// on a remote-tracking branch is left out, since the forge has it. When nothing over the limit turns up, which a
+    /// delta against an older version can cause, the reason is given without names.
+    /// </summary>
+    private static async Task<string> TooLargeAsync(byte[] commands, CancellationToken cancellationToken)
+    {
+        string advice = Repository.ObjectTooLarge;
+        List<string> pushed = [];
+        foreach (string line in Packets(commands))
+        {
+            string[] parts = line.Split('\0')[0].TrimEnd('\n').Split(' ');
+            if (parts.Length == 3 && parts[1] != Limits.Zero) pushed.Add(parts[1]);
+        }
+        if (pushed.Count == 0) return advice;
+        try
+        {
+            (int listed, string objects) = await Git.RunAsync(["rev-list", "--objects", .. pushed, "--not", "--remotes"], null, cancellationToken);
+            if (listed != 0) return advice;
+            Dictionary<string, string> paths = new(StringComparer.Ordinal);
+            foreach (string entry in objects.Split('\n'))
+            {
+                int space = entry.IndexOf(' ', StringComparison.Ordinal);
+                if (space > 0) paths.TryAdd(entry[..space], entry[(space + 1)..].TrimEnd('\r'));
+            }
+            if (paths.Count == 0) return advice;
+            (int checkedExit, string sizes) = await Git.RunAsync(["cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
+                string.Join('\n', paths.Keys) + "\n", cancellationToken);
+            if (checkedExit != 0) return advice;
+            List<string> large = [];
+            foreach (string entry in sizes.Split('\n'))
+            {
+                string[] fields = entry.TrimEnd('\r').Split(' ');
+                if (fields.Length == 3 && fields[1] == "blob" && long.TryParse(fields[2], System.Globalization.NumberStyles.None,
+                        System.Globalization.CultureInfo.InvariantCulture, out long size) && size > Limits.ObjectBytes)
+                    large.Add("  " + paths[fields[0]] + " (" + (size / (1024.0 * 1024.0)).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + " MiB)");
+            }
+            if (large.Count == 0) return advice;
+            large.Sort(StringComparer.Ordinal);
+            return advice + ":\n" + string.Join('\n', large.Distinct(StringComparer.Ordinal)) +
+                "\nTrack them with 'git lfs track', then move them out of the unpushed commits with 'git lfs migrate import --include=<path>'.";
+        }
+        catch (Exception exception) when (exception is System.ComponentModel.Win32Exception or IOException) { return advice; }
+    }
 
     private static IEnumerable<string> Packets(byte[] section)
     {

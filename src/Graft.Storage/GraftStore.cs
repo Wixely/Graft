@@ -912,6 +912,7 @@ public sealed partial class GraftStore : IAsyncDisposable
             $"Project {project.Namespace}/{project.Slug} deleted; repository storage {project.StorageId}.", now);
         await db.ExecuteAsync("DELETE FROM ProjectMemberships WHERE ProjectId = @Id;", new IdParameters(projectId), transaction);
         await db.ExecuteAsync("DELETE FROM ProjectBanners WHERE ProjectId = @Id;", new IdParameters(projectId), transaction);
+        await db.ExecuteAsync("DELETE FROM LfsLocks WHERE ProjectId = @Id;", new IdParameters(projectId), transaction);
         await db.ExecuteAsync("DELETE FROM Avatars WHERE OwnerType = 'project' AND OwnerId = @Id;",
             new IdParameters(projectId), transaction);
         await db.ExecuteAsync("DELETE FROM Comments WHERE ProjectId = @Id;", new IdParameters(projectId), transaction);

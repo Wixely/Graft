@@ -125,7 +125,10 @@ tab does.
 
 **If the config names a `site` and the operator has a pages origin, the site is the page.** `/-/p/<slug>`
 forwards to it. Add any `?tab=` (`code`, `commits`, `issues`, `releases`) to stay on the forge's page, which is
-how a site links to its own files, issues or releases.
+how a site links to its own files, issues or releases. The forge records where each page's site starts whenever the
+default branch moves or the page is published, so the bare address answers with a redirect before the browser
+application loads, and an Explore card for a page-only project links to the site itself
+([ADR 0056](decisions/0056-page-site-recorded.md)).
 
 ## Pictures in the readme
 

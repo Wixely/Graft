@@ -1,6 +1,19 @@
 # Next-agent handoff
 
-Updated: 2026-11-16. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the project owner.
+Updated: 2026-11-18. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the project owner.
+
+## Added on 2026-11-18: straight to a page's site, LFS locking, and the 64 MiB refusal
+
+- **A page's site is recorded** (`Projects.PageSite`, migration 33), so Explore links a page-only project's card to
+  its site and `/-/p/<slug>` redirects before the application loads. [ADR 0056](decisions/0056-page-site-recorded.md).
+- **Git LFS locking** (migration 34): `git lfs lock`, `locks` and `unlock`, the pre-push verify, and the forge
+  refusing a push that changes somebody else's locked path. No browser view of locks yet.
+  [ADR 0057](decisions/0057-lfs-file-locking.md).
+- **A file over 64 MiB** is refused in Git's push report with the remedy, and `git-remote-graft` names the files
+  before sending anything. [ADR 0018's amendment](decisions/0018-repository-capacity.md).
+- **Explore on a phone** puts each card's name and description under its picture, and drops "page only".
+- **Next action (project owner):** update the live server; the site redirect, locking and the clearer refusal need
+  both the server and, for the naming, a new `git-remote-graft`.
 
 ## Added on 2026-11-16, after that: runners verified on Linux under systemd
 

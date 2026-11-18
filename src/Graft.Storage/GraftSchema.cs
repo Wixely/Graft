@@ -4,7 +4,7 @@ namespace Graft.Storage;
 
 public static class GraftSchema
 {
-    public static DnaXMigrationManifest Manifest { get; } = new(32,
+    public static DnaXMigrationManifest Manifest { get; } = new(34,
     [
         DnaXMigration.Sql(1, "initial-identity-project-schema", "Create identity and private project schema", """
             CREATE TABLE Users (
@@ -1012,6 +1012,25 @@ public static class GraftSchema
             ALTER TABLE Runners ADD COLUMN Tags TEXT NOT NULL DEFAULT '[]';
             ALTER TABLE Runners ADD COLUMN RunUntagged INTEGER NOT NULL DEFAULT 1 CHECK (RunUntagged IN (0, 1));
             ALTER TABLE Jobs ADD COLUMN Tags TEXT NOT NULL DEFAULT '[]';
+            """),
+        // Where a published page's site starts (ADR 0056), read from the repository's .graft/project.json whenever
+        // the default branch or the page's publication changes, so Explore and the page's own address can send a
+        // reader straight to the site without opening the repository. NULL is no site, '' the site's root, and
+        // anything else the name of the page artifact the config makes its front door.
+        DnaXMigration.Sql(33, "page-site", "Where a published page's site starts, kept beside the project", """
+            ALTER TABLE Projects ADD COLUMN PageSite TEXT NULL;
+            """),
+        // Git LFS file locks (ADR 0057): one row per locked path, held by the person who took it. A path is locked
+        // at most once in a project, which the unique constraint enforces when two people race for it.
+        DnaXMigration.Sql(34, "lfs-locks", "Git LFS file locks", """
+            CREATE TABLE LfsLocks (
+                Id INTEGER PRIMARY KEY,
+                ProjectId INTEGER NOT NULL REFERENCES Projects(Id) ON DELETE CASCADE,
+                Path TEXT NOT NULL,
+                OwnerUserId INTEGER NOT NULL REFERENCES Users(Id),
+                CreatedAtUtc TEXT NOT NULL,
+                UNIQUE (ProjectId, Path)
+            );
             """)
     ]);
 }

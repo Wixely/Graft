@@ -2069,6 +2069,7 @@ app.MapPost("/api/projects/{projectId:long}/default-branch", async context =>
     try
     {
         await store.SetDefaultBranchAsync(browser.Value.Identity, projectId, branch, context.RequestAborted);
+        QueuePageSiteRefresh(projectId);
         context.Response.StatusCode = StatusCodes.Status204NoContent;
     }
     catch (UnauthorizedAccessException) { await ApiError(context, 404, "project"); }
@@ -2119,6 +2120,7 @@ app.MapPost("/api/projects/{projectId:long}/page", async context =>
     try
     {
         await store.SetPagePublishedAsync(browser.Value.Identity, projectId, request.Published, context.RequestAborted);
+        QueuePageSiteRefresh(projectId);
         context.Response.StatusCode = StatusCodes.Status204NoContent;
     }
     catch (UnauthorizedAccessException) { await ApiError(context, 404, "project"); }
@@ -2181,7 +2183,11 @@ app.MapGet("/api/browse", async context =>
             project.Description, avatarUrl, Origin(context) + "/" + path, project.CreatedAtUtc,
             VisibilityName(project.Project.Visibility),
             project.Project.Visibility == ProjectVisibility.Public,
-            project.Project.GlobalSlug));
+            project.Project.GlobalSlug,
+            // So the card can go straight to the site the page would forward to (ADR 0056).
+            project.Project.PagePublished
+                ? await PageSiteUrl(project.Project, await store.GetPageSiteAsync(project.Project.Id, context.RequestAborted), context.RequestAborted)
+                : null));
     }
     await context.Response.WriteAsJsonAsync(new BrowseResponse(entries.ToArray(), projects.Total, page, perPage),
         ApiJson.Default.BrowseResponse, null, context.RequestAborted);
@@ -2644,13 +2650,9 @@ app.MapGet("/api/graft/pages/{globalSlug}", async context =>
             details.Project.GlobalSlug,
             readme,
             files,
-            page.Site is null || settings.PagesOrigin is null
-                ? null
-                // A site whose front door is a page artifact is linked to there directly, sparing the reader
-                // the redirect the site's root would give them.
-                : page.Site.Artifact is { } frontDoor
-                    ? PageArtifactUrl(details.Project, frontDoor, await store.GetPageServingSettingsAsync(context.RequestAborted))
-                    : settings.PagesOrigin.TrimEnd('/') + "/" + Uri.EscapeDataString(details.Project.GlobalSlug) + "/",
+            // Read live here, as everything on this route is; the stored copy only spares Explore and the page's
+            // address from opening the repository.
+            await PageSiteUrl(details.Project, page.Site is null ? null : page.Site.Artifact ?? "", context.RequestAborted),
             features,
             tree,
             history,
@@ -4170,7 +4172,10 @@ app.MapMethods("/api/v4/projects/{**projectId}", ["PUT"], async context =>
         if (newName is not null || newDescription is not null)
             await store.SetProjectDetailsAsync(caller, project.Details.Project.Id, newName, newDescription, context.RequestAborted);
         if (defaultBranchGiven)
+        {
             await store.SetDefaultBranchAsync(caller, project.Details.Project.Id, newDefaultBranch, context.RequestAborted);
+            QueuePageSiteRefresh(project.Details.Project.Id);
+        }
     }
     catch (UnauthorizedAccessException) { await ApiError(context, 404, "404 Project Not Found"); return; }
     catch (ArgumentException error) { await ApiError(context, 400, error.Message); return; }
@@ -4202,6 +4207,7 @@ app.MapMethods("/api/graft/projects/{projectId}/page", ["PUT"], async context =>
     try
     {
         await store.SetPagePublishedAsync(caller, project.Details.Project.Id, request.Published, context.RequestAborted);
+        QueuePageSiteRefresh(project.Details.Project.Id);
     }
     catch (UnauthorizedAccessException) { await ApiError(context, 404, "404 Project Not Found"); return; }
 
@@ -4595,6 +4601,49 @@ PageArtifactResponse PageArtifactResponseFor(ProjectInfo project, PageArtifact a
 /// <summary>Where a promoted artifact answers on the pages origin. Only meaningful when there is one.</summary>
 string PageArtifactUrl(ProjectInfo project, string name, PageServingSettings serving) =>
     settings.PagesOrigin!.TrimEnd('/') + "/" + Uri.EscapeDataString(project.GlobalSlug) + "/" + serving.ArtifactPrefix + "/" + name + "/";
+
+/// <summary>
+/// Where a reader of a page is sent for its site: the site's root on the pages origin, or, when the config makes a
+/// page artifact the front door, that artifact directly, sparing the reader the redirect the root would give them.
+/// <paramref name="site"/> is what the config says, in the stored form (ADR 0056): null for none, empty for the root.
+/// </summary>
+async Task<string?> PageSiteUrl(ProjectInfo project, string? site, CancellationToken cancellationToken) =>
+    site is null || settings.PagesOrigin is null ? null
+    : site.Length == 0 ? settings.PagesOrigin.TrimEnd('/') + "/" + Uri.EscapeDataString(project.GlobalSlug) + "/"
+    : PageArtifactUrl(project, site, await store.GetPageServingSettingsAsync(cancellationToken));
+
+// Where each published page's site starts, kept in the database (ADR 0056) so Explore and the page's own address can send
+// a reader straight to the site without opening the repository. Read again from .graft/project.json whenever the answer
+// could have changed: a branch moved (every push, web edit and merge notifies), the default branch changed, the page was
+// published or withdrawn, a mirror updated, and once for every published page when the server starts. A refresh that is
+// missed leaves the old answer, and the page's own route still reads the config live, so the worst case is a detour.
+async Task RefreshPageSite(long projectId)
+{
+    ProjectDetails? details = await store.GetReadyProjectAsync(projectId, CancellationToken.None);
+    if (details is null) return;
+    string? site = null;
+    if (details.Project.PagePublished)
+    {
+        RepositoryEndpoint endpoint = EndpointFor(details.Project);
+        await endpoint.Gate.WaitAsync();
+        try
+        {
+            PageConfigurationResult config = PageConfiguration.Read(ReadRepositoryFile(endpoint.Repository, PageConfiguration.Path));
+            if (config.Ok && config.Settings!.Site is PageSite configured) site = configured.Artifact ?? "";
+        }
+        finally { endpoint.Gate.Release(); }
+    }
+    await store.SetPageSiteAsync(projectId, site);
+}
+
+// In the background, because the callers hold the repository (the SSH host does while it notifies) or are answering a
+// request that should not wait on it.
+void QueuePageSiteRefresh(long projectId) => _ = Task.Run(async () =>
+{
+    try { await RefreshPageSite(projectId); }
+    catch (Exception exception) when (exception is not OperationCanceledException)
+    { app.Logger.LogWarning(exception, "the site of project {Project} was not read", projectId); }
+});
 
 // What an administrator decides about the pages origin: the path page artifacts answer under, how large one may
 // be, and the file types served beyond the built-in list. Kept in the database beside the agent switches, so a
@@ -5001,6 +5050,7 @@ async Task<MirrorOutcome> UpdateMirror(MirrorJob job, CancellationToken cancella
         finally { pack?.Dispose(); }
     }
     if (job.FirstImport && listed.HeadBranch is not null) await store.SetImportedDefaultBranchAsync(details.Project.Id, listed.HeadBranch, cancellationToken);
+    if (result.Changed && details.Project.PagePublished) QueuePageSiteRefresh(details.Project.Id);
 
     int Count(MirrorRefChange change) => result.References.Count(reference => reference.Change == change);
     string summary = result.Changed || result.ObjectsReceived > 0
@@ -6124,6 +6174,8 @@ Task Notify(HttpContext context, ProjectInfo project, WebhookEvent single, Actio
 async Task NotifyAt(string origin, ProjectInfo project, WebhookEvent single,
     Action<System.Text.Json.Nodes.JsonObject> describe, CancellationToken cancellationToken)
 {
+    // Every way a branch moves notifies here, webhooks or not, so this is where a page's site is read again.
+    if (single == WebhookEvent.Push && project.PagePublished) QueuePageSiteRefresh(project.Id);
     if (webhooks is null) return;
     System.Text.Json.Nodes.JsonObject payload = new()
     {
@@ -9632,6 +9684,125 @@ app.MapGet("/{projectNamespace}/{project}.git/info/lfs/objects/{oid}", async con
     await WriteRanged(context, content, "application/octet-stream");
 });
 
+// ---------------------------------------------------------------------------------------------------
+// Git LFS file locks (ADR 0057): `git lfs lock`, `unlock` and `locks`, and the check git-lfs makes before a push. A lock
+// is held by a person; listing them needs what a fetch needs, and taking, checking or releasing one what a push needs.
+// Releasing somebody else's lock is `--force`, and only for whoever may manage the project. A push that changes a
+// path locked by somebody else is refused on the forge as well, so a client that skips the check is held to it.
+// ---------------------------------------------------------------------------------------------------
+
+const int LfsLockPageDefault = 100;
+const int LfsLockPageLargest = 1000;
+
+static LfsLockResponse LfsLockResponseFor(LfsLockInfo held) =>
+    new(held.Id.ToString(System.Globalization.CultureInfo.InvariantCulture), held.Path, held.LockedAtUtc, new(held.OwnerUsername));
+
+// A path as git-lfs sends it: relative to the repository's root, with forward slashes.
+static bool IsLockPath(string? path) =>
+    path is { Length: > 0 and <= GraftStore.MaximumLfsLockPathLength } && !path.StartsWith('/') && !path.Contains('\0') &&
+    !path.Contains('\\') && path.Split('/').All(segment => segment is { Length: > 0 } and not ("." or ".."));
+
+static bool TryLockPage(string? cursorText, string? limitText, int? limitValue, out long after, out int limit)
+{
+    after = 0;
+    limit = limitValue ?? LfsLockPageDefault;
+    if (limitText is { Length: > 0 } && !int.TryParse(limitText, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out limit))
+        return false;
+    if (limit < 1) limit = LfsLockPageDefault;
+    limit = Math.Min(limit, LfsLockPageLargest);
+    return cursorText is not { Length: > 0 } ||
+        long.TryParse(cursorText, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out after);
+}
+
+app.MapPost("/{projectNamespace}/{project}.git/info/lfs/locks", async context =>
+{
+    LfsLockCreateRequest? request;
+    try { request = await context.Request.ReadFromJsonAsync(ApiJson.Default.LfsLockCreateRequest, context.RequestAborted); }
+    catch (JsonException) { await LfsError(context, 400, "the lock request is not valid JSON"); return; }
+    if (!IsLockPath(request?.Path)) { await LfsError(context, 422, "path is a file's path from the root of the repository"); return; }
+    AuthorizedRepository? authorized = await Authorize(context, ProjectAction.PushRepository);
+    if (authorized is null) return;
+    if (authorized.Identity is null) { await LfsError(context, 403, "a lock is held by a person, and this credential names nobody"); return; }
+    (LfsLockInfo held, bool created) result;
+    try { result = await store.CreateLfsLockAsync(authorized.Project.Id, authorized.Identity.UserId, request!.Path!, context.RequestAborted); }
+    catch (InvalidOperationException error) { await LfsError(context, 422, error.Message); return; }
+    context.Response.StatusCode = result.created ? StatusCodes.Status201Created : StatusCodes.Status409Conflict;
+    context.Response.ContentType = LfsMediaType;
+    await context.Response.WriteAsJsonAsync(new LfsLockResultResponse(LfsLockResponseFor(result.held),
+        result.created ? null : "already locked by " + result.held.OwnerUsername), ApiJson.Default.LfsLockResultResponse, LfsMediaType, context.RequestAborted);
+});
+
+app.MapGet("/{projectNamespace}/{project}.git/info/lfs/locks", async context =>
+{
+    string? path = context.Request.Query["path"].ToString() is { Length: > 0 } wanted ? wanted : null;
+    long? id = null;
+    if (context.Request.Query["id"].ToString() is { Length: > 0 } idText)
+    {
+        if (!long.TryParse(idText, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out long parsed))
+        { await LfsError(context, 400, "id is a lock's number"); return; }
+        id = parsed;
+    }
+    if (!TryLockPage(context.Request.Query["cursor"].ToString(), context.Request.Query["limit"].ToString(), null, out long after, out int limit))
+    { await LfsError(context, 400, "cursor and limit are numbers"); return; }
+    AuthorizedRepository? authorized = await Authorize(context, ProjectAction.FetchRepository);
+    if (authorized is null) return;
+    IReadOnlyList<LfsLockInfo> locks = await store.ListLfsLocksAsync(authorized.Project.Id, path, id, after, limit, context.RequestAborted);
+    context.Response.ContentType = LfsMediaType;
+    await context.Response.WriteAsJsonAsync(new LfsLockListResponse([.. locks.Take(limit).Select(LfsLockResponseFor)],
+        locks.Count > limit ? locks[limit - 1].Id.ToString(System.Globalization.CultureInfo.InvariantCulture) : null),
+        ApiJson.Default.LfsLockListResponse, LfsMediaType, context.RequestAborted);
+});
+
+app.MapPost("/{projectNamespace}/{project}.git/info/lfs/locks/verify", async context =>
+{
+    LfsLockVerifyRequest? request;
+    try { request = await context.Request.ReadFromJsonAsync(ApiJson.Default.LfsLockVerifyRequest, context.RequestAborted); }
+    catch (JsonException) { await LfsError(context, 400, "the verify request is not valid JSON"); return; }
+    if (!TryLockPage(request?.Cursor, null, request?.Limit, out long after, out int limit))
+    { await LfsError(context, 400, "cursor is a number"); return; }
+    AuthorizedRepository? authorized = await Authorize(context, ProjectAction.PushRepository);
+    if (authorized is null) return;
+    IReadOnlyList<LfsLockInfo> locks = await store.ListLfsLocksAsync(authorized.Project.Id, null, null, after, limit, context.RequestAborted);
+    IEnumerable<LfsLockInfo> page = locks.Take(limit);
+    long? holder = authorized.Identity?.UserId;
+    context.Response.ContentType = LfsMediaType;
+    await context.Response.WriteAsJsonAsync(new LfsLockVerifyResponse(
+        [.. page.Where(held => held.OwnerUserId == holder).Select(LfsLockResponseFor)],
+        [.. page.Where(held => held.OwnerUserId != holder).Select(LfsLockResponseFor)],
+        locks.Count > limit ? locks[limit - 1].Id.ToString(System.Globalization.CultureInfo.InvariantCulture) : null),
+        ApiJson.Default.LfsLockVerifyResponse, LfsMediaType, context.RequestAborted);
+});
+
+app.MapPost("/{projectNamespace}/{project}.git/info/lfs/locks/{lockId}/unlock", async context =>
+{
+    if (!long.TryParse(context.Request.RouteValues["lockId"]?.ToString(), System.Globalization.NumberStyles.None,
+            System.Globalization.CultureInfo.InvariantCulture, out long lockId))
+    { await LfsError(context, 404, "no such lock"); return; }
+    LfsUnlockRequest? request = null;
+    if (context.Request.ContentLength is not 0)
+    {
+        try { request = await context.Request.ReadFromJsonAsync(ApiJson.Default.LfsUnlockRequest, context.RequestAborted); }
+        catch (JsonException) { await LfsError(context, 400, "the unlock request is not valid JSON"); return; }
+    }
+    AuthorizedRepository? authorized = await Authorize(context, ProjectAction.PushRepository);
+    if (authorized is null) return;
+    if (authorized.Identity is null) { await LfsError(context, 403, "a lock is released by a person, and this credential names nobody"); return; }
+    LfsLockInfo? held = await store.GetLfsLockAsync(authorized.Project.Id, lockId, context.RequestAborted);
+    if (held is null) { await LfsError(context, 404, "no such lock"); return; }
+    if (held.OwnerUserId != authorized.Identity.UserId)
+    {
+        if (request?.Force != true)
+        { await LfsError(context, 403, "the lock is held by " + held.OwnerUsername + "; only they can release it, or a Maintainer with --force"); return; }
+        if (!(await DecideFor(context, authorized.Identity, authorized.Project.Id, ProjectAction.ManageProject)).Allowed)
+        { await LfsError(context, 403, "the lock is held by " + held.OwnerUsername + ", and only a Maintainer may release somebody else's lock"); return; }
+    }
+    LfsLockInfo? released = await store.DeleteLfsLockAsync(authorized.Identity.UserId, authorized.Project.Id, lockId, context.RequestAborted);
+    if (released is null) { await LfsError(context, 404, "no such lock"); return; }
+    context.Response.ContentType = LfsMediaType;
+    await context.Response.WriteAsJsonAsync(new LfsLockResultResponse(LfsLockResponseFor(released)),
+        ApiJson.Default.LfsLockResultResponse, LfsMediaType, context.RequestAborted);
+});
+
 static async Task LfsError(HttpContext context, int status, string message)
 {
     context.Response.StatusCode = status;
@@ -9718,7 +9889,8 @@ app.MapPost("/{projectNamespace}/{project}.git/{service}", async context =>
         context.Response.ContentType = "application/x-" + service + "-result";
         if (service == "git-receive-pack")
         {
-            byte[] data = authorized.Endpoint.Repository.Receive(input, context.RequestAborted);
+            byte[] data = authorized.Endpoint.Repository.Receive(input, context.RequestAborted,
+                await LfsLockRule.ForAsync(store, authorized.Project.Id, authorized.Identity?.UserId, context.RequestAborted));
             await context.Response.Body.WriteAsync(data, context.RequestAborted);
         }
         else
@@ -9935,7 +10107,8 @@ async Task RunTransfer(TransferSession session, ProjectInfo project, Authenticat
         if (session.Kind == TransferKind.ReceivePack)
         {
             Dictionary<string, string> before = new(endpoint.Repository.Refs, StringComparer.Ordinal);
-            byte[] report = endpoint.Repository.Receive(input, app.Lifetime.ApplicationStopping);
+            byte[] report = endpoint.Repository.Receive(input, app.Lifetime.ApplicationStopping,
+                await LfsLockRule.ForAsync(store, project.Id, identity?.UserId, app.Lifetime.ApplicationStopping));
             await output.WriteAsync(report, app.Lifetime.ApplicationStopping);
             pushed = Moved(before, endpoint.Repository.Refs);
         }
@@ -10240,6 +10413,29 @@ else
     app.Map(McpPath, context => ApiError(context, 404, "the MCP endpoint is not enabled on this server; start Graft with --mcp true"));
 }
 
+// A page with a site of its own is that site (ADR 0048), so a reader who opens the page's address is sent there before
+// the browser application loads, rather than after it has loaded, asked and drawn a status line (ADR 0056). Only the
+// bare address: ?tab=, ?file= and ?path= are how the site links back to the files, so those are always the page. The
+// stored site is used, so this opens no repository; when there is none, or the reader may not see the page, this is
+// the application as before, which decides and says so itself.
+app.MapGet("/-/p/{globalSlug}", async context =>
+{
+    if (context.Request.Query.Count == 0 && settings.PagesOrigin is not null &&
+        await store.FindReadyProjectByGlobalSlugAsync(context.Request.RouteValues["globalSlug"]?.ToString() ?? "", context.RequestAborted) is { PagePublished: true } project &&
+        await PageSiteUrl(project, await store.GetPageSiteAsync(project.Id, context.RequestAborted), context.RequestAborted) is string site)
+    {
+        (AuthenticatedIdentity Identity, string Secret)? browser = await AuthenticateBrowser(context, writeError: false);
+        if ((await DecideFor(context, browser?.Identity, project.Id, ProjectAction.ReadPage)).Allowed)
+        {
+            // Found, not permanent: the site can be withdrawn or moved, and a browser never forgets a permanent one.
+            context.Response.StatusCode = StatusCodes.Status302Found;
+            context.Response.Headers.Location = site;
+            return;
+        }
+    }
+    await assets.Serve(context);
+});
+
 app.MapFallback("/{**path}", context => assets.Serve(context));
 
 await app.StartAsync();
@@ -10410,6 +10606,18 @@ Console.WriteLine("RELEASE PUBLISHING: " + settings.ReleasePublishing switch
 });
 Console.WriteLine("TRANSFERS: in parts of " + (settings.TransferPartBytes / (1024 * 1024)).ToString(System.Globalization.CultureInfo.InvariantCulture) + " MiB, for git-remote-graft");
 Console.WriteLine("VERSION: " + graftVersion);
+// Every published page's site, read once now: a database from before ADR 0056 has none recorded, and a change made
+// while the server was down was never seen. In the background and one at a time, so a slow repository delays nothing.
+_ = Task.Run(async () =>
+{
+    foreach (long projectId in await store.ListPagePublishedProjectIdsAsync(app.Lifetime.ApplicationStopping))
+    {
+        if (app.Lifetime.ApplicationStopping.IsCancellationRequested) return;
+        try { await RefreshPageSite(projectId); }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        { app.Logger.LogWarning(exception, "the site of project {Project} was not read", projectId); }
+    }
+});
 Console.WriteLine("READY: " + address);
 await app.WaitForShutdownAsync();
 return 0;

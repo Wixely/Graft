@@ -211,7 +211,8 @@ public static class Pack
                 size |= (long)(next & 127) << shift;
                 shift += 7;
             }
-            Limits.Require(size <= Limits.ObjectBytes && (expanded += size) <= expandedBudget, "expanded-limit");
+            Limits.Require(size <= Limits.ObjectBytes, "object-too-large");
+            Limits.Require((expanded += size) <= expandedBudget, "expanded-limit");
             long? baseOffset = null;
             string? baseId = null;
             if (type == 6)
@@ -305,7 +306,7 @@ public static class Pack
             {
                 var part = cursor.Byte();
                 value |= (long)(part & 127) << shift;
-                Limits.Require(value <= Limits.ObjectBytes, "delta-size");
+                Limits.Require(value <= Limits.ObjectBytes, "object-too-large");
                 if ((part & 128) == 0) return (int)value;
             }
             throw new GitInputException("delta-size");
@@ -399,7 +400,7 @@ public static class Pack
                 size |= (long)(next & 127) << shift;
                 shift += 7;
             }
-            Limits.Require(size <= Limits.ObjectBytes, "expanded-limit");
+            Limits.Require(size <= Limits.ObjectBytes, "object-too-large");
             if (type == 6)
             {
                 next = tee.Byte();
@@ -415,20 +416,52 @@ public static class Pack
             // end and the next object's header is not swallowed.
             using ZLibStream zlib = new(new OneByteSource(tee), CompressionMode.Decompress, leaveOpen: true);
             long inflated = 0;
+            // A delta's own size says nothing about the object it makes, which its first bytes state; kept so a
+            // file too large for Graft is refused here too, not only when it is stored whole.
+            byte[] head = new byte[20];
+            int headLength = 0;
             try
             {
                 int read;
                 while ((read = zlib.Read(sink, 0, sink.Length)) > 0)
                 {
+                    if (headLength < head.Length)
+                    {
+                        int keep = Math.Min(read, head.Length - headLength);
+                        sink.AsSpan(0, keep).CopyTo(head.AsSpan(headLength));
+                        headLength += keep;
+                    }
                     inflated += read;
                     Limits.Require(inflated <= size, "inflated-size");
                 }
             }
             catch (InvalidDataException) { throw new GitInputException("zlib-data"); }
             Limits.Require(inflated == size, "inflated-size");
+            if (type is 6 or 7) Limits.Require(DeltaResultSize(head.AsSpan(0, headLength)) <= Limits.ObjectBytes, "object-too-large");
         }
         tee.Take(20);
         destination.Flush();
+    }
+
+    /// <summary>The size of the object a delta makes, the second of the two sizes it begins with; past the limit when malformed.</summary>
+    private static long DeltaResultSize(ReadOnlySpan<byte> head)
+    {
+        int at = 0;
+        long result = long.MaxValue;
+        for (int which = 0; which < 2; which++)
+        {
+            long value = 0;
+            bool ended = false;
+            for (int shift = 0; shift <= 28 && at < head.Length; shift += 7)
+            {
+                byte part = head[at++];
+                value |= (long)(part & 127) << shift;
+                if ((part & 128) == 0) { ended = true; break; }
+            }
+            if (!ended) return long.MaxValue;
+            result = value;
+        }
+        return result;
     }
 
     /// <summary>Reads from one stream and writes every byte read to another, counting against the request bound.</summary>

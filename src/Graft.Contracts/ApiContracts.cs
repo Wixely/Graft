@@ -787,7 +787,9 @@ public sealed record BrowseEntryResponse(
     /// a page, and its repository is not readable.</summary>
     bool SourcePublic,
     /// <summary>The project's instance-wide slug, which addresses its page and names no account.</summary>
-    [property: JsonPropertyName("global_slug")] string GlobalSlug = "");
+    [property: JsonPropertyName("global_slug")] string GlobalSlug = "",
+    /// <summary>The site the project's published page forwards to, when it has one (ADR 0056).</summary>
+    [property: JsonPropertyName("site_url")] string? SiteUrl = null);
 
 public sealed record BrowseResponse(
     IReadOnlyList<BrowseEntryResponse> Projects,
@@ -1229,6 +1231,25 @@ public sealed record LfsActionResponse(
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyDictionary<string, string>? Header,
     [property: JsonPropertyName("expires_in")] int ExpiresIn);
 public sealed record LfsObjectErrorResponse(int Code, string Message);
+
+/// <summary>The Git LFS locking API's shapes (ADR 0057), as git-lfs sends and reads them. Ids are strings there.</summary>
+public sealed record LfsRefRequest(string? Name);
+public sealed record LfsLockCreateRequest(string? Path, LfsRefRequest? Ref);
+public sealed record LfsLockVerifyRequest(string? Cursor, int? Limit, LfsRefRequest? Ref);
+public sealed record LfsUnlockRequest(bool? Force, LfsRefRequest? Ref);
+public sealed record LfsLockOwnerResponse(string Name);
+public sealed record LfsLockResponse(string Id, string Path, [property: JsonPropertyName("locked_at")] DateTimeOffset LockedAt, LfsLockOwnerResponse Owner);
+/// <summary>One lock, or, on a conflict, the lock already held and why the new one was not taken.</summary>
+public sealed record LfsLockResultResponse(
+    LfsLockResponse Lock,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Message = null);
+public sealed record LfsLockListResponse(
+    IReadOnlyList<LfsLockResponse> Locks,
+    [property: JsonPropertyName("next_cursor"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? NextCursor);
+public sealed record LfsLockVerifyResponse(
+    IReadOnlyList<LfsLockResponse> Ours,
+    IReadOnlyList<LfsLockResponse> Theirs,
+    [property: JsonPropertyName("next_cursor"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? NextCursor);
 
 /// <summary>A package in GitLab's shape, with its files inline because a listing wants them.</summary>
 public sealed record PackageResponse(
@@ -1730,6 +1751,12 @@ public sealed record ProjectUploadResponse(
 [JsonSerializable(typeof(RegistryErrors))]
 [JsonSerializable(typeof(LfsBatchRequest))]
 [JsonSerializable(typeof(LfsBatchResponse))]
+[JsonSerializable(typeof(LfsLockCreateRequest))]
+[JsonSerializable(typeof(LfsLockVerifyRequest))]
+[JsonSerializable(typeof(LfsUnlockRequest))]
+[JsonSerializable(typeof(LfsLockResultResponse))]
+[JsonSerializable(typeof(LfsLockListResponse))]
+[JsonSerializable(typeof(LfsLockVerifyResponse))]
 [JsonSerializable(typeof(TransferStatusResponse))]
 [JsonSerializable(typeof(ForkedFromResponse))]
 [JsonSerializable(typeof(HousekeepingResponse))]

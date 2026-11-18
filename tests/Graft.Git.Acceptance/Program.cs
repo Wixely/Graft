@@ -824,6 +824,32 @@ async Task CheckProjectPages(string address, AuthenticatedIdentity alice, string
             "and the page's address on a tab, for the same reason");
     }
 
+    // The page's own address goes straight to the site once the forge has recorded it (ADR 0056). Published behind the
+    // server's back above, so nothing is recorded yet and the address is still the application.
+    using (HttpResponseMessage unrecorded = await PagesGet(address, null, "/-/p/" + slug))
+        Check(unrecorded.StatusCode == System.Net.HttpStatusCode.OK && unrecorded.Content.Headers.ContentType?.MediaType == "text/html",
+            "a page whose site the forge has not recorded is served as the application, which forwards from the browser");
+    using (HttpResponseMessage republished = await ApiPutJson(address, "/api/graft/projects/" + pageProjectId + "/page", grant.Secret, "{\"published\":true}"))
+        Check(republished.IsSuccessStatusCode, "publishing through the forge (got " + (int)republished.StatusCode + ")");
+    string siteRoot = "https://" + PagesHost + "/" + slug + "/";
+    string? forwarded = null;
+    for (int attempt = 0; attempt < 50 && forwarded is null; attempt++)
+    {
+        using HttpResponseMessage bare = await PagesGet(address, null, "/-/p/" + slug);
+        if (bare.StatusCode == System.Net.HttpStatusCode.Found) forwarded = bare.Headers.Location?.ToString();
+        else await Task.Delay(100);
+    }
+    Check(forwarded == siteRoot, "then the page's bare address sends a reader to its site before the application loads (got " + (forwarded ?? "no redirect") + ")");
+    foreach (string query in new[] { "?tab=code", "?file=README.md", "?path=docs" })
+        using (HttpResponseMessage onTab = await PagesGet(address, null, "/-/p/" + slug + query))
+            Check(onTab.StatusCode == System.Net.HttpStatusCode.OK, "but not an address on a tab, a file or a folder: " + query);
+    using (HttpResponseMessage browse = await PagesGet(address, null, "/api/browse?search=pagesample"))
+    {
+        string listing = await browse.Content.ReadAsStringAsync();
+        Check(browse.StatusCode != System.Net.HttpStatusCode.OK || listing.Contains("\"site_url\":\"" + siteRoot + "\"", StringComparison.Ordinal),
+            "and Explore links the card to the site itself");
+    }
+
     // A type that is not on the allowlist is refused rather than guessed at.
     using (HttpResponseMessage unknown = await PagesGet(address, PagesHost, "/" + slug + "/payload.exe"))
         Check(unknown.StatusCode == System.Net.HttpStatusCode.NotFound, "and no file whose extension it does not serve");
@@ -5807,7 +5833,125 @@ async Task CheckLargeFiles(string address, AuthenticatedIdentity alice)
             Check(file.IsSuccessStatusCode && json.RootElement.GetProperty("size").GetInt64() < 200,
                 "the file API still describes the pointer, which is what is in the tree");
         }
+
+        await CheckLfsLocks(address, alice, projectId, work, remote, aliceApi);
     }
+
+    // A file too large for Git is refused in Git's own report, saying what to do, rather than as a failed request.
+    {
+        string work = Path.Combine(root, "heavy-oversize");
+        Directory.CreateDirectory(work);
+        await Git(work, ["init", "--initial-branch=oversize"]);
+        // Zeros, so the pack is small on the wire while the file is over the limit.
+        File.WriteAllBytes(Path.Combine(work, "huge.bin"), new byte[Limits.ObjectBytes + 1]);
+        await Git(work, ["add", "."]);
+        await Git(work, ["commit", "-m", "Too large"]);
+        var refused = await RunGit(work, ["push", remote, "oversize"]);
+        Check(refused.ExitCode != 0 && refused.Errors.Contains("larger than the 64 MiB Graft keeps in Git", StringComparison.Ordinal) &&
+            refused.Errors.Contains("Git LFS", StringComparison.Ordinal),
+            "a push holding a file over 64 MiB is refused with the reason and the remedy: " + Redact(refused.Errors.Trim()));
+    }
+}
+
+/// <summary>
+/// Git LFS file locks (ADR 0057): the real client takes, lists and releases them, the API refuses what it should, and a
+/// push that changes a path somebody else holds is refused by the forge even when the client skips its own check.
+/// </summary>
+async Task CheckLfsLocks(string address, AuthenticatedIdentity alice, long projectId, string work, string aliceRemote, string aliceApi)
+{
+    string bobApi;
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        UserAccount bob = Required(await store.FindActiveUserAsync("bob"), "bob account");
+        await store.SetMembershipAsync(alice, projectId, bob.Id, ProjectRole.Developer);
+        AuthenticatedIdentity bobIdentity = new(bob.Id, bob.Username, false, IdentityKind.BrowserSession);
+        bobApi = (await store.CreateTokenAsync(bobIdentity, "heavy-locks", TokenScope.Api | TokenScope.WriteRepository, DateTimeOffset.UtcNow.AddHours(1))).Secret;
+    }
+    const string Locks = "/alice/heavy.git/info/lfs/locks";
+
+    var locked = await RunGit(work, ["lfs", "lock", "readme.txt"]);
+    Check(locked.ExitCode == 0, "git lfs lock takes a lock: " + Redact((locked.Output + locked.Errors).Trim()));
+    var listed = await RunGit(work, ["lfs", "locks"]);
+    Check(listed.ExitCode == 0 && listed.Output.Contains("readme.txt", StringComparison.Ordinal) && listed.Output.Contains("alice", StringComparison.Ordinal),
+        "git lfs locks lists it with its holder: " + Redact(listed.Output.Trim()));
+    var again = await RunGit(work, ["lfs", "lock", "readme.txt"]);
+    Check(again.ExitCode != 0, "the same path cannot be locked twice");
+
+    using (HttpResponseMessage anonymous = await LfsLockCall(address, HttpMethod.Get, Locks, null, null, null))
+        Check(anonymous.StatusCode == HttpStatusCode.Unauthorized, "a private project's locks ask for credentials");
+    long lockId;
+    using (HttpResponseMessage taken = await LfsLockCall(address, HttpMethod.Post, Locks, "bob", bobApi, "{\"path\":\"readme.txt\"}"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await taken.Content.ReadAsStreamAsync());
+        Check(taken.StatusCode == HttpStatusCode.Conflict && json.RootElement.GetProperty("lock").GetProperty("owner").GetProperty("name").GetString() == "alice",
+            "a colleague asking for a held path is told who holds it");
+        lockId = long.Parse(json.RootElement.GetProperty("lock").GetProperty("id").GetString()!, System.Globalization.CultureInfo.InvariantCulture);
+    }
+    using (HttpResponseMessage climbing = await LfsLockCall(address, HttpMethod.Post, Locks, "bob", bobApi, "{\"path\":\"../outside\"}"))
+        Check(climbing.StatusCode == HttpStatusCode.UnprocessableContent, "a path that is not inside the repository is not locked");
+    using (HttpResponseMessage verified = await LfsLockCall(address, HttpMethod.Post, Locks + "/verify", "bob", bobApi, "{}"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await verified.Content.ReadAsStreamAsync());
+        Check(verified.IsSuccessStatusCode && json.RootElement.GetProperty("ours").GetArrayLength() == 0 &&
+            json.RootElement.GetProperty("theirs")[0].GetProperty("path").GetString() == "readme.txt",
+            "verify sorts the locks into the caller's own and other people's");
+    }
+
+    // Bob changes the locked file and pushes without git-lfs's check; the forge holds him to it anyway.
+    string bobRemote = AuthenticatedUrl(address, "bob", bobApi, "alice/heavy.git");
+    string bobWork = Path.Combine(root, "heavy-bob");
+    await Git(root, ["clone", bobRemote, "heavy-bob"]);
+    File.AppendAllText(Path.Combine(bobWork, "readme.txt"), "changed while locked\n");
+    await Git(bobWork, ["commit", "-am", "Change a locked file"]);
+    var blocked = await RunGit(bobWork, ["push", "--no-verify", "origin", "main"]);
+    Check(blocked.ExitCode != 0 && blocked.Errors.Contains("'readme.txt' is locked by alice", StringComparison.Ordinal),
+        "a push changing a path somebody else locked is refused, naming the path and the holder: " + Redact(blocked.Errors.Trim()));
+
+    using (HttpResponseMessage notTheirs = await LfsLockCall(address, HttpMethod.Post, Locks + "/" + lockId + "/unlock", "bob", bobApi, "{}"))
+        Check(notTheirs.StatusCode == HttpStatusCode.Forbidden, "a colleague cannot release somebody else's lock");
+    using (HttpResponseMessage forced = await LfsLockCall(address, HttpMethod.Post, Locks + "/" + lockId + "/unlock", "bob", bobApi, "{\"force\":true}"))
+        Check(forced.StatusCode == HttpStatusCode.Forbidden, "nor force it, as a Developer");
+    var unlocked = await RunGit(work, ["lfs", "unlock", "readme.txt"]);
+    Check(unlocked.ExitCode == 0, "the holder releases it with git lfs unlock: " + Redact((unlocked.Output + unlocked.Errors).Trim()));
+    var through = await RunGit(bobWork, ["push", "--no-verify", "origin", "main"]);
+    Check(through.ExitCode == 0, "and the same push then goes through: " + Redact(through.Errors.Trim()));
+
+    // A Maintainer may release a colleague's lock, and that is written down.
+    long bobLock;
+    using (HttpResponseMessage bobs = await LfsLockCall(address, HttpMethod.Post, Locks, "bob", bobApi, "{\"path\":\"assets/model.bin\"}"))
+    {
+        using JsonDocument json = JsonDocument.Parse(await bobs.Content.ReadAsStreamAsync());
+        Check(bobs.StatusCode == HttpStatusCode.Created, "a Developer locks a path that does not exist yet");
+        bobLock = long.Parse(json.RootElement.GetProperty("lock").GetProperty("id").GetString()!, System.Globalization.CultureInfo.InvariantCulture);
+    }
+    using (HttpResponseMessage plain = await LfsLockCall(address, HttpMethod.Post, Locks + "/" + bobLock + "/unlock", "alice", aliceApi, "{}"))
+        Check(plain.StatusCode == HttpStatusCode.Forbidden, "a Maintainer releasing somebody else's lock must say --force");
+    using (HttpResponseMessage forced = await LfsLockCall(address, HttpMethod.Post, Locks + "/" + bobLock + "/unlock", "alice", aliceApi, "{\"force\":true}"))
+        Check(forced.IsSuccessStatusCode, "and then may");
+    using (HttpResponseMessage remaining = await LfsLockCall(address, HttpMethod.Get, Locks, "alice", aliceApi, null))
+    {
+        using JsonDocument json = JsonDocument.Parse(await remaining.Content.ReadAsStreamAsync());
+        Check(remaining.IsSuccessStatusCode && json.RootElement.GetProperty("locks").GetArrayLength() == 0, "leaving no locks");
+    }
+    await using (GraftStore store = await GraftStore.OpenAsync(databasePath))
+    {
+        AuditPage audit = await store.ListProjectAuditEventsAsync(alice, projectId, 0, 50, "force-unlock-lfs");
+        Check(audit.Total == 1, "and the forced release is in the project's audit trail");
+    }
+}
+
+async Task<HttpResponseMessage> LfsLockCall(string address, HttpMethod method, string path, string? username, string? token, string? body)
+{
+    HttpClientHandler handler = new() { ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator, UseProxy = false };
+    HttpClient client = new(handler) { BaseAddress = new(address), Timeout = TimeSpan.FromSeconds(20) };
+    HttpRequestMessage request = new(method, path);
+    if (body is not null) request.Content = new StringContent(body, Encoding.UTF8, "application/vnd.git-lfs+json");
+    if (token is not null) request.Headers.Authorization = new("Basic", Convert.ToBase64String(Encoding.UTF8.GetBytes(username + ":" + token)));
+    HttpResponseMessage response = await client.SendAsync(request);
+    request.Dispose();
+    client.Dispose();
+    handler.Dispose();
+    return response;
 }
 
 async Task<HttpResponseMessage> LfsBatch(string address, string path, string? token, string operation, string oid, long size)
@@ -6555,6 +6699,22 @@ async Task<string> CheckRemoteHelper(string address, AuthenticatedIdentity alice
     var second = await RunGit(work, [.. credential, "push", "origin", "main"], environment);
     var pulled = await RunGit(clone, [.. credential, "pull", "--ff-only", "origin", "main"], environment);
     Check(second.ExitCode == 0 && pulled.ExitCode == 0 && File.Exists(Path.Combine(clone, "NEXT.md")), "a later push and an incremental fetch go through it too");
+
+    // A file over Graft's limit is caught before anything is sent, and the helper names it from the repository.
+    {
+        string oversize = Path.Combine(root, "relayed-oversize");
+        var copied = await RunGit(root, [.. credential, "clone", repository, "relayed-oversize"], environment);
+        Check(copied.ExitCode == 0, "a clone to push from");
+        Directory.CreateDirectory(Path.Combine(oversize, "media"));
+        File.WriteAllBytes(Path.Combine(oversize, "media", "huge.bin"), new byte[Limits.ObjectBytes + 1]);
+        await Git(oversize, ["checkout", "-b", "oversize"]);
+        await Git(oversize, ["add", "."]);
+        await Git(oversize, ["commit", "-m", "Too large"]);
+        var refused = await RunGit(oversize, [.. credential, "push", "origin", "oversize"], environment);
+        Check(refused.ExitCode != 0 && refused.Errors.Contains("media/huge.bin (64.0 MiB)", StringComparison.Ordinal) &&
+            refused.Errors.Contains("git lfs migrate import", StringComparison.Ordinal),
+            "the helper refuses a file over 64 MiB before sending it, naming the file and the remedy: " + Redact(refused.Errors.Trim()));
+    }
     using (HttpResponseMessage events = await ApiGet(address, "/api/v4/projects/" + projectId + "/events", token))
         Check((await events.Content.ReadAsStringAsync()).Contains("\"pushed new\"", StringComparison.Ordinal), "a push carried in parts is recorded in the activity feed like any other");
 

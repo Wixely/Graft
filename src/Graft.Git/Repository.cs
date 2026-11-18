@@ -230,13 +230,18 @@ public sealed class Repository
         return output.ToArray();
     }
 
-    public byte[] Receive(byte[] body, CancellationToken cancellationToken = default)
+    public byte[] Receive(byte[] body, CancellationToken cancellationToken = default, Func<IReadOnlySet<string>, string?>? pathRule = null)
     {
         using MemoryStream input = new(body, false);
-        return Receive(input, cancellationToken);
+        return Receive(input, cancellationToken, pathRule);
     }
 
-    public byte[] Receive(Stream body, CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Applies a push. <paramref name="pathRule"/>, when the host gives one, is asked about every branch the push moves
+    /// with the paths its new commits change, and refuses that branch by returning the reason, one line, or allows it
+    /// with null. The host's own rules about paths, such as files locked by somebody else, live there and not here.
+    /// </summary>
+    public byte[] Receive(Stream body, CancellationToken cancellationToken = default, Func<IReadOnlySet<string>, string?>? pathRule = null)
     {
         using TemporaryStorage? staging = persistence is null ? null : new();
         var cursor = new Cursor(body, body.Position, body.Length);
@@ -262,9 +267,23 @@ public sealed class Repository
             commands.Add((parts[0], parts[1], parts[2]));
         }
         Limits.Require(commands.Count > 0, "empty-update");
-        var pack = cursor.Remaining == 0
-            ? new PackResult(new(StringComparer.Ordinal), 0, 0)
-            : Pack.Read(body, Objects, cancellationToken, staging?.DirectoryPath);
+        PackResult pack;
+        try
+        {
+            pack = cursor.Remaining == 0
+                ? new PackResult(new(StringComparer.Ordinal), 0, 0)
+                : Pack.Read(body, Objects, cancellationToken, staging?.DirectoryPath);
+        }
+        catch (GitInputException error) when (error.Message == "object-too-large" && requested.Contains("report-status"))
+        {
+            // Said in the report, where Git prints it as "remote unpack failed" with the reason, rather than as an HTTP
+            // failure Git reports only as a broken connection. Nothing is applied: the pack as a whole is refused.
+            using var refused = new MemoryStream();
+            Packet.Write(refused, "unpack " + RefusalText(error.Message) + "\n");
+            foreach (var command in commands) Packet.Write(refused, "ng " + command.Name + " unpacker error\n");
+            Packet.Flush(refused);
+            return refused.ToArray();
+        }
         var stagedObjects = new Dictionary<string, GitObject>(Objects, StringComparer.Ordinal);
         foreach (var pair in pack.Objects) stagedObjects[pair.Key] = pair.Value;
         Limits.Require(stagedObjects.Count <= Limits.ObjectCount && stagedObjects.Values.Sum(obj => (long)obj.Size) <= Limits.ExpandedBytes, "repository-budget");
@@ -276,10 +295,13 @@ public sealed class Repository
         // beside the reference. Only a malformed request or pack refuses the whole push.
         var stagedRefs = new Dictionary<string, string>(Refs, StringComparer.Ordinal);
         var refusals = new Dictionary<string, string>(StringComparer.Ordinal);
+        HashSet<string>? added = null;
         foreach (var command in commands)
         {
             cancellationToken.ThrowIfCancellationRequested();
             string? refusal = Judge(command, stagedObjects, stagedRefs, cancellationToken);
+            if (refusal is null && pathRule is not null && command.New != Limits.Zero && command.Name.StartsWith("refs/heads/", StringComparison.Ordinal))
+                refusal = pathRule(Graph.ChangedPaths(stagedObjects, command.New, added ??= new HashSet<string>(pack.Objects.Keys, StringComparer.Ordinal), cancellationToken));
             if (refusal is not null) { refusals[command.Name] = refusal; continue; }
             if (command.New == Limits.Zero) stagedRefs.Remove(command.Name);
             else stagedRefs[command.Name] = command.New;
@@ -347,6 +369,9 @@ public sealed class Repository
         return null;
     }
 
+    /// <summary>Why a push holding a file over the per-object limit is refused, and what to do instead (ADR 0018).</summary>
+    public const string ObjectTooLarge = "a file in this push is larger than the 64 MiB Graft keeps in Git; store large files with Git LFS";
+
     /// <summary>What Git prints beside a refused reference. One line, no newline, as the status report requires.</summary>
     private string RefusalText(string code) => code switch
     {
@@ -358,6 +383,7 @@ public sealed class Repository
         "non-fast-forward" => "this forge does not rewrite a branch; push a fast-forward",
         "tag-replacement" => AcceptsDeletion ? "a tag is not moved; delete it and push it again" : "a tag is not moved",
         "ref-prefix-conflict" => "the name conflicts with an existing reference",
+        "object-too-large" => ObjectTooLarge,
         _ => code
     };
 
@@ -733,6 +759,60 @@ public static class Graph
             if (!reached) return false;
         }
         return true;
+    }
+
+    /// <summary>
+    /// The paths changed by the commits a push adds on the way to <paramref name="tip"/>: each commit in
+    /// <paramref name="added"/> compared with its parent, or with nothing when it has none. A merge is not compared,
+    /// because what it brings in was changed by commits of its own, which are compared if they are new and were
+    /// allowed when they arrived if not. Commits outside <paramref name="added"/> were already here and are not walked.
+    /// </summary>
+    public static HashSet<string> ChangedPaths(IReadOnlyDictionary<string, GitObject> objects, string tip, IReadOnlySet<string> added,
+        CancellationToken cancellationToken)
+    {
+        HashSet<string> paths = new(StringComparer.Ordinal);
+        HashSet<string> seen = new(StringComparer.Ordinal);
+        Stack<string> pending = new();
+        pending.Push(tip);
+        while (pending.TryPop(out string? id))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!added.Contains(id) || !seen.Add(id)) continue;
+            if (!objects.TryGetValue(id, out GitObject? commit) || commit.Type != 1) continue;
+            List<(string Id, int Type)> links = Links(commit);
+            List<string> parents = [.. links.Skip(1).Where(link => link.Type == 1).Select(link => link.Id)];
+            foreach (string parent in parents) pending.Push(parent);
+            if (parents.Count > 1) continue;
+            string? before = parents.Count == 1 && objects.TryGetValue(parents[0], out GitObject? parentCommit) && parentCommit.Type == 1
+                ? Links(parentCommit)[0].Id
+                : null;
+            CompareTrees(objects, before, links[0].Id, "", paths, 0, cancellationToken);
+        }
+        return paths;
+    }
+
+    private static void CompareTrees(IReadOnlyDictionary<string, GitObject> objects, string? before, string? after, string prefix,
+        HashSet<string> paths, int depth, CancellationToken cancellationToken)
+    {
+        if (before == after) return;
+        cancellationToken.ThrowIfCancellationRequested();
+        Limits.Require(depth <= 64, "tree-depth");
+        Limits.Require(paths.Count <= Limits.ObjectCount, "graph-budget");
+        Dictionary<string, (string Id, int Type)> Entries(string? tree) => tree is null ? new(StringComparer.Ordinal)
+            : TreeEntries(objects.TryGetValue(tree, out GitObject? value) ? value : throw new GitInputException("missing-object"))
+                .ToDictionary(entry => entry.Name, entry => (entry.Id, entry.Type), StringComparer.Ordinal);
+        Dictionary<string, (string Id, int Type)> left = Entries(before), right = Entries(after);
+        foreach (string name in left.Keys.Union(right.Keys))
+        {
+            bool inLeft = left.TryGetValue(name, out (string Id, int Type) old);
+            bool inRight = right.TryGetValue(name, out (string Id, int Type) @new);
+            if (inLeft && inRight && old == @new) continue;
+            string path = prefix + name;
+            string? oldTree = inLeft && old.Type == 2 ? old.Id : null;
+            string? newTree = inRight && @new.Type == 2 ? @new.Id : null;
+            if (oldTree is not null || newTree is not null) CompareTrees(objects, oldTree, newTree, path + "/", paths, depth + 1, cancellationToken);
+            if ((inLeft && old.Type != 2) || (inRight && @new.Type != 2)) paths.Add(path);
+        }
     }
 
     public static bool IsAncestor(IReadOnlyDictionary<string, GitObject> objects, string ancestor, string child, CancellationToken cancellationToken)

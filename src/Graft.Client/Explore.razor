@@ -64,27 +64,27 @@ else
         }
         else
         {
-            <div class="list">
+            <div class="list explore-list">
                 @foreach (BrowseEntryResponse entry in entries)
                 {
                     @* A project listed only because it publishes a page has no readable repository, so the
-                       card links to the page rather than to a repository view that would refuse the reader. *@
+                       card links to the page rather than to a repository view that would refuse the reader, and
+                       straight to the page's site when it has one, which is where the page would send them. *@
                     <a class="list-item" href="@(entry.SourcePublic || entry.GlobalSlug.Length == 0
                         ? "/" + entry.Path
-                        : "/-/p/" + Uri.EscapeDataString(entry.GlobalSlug))">
+                        : entry.SiteUrl ?? "/-/p/" + Uri.EscapeDataString(entry.GlobalSlug))">
                         <Avatar Url="@entry.AvatarUrl" Name="@entry.Name" />
                         <span class="list-item-main">
                             <strong>@entry.Name</strong>
                             <small class="mono">@entry.Path</small>
                             @if (entry.Description.Length > 0) { <small>@entry.Description</small> }
                         </span>
-                        <span class="list-item-actions">
-                            @* Said plainly, because "public" on a card next to a project whose code is not
-                               readable would be read as an offer of the code. *@
-                            <span class="label @(entry.SourcePublic ? "accent" : "")">
-                                @(entry.SourcePublic ? "source public" : "page only")
-                            </span>
-                        </span>
+                        @* Only a project whose code may be read says so. A page-only project carries no label:
+                           its page is all a reader is offered, and "page only" told them nothing they could use. *@
+                        @if (entry.SourcePublic)
+                        {
+                            <span class="list-item-actions"><span class="label accent">source public</span></span>
+                        }
                     </a>
                 }
             </div>

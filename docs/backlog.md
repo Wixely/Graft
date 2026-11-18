@@ -137,6 +137,14 @@ Then the first of the four large items, in the order given:
   trail, transfer and deletion, with token routes for the banner, approvals and transfer.
   [ADR 0047](decisions/0047-agent-project-settings.md).
 
+## Closed on 2026-11-18
+
+- **Straight to a page's site.** Explore and the page's own address go to a page's site without drawing Graft on
+  the way. [ADR 0056](decisions/0056-page-site-recorded.md).
+- **Git LFS locking,** enforced on push as well as by the client. [ADR 0057](decisions/0057-lfs-file-locking.md).
+  Left open: locks in the browser.
+- **A file over 64 MiB said `expanded-limit`.** It now says what is too large and to use LFS.
+
 ## Closed on 2026-11-16
 
 - **Runner tags.** A job's `tags:` send it only to a runner holding every tag; a job with no tags goes only to a

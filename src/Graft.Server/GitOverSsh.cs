@@ -251,10 +251,12 @@ internal sealed partial class GitSshHost(
         if (expectPack) Pack.Capture(command.Input, request, cancellationToken);
         request.Position = 0;
 
+        // Read before the repository is held: the locks are rows, and nothing about them needs the repository.
+        Func<IReadOnlySet<string>, string?>? lockRule = await LfsLockRule.ForAsync(store, project.Id, identity.UserId, cancellationToken);
         return await WithRepositoryAsync(endpoint, async repository =>
         {
             Dictionary<string, string> before = new(repository.Refs, StringComparer.Ordinal);
-            byte[] report = repository.Receive(request, cancellationToken);
+            byte[] report = repository.Receive(request, cancellationToken, lockRule);
             await command.Output.WriteAsync(report, cancellationToken);
             // Created, moved and deleted branches alike; a deleted one reports no new commit, as over HTTP.
             List<(string Branch, string? From, string? To)> moved = [];

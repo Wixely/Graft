@@ -65,3 +65,16 @@ was refused for a 50-deep delta chain. Git writes chains up to 50 by default (`p
 under `gc --aggressive` before 2.18, so a push of any long-lived repository could have met the same refusal. The
 limit is now 250. The work a pack can cause is still bounded by the 8 GiB expansion budget, which was always the
 real bound; the depth only caps how many passes reference-delta resolution may take.
+
+## Amended on 2026-11-18: a file over the limit is refused with the reason
+
+The 64 MiB limit on one object is unchanged. A push that broke it used to fail as an HTTP 400 that Git reported
+as a broken connection, and the `git-remote-graft` helper printed `expanded-limit`. Now:
+- The forge refuses it in Git's own status report, which Git prints as `remote unpack failed`. The reason says a
+  file is larger than the 64 MiB Graft keeps in Git, and to store large files with Git LFS.
+- The helper catches it before sending anything. It finds the files from the repository being pushed and names
+  each one with its size, then says to track them with `git lfs track` and move them with `git lfs migrate import`.
+- Both now also catch a delta that makes an object over the limit, which the helper used to let through.
+
+Over the limit has its own refusal code, `object-too-large`; `expanded-limit` now means only the 8 GiB budget for
+one pack.
