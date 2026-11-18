@@ -296,6 +296,14 @@ Under WSL's default NAT networking, a runner reaches a forge on the same machine
 `localhost`. WSL runs Microsoft's kernel, so a job passing there says nothing about the 3.10 host. See
 [ADR 0054](decisions/0054-runner-tags.md); the WSL path has not yet been run on a real distribution.
 
+To update runners, put the new release's `graft-runner-*` files in the downloads directory. **Runners** then shows
+each runner as running the served build or not, and offers **Update** and **Update all**. An updated runner fetches
+the build over CupriNet the next time it is idle, checks that it starts, swaps it in, keeps the old executable as
+`graft-runner.old`, and restarts. A runner from v0.1.4 or earlier cannot be told to update. Run the update script on
+it once: `/-/runner/update.ps1` on Windows as an administrator, or `/-/runner/update.sh` on Linux as root. Either
+script fetches the served build, checks it starts, swaps it in and restarts the service, keeping the registration;
+`-Binary` or `--binary` takes a build you already have. See [ADR 0058](decisions/0058-runner-updates.md).
+
 In a container deployment, publish the runner port as well as the HTTPS port; the compose file lists only the
 latter by default.
 

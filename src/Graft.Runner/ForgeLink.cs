@@ -137,8 +137,8 @@ internal sealed class RunnerTransfers(ForgeLink link, string home, Action<string
     // Downloads
     // ------------------------------------------------------------------------------------------------
 
-    /// <summary>Downloads the job's source to a file and returns its path, after checking the whole file's SHA-256.</summary>
-    public async Task<string> DownloadAsync(TransferDescriptor source, CancellationToken cancellationToken)
+    /// <summary>Downloads a file the forge offers, a job's source or a runner build, and returns its path, after checking the whole file's SHA-256.</summary>
+    public async Task<string> DownloadAsync(TransferDescriptor source, CancellationToken cancellationToken, string what = "the source")
     {
         if (source.Size > Transfers.MaximumFileBytes) throw new InvalidOperationException("the forge offered " + source.Size + " bytes, past the 4 GiB a runner accepts");
         Directory.CreateDirectory(TransferDirectory);
@@ -151,13 +151,13 @@ internal sealed class RunnerTransfers(ForgeLink link, string home, Action<string
                 {
                     byte[] bytes = await link.FetchRelicAsync(source.Name, Math.Max(1, source.Size), cancellationToken);
                     if (bytes.LongLength != source.Size || Transfers.Sha256Hex(bytes) != source.Sha256)
-                        throw new InvalidDataException("the source did not match the size and SHA-256 the forge declared");
+                        throw new InvalidDataException(what + " did not match the size and SHA-256 the forge declared");
                     await File.WriteAllBytesAsync(path, bytes, cancellationToken);
                     return path;
                 }
                 catch (Exception exception) when (Retryable(exception, cancellationToken) && failures + 1 < Attempts)
                 {
-                    say("Fetching the source failed (" + exception.Message + "); starting it again");
+                    say("Fetching " + what + " failed (" + exception.Message + "); starting it again");
                     await Pause(failures, cancellationToken);
                 }
             }
@@ -172,7 +172,7 @@ internal sealed class RunnerTransfers(ForgeLink link, string home, Action<string
         await using (FileStream file = new(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None))
         {
             file.SetLength((long)have * source.ChunkSize);
-            if (have > 0) say("Resuming the source at chunk " + (have + 1) + " of " + count);
+            if (have > 0) say("Resuming " + what + " at chunk " + (have + 1) + " of " + count);
             int failures = 0;
             while (have < count)
             {
@@ -199,11 +199,11 @@ internal sealed class RunnerTransfers(ForgeLink link, string home, Action<string
             if (await Transfers.Sha256HexAsync(file, cancellationToken) != source.Sha256)
             {
                 File.Delete(progressPath);
-                throw new InvalidDataException("the source's chunks all matched but the whole did not match its SHA-256");
+                throw new InvalidDataException(what + "'s chunks all matched but the whole did not match its SHA-256");
             }
         }
         File.Delete(progressPath);
-        say("Fetched the source in " + count + " chunks");
+        say("Fetched " + what + " in " + count + " chunks");
         return path;
     }
 

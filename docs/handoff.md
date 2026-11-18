@@ -2,6 +2,20 @@
 
 Updated: 2026-11-18. Review: at the start and end of the next work session. Owner: Implementation agent; product choices belong to the project owner.
 
+## Added on 2026-11-18, later: runners update when asked
+
+- **Runner protocol 2** (migration 35): a runner reports its release and its executable's SHA-256 every time it asks
+  for work, so the version on **Runners** is now current, not the one it registered with.
+- **Update and Update all** on **Runners** ask a runner to take the build in `--runner-downloads`. The idle runner
+  fetches it over CupriNet, runs it once, swaps it in (keeping `graft-runner.old`), and ends with exit code 3 so its
+  service brings the new build up. A failure is reported back and shown beside the runner.
+- **Update scripts** at `/-/runner/update.ps1` and `/-/runner/update.sh` bring runners from v0.1.4 and earlier up by
+  hand, keeping their registration; the Windows install and update scripts now set the service to restart when it
+  ends. [ADR 0058](decisions/0058-runner-updates.md).
+- **Not verified:** the restart under a real Windows service or systemd unit; the suite drives `--once` runners.
+- **Next action (project owner):** after the next release, put its runners in the downloads directory and run the
+  update script once on each runner. Then press **Update** on one runner to watch the service come back as the new build.
+
 ## Added on 2026-11-18: straight to a page's site, LFS locking, and the 64 MiB refusal
 
 - **A page's site is recorded** (`Projects.PageSite`, migration 33), so Explore links a page-only project's card to

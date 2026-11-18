@@ -88,7 +88,14 @@ else
     }
 
     <div class="panel">
-        <div class="panel-header"><Icon Name="settings" /><h2>Runners</h2><span class="spacer"></span><span class="label">@runners.Length</span></div>
+        <div class="panel-header">
+            <Icon Name="settings" /><h2>Runners</h2><span class="spacer"></span>
+            @if (runners.Count(runner => runner.UpdateStatus == "available") > 1)
+            {
+                <button type="button" class="secondary" @onclick="UpdateAll" disabled="@busy">Update all</button>
+            }
+            <span class="label">@runners.Length</span>
+        </div>
         @if (runners.Length == 0)
         {
             <p class="panel-empty">No runners yet.</p>
@@ -110,9 +117,25 @@ else
                                 @(runner.TagList is { Length: > 0 } runnerTags ? "Tags " + string.Join(", ", runnerTags) : "No tags")
                                 @(runner.RunUntagged ? " · runs untagged jobs" : " · tagged jobs only")
                             </small>
+                            @if (runner.UpdateStatus is not null)
+                            {
+                                <small>@(runner.Version is { Length: > 0 } version ? "Version " + version + " · " : "")@UpdateText(runner)</small>
+                            }
+                            @if (runner.UpdateError is { Length: > 0 } updateError)
+                            {
+                                <small class="danger-text">The last update did not happen: @updateError</small>
+                            }
                         </span>
                         <span class="label @(runner.Online ? "success" : "")">@StatusText(runner.Status)</span>
                         <span class="list-item-actions">
+                            @if (runner.UpdateStatus == "available")
+                            {
+                                <button type="button" class="secondary" @onclick="() => RequestUpdate(runner)" disabled="@busy">Update</button>
+                            }
+                            else if (runner.UpdateStatus == "requested")
+                            {
+                                <button type="button" class="secondary" @onclick="() => CancelUpdate(runner)" disabled="@busy">Cancel update</button>
+                            }
                             <button type="button" class="secondary" @onclick="() => StartEdit(runner)" disabled="@busy">Edit tags</button>
                             <button type="button" class="@(pendingDelete == runner.Id ? "danger" : "secondary")" @onclick="() => Delete(runner)" disabled="@busy">
                                 @(pendingDelete == runner.Id ? "Confirm remove" : "Remove")
@@ -135,9 +158,89 @@ else
             </div>
         }
     </div>
+
+    <div class="panel">
+        <div class="panel-header"><Icon Name="download" /><h2>Update a runner by hand</h2></div>
+        <div class="panel-body">
+            <p class="secondary-text">
+                A runner older than the build this forge serves updates when you press Update above, once it has been
+                updated by hand one time. The update script replaces its executable with the one this forge serves and
+                restarts its service; it keeps the runner's registration and carries no secret. Run it on the runner's machine,
+                as an administrator on Windows or as root on Linux. A job the runner is running at that moment is stopped.
+            </p>
+            <label for="update-ps1">Windows</label>
+            <input id="update-ps1" readonly class="mono" value="@WindowsUpdateCommand" />
+            <label for="update-sh">Linux</label>
+            <input id="update-sh" readonly class="mono" value="@LinuxUpdateCommand" />
+            <p class="field-hint">
+                Add <span class="mono">-InstallDir</span> or <span class="mono">--dir</span> for a runner installed somewhere other than the
+                install script's default, and <span class="mono">-Binary</span> or <span class="mono">--binary</span> to use a runner you already have.
+            </p>
+        </div>
+    </div>
 }
 
 @code {
+    private string Origin => Navigation.BaseUri.TrimEnd('/');
+    private string WindowsUpdateCommand =>
+        $"Invoke-WebRequest -UseBasicParsing {Origin}/-/runner/update.ps1 -OutFile update-graft-runner.ps1; powershell -ExecutionPolicy Bypass -File update-graft-runner.ps1";
+    private string LinuxUpdateCommand => $"curl -fsSL {Origin}/-/runner/update.sh | sudo sh";
+
+    private static string UpdateText(RunnerResponse runner) => runner.UpdateStatus switch
+    {
+        "current" => "runs the build this forge serves",
+        "available" => "a different build is served here; it can be updated",
+        "requested" => "update requested" + (runner.UpdateRequestedAt is DateTimeOffset at ? " at " + at.ToLocalTime().ToString("HH:mm") : "") +
+            "; it updates the next time it is idle",
+        "needs_script" => "too old to update itself: run the update script below on it once",
+        "no_download" => "this forge serves no runner for its platform",
+        _ => ""
+    };
+
+    private async Task RequestUpdate(RunnerResponse runner)
+    {
+        if (busy) return;
+        busy = true;
+        try
+        {
+            ApiResult<RunnerResponse> result = await Api.SendAsync(HttpMethod.Post, $"api/admin/runners/{runner.Id}/update", ApiJson.Default.RunnerResponse,
+                $"Runner #{runner.Id} will update the next time it is idle, then restart as the new build.");
+            message = result.Message;
+            messageKind = result.Ok ? "success" : "error";
+            await Load();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task CancelUpdate(RunnerResponse runner)
+    {
+        if (busy) return;
+        busy = true;
+        try
+        {
+            ApiResult<RunnerResponse> result = await Api.SendAsync(HttpMethod.Delete, $"api/admin/runners/{runner.Id}/update", ApiJson.Default.RunnerResponse,
+                $"Runner #{runner.Id} will not be asked to update.");
+            message = result.Message;
+            messageKind = result.Ok ? "success" : "error";
+            await Load();
+        }
+        finally { busy = false; }
+    }
+
+    private async Task UpdateAll()
+    {
+        if (busy) return;
+        busy = true;
+        try
+        {
+            ApiResult<RunnerResponse[]> result = await Api.SendAsync(HttpMethod.Post, "api/admin/runners/update", ApiJson.Default.RunnerResponseArray,
+                "Every runner that can update will do so the next time it is idle.");
+            message = result.Ok && result.Value is { } asked ? $"{asked.Length} runner(s) will update the next time each is idle." : result.Message;
+            messageKind = result.Ok ? "success" : "error";
+            await Load();
+        }
+        finally { busy = false; }
+    }
     private RunnerResponse[] runners = [];
     private RunnerCreatedResponse? created;
     private string description = "";

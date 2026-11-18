@@ -12,7 +12,9 @@ using Microsoft.Extensions.Hosting;
 // the one-time registration and writes the configuration the runner keeps using. `run` connects to the same
 // Shrine, asks for work, runs it and reports back, until stopped. With `--once` it stops the first time the forge
 // has nothing for it, which is how the acceptance suite drives it. Under the Windows service manager or systemd
-// it runs as a service; anywhere else as an ordinary console process.
+// it runs as a service; anywhere else as an ordinary console process. Told by its forge to update, it fetches the
+// build the forge serves, puts it in place of its own executable and ends with exit code 3 so the new build starts
+// (ADR 0058).
 
 if (args.Length == 0 || args[0] is "-h" or "--help" or "help")
 {
@@ -53,7 +55,12 @@ try
             if (!options.TryGetValue("--config", out string? runConfig)) { Console.Error.WriteLine("run needs --config."); return 2; }
             RunnerConfig config = RunnerConfig.Load(runConfig);
             if (flags.Contains("--once"))
-                return await new RunnerAgent(config, Path.GetDirectoryName(Path.GetFullPath(runConfig))!).RunAsync(once: true, CancellationToken.None);
+            {
+                RunnerAgent once = new(config, Path.GetDirectoryName(Path.GetFullPath(runConfig))!);
+                int result = await once.RunAsync(once: true, CancellationToken.None);
+                if (once.Updated) Console.WriteLine("Run it again to use the new build.");
+                return result;
+            }
             // The content root is the runner's own directory, not the working directory. systemd starts a unit in /,
             // and a host rooted there watches the whole filesystem for configuration changes and never finishes
             // starting, so the runner neither asked for work nor told systemd it was ready. Nothing is watched at all:
@@ -67,7 +74,8 @@ try
             });
             builder.Services.AddWindowsService(service => service.ServiceName = "GraftRunner");
             builder.Services.AddSystemd();
-            builder.Services.AddSingleton(new RunnerAgent(config, Path.GetDirectoryName(Path.GetFullPath(runConfig))!));
+            RunnerAgent agent = new(config, Path.GetDirectoryName(Path.GetFullPath(runConfig))!);
+            builder.Services.AddSingleton(agent);
             builder.Services.AddHostedService<RunnerService>();
             IHost host = builder.Build();
             // The unit the install script writes is Type=notify. The hosting library's own notification did not
@@ -77,6 +85,12 @@ try
             lifetime.ApplicationStarted.Register(() => SystemdNotify.Send("READY=1\nSTATUS=Graft runner is asking for work"));
             lifetime.ApplicationStopping.Register(() => SystemdNotify.Send("STOPPING=1\nSTATUS=Graft runner is stopping"));
             await host.RunAsync();
+            // Updated by the forge (ADR 0058): the new build is in place; see that it starts as this one was started.
+            if (agent.Updated)
+            {
+                SelfUpdate.Restart(args);
+                return SelfUpdate.UpdatedExitCode;
+            }
             return 0;
         default:
             Console.Error.WriteLine("Unknown command: " + args[0]);

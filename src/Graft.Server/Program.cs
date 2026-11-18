@@ -1160,6 +1160,69 @@ app.MapDelete("/api/admin/runners/{runnerId:long}", async context =>
     else await ApiError(context, 404, "runner");
 });
 
+// Asking runners to update to the build this forge serves (ADR 0058). A runner takes the request the next time it is
+// idle; one too old to understand it is refused here by name, with the update script as the way forward.
+app.MapPost("/api/admin/runners/{runnerId:long}/update", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await BrowserWriter(context);
+    if (browser is null) return;
+    if (!browser.Value.Identity.IsAdministrator) { await ApiError(context, 403, "administrator"); return; }
+    long runnerId = Convert.ToInt64(context.Request.RouteValues["runnerId"], System.Globalization.CultureInfo.InvariantCulture);
+    RunnerInfo? runner = (await store.ListRunnersAsync(browser.Value.Identity, context.RequestAborted)).FirstOrDefault(found => found.Id == runnerId);
+    if (runner is null) { await ApiError(context, 404, "runner"); return; }
+    string? refusal = RunnerUpdateRefusal(runner);
+    if (refusal is not null) { await ApiError(context, 409, refusal); return; }
+    runner = await store.RequestRunnerUpdateAsync(browser.Value.Identity, runnerId, context.RequestAborted);
+    if (runner is null) { await ApiError(context, 404, "runner"); return; }
+    context.Response.StatusCode = StatusCodes.Status202Accepted;
+    await context.Response.WriteAsJsonAsync(RunnerResponseFor(runner), ApiJson.Default.RunnerResponse, null, context.RequestAborted);
+});
+
+app.MapDelete("/api/admin/runners/{runnerId:long}/update", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await BrowserWriter(context);
+    if (browser is null) return;
+    if (!browser.Value.Identity.IsAdministrator) { await ApiError(context, 403, "administrator"); return; }
+    long runnerId = Convert.ToInt64(context.Request.RouteValues["runnerId"], System.Globalization.CultureInfo.InvariantCulture);
+    RunnerInfo? runner = await store.CancelRunnerUpdateAsync(browser.Value.Identity, runnerId, context.RequestAborted);
+    if (runner is null) { await ApiError(context, 404, "runner"); return; }
+    await context.Response.WriteAsJsonAsync(RunnerResponseFor(runner), ApiJson.Default.RunnerResponse, null, context.RequestAborted);
+});
+
+// Every runner that can be told, in one go; the ones that cannot are left as they are and listed as such.
+app.MapPost("/api/admin/runners/update", async context =>
+{
+    (AuthenticatedIdentity Identity, string Secret)? browser = await BrowserWriter(context);
+    if (browser is null) return;
+    if (!browser.Value.Identity.IsAdministrator) { await ApiError(context, 403, "administrator"); return; }
+    List<RunnerResponse> asked = [];
+    foreach (RunnerInfo runner in await store.ListRunnersAsync(browser.Value.Identity, context.RequestAborted))
+        if (runners?.UpdateStatus(runner) == "available" &&
+            await store.RequestRunnerUpdateAsync(browser.Value.Identity, runner.Id, context.RequestAborted) is { } requested)
+            asked.Add(RunnerResponseFor(requested));
+    context.Response.StatusCode = StatusCodes.Status202Accepted;
+    await context.Response.WriteAsJsonAsync(asked.ToArray(), ApiJson.Default.RunnerResponseArray, null, context.RequestAborted);
+});
+
+// The update scripts (ADR 0058): no secret, so anyone may fetch them. Each replaces an installed runner's executable
+// with the one this forge serves and restarts its service, keeping its registration; it is how a runner too old to be
+// told to update is brought up to one that can be.
+app.MapGet("/-/runner/update.ps1", async context =>
+{
+    if (!await OnlyQuery(context)) return;
+    context.Response.ContentType = "text/plain; charset=utf-8";
+    await context.Response.WriteAsync(Graft.Server.RunnerInstallScripts.UpdatePowerShell(serverOrigin ?? Origin(context), settings.RunnerDownloads is not null),
+        context.RequestAborted);
+});
+
+app.MapGet("/-/runner/update.sh", async context =>
+{
+    if (!await OnlyQuery(context)) return;
+    context.Response.ContentType = "text/plain; charset=utf-8";
+    await context.Response.WriteAsync(Graft.Server.RunnerInstallScripts.UpdateShell(serverOrigin ?? Origin(context), settings.RunnerDownloads is not null),
+        context.RequestAborted);
+});
+
 // Runner binaries for install scripts, from a directory the operator fills. Only the names the scripts ask for.
 app.MapGet("/-/runner/download/{file}", async context =>
 {
@@ -1518,7 +1581,7 @@ async Task CreateRunner(HttpContext context, AuthenticatedIdentity identity)
     await context.Response.WriteAsJsonAsync(response, ApiJson.Default.RunnerCreatedResponse, null, context.RequestAborted);
 }
 
-static RunnerResponse RunnerResponseFor(RunnerInfo runner)
+RunnerResponse RunnerResponseFor(RunnerInfo runner)
 {
     // A runner asks for work at least every twenty seconds while it is up, so a minute and a half of silence is gone.
     bool online = runner.ContactedAtUtc is DateTimeOffset contacted && DateTimeOffset.UtcNow - contacted < TimeSpan.FromSeconds(90);
@@ -1526,8 +1589,21 @@ static RunnerResponse RunnerResponseFor(RunnerInfo runner)
         ? (runner.RegistrationExpiresAtUtc <= DateTimeOffset.UtcNow ? "registration_expired" : "never_contacted")
         : online ? "online" : "offline";
     return new(runner.Id, runner.Description, runner.Name, runner.Platform, runner.Version, "instance_type", true, true, false, online, status,
-        runner.ContactedAtUtc, runner.CreatedAtUtc, [.. runner.Tags ?? []], runner.RunUntagged);
+        runner.ContactedAtUtc, runner.CreatedAtUtc, [.. runner.Tags ?? []], runner.RunUntagged,
+        runners?.UpdateStatus(runner), runner.UpdateRequestedAtUtc, runner.UpdateError);
 }
+
+// Why a runner cannot be asked to update, or null when it can (ADR 0058).
+string? RunnerUpdateRefusal(RunnerInfo runner) => runners?.UpdateStatus(runner) switch
+{
+    null when runners is null => "this forge runs no runners",
+    null => "runner #" + runner.Id.ToString(System.Globalization.CultureInfo.InvariantCulture) + " has not registered yet",
+    "no_download" => "this forge serves no runner for " + (runner.Platform ?? "its platform") + "; start it with --runner-downloads holding one",
+    "current" => "runner #" + runner.Id.ToString(System.Globalization.CultureInfo.InvariantCulture) + " already runs the build this forge serves",
+    "needs_script" => "runner #" + runner.Id.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+        " is too old to update itself; run the update script on it once, and later updates can be asked for here",
+    _ => null
+};
 
 // GitLab's PUT on a runner, for what Graft keeps: the description, the tags and run_untagged. Graft has no paused
 // runners, so asking to pause one is refused rather than answered as though it had been.
@@ -10506,7 +10582,7 @@ if (settings.RunnerPort >= 0)
             app.Services.GetRequiredService<IDataProtectionProvider>().CreateProtector("graft.runner.shrine.v1"),
             settings.RunnerChunkThreshold, settings.RunnerChunkBytes,
             Path.Combine(Path.GetDirectoryName(settings.Database)!, "runner-transfers"),
-            ArtifactsPathFor),
+            ArtifactsPathFor, settings.RunnerDownloads),
         store, ArchiveForJob, (text, exception) => app.Logger.LogInformation(exception, "{Message}", text));
     app.Lifetime.ApplicationStopping.Register(() => runners.DisposeAsync().AsTask().GetAwaiter().GetResult());
     Console.WriteLine("RUNNERS: cupri port " + runners.Port.ToString(System.Globalization.CultureInfo.InvariantCulture) +

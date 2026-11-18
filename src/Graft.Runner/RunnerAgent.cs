@@ -125,7 +125,7 @@ public sealed class RunnerAgent(RunnerConfig config, string home)
         while (!cancellationToken.IsCancellationRequested)
         {
             OracleResponse response;
-            try { response = await link.ConsultAsync(Request(Protocol.Routes.RequestJob, [], config.Credential), cancellationToken); }
+            try { response = await link.ConsultAsync(PollRequest(), cancellationToken); }
             catch (Exception exception) when (exception is not OperationCanceledException and not RunnerException)
             {
                 if (once) throw new RunnerException("Could not reach the forge: " + exception.Message);
@@ -142,6 +142,15 @@ public sealed class RunnerAgent(RunnerConfig config, string home)
             }
             if (response.Status == 401) throw new RunnerException("The forge no longer accepts this runner's credential: " + ErrorText(response));
             if (response.Status == 426) throw new RunnerException("This runner and the forge share no protocol version: " + ErrorText(response));
+            if (response.Status == 200 && response.Headers.FirstOrDefault(header => header.Name == Protocol.ActionHeader)?.Value == Protocol.UpdateAction)
+            {
+                if (await UpdateAsync(response, cancellationToken))
+                {
+                    Updated = true;
+                    return SelfUpdate.UpdatedExitCode;
+                }
+                continue;
+            }
             if (response.Status != 200)
             {
                 if (once) throw new RunnerException("The forge answered " + response.Status + ": " + ErrorText(response));
@@ -154,6 +163,55 @@ public sealed class RunnerAgent(RunnerConfig config, string home)
             allSucceeded &= await RunJobAsync(job, cancellationToken);
         }
         return allSucceeded ? 0 : 1;
+    }
+
+    /// <summary>True once the runner has replaced its executable and is ending so the new build can start.</summary>
+    public bool Updated { get; private set; }
+
+    /// <summary>A request for work, saying which build this runner is so the forge can tell whether it is the one it serves.</summary>
+    private OracleRequest PollRequest()
+    {
+        OracleRequest request = Request(Protocol.Routes.RequestJob, [], config.Credential);
+        List<OracleHeader> headers = [.. request.Headers, new(Protocol.RunnerVersionHeader, Version)];
+        if (SelfUpdate.ExecutableSha256 is { } sha256) headers.Add(new(Protocol.RunnerSha256Header, sha256));
+        return new OracleRequest { Method = request.Method, Path = request.Path, Headers = headers, Body = request.Body };
+    }
+
+    /// <summary>
+    /// Fetches the build the forge serves and puts it in place of this executable (ADR 0058). True when it did; when
+    /// it could not, the forge is told why, so the request ends there rather than being repeated.
+    /// </summary>
+    private async Task<bool> UpdateAsync(OracleResponse response, CancellationToken cancellationToken)
+    {
+        string? failure = null;
+        string? downloaded = null;
+        RunnerUpdateResponse? update = JsonSerializer.Deserialize(response.Body, ApiJson.Default.RunnerUpdateResponse);
+        if (update is null) failure = "the forge's update instruction was empty";
+        else if (SelfUpdate.Executable is null) failure = "this runner is not running from its own executable, so it cannot replace it";
+        else
+        {
+            Console.WriteLine("The forge asks this runner to update to the " + update.Platform + " build it serves, " + update.Binary.Size + " bytes");
+            try
+            {
+                downloaded = await new RunnerTransfers(link, home, line => Console.WriteLine("  " + line)).DownloadAsync(update.Binary, cancellationToken, "the new build");
+                string version = await SelfUpdate.InstallAsync(downloaded, cancellationToken);
+                Console.WriteLine("Updated from " + Version + " to " + version + "; ending so the new build starts");
+                return true;
+            }
+            catch (RunnerException exception) { failure = exception.Message; }
+            catch (Exception exception) when (exception is not OperationCanceledException) { failure = "the new build could not be fetched: " + exception.Message; }
+        }
+        if (downloaded is not null) try { File.Delete(downloaded); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+        Console.Error.WriteLine("Could not update: " + failure);
+        byte[] body = JsonSerializer.SerializeToUtf8Bytes(new RunnerUpdateFailedRequest(failure!), ApiJson.Default.RunnerUpdateFailedRequest);
+        try { await link.ConsultAsync(Request(Protocol.Routes.UpdateFailed, body, config.Credential), cancellationToken); }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            // The forge still holds the request and will ask again; not straight away.
+            Console.Error.WriteLine("Could not tell the forge the update failed (" + exception.Message + ")");
+            await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken);
+        }
+        return false;
     }
 
     /// <summary>Runs one job to its end and reports it. True when it succeeded.</summary>
@@ -449,12 +507,20 @@ public sealed class RunnerAgent(RunnerConfig config, string home)
     }
 }
 
-/// <summary>The runner under a service manager: runs until the service is stopped.</summary>
-internal sealed class RunnerService(RunnerAgent agent) : BackgroundService
+/// <summary>The runner under a service manager: runs until the service is stopped, or until the runner has updated itself.</summary>
+internal sealed class RunnerService(RunnerAgent agent, IHostApplicationLifetime lifetime) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        try { await agent.RunAsync(once: false, stoppingToken); }
+        try
+        {
+            await agent.RunAsync(once: false, stoppingToken);
+            if (agent.Updated)
+            {
+                Environment.ExitCode = SelfUpdate.UpdatedExitCode;
+                lifetime.StopApplication();
+            }
+        }
         catch (OperationCanceledException) { }
         catch (RunnerException error) { Console.Error.WriteLine("graft-runner: " + error.Message); throw; }
     }

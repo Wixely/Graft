@@ -36,7 +36,26 @@ public static class RunnerProtocol
     public static Component Component { get; } = new(ComponentName,
     [
         new ComponentVersion(1, BumpReason.Functionality, VersionStatus.Active),
+        // 2: the runner says which build it is on every request for work, and may be told to update (ADR 0058).
+        new ComponentVersion(2, BumpReason.Functionality, VersionStatus.Active),
     ]);
+
+    /// <summary>The first version in which a runner reports its build and accepts an update from the forge.</summary>
+    public const ushort SelfUpdate = 2;
+
+    /// <summary>The request header carrying the runner's release, as it prints it.</summary>
+    public const string RunnerVersionHeader = "graft-runner-version";
+
+    /// <summary>The request header carrying the SHA-256 of the runner's own executable, in lower-case hex.</summary>
+    public const string RunnerSha256Header = "graft-runner-sha256";
+
+    /// <summary>
+    /// The response header that turns an answer to a request for work into an instruction. Its only value so far is
+    /// <see cref="UpdateAction"/>, sent only to a runner that negotiated <see cref="SelfUpdate"/> or later.
+    /// </summary>
+    public const string ActionHeader = "graft-runner-action";
+
+    public const string UpdateAction = "update";
 
     public static Catalogue Catalogue { get; } = Catalogue.Create("graft-runner", [Component]);
 
@@ -83,7 +102,23 @@ public static class RunnerProtocol
         public const string RequestJob = "/runner/v1/jobs/request";
         /// <summary>Followed by the job id and <c>/trace</c> or <c>/finish</c>.</summary>
         public const string JobPrefix = "/runner/v1/jobs/";
+        /// <summary>A runner told to update says here why it could not, so the request is not repeated for ever.</summary>
+        public const string UpdateFailed = "/runner/v1/update/failed";
     }
+
+    /// <summary>The relic name a runner binary is offered under for an update; chunks add <c>.00000</c> onward.</summary>
+    public static string UpdateRelic(string platform, string sha256) => "runner-" + platform + "-" + sha256[..16];
+
+    /// <summary>
+    /// The download a runner of <paramref name="reported"/> platform, as it reports it (<c>windows-x64</c>), is updated
+    /// from (<c>win-x64</c>); null for a platform no runner is built for.
+    /// </summary>
+    public static string? DownloadPlatform(string? reported) => reported switch
+    {
+        "windows-x64" => "win-x64",
+        "linux-x64" => "linux-x64",
+        _ => null
+    };
 
     /// <summary>The relic name a job's source archive is served under; chunks add <c>.00000</c> onward.</summary>
     public static string ArchiveRelic(long jobId) => "job-" + jobId.ToString(CultureInfo.InvariantCulture) + "-source.tar.gz";

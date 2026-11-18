@@ -74,6 +74,15 @@ public sealed record RunnerTraceRequest(long Offset, string Text);
 /// <summary>A job's result.</summary>
 public sealed record RunnerFinishRequest(string Status, [property: JsonPropertyName("exit_code")] int? ExitCode, string? Failure);
 
+/// <summary>
+/// The forge telling an idle runner to replace itself with the build it serves: fetched as <c>binary</c> describes,
+/// checked against its SHA-256, run once to see that it starts, then swapped in for the running executable.
+/// </summary>
+public sealed record RunnerUpdateResponse(string Platform, TransferDescriptor Binary);
+
+/// <summary>Why a runner could not update, recorded for the administrator who asked.</summary>
+public sealed record RunnerUpdateFailedRequest(string Message);
+
 // ----------------------------------------------------------------------------------------------------
 // The administrator's and the projects' side, in GitLab's shapes as far as Graft has them.
 // ----------------------------------------------------------------------------------------------------
@@ -124,7 +133,16 @@ public sealed record RunnerResponse(
     [property: JsonPropertyName("contacted_at")] DateTimeOffset? ContactedAt,
     [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt,
     [property: JsonPropertyName("tag_list")] string[]? TagList = null,
-    [property: JsonPropertyName("run_untagged")] bool RunUntagged = true);
+    [property: JsonPropertyName("run_untagged")] bool RunUntagged = true,
+    /// <summary>
+    /// Graft's: whether the runner runs the build this forge serves. <c>current</c>, <c>available</c> (it can be told
+    /// to update), <c>requested</c>, <c>needs_script</c> (too old to update itself; run the update script once),
+    /// <c>no_download</c> (this forge serves no runner for its platform), or null for a runner not registered yet.
+    /// </summary>
+    [property: JsonPropertyName("update_status")] string? UpdateStatus = null,
+    [property: JsonPropertyName("update_requested_at")] DateTimeOffset? UpdateRequestedAt = null,
+    /// <summary>Graft's: why the last update the forge asked for did not happen.</summary>
+    [property: JsonPropertyName("update_error")] string? UpdateError = null);
 
 /// <summary>A pipeline in GitLab's shape, with Graft's <c>error</c> for a file that could not be run.</summary>
 public sealed record PipelineResponse(

@@ -4,7 +4,7 @@ namespace Graft.Storage;
 
 public static class GraftSchema
 {
-    public static DnaXMigrationManifest Manifest { get; } = new(34,
+    public static DnaXMigrationManifest Manifest { get; } = new(35,
     [
         DnaXMigration.Sql(1, "initial-identity-project-schema", "Create identity and private project schema", """
             CREATE TABLE Users (
@@ -1031,6 +1031,16 @@ public static class GraftSchema
                 CreatedAtUtc TEXT NOT NULL,
                 UNIQUE (ProjectId, Path)
             );
+            """),
+        // Runners that update when asked (ADR 0058). A runner reports the SHA-256 of its own executable and the
+        // protocol it speaks on every request for work, so the forge can tell whether it runs the build it serves and
+        // whether it understands being told to update. An administrator's request waits in UpdateRequestedAtUtc until
+        // the runner reports the served build or says why it could not, which is kept in UpdateError.
+        DnaXMigration.Sql(35, "runner-updates", "Runners report their build and can be asked to update", """
+            ALTER TABLE Runners ADD COLUMN BinarySha256 TEXT NULL;
+            ALTER TABLE Runners ADD COLUMN ProtocolVersion INTEGER NULL;
+            ALTER TABLE Runners ADD COLUMN UpdateRequestedAtUtc TEXT NULL;
+            ALTER TABLE Runners ADD COLUMN UpdateError TEXT NULL;
             """)
     ]);
 }

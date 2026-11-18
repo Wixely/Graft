@@ -144,6 +144,9 @@ Then the first of the four large items, in the order given:
 - **Git LFS locking,** enforced on push as well as by the client. [ADR 0057](decisions/0057-lfs-file-locking.md).
   Left open: locks in the browser.
 - **A file over 64 MiB said `expanded-limit`.** It now says what is too large and to use LFS.
+- **Updating runners meant registering them again.** An administrator now asks from **Runners**, and runners from
+  v0.1.4 and earlier have an update script. [ADR 0058](decisions/0058-runner-updates.md). Left open: checking the
+  restart under a real Windows service and systemd unit.
 
 ## Closed on 2026-11-16
 

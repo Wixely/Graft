@@ -133,8 +133,12 @@ public sealed partial class GraftStore
         return (runner, credential);
     }
 
-    /// <summary>The runner a credential belongs to, recording the contact; null for an unknown credential.</summary>
-    public async Task<RunnerInfo?> ResolveRunnerAsync(string credential, CancellationToken cancellationToken = default)
+    /// <summary>
+    /// The runner a credential belongs to, recording the contact and, when given, what the runner said about itself;
+    /// null for an unknown credential. A report without a SHA-256 is from a runner too old to send one, and leaves
+    /// the release it registered with alone.
+    /// </summary>
+    public async Task<RunnerInfo?> ResolveRunnerAsync(string credential, RunnerReport? report = null, CancellationToken cancellationToken = default)
     {
         if (!ValidSecret(credential ?? "", "graft_runner_")) return null;
         await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
@@ -142,8 +146,62 @@ public sealed partial class GraftStore
         long? id = await db.ExecuteScalarAsync<long?>("SELECT Id FROM Runners WHERE CredentialDigest = @SecretDigest;",
             new ResolveSecretParameters(Digest(credential!), now));
         if (id is null) return null;
-        await db.ExecuteAsync("UPDATE Runners SET ContactedAtUtc = @NowUtc WHERE Id = @Id;", new TouchKeyParameters(id.Value, now));
+        string? sha = report?.BinarySha256 is { Length: 64 } reported && reported.All(Uri.IsHexDigit) ? reported.ToLowerInvariant() : null;
+        if (report is null)
+            await db.ExecuteAsync("UPDATE Runners SET ContactedAtUtc = @NowUtc WHERE Id = @Id;", new TouchKeyParameters(id.Value, now));
+        else
+            await db.ExecuteAsync("""
+                UPDATE Runners SET ContactedAtUtc = @NowUtc, ProtocolVersion = @ProtocolVersion,
+                                   Version = CASE WHEN @BinarySha256 IS NULL THEN Version ELSE @Version END,
+                                   BinarySha256 = @BinarySha256
+                WHERE Id = @Id;
+                """, new RunnerReportParameters(id.Value, now, Bounded(report.Version, 50), sha, report.ProtocolVersion));
         return await RunnerByIdAsync(db, null, id.Value);
+    }
+
+    /// <summary>
+    /// Asks a runner to update to the build the forge serves the next time it is idle; null for no such runner. Asking
+    /// again while a request waits changes nothing. The request is written to the audit trail.
+    /// </summary>
+    public async Task<RunnerInfo?> RequestRunnerUpdateAsync(AuthenticatedIdentity actor, long runnerId, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(actor);
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        await using SqliteTransaction transaction = db.BeginTransaction(deferred: false);
+        AuthenticatedIdentity liveActor = await RequireLiveIdentityAsync(db, transaction, actor, cancellationToken);
+        if (!liveActor.IsAdministrator) throw new UnauthorizedAccessException("Administrator access is required.");
+        RunnerInfo? runner = await RunnerByIdAsync(db, transaction, runnerId);
+        if (runner is null) return null;
+        if (runner.UpdateRequestedAtUtc is not null) return runner;
+        string now = Now();
+        await db.ExecuteAsync("UPDATE Runners SET UpdateRequestedAtUtc = @NowUtc, UpdateError = NULL WHERE Id = @Id;", new TouchKeyParameters(runnerId, now), transaction);
+        await AuditAsync(db, transaction, liveActor.UserId, "request-runner-update", "runner", runnerId.ToString(CultureInfo.InvariantCulture),
+            "Runner asked to update from " + (runner.Version ?? "an unknown release") + ".", now);
+        await transaction.CommitAsync(cancellationToken);
+        return await RunnerByIdAsync(db, null, runnerId);
+    }
+
+    /// <summary>Withdraws a waiting update request; null for no such runner.</summary>
+    public async Task<RunnerInfo?> CancelRunnerUpdateAsync(AuthenticatedIdentity actor, long runnerId, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(actor);
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        AuthenticatedIdentity liveActor = await RequireLiveIdentityAsync(db, null, actor, cancellationToken);
+        if (!liveActor.IsAdministrator) throw new UnauthorizedAccessException("Administrator access is required.");
+        if (await RunnerByIdAsync(db, null, runnerId) is null) return null;
+        await db.ExecuteAsync("UPDATE Runners SET UpdateRequestedAtUtc = NULL WHERE Id = @Id;", new IdParameters(runnerId));
+        return await RunnerByIdAsync(db, null, runnerId);
+    }
+
+    /// <summary>
+    /// Ends a waiting update: done when <paramref name="error"/> is null, otherwise failed for the reason given, which
+    /// is kept for the administrator. The runner's side; it needs no actor.
+    /// </summary>
+    public async Task FinishRunnerUpdateAsync(long runnerId, string? error, CancellationToken cancellationToken = default)
+    {
+        await using SqliteConnection db = await OpenConnectionAsync(cancellationToken);
+        await db.ExecuteAsync("UPDATE Runners SET UpdateRequestedAtUtc = NULL, UpdateError = @UpdateError WHERE Id = @Id;",
+            new RunnerUpdateEndParameters(runnerId, error is null ? null : error.Length > 500 ? error[..500] : error));
     }
 
     public async Task<IReadOnlyList<RunnerInfo>> ListRunnersAsync(AuthenticatedIdentity actor, CancellationToken cancellationToken = default)
@@ -449,7 +507,8 @@ public sealed partial class GraftStore
     // ------------------------------------------------------------------------------------------------
 
     private const string RunnerSelect = """
-        SELECT Id, Description, Name, Platform, Version, CreatedAtUtc, ClaimedAtUtc, ContactedAtUtc, RegistrationExpiresAtUtc, Tags, RunUntagged FROM Runners
+        SELECT Id, Description, Name, Platform, Version, CreatedAtUtc, ClaimedAtUtc, ContactedAtUtc, RegistrationExpiresAtUtc, Tags, RunUntagged,
+               BinarySha256, ProtocolVersion, UpdateRequestedAtUtc, UpdateError FROM Runners
         """;
 
     /// <summary>
@@ -490,7 +549,8 @@ public sealed partial class GraftStore
 
     private static RunnerInfo ToRunner(RunnerRow row) => new(row.Id, row.Description, row.Name, row.Platform, row.Version, Instant(row.CreatedAtUtc),
         row.ClaimedAtUtc is null ? null : Instant(row.ClaimedAtUtc), row.ContactedAtUtc is null ? null : Instant(row.ContactedAtUtc),
-        Instant(row.RegistrationExpiresAtUtc), DecodeLines(row.Tags), row.RunUntagged != 0);
+        Instant(row.RegistrationExpiresAtUtc), DecodeLines(row.Tags), row.RunUntagged != 0, row.BinarySha256,
+        row.ProtocolVersion is null ? null : (int)row.ProtocolVersion.Value, row.UpdateRequestedAtUtc is null ? null : Instant(row.UpdateRequestedAtUtc), row.UpdateError);
 
     private static PipelineInfo ToPipeline(PipelineRow row) => new(row.Id, row.ProjectId, row.Iid, row.Ref, row.Sha, row.Status, row.Source, row.Error,
         Instant(row.CreatedAtUtc), Instant(row.UpdatedAtUtc), row.FinishedAtUtc is null ? null : Instant(row.FinishedAtUtc));
@@ -564,7 +624,10 @@ internal sealed record JobFinishParameters(long Id, string Status, int? ExitCode
 internal sealed record SkipLaterParameters(long PipelineId, long StageIndex, string NowUtc);
 internal sealed record PipelineSettleParameters(long Id, string Status, string NowUtc);
 internal sealed record RunnerRow(long Id, string Description, string? Name, string? Platform, string? Version, string CreatedAtUtc, string? ClaimedAtUtc,
-    string? ContactedAtUtc, string RegistrationExpiresAtUtc, string Tags, long RunUntagged);
+    string? ContactedAtUtc, string RegistrationExpiresAtUtc, string Tags, long RunUntagged, string? BinarySha256, long? ProtocolVersion,
+    string? UpdateRequestedAtUtc, string? UpdateError);
+internal sealed record RunnerReportParameters(long Id, string NowUtc, string? Version, string? BinarySha256, int ProtocolVersion);
+internal sealed record RunnerUpdateEndParameters(long Id, string? UpdateError);
 internal sealed record PipelineRow(long Id, long ProjectId, long Iid, string Ref, string Sha, string Status, string Source, string? Error, string CreatedAtUtc,
     string UpdatedAtUtc, string? FinishedAtUtc);
 internal sealed record JobRow(long Id, long PipelineId, long ProjectId, string Name, string Stage, long StageIndex, string Script, string Variables, long AllowFailure,

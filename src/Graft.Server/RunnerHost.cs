@@ -32,7 +32,11 @@ internal sealed record RunnerHostOptions(
     long ChunkThresholdBytes,
     long ChunkBytes,
     string TransferDirectory,
-    Func<ProjectInfo, long, string> ArtifactPath);
+    Func<ProjectInfo, long, string> ArtifactPath,
+    string? Downloads = null);
+
+/// <summary>A runner build this forge serves for one platform, as runners are updated to it (ADR 0058).</summary>
+internal sealed record ServedRunner(string Platform, string Path, long Size, string Sha256, DateTime WrittenUtc);
 
 /// <summary>CupriNet keeps its secrets through an interface of its own; this hands it the forge's key ring.</summary>
 internal sealed class KeyRingProtector(AspNetProtector protector) : CupriNet.Abstractions.IDataProtector
@@ -180,7 +184,8 @@ internal sealed class RunnerHost : IAsyncDisposable
             ushort? version = Protocol.Negotiate(request.Header(Protocol.VersionHeader), out string reason);
             if (version is null) return Error(426, reason);
             if (request.Path == Protocol.Routes.Register) return await RegisterAsync(request, version.Value, cancellationToken);
-            if (request.Path == Protocol.Routes.RequestJob) return await RequestJobAsync(request, cancellationToken);
+            if (request.Path == Protocol.Routes.RequestJob) return await RequestJobAsync(request, version.Value, cancellationToken);
+            if (request.Path == Protocol.Routes.UpdateFailed) return await UpdateFailedAsync(request, cancellationToken);
             if (request.Path.StartsWith(Protocol.Routes.JobPrefix, StringComparison.Ordinal))
             {
                 string[] parts = request.Path[Protocol.Routes.JobPrefix.Length..].Split('/');
@@ -218,10 +223,12 @@ internal sealed class RunnerHost : IAsyncDisposable
             ApiJson.Default.RunnerRegisterResponse));
     }
 
-    private async Task<OracleResponse> RequestJobAsync(OracleRequest request, CancellationToken cancellationToken)
+    private async Task<OracleResponse> RequestJobAsync(OracleRequest request, ushort version, CancellationToken cancellationToken)
     {
-        RunnerInfo? runner = await store.ResolveRunnerAsync(request.Header(Protocol.AuthorizationHeader) ?? "", cancellationToken);
+        RunnerReport report = new(request.Header(Protocol.RunnerVersionHeader), request.Header(Protocol.RunnerSha256Header), version);
+        RunnerInfo? runner = await store.ResolveRunnerAsync(request.Header(Protocol.AuthorizationHeader) ?? "", report, cancellationToken);
         if (runner is null) return Error(401, "the runner credential is not valid; the runner may have been removed");
+        if (runner.UpdateRequestedAtUtc is not null && await UpdateFor(runner, cancellationToken) is { } update) return update;
         DateTimeOffset until = DateTimeOffset.UtcNow + LongPoll;
         while (true)
         {
@@ -239,6 +246,117 @@ internal sealed class RunnerHost : IAsyncDisposable
             try { await wake.WaitAsync(left, cancellationToken); }
             catch (TimeoutException) { return new OracleResponse { Status = 204 }; }
         }
+    }
+
+    // ------------------------------------------------------------------------------------------------
+    // Updates (ADR 0058)
+    // ------------------------------------------------------------------------------------------------
+
+    private readonly ConcurrentDictionary<string, ServedRunner> served = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, TransferDescriptor> offered = new(StringComparer.Ordinal);
+    private readonly SemaphoreSlim offering = new(1, 1);
+
+    /// <summary>
+    /// The build this forge serves for a runner on <paramref name="reportedPlatform"/>, as the runner reports it; null
+    /// when it serves none. Hashed once per file the operator puts there, not on every request.
+    /// </summary>
+    public ServedRunner? Served(string? reportedPlatform)
+    {
+        if (options.Downloads is null || Protocol.DownloadPlatform(reportedPlatform) is not { } platform) return null;
+        string path = Path.Combine(options.Downloads, RunnerInstallScripts.BinaryName(platform));
+        FileInfo file = new(path);
+        if (!file.Exists) return null;
+        if (served.TryGetValue(platform, out ServedRunner? known) && known.Size == file.Length && known.WrittenUtc == file.LastWriteTimeUtc) return known;
+        string sha256;
+        try
+        {
+            using FileStream stream = File.OpenRead(path);
+            sha256 = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(stream));
+        }
+        catch (IOException) { return null; }
+        ServedRunner current = new(platform, path, file.Length, sha256, file.LastWriteTimeUtc);
+        served[platform] = current;
+        return current;
+    }
+
+    /// <summary>Where a runner stands against the build this forge serves; see <see cref="RunnerResponse.UpdateStatus"/>.</summary>
+    public string? UpdateStatus(RunnerInfo runner)
+    {
+        if (runner.ClaimedAtUtc is null) return null;
+        ServedRunner? build = Served(runner.Platform);
+        if (build is null) return "no_download";
+        if (runner.BinarySha256 == build.Sha256) return "current";
+        if (runner.UpdateRequestedAtUtc is not null) return "requested";
+        if (runner.BinarySha256 is null || (runner.ProtocolVersion ?? 1) < Protocol.SelfUpdate) return "needs_script";
+        return "available";
+    }
+
+    /// <summary>
+    /// What an idle runner with an update waiting is told: to fetch the served build, when it differs from what the
+    /// runner reports and the runner understands the instruction. The request ends here when the runner already runs
+    /// the build, or when there is nothing to update it to. Null to carry on and hand it work.
+    /// </summary>
+    private async Task<OracleResponse?> UpdateFor(RunnerInfo runner, CancellationToken cancellationToken)
+    {
+        ServedRunner? build = Served(runner.Platform);
+        if (build is null)
+        {
+            await store.FinishRunnerUpdateAsync(runner.Id, "this forge serves no runner for " + (runner.Platform ?? "its platform"), cancellationToken);
+            return null;
+        }
+        if (runner.BinarySha256 == build.Sha256)
+        {
+            await store.FinishRunnerUpdateAsync(runner.Id, null, cancellationToken);
+            log("runner " + runner.Id.ToString(CultureInfo.InvariantCulture) + " runs the served build " + (runner.Version ?? "?"), null);
+            return null;
+        }
+        // A runner too old to be told keeps working; the request waits for the update script to be run on it.
+        if (runner.BinarySha256 is null || (runner.ProtocolVersion ?? 1) < Protocol.SelfUpdate) return null;
+        TransferDescriptor binary = await OfferAsync(build, cancellationToken);
+        log("runner " + runner.Id.ToString(CultureInfo.InvariantCulture) + " told to update to the served " + build.Platform + " build", null);
+        return new OracleResponse
+        {
+            Status = 200,
+            Headers = [new OracleHeader("content-type", "application/json"), new OracleHeader(Protocol.ActionHeader, Protocol.UpdateAction)],
+            Body = JsonSerializer.SerializeToUtf8Bytes(new RunnerUpdateResponse(build.Platform, binary), ApiJson.Default.RunnerUpdateResponse),
+        };
+    }
+
+    /// <summary>
+    /// Offers a served build as chunked relics read from a copy beside the job sources, so the operator replacing the
+    /// download mid-transfer changes nothing a runner is fetching. One copy per build, kept until the forge stops.
+    /// </summary>
+    private async Task<TransferDescriptor> OfferAsync(ServedRunner build, CancellationToken cancellationToken)
+    {
+        string relic = Protocol.UpdateRelic(build.Platform, build.Sha256);
+        if (offered.TryGetValue(relic, out TransferDescriptor? known)) return known;
+        await offering.WaitAsync(cancellationToken);
+        try
+        {
+            if (offered.TryGetValue(relic, out known)) return known;
+            string copy = Path.Combine(SourceDirectory, relic);
+            File.Copy(build.Path, copy, overwrite: true);
+            string sha256;
+            await using (FileStream file = File.OpenRead(copy)) sha256 = await Transfers.Sha256HexAsync(file, cancellationToken);
+            if (sha256 != build.Sha256) throw new IOException("the served runner changed while it was being offered");
+            string[] hashes = await Transfers.ChunkHashesAsync(copy, options.ChunkBytes, cancellationToken);
+            archives.AddChunked(relic, copy, build.Size);
+            TransferDescriptor descriptor = new(relic, build.Size, sha256, true, options.ChunkBytes, hashes);
+            offered[relic] = descriptor;
+            return descriptor;
+        }
+        finally { offering.Release(); }
+    }
+
+    private async Task<OracleResponse> UpdateFailedAsync(OracleRequest request, CancellationToken cancellationToken)
+    {
+        RunnerInfo? runner = await store.ResolveRunnerAsync(request.Header(Protocol.AuthorizationHeader) ?? "", null, cancellationToken);
+        if (runner is null) return Error(401, "the runner credential is not valid; the runner may have been removed");
+        RunnerUpdateFailedRequest? body = JsonSerializer.Deserialize(request.Body, ApiJson.Default.RunnerUpdateFailedRequest);
+        string message = body?.Message is { Length: > 0 } text ? text : "the runner did not say why";
+        await store.FinishRunnerUpdateAsync(runner.Id, message, cancellationToken);
+        log("runner " + runner.Id.ToString(CultureInfo.InvariantCulture) + " could not update: " + message, null);
+        return new OracleResponse { Status = 200 };
     }
 
     /// <summary>

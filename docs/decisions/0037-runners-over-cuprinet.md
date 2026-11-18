@@ -1,7 +1,8 @@
 # 0037: Graft's own runner, over CupriNet, installed from a script the forge writes
 
 - Date: 2026-10-31
-- Status: Accepted, implemented in its first slice
+- Status: Accepted, implemented in its first slice. Amended 2026-11-18 by [ADR 0058](0058-runner-updates.md): protocol
+  version 2 has runners report their build and accept an update from the forge; version 1 is still spoken
 - Source: Requests on 2026-10-31 for a runner, for it to use CupriMark and CupriNet, and for Graft to give out install scripts that carry the Intonation a runner needs to connect. The requirement "simplify runner setup and networking; investigate CupriNet integration" dates from the first requirements, and continuous integration had been a long-term goal since [ADR 0001](0001-name-and-compatibility.md)
 - Review trigger: CupriNet or CupriMark reaching 1.0, or an external audit of CupriNet's Noise usage; a request for GitLab's runner API so the official `gitlab-runner` connects; a request for containers, caches, artifacts, services or `rules`; a runner that cannot reach the forge's runner port directly; the Linux 3.10.108 acceptance run; approval of the authenticated GitHub Packages feed
 

@@ -18,7 +18,18 @@ public sealed record RunnerInfo(
     /// <summary>The tags an administrator gave the runner; a job is routed by them.</summary>
     IReadOnlyList<string>? Tags = null,
     /// <summary>Whether the runner also takes jobs that ask for no tags.</summary>
-    bool RunUntagged = true);
+    bool RunUntagged = true,
+    /// <summary>The SHA-256 of the runner's executable, as it last reported it; null for a runner too old to say.</summary>
+    string? BinarySha256 = null,
+    /// <summary>The runner protocol version agreed when it last asked for work.</summary>
+    int? ProtocolVersion = null,
+    /// <summary>When an administrator asked the runner to update, until it has or has said why it could not.</summary>
+    DateTimeOffset? UpdateRequestedAtUtc = null,
+    /// <summary>Why the last update asked for did not happen.</summary>
+    string? UpdateError = null);
+
+/// <summary>What a runner says about itself each time it asks for work: its release, its executable's SHA-256 and the protocol agreed.</summary>
+public sealed record RunnerReport(string? Version, string? BinarySha256, int ProtocolVersion);
 
 /// <summary>
 /// The rule for runner and job tags, shared by the pipeline reader and the runner settings so a tag a job asks for

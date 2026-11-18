@@ -256,7 +256,7 @@ try
     await CheckSsh(address, aliceIdentity, bob.Username);
     await CheckEmptyRepository(address, aliceIdentity, alicePassword);
     address = await CheckWebhooks(address, aliceIdentity);
-    address = await CheckRunners(address, aliceIdentity, bob.Username);
+    address = await CheckRunners(address, aliceIdentity, bob.Username, adminPassword);
     address = await CheckUrlImport(address, aliceIdentity, bob.Username);
     address = await CheckReleasePublishing(address, aliceIdentity, bob.Username);
     address = await CheckRemoteHelper(address, aliceIdentity, bob.Username);
@@ -7656,7 +7656,7 @@ async Task CheckFetching(string address, AuthenticatedIdentity alice, string str
 /// are driven too: no runners configured, the wrong caller, a spent token, a file Graft does not run, a stranger,
 /// and a runner that was removed.
 /// </summary>
-async Task<string> CheckRunners(string address, AuthenticatedIdentity alice, string bobUsername)
+async Task<string> CheckRunners(string address, AuthenticatedIdentity alice, string bobUsername, string adminPassword)
 {
     string runnerExe = Environment.GetEnvironmentVariable("GRAFT_RUNNER") ??
         Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "src", "Graft.Runner", "bin", "Debug", "net10.0",
@@ -8208,6 +8208,114 @@ async Task<string> CheckRunners(string address, AuthenticatedIdentity alice, str
         Check(json.RootElement[0].GetProperty("status").GetString() == "failed" &&
             json.RootElement[0].GetProperty("error").GetString()!.Contains("variable", StringComparison.Ordinal),
             "a tag that would need a variable expanded fails the pipeline, saying so");
+    }
+
+    // Updates (ADR 0058). The forge serves a build the runner is not: the suite's runner with bytes after its end, which
+    // both systems still run. A copy of the runner is asked to update to it, does, and reports the new build after.
+    Check(powerShell.Contains("sc.exe failureflag GraftRunner 1", StringComparison.Ordinal),
+        "the Windows install script has the service restart when it ends, which is how an updated runner comes back");
+    string servedPath = Path.Combine(runnerDownloads!, OperatingSystem.IsWindows() ? "graft-runner-win-x64.exe" : "graft-runner-linux-x64");
+    byte[] runnerBytes = File.ReadAllBytes(runnerExe);
+    byte[] servedBytes = [.. runnerBytes, .. System.Text.Encoding.ASCII.GetBytes("\nserved build " + Guid.NewGuid().ToString("N") + "\n")];
+    File.WriteAllBytes(servedPath, servedBytes);
+    string copyDirectory = Path.Combine(root, "runner-copy");
+    CopyTree(Path.GetDirectoryName(runnerExe)!, copyDirectory);
+    string copyExe = Path.Combine(copyDirectory, Path.GetFileName(runnerExe));
+    string copyOld = Path.Combine(copyDirectory, Path.GetFileNameWithoutExtension(runnerExe) + ".old" + Path.GetExtension(runnerExe));
+    (int copyExit, _, string copyErrors) = await RunTool(copyExe, scripts, ["run", "--config", config, "--once"]);
+    JsonElement reported = await ReadRunner();
+    Check(copyExit == 0 && reported.GetProperty("update_status").GetString() == "available" && reported.GetProperty("version").GetString() is { Length: > 0 },
+        "a runner reports its build when it asks for work, and the forge sees it is not the one it serves (" + copyErrors.Trim() + ")");
+
+    (HttpClient Client, string Csrf) adminSession = await BrowserSession(address, "admin", adminPassword);
+    using HttpClient adminBrowser = adminSession.Client;
+    using (HttpResponseMessage asked = await AdminSend(HttpMethod.Post, "/api/admin/runners/" + runnerId + "/update"))
+        Check(asked.StatusCode == HttpStatusCode.Accepted && (await asked.Content.ReadAsStringAsync()).Contains("\"update_status\":\"requested\"", StringComparison.Ordinal),
+            "an administrator asks the runner to update");
+    using (HttpResponseMessage withdrawn = await AdminSend(HttpMethod.Delete, "/api/admin/runners/" + runnerId + "/update"))
+        Check(withdrawn.IsSuccessStatusCode && (await withdrawn.Content.ReadAsStringAsync()).Contains("\"update_status\":\"available\"", StringComparison.Ordinal),
+            "and may withdraw the request before the runner takes it");
+    using (HttpResponseMessage asked = await AdminSend(HttpMethod.Post, "/api/admin/runners/" + runnerId + "/update"))
+        Check(asked.StatusCode == HttpStatusCode.Accepted, "and ask again");
+    (int updateExit, string updateOut, string updateErrors) = await RunTool(copyExe, scripts, ["run", "--config", config, "--once"]);
+    Check(updateExit == 3 && updateOut.Contains("Updated from", StringComparison.Ordinal) && File.ReadAllBytes(copyExe).AsSpan().SequenceEqual(servedBytes) &&
+        File.Exists(copyOld) && File.ReadAllBytes(copyOld).AsSpan().SequenceEqual(runnerBytes),
+        "the idle runner fetches the served build over CupriNet, swaps it in, keeps the old one beside it, and ends with exit 3 (" + updateErrors.Trim() + ")");
+    (int afterExit, _, string afterErrors) = await RunTool(copyExe, scripts, ["run", "--config", config, "--once"]);
+    reported = await ReadRunner();
+    Check(afterExit == 0 && reported.GetProperty("update_status").GetString() == "current" && IsNull(reported, "update_requested_at") && IsNull(reported, "update_error"),
+        "started again, it reports the served build, and the request is done (" + afterErrors.Trim() + ")");
+    using (HttpResponseMessage again = await AdminSend(HttpMethod.Post, "/api/admin/runners/" + runnerId + "/update"))
+        Check(again.StatusCode == HttpStatusCode.Conflict && (await again.Content.ReadAsStringAsync()).Contains("already runs", StringComparison.Ordinal),
+            "a runner on the served build is not asked again");
+
+    // A served build that does not start on the runner's machine is refused before anything is replaced, and the
+    // administrator is told why.
+    File.WriteAllText(servedPath, "not a runner\n");
+    using (HttpResponseMessage asked = await AdminSend(HttpMethod.Post, "/api/admin/runners/" + runnerId + "/update"))
+        Check(asked.StatusCode == HttpStatusCode.Accepted, "a runner can be asked to update to a broken build");
+    (int brokenExit, _, string brokenErrors) = await RunTool(copyExe, scripts, ["run", "--config", config, "--once"]);
+    reported = await ReadRunner();
+    Check(brokenExit == 0 && brokenErrors.Contains("Could not update", StringComparison.Ordinal) && File.ReadAllBytes(copyExe).AsSpan().SequenceEqual(servedBytes) &&
+        !Directory.EnumerateFiles(copyDirectory, "*.new*").Any(),
+        "but finds it does not start, keeps running the build it has, and leaves nothing behind (" + brokenErrors.Trim() + ")");
+    Check(reported.GetProperty("update_error").GetString() is { } updateError && updateError.Contains("does not start", StringComparison.Ordinal) &&
+        IsNull(reported, "update_requested_at"), "and the forge records why, ending the request");
+
+    // The update script, for a runner too old to be told: it replaces the executable in an install directory with the
+    // build given, after seeing it start, and keeps the old one.
+    File.WriteAllBytes(servedPath, servedBytes);
+    string updatePs1 = Path.Combine(scripts, "update-graft-runner.ps1");
+    string updateSh = Path.Combine(scripts, "update-graft-runner.sh");
+    using (HttpResponseMessage ps1Script = await ApiGet(address, "/-/runner/update.ps1", null))
+    using (HttpResponseMessage shScript = await ApiGet(address, "/-/runner/update.sh", null))
+    {
+        string ps1Text = await ps1Script.Content.ReadAsStringAsync();
+        string shText = await shScript.Content.ReadAsStringAsync();
+        Check(ps1Script.IsSuccessStatusCode && shScript.IsSuccessStatusCode && ps1Text.Contains("/-/runner/download/graft-runner-win-x64.exe", StringComparison.Ordinal) &&
+            shText.Contains("/-/runner/download/graft-runner-$PLATFORM", StringComparison.Ordinal) && !ps1Text.Contains("graft_r", StringComparison.Ordinal),
+            "the update scripts are served to anyone, carry no secret, and fetch the runner from this forge");
+        File.WriteAllText(updatePs1, ps1Text);
+        File.WriteAllText(updateSh, shText);
+    }
+    (int updateShParse, _, string updateShErrors) = await RunTool("sh", scripts, ["-n", updateSh]);
+    Check(updateShParse == 0, "the shell update script is valid POSIX shell (" + updateShErrors.Trim() + ")");
+    string manualDirectory = Path.Combine(root, "runner-manual");
+    CopyTree(Path.GetDirectoryName(runnerExe)!, manualDirectory);
+    string manualExe = Path.Combine(manualDirectory, Path.GetFileName(runnerExe));
+    (int manualExit, string manualOut, string manualErrors) = OperatingSystem.IsWindows()
+        ? await RunTool("powershell.exe", scripts, ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", updatePs1, "-InstallDir", manualDirectory, "-Binary", servedPath])
+        : await RunTool("sh", scripts, [updateSh, "--dir", manualDirectory, "--binary", servedPath]);
+    Check(manualExit == 0 && manualOut.Contains("Updated", StringComparison.Ordinal) && File.ReadAllBytes(manualExe).AsSpan().SequenceEqual(servedBytes) &&
+        File.Exists(Path.Combine(manualDirectory, Path.GetFileNameWithoutExtension(runnerExe) + ".old" + Path.GetExtension(runnerExe))),
+        "the update script swaps in the new build after seeing it start, keeping the old one (" + manualOut.Trim() + manualErrors.Trim() + ")");
+    File.WriteAllText(Path.Combine(scripts, "not-a-runner"), "not a runner\n");
+    (int refusedExit, _, string refusedErrors) = OperatingSystem.IsWindows()
+        ? await RunTool("powershell.exe", scripts, ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", updatePs1, "-InstallDir", manualDirectory, "-Binary", Path.Combine(scripts, "not-a-runner")])
+        : await RunTool("sh", scripts, [updateSh, "--dir", manualDirectory, "--binary", Path.Combine(scripts, "not-a-runner")]);
+    Check(refusedExit != 0 && File.ReadAllBytes(manualExe).AsSpan().SequenceEqual(servedBytes), "and refuses one that does not start, changing nothing (" + refusedErrors.Trim() + ")");
+
+    async Task<JsonElement> ReadRunner()
+    {
+        using HttpResponseMessage read = await ApiGet(address, "/api/v4/runners/" + runnerId, adminApi);
+        using JsonDocument json = JsonDocument.Parse(await read.Content.ReadAsStringAsync());
+        return json.RootElement.Clone();
+    }
+    async Task<HttpResponseMessage> AdminSend(HttpMethod method, string path)
+    {
+        using HttpRequestMessage request = new(method, path);
+        request.Headers.Add("Origin", address);
+        request.Headers.Add("X-Graft-CSRF", adminSession.Csrf);
+        return await adminBrowser.SendAsync(request);
+    }
+    static bool IsNull(JsonElement element, string name) => !element.TryGetProperty(name, out JsonElement value) || value.ValueKind == JsonValueKind.Null;
+    static void CopyTree(string from, string to)
+    {
+        Directory.CreateDirectory(to);
+        foreach (string directory in Directory.EnumerateDirectories(from, "*", SearchOption.AllDirectories))
+            Directory.CreateDirectory(Path.Combine(to, Path.GetRelativePath(from, directory)));
+        foreach (string file in Directory.EnumerateFiles(from, "*", SearchOption.AllDirectories))
+            File.Copy(file, Path.Combine(to, Path.GetRelativePath(from, file)), overwrite: true);
     }
 
     // A file Graft does not run is a failed pipeline that says why, not silence.

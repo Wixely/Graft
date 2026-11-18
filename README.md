@@ -153,6 +153,26 @@ machine that will run jobs:
 The script downloads `graft-runner` from the forge when the forge has `--runner-downloads`, or takes one you already
 have with `-Binary` or `--binary`. `-NoService` and `--no-service` register without installing a service.
 
+### Updating a runner
+
+When the forge serves a newer runner than one is running, **Runners** offers **Update** beside it, and **Update all**.
+The runner takes the build the next time it is idle, checks that it starts, swaps it in and restarts as it
+([ADR 0058](docs/decisions/0058-runner-updates.md)).
+
+A runner from v0.1.4 or earlier is too old to be told. Update it once by hand with the update script, which keeps its
+registration and restarts its service:
+
+```powershell
+# Windows, as an administrator
+Invoke-WebRequest -UseBasicParsing https://<forge>/-/runner/update.ps1 -OutFile update-graft-runner.ps1
+powershell -ExecutionPolicy Bypass -File update-graft-runner.ps1
+```
+
+```sh
+# Linux, as root
+curl -fsSL https://<forge>/-/runner/update.sh | sudo sh
+```
+
 ## git-remote-graft: for a forge behind Cloudflare or another proxy
 
 A proxy can refuse a request over a size: Cloudflare's free plan stops at 100 MB. Git sends a whole push, and Git LFS a
